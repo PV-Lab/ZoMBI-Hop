@@ -1,0 +1,7 @@
+numpy
+scipy
+pandas
+scikit-opt
+matplotlib
+itertools
+joblib
