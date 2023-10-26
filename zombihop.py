@@ -7,7 +7,7 @@ import random
 
 class ZombiHop:
     def __init__(self, seed, X_init, Y_init, Y_experimental, Gammas, alphas, n_draws_per_activation, acquisition_type,
-                 tolerance, penalty_width, m, k, lower_bound, upper_bound, resolution):
+                 tolerance, penalty_width, m, k, lower_bound, upper_bound, resolution, sampler):
         '''
         Runs the ZoMBI-Hop optimization procedure over
         #Gammas hops, #alphas ZoMBI zoom-ins per hop, and #n_draws_per_activation experiments drawn per zoom-in.
@@ -32,7 +32,9 @@ class ZombiHop:
         :param k:                       Top k-number of data points to keep
         :param lower_bound:             An (d,) array of lower bound coordinates for each dimension (d) to begin the search
         :param upper_bound:             An (d,) array of upper bound coordinates for each dimension (d) to begin the search
-        :param resolution:              Number for the resolution of the mesh search space, e.g., resolution=100000
+        :param resolution:              Number for the resolution of the mesh search space, e.g., resolution=10
+        :param sampler:                 Either None or a sampler that takes in arguments (X_ask, acquisitions, Y_experimental) and
+                                        outputs X_tell, Y_tell with X_tell shape=(n,d); Y_tell shape=(n,) for n samples and d dimensions 
         '''
 
         if not (acquisition_type == LCB_ada or acquisition_type == EI):
@@ -54,6 +56,7 @@ class ZombiHop:
         self.lower_bound = lower_bound
         self.upper_bound = upper_bound
         self.resolution = resolution
+        self.sampler = sampler
 
         self.ftype = np.float16 # set formatting data type to float16 for memory conservation, float64 is too large
 
@@ -106,23 +109,33 @@ class ZombiHop:
                     # acquisition function for mesh
                     acquisition = self.acquisition_type(X=dimension_meshes, GP_model=GP,  n=n, fX_best=Y_BOUNDmemory.min(), ratio=self.ratio, decay=self.decay, xi=self.xi, ftype=self.ftype)
                     acquisition = acquisition * penalty_mask
+                    
+                    # gather the best X-value to ask the virtual "experiment" to create
+                    X_ask = dimension_meshes[np.argmax(acquisition),:].reshape(1,-1)
 
-                    # "experimental" prediction
-                    ypred = self.Y_experimental(dimension_meshes)[np.argmax(acquisition)]
+                    # tell the model what experiments were created
+                    if self.sampler: # if using a sampler, required outputs: X_tell shape = (n,d); Y_tell shape = (n,) for n samples and d dimensions
+                        X_tell, Y_tell = self.sampler(X_ask, acquisition.reshape(-1,dimension_meshes.shape[1]), self.Y_experimental) 
+                    else:
+                        Y_tell = self.Y_experimental(X_ask)
+                        X_tell = X_ask
 
-                    # model prediction
-                    mu, std = utils.GP_pred([dimension_meshes[np.argmax(acquisition)]], GP, self.ftype)
+                    # check posterior of surrogate with Y_tell, only check best performer of Y_tell
+                    Y_tell_min = np.min(Y_tell) # get minimum Y_tell
+                    X_tell_min = X_tell[np.argmin(Y_tell), :].reshape(1,-1) # get corresponding minimum X_tell
+                    mu, std = utils.GP_pred(X_tell_min, GP, self.ftype) # check surrogate posterior at corresponding minimum X_tell
                     ymodel = mu[0][0]
 
-                    error = np.abs(ypred - ymodel) / np.abs(ypred)
+                    # compute error between surrogate posterior and "experimental"
+                    error = np.abs(Y_tell_min - ymodel)/np.abs(Y_tell_min)
                     error_list.append(error)
 
                     # get "experimental" measurements from the BO prediction for X and Y
-                    newframeX = pd.DataFrame(dimension_meshes[np.argmax(acquisition)].reshape(1, -1), columns=X_intermediate.columns.values)
-                    newframeY = pd.DataFrame([ypred], columns=Y_intermediate.columns.values)
+                    newframeX = pd.DataFrame(X_tell, columns = X_intermediate.columns.values)
+                    newframeY = pd.DataFrame(Y_tell.reshape(len(Y_tell),1), columns = Y_intermediate.columns.values)
 
                     if verbose:
-                        print(f'\nactual: {ypred}')
+                        print(f'\nactual: {Y_tell_min}')
                         print(f'model: {ymodel}')
                         print(f'error: {error}')
                         print(newframeX)
