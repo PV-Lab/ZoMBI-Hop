@@ -33,8 +33,9 @@ class ZombiHop:
         :param lower_bound:             An (d,) array of lower bound coordinates for each dimension (d) to begin the search
         :param upper_bound:             An (d,) array of upper bound coordinates for each dimension (d) to begin the search
         :param resolution:              Number for the resolution of the mesh search space, e.g., resolution=10
-        :param sampler:                 Either None or a sampler that takes in arguments (X_ask, acquisitions, Y_experimental) and
-                                        outputs X_tell, Y_tell with X_tell shape=(n,d); Y_tell shape=(n,) for n samples and d dimensions 
+        :param sampler:                 Either None or a sampler that takes in arguments (X_ask, dimension_meshes, acquisitions, Y_experimental) and
+                                        outputs X_tell, Y_tell with X_tell (shape=(n,d)); Y_tell (shape=(n,)) for n samples and d dimensions.
+                                        dimension_meshes (shape=(n,d)) are the X-values to the acquisitions (shape=(n,)) values. 
         '''
 
         if not (acquisition_type == LCB_ada or acquisition_type == EI):
@@ -115,7 +116,7 @@ class ZombiHop:
 
                     # tell the model what experiments were created
                     if self.sampler: # if using a sampler, required outputs: X_tell shape = (n,d); Y_tell shape = (n,) for n samples and d dimensions
-                        X_tell, Y_tell = self.sampler(X_ask, acquisition.reshape(-1,dimension_meshes.shape[1]), self.Y_experimental) 
+                        X_tell, Y_tell = self.sampler(X_ask, dimension_meshes, acquisition, self.Y_experimental) 
                     else:
                         Y_tell = self.Y_experimental(X_ask)
                         X_tell = X_ask
