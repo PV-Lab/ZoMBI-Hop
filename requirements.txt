@@ -1,7 +1,8 @@
+pymatgen
 numpy
 scipy
 pandas
 scikit-opt
 matplotlib
 itertools
-joblib
+joblib==1.1.0
