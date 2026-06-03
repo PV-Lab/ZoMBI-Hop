@@ -1,10 +1,8 @@
 # ZoMBI-Hop
- 
-![zombi](./figs/zombi-hop.png)
 
 **Zero-shot Multi-modal Bayesian Inference with Hops** — multi-modal Bayesian optimization over a probability simplex, designed for high-dimensional materials composition search.
 
-![ZoMBI-Hop needle manifold](data/needle_manifold_R1.png)
+![zombi](./data/zombi-hop.png)
 
 > **Version:** ellipsoid branch (Edit 1 / 2A / 2B applied May 2026)  
 > **Location:** `src/`  
