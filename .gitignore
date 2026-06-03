@@ -1,0 +1,45 @@
+interactive_testing/
+runs/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Unit test / coverage reports
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+.claude/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# SQLite DBs (runtime artifacts)
+sql/*.db
+
+# Checkpoints / runs (runtime artifacts)
+actual_runs/
+old_stuff/
+results_2000/
+test_rfs/
+
+# Large binaries
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.h5
+*.hdf5

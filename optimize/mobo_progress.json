@@ -1,0 +1,508 @@
+{
+  "n_trials": 17,
+  "n_pareto": 5,
+  "averages": {
+    "dist_to_needles": 2.800473,
+    "dup_fraction": 0.638339,
+    "runtime_s": 818.937
+  },
+  "best_dist": {
+    "value": 0.062296,
+    "trial": 5
+  },
+  "trials": [
+    {
+      "trial": 1,
+      "phase": "sobol",
+      "pareto": false,
+      "metrics": {
+        "dist_to_needles": 5.064884,
+        "dup_fraction": 0.905555,
+        "runtime_s": 1462.813
+      },
+      "hparams": {
+        "nat_grad_step": 0.09283929,
+        "nat_grad_max_steps": 54,
+        "n_restarts": 196,
+        "raw": 1721,
+        "ucb_beta": 1.22091434,
+        "max_zooms": 9,
+        "max_iterations": 9,
+        "top_m_points": 2,
+        "n_consecutive_converged": 3,
+        "convergence_pi_threshold": 0.00030387,
+        "input_noise_threshold_mult": 4.06858465,
+        "output_noise_threshold_mult": 0.14352812,
+        "max_penalty_radius": 2.31440403,
+        "needle_shrink_factor": 0.79777721,
+        "needle_stop_noise_multiplier": 3.24933261,
+        "paring_spatial_halfnoise": 1.79522132,
+        "paring_y_noise_multiplier": 0.79702946
+      }
+    },
+    {
+      "trial": 2,
+      "phase": "sobol",
+      "pareto": false,
+      "metrics": {
+        "dist_to_needles": 3.777543,
+        "dup_fraction": 0.781278,
+        "runtime_s": 736.023
+      },
+      "hparams": {
+        "nat_grad_step": 0.00443249,
+        "nat_grad_max_steps": 118,
+        "n_restarts": 159,
+        "raw": 388,
+        "ucb_beta": 1.94042268,
+        "max_zooms": 3,
+        "max_iterations": 5,
+        "top_m_points": 6,
+        "n_consecutive_converged": 9,
+        "convergence_pi_threshold": 0.03999007,
+        "input_noise_threshold_mult": 1.6044401,
+        "output_noise_threshold_mult": 1.1950365,
+        "max_penalty_radius": 1.28835661,
+        "needle_shrink_factor": 0.75405671,
+        "needle_stop_noise_multiplier": 7.92681931,
+        "paring_spatial_halfnoise": 0.8270619,
+        "paring_y_noise_multiplier": 2.67769104
+      }
+    },
+    {
+      "trial": 3,
+      "phase": "sobol",
+      "pareto": false,
+      "metrics": {
+        "dist_to_needles": 3.395108,
+        "dup_fraction": 0.814891,
+        "runtime_s": 1282.98
+      },
+      "hparams": {
+        "nat_grad_step": 0.01265539,
+        "nat_grad_max_steps": 75,
+        "n_restarts": 251,
+        "raw": 1243,
+        "ucb_beta": 2.80228222,
+        "max_zooms": 6,
+        "max_iterations": 6,
+        "top_m_points": 8,
+        "n_consecutive_converged": 6,
+        "convergence_pi_threshold": 0.00540522,
+        "input_noise_threshold_mult": 2.32052607,
+        "output_noise_threshold_mult": 1.84038211,
+        "max_penalty_radius": 1.68833946,
+        "needle_shrink_factor": 0.93849784,
+        "needle_stop_noise_multiplier": 5.24712994,
+        "paring_spatial_halfnoise": 1.36771598,
+        "paring_y_noise_multiplier": 2.14308117
+      }
+    },
+    {
+      "trial": 4,
+      "phase": "sobol",
+      "pareto": false,
+      "metrics": {
+        "dist_to_needles": 3.462239,
+        "dup_fraction": 0.821283,
+        "runtime_s": 1492.958
+      },
+      "hparams": {
+        "nat_grad_step": 0.33487029,
+        "nat_grad_max_steps": 198,
+        "n_restarts": 34,
+        "raw": 809,
+        "ucb_beta": 0.59483252,
+        "max_zooms": 8,
+        "max_iterations": 4,
+        "top_m_points": 4,
+        "n_consecutive_converged": 4,
+        "convergence_pi_threshold": 0.00220227,
+        "input_noise_threshold_mult": 4.6637162,
+        "output_noise_threshold_mult": 1.02151718,
+        "max_penalty_radius": 0.66771781,
+        "needle_shrink_factor": 0.55790151,
+        "needle_stop_noise_multiplier": 2.42901814,
+        "paring_spatial_halfnoise": 0.4511547,
+        "paring_y_noise_multiplier": 1.30438583
+      }
+    },
+    {
+      "trial": 5,
+      "phase": "sobol",
+      "pareto": true,
+      "metrics": {
+        "dist_to_needles": 0.062296,
+        "dup_fraction": 0.71021,
+        "runtime_s": 1420.766
+      },
+      "hparams": {
+        "nat_grad_step": 0.16536095,
+        "nat_grad_max_steps": 103,
+        "n_restarts": 114,
+        "raw": 983,
+        "ucb_beta": 0.21551816,
+        "max_zooms": 10,
+        "max_iterations": 8,
+        "top_m_points": 7,
+        "n_consecutive_converged": 7,
+        "convergence_pi_threshold": 0.01107044,
+        "input_noise_threshold_mult": 2.87551003,
+        "output_noise_threshold_mult": 0.71123172,
+        "max_penalty_radius": 2.01233787,
+        "needle_shrink_factor": 0.70128506,
+        "needle_stop_noise_multiplier": 1.51722193,
+        "paring_spatial_halfnoise": 0.20658339,
+        "paring_y_noise_multiplier": 1.02811624
+      }
+    },
+    {
+      "trial": 6,
+      "phase": "sobol",
+      "pareto": false,
+      "metrics": {
+        "dist_to_needles": 3.806693,
+        "dup_fraction": 0.844026,
+        "runtime_s": 555.452
+      },
+      "hparams": {
+        "nat_grad_step": 0.00798912,
+        "nat_grad_max_steps": 170,
+        "n_restarts": 171,
+        "raw": 1421,
+        "ucb_beta": 2.4445919,
+        "max_zooms": 4,
+        "max_iterations": 2,
+        "top_m_points": 5,
+        "n_consecutive_converged": 5,
+        "convergence_pi_threshold": 0.00019203,
+        "input_noise_threshold_mult": 5.91140603,
+        "output_noise_threshold_mult": 1.55506926,
+        "max_penalty_radius": 0.28083212,
+        "needle_shrink_factor": 0.87756373,
+        "needle_stop_noise_multiplier": 6.19470897,
+        "paring_spatial_halfnoise": 1.13728547,
+        "paring_y_noise_multiplier": 1.73007771
+      }
+    },
+    {
+      "trial": 7,
+      "phase": "sobol",
+      "pareto": false,
+      "metrics": {
+        "dist_to_needles": 1.747493,
+        "dup_fraction": 0.510334,
+        "runtime_s": 629.024
+      },
+      "hparams": {
+        "nat_grad_step": 0.00100635,
+        "nat_grad_max_steps": 23,
+        "n_restarts": 62,
+        "raw": 450,
+        "ucb_beta": 1.58360996,
+        "max_zooms": 5,
+        "max_iterations": 9,
+        "top_m_points": 3,
+        "n_consecutive_converged": 4,
+        "convergence_pi_threshold": 0.00058077,
+        "input_noise_threshold_mult": 3.85600846,
+        "output_noise_threshold_mult": 1.50997507,
+        "max_penalty_radius": 2.79156957,
+        "needle_shrink_factor": 0.62243288,
+        "needle_stop_noise_multiplier": 7.0150233,
+        "paring_spatial_halfnoise": 0.58225334,
+        "paring_y_noise_multiplier": 2.54913522
+      }
+    },
+    {
+      "trial": 8,
+      "phase": "sobol",
+      "pareto": false,
+      "metrics": {
+        "dist_to_needles": 0.691763,
+        "dup_fraction": 0.779673,
+        "runtime_s": 1226.838
+      },
+      "hparams": {
+        "nat_grad_step": 0.02695662,
+        "nat_grad_max_steps": 149,
+        "n_restarts": 293,
+        "raw": 1786,
+        "ucb_beta": 0.83964173,
+        "max_zooms": 7,
+        "max_iterations": 5,
+        "top_m_points": 6,
+        "n_consecutive_converged": 10,
+        "convergence_pi_threshold": 0.00358565,
+        "input_noise_threshold_mult": 0.69915795,
+        "output_noise_threshold_mult": 0.42418775,
+        "max_penalty_radius": 1.05455253,
+        "needle_shrink_factor": 0.90183738,
+        "needle_stop_noise_multiplier": 4.19691134,
+        "paring_spatial_halfnoise": 1.56503165,
+        "paring_y_noise_multiplier": 0.1704785
+      }
+    },
+    {
+      "trial": 9,
+      "phase": "mobo",
+      "pareto": true,
+      "metrics": {
+        "dist_to_needles": 1.458213,
+        "dup_fraction": 0.427163,
+        "runtime_s": 278.62
+      },
+      "hparams": {
+        "nat_grad_step": 0.00131206,
+        "nat_grad_max_steps": 43,
+        "n_restarts": 73,
+        "raw": 456,
+        "ucb_beta": 1.83604238,
+        "max_zooms": 3,
+        "max_iterations": 8,
+        "top_m_points": 3,
+        "n_consecutive_converged": 2,
+        "convergence_pi_threshold": 0.0003774,
+        "input_noise_threshold_mult": 4.79976657,
+        "output_noise_threshold_mult": 1.61346586,
+        "max_penalty_radius": 2.55677361,
+        "needle_shrink_factor": 0.6524708,
+        "needle_stop_noise_multiplier": 7.50191485,
+        "paring_spatial_halfnoise": 0.53516094,
+        "paring_y_noise_multiplier": 2.7476734
+      }
+    },
+    {
+      "trial": 10,
+      "phase": "mobo",
+      "pareto": false,
+      "metrics": {
+        "dist_to_needles": 5.11267,
+        "dup_fraction": 0.616762,
+        "runtime_s": 747.11
+      },
+      "hparams": {
+        "nat_grad_step": 0.001,
+        "nat_grad_max_steps": 47,
+        "n_restarts": 62,
+        "raw": 415,
+        "ucb_beta": 1.71774938,
+        "max_zooms": 2,
+        "max_iterations": 8,
+        "top_m_points": 2,
+        "n_consecutive_converged": 2,
+        "convergence_pi_threshold": 0.00011851,
+        "input_noise_threshold_mult": 6.0,
+        "output_noise_threshold_mult": 1.86367977,
+        "max_penalty_radius": 2.57290238,
+        "needle_shrink_factor": 0.65330186,
+        "needle_stop_noise_multiplier": 8.0,
+        "paring_spatial_halfnoise": 0.44993525,
+        "paring_y_noise_multiplier": 3.0
+      }
+    },
+    {
+      "trial": 11,
+      "phase": "mobo",
+      "pareto": false,
+      "metrics": {
+        "dist_to_needles": 2.997657,
+        "dup_fraction": 0.538089,
+        "runtime_s": 548.601
+      },
+      "hparams": {
+        "nat_grad_step": 0.00164673,
+        "nat_grad_max_steps": 58,
+        "n_restarts": 85,
+        "raw": 438,
+        "ucb_beta": 2.49770551,
+        "max_zooms": 3,
+        "max_iterations": 8,
+        "top_m_points": 3,
+        "n_consecutive_converged": 2,
+        "convergence_pi_threshold": 0.00050789,
+        "input_noise_threshold_mult": 4.39180691,
+        "output_noise_threshold_mult": 1.47691465,
+        "max_penalty_radius": 2.3581415,
+        "needle_shrink_factor": 0.6764906,
+        "needle_stop_noise_multiplier": 7.73708428,
+        "paring_spatial_halfnoise": 0.44811798,
+        "paring_y_noise_multiplier": 2.63800188
+      }
+    },
+    {
+      "trial": 12,
+      "phase": "mobo",
+      "pareto": false,
+      "metrics": {
+        "dist_to_needles": 1.232947,
+        "dup_fraction": 0.531034,
+        "runtime_s": 708.693
+      },
+      "hparams": {
+        "nat_grad_step": 0.00161042,
+        "nat_grad_max_steps": 49,
+        "n_restarts": 85,
+        "raw": 514,
+        "ucb_beta": 1.42919501,
+        "max_zooms": 3,
+        "max_iterations": 8,
+        "top_m_points": 3,
+        "n_consecutive_converged": 2,
+        "convergence_pi_threshold": 0.00037272,
+        "input_noise_threshold_mult": 4.49507464,
+        "output_noise_threshold_mult": 1.6777858,
+        "max_penalty_radius": 2.39863261,
+        "needle_shrink_factor": 0.66573455,
+        "needle_stop_noise_multiplier": 7.02223909,
+        "paring_spatial_halfnoise": 0.68012772,
+        "paring_y_noise_multiplier": 2.72870131
+      }
+    },
+    {
+      "trial": 13,
+      "phase": "mobo",
+      "pareto": true,
+      "metrics": {
+        "dist_to_needles": 2.530119,
+        "dup_fraction": 0.474501,
+        "runtime_s": 267.527
+      },
+      "hparams": {
+        "nat_grad_step": 0.00163607,
+        "nat_grad_max_steps": 10,
+        "n_restarts": 89,
+        "raw": 542,
+        "ucb_beta": 1.94650654,
+        "max_zooms": 3,
+        "max_iterations": 9,
+        "top_m_points": 4,
+        "n_consecutive_converged": 2,
+        "convergence_pi_threshold": 0.00037646,
+        "input_noise_threshold_mult": 4.99753958,
+        "output_noise_threshold_mult": 1.42929983,
+        "max_penalty_radius": 2.71762232,
+        "needle_shrink_factor": 0.5867373,
+        "needle_stop_noise_multiplier": 6.84560464,
+        "paring_spatial_halfnoise": 0.82397688,
+        "paring_y_noise_multiplier": 2.79757276
+      }
+    },
+    {
+      "trial": 14,
+      "phase": "mobo",
+      "pareto": true,
+      "metrics": {
+        "dist_to_needles": 3.64862,
+        "dup_fraction": 0.502203,
+        "runtime_s": 263.289
+      },
+      "hparams": {
+        "nat_grad_step": 0.00109603,
+        "nat_grad_max_steps": 55,
+        "n_restarts": 56,
+        "raw": 365,
+        "ucb_beta": 1.84132113,
+        "max_zooms": 3,
+        "max_iterations": 8,
+        "top_m_points": 2,
+        "n_consecutive_converged": 2,
+        "convergence_pi_threshold": 0.00051356,
+        "input_noise_threshold_mult": 4.4726913,
+        "output_noise_threshold_mult": 1.17982709,
+        "max_penalty_radius": 2.63095392,
+        "needle_shrink_factor": 0.68122669,
+        "needle_stop_noise_multiplier": 7.89579893,
+        "paring_spatial_halfnoise": 0.1,
+        "paring_y_noise_multiplier": 2.84999767
+      }
+    },
+    {
+      "trial": 15,
+      "phase": "mobo",
+      "pareto": false,
+      "metrics": {
+        "dist_to_needles": 2.938678,
+        "dup_fraction": 0.496998,
+        "runtime_s": 322.183
+      },
+      "hparams": {
+        "nat_grad_step": 0.00132129,
+        "nat_grad_max_steps": 30,
+        "n_restarts": 70,
+        "raw": 449,
+        "ucb_beta": 1.97915453,
+        "max_zooms": 3,
+        "max_iterations": 9,
+        "top_m_points": 3,
+        "n_consecutive_converged": 2,
+        "convergence_pi_threshold": 0.00049492,
+        "input_noise_threshold_mult": 4.04922363,
+        "output_noise_threshold_mult": 1.83952033,
+        "max_penalty_radius": 2.62928921,
+        "needle_shrink_factor": 0.62245375,
+        "needle_stop_noise_multiplier": 8.0,
+        "paring_spatial_halfnoise": 0.52166103,
+        "paring_y_noise_multiplier": 2.51728469
+      }
+    },
+    {
+      "trial": 16,
+      "phase": "mobo",
+      "pareto": false,
+      "metrics": {
+        "dist_to_needles": 5.602831,
+        "dup_fraction": 0.638813,
+        "runtime_s": 1279.501
+      },
+      "hparams": {
+        "nat_grad_step": 0.001,
+        "nat_grad_max_steps": 52,
+        "n_restarts": 46,
+        "raw": 472,
+        "ucb_beta": 1.98148675,
+        "max_zooms": 4,
+        "max_iterations": 8,
+        "top_m_points": 2,
+        "n_consecutive_converged": 3,
+        "convergence_pi_threshold": 0.00071171,
+        "input_noise_threshold_mult": 4.74481153,
+        "output_noise_threshold_mult": 1.15805621,
+        "max_penalty_radius": 2.86743992,
+        "needle_shrink_factor": 0.6945493,
+        "needle_stop_noise_multiplier": 5.5798191,
+        "paring_spatial_halfnoise": 0.59531854,
+        "paring_y_noise_multiplier": 2.44732245
+      }
+    },
+    {
+      "trial": 17,
+      "phase": "mobo",
+      "pareto": true,
+      "metrics": {
+        "dist_to_needles": 0.078282,
+        "dup_fraction": 0.458949,
+        "runtime_s": 699.548
+      },
+      "hparams": {
+        "nat_grad_step": 0.00101169,
+        "nat_grad_max_steps": 31,
+        "n_restarts": 64,
+        "raw": 393,
+        "ucb_beta": 1.17833392,
+        "max_zooms": 3,
+        "max_iterations": 9,
+        "top_m_points": 3,
+        "n_consecutive_converged": 2,
+        "convergence_pi_threshold": 0.00034302,
+        "input_noise_threshold_mult": 4.97738817,
+        "output_noise_threshold_mult": 1.38145401,
+        "max_penalty_radius": 2.83689502,
+        "needle_shrink_factor": 0.63319747,
+        "needle_stop_noise_multiplier": 7.44283686,
+        "paring_spatial_halfnoise": 0.46207453,
+        "paring_y_noise_multiplier": 2.99974589
+      }
+    }
+  ]
+}

@@ -1,8 +1,0 @@
-pymatgen
-numpy
-scipy
-pandas
-scikit-opt
-matplotlib
-itertools
-joblib==1.1.0
