@@ -1,4 +1,5 @@
-interactive_testing/
+interactive_testing/*
+!interactive_testing/*.py
 runs/
 
 # Byte-compiled / optimized / DLL files
