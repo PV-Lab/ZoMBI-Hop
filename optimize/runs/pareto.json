@@ -1,0 +1,209 @@
+{
+  "generated": "2026-06-04T15:12:29",
+  "runs_dir": "C:\\Users\\AMLS at MIT\\MIT Dropbox\\Buonassisi-Group\\Projects - Active\\ZoMBI-Hop\\06_Code\\ZoMBI-Hop\\optimize\\runs",
+  "objectives": {
+    "dist_to_needles": "minimize",
+    "dup_fraction": "minimize",
+    "runtime_s": "minimize"
+  },
+  "n_trials_total": 21,
+  "n_pareto": 7,
+  "pareto": [
+    {
+      "source_run": "mobo_04_06_13_53",
+      "trial": 1,
+      "metrics": {
+        "dist_to_needles": 0.020933,
+        "dup_fraction": 0.65548,
+        "runtime_s": 1482.98
+      },
+      "hparams": {
+        "nat_grad_step": 0.001,
+        "nat_grad_max_steps": 28,
+        "n_restarts": 38,
+        "raw": 341,
+        "ucb_beta": 1.84573961,
+        "max_zooms": 4,
+        "max_iterations": 8,
+        "top_m_points": 3,
+        "n_consecutive_converged": 3,
+        "convergence_pi_threshold": 0.00042163,
+        "input_noise_threshold_mult": 4.58402832,
+        "output_noise_threshold_mult": 0.72046436,
+        "max_penalty_radius": 2.9152679,
+        "needle_shrink_factor": 0.64193844,
+        "needle_stop_noise_multiplier": 7.7977243,
+        "paring_spatial_halfnoise": 0.19020238,
+        "paring_y_noise_multiplier": 2.78201929
+      }
+    },
+    {
+      "source_run": "mobo_04_06_13_53",
+      "trial": 2,
+      "metrics": {
+        "dist_to_needles": 0.047955,
+        "dup_fraction": 0.727586,
+        "runtime_s": 1440.07
+      },
+      "hparams": {
+        "nat_grad_step": 0.00166859,
+        "nat_grad_max_steps": 58,
+        "n_restarts": 124,
+        "raw": 487,
+        "ucb_beta": 1.20232559,
+        "max_zooms": 2,
+        "max_iterations": 9,
+        "top_m_points": 3,
+        "n_consecutive_converged": 2,
+        "convergence_pi_threshold": 0.000851,
+        "input_noise_threshold_mult": 3.3631343,
+        "output_noise_threshold_mult": 1.53404037,
+        "max_penalty_radius": 2.68857351,
+        "needle_shrink_factor": 0.68186217,
+        "needle_stop_noise_multiplier": 8.0,
+        "paring_spatial_halfnoise": 0.1,
+        "paring_y_noise_multiplier": 2.88787654
+      }
+    },
+    {
+      "source_run": "mobo_old_jackson",
+      "trial": 5,
+      "metrics": {
+        "dist_to_needles": 0.062296,
+        "dup_fraction": 0.71021,
+        "runtime_s": 1420.766
+      },
+      "hparams": {
+        "nat_grad_step": 0.16536095,
+        "nat_grad_max_steps": 103,
+        "n_restarts": 114,
+        "raw": 983,
+        "ucb_beta": 0.21551816,
+        "max_zooms": 10,
+        "max_iterations": 8,
+        "top_m_points": 7,
+        "n_consecutive_converged": 7,
+        "convergence_pi_threshold": 0.01107044,
+        "input_noise_threshold_mult": 2.87551003,
+        "output_noise_threshold_mult": 0.71123172,
+        "max_penalty_radius": 2.01233787,
+        "needle_shrink_factor": 0.70128506,
+        "needle_stop_noise_multiplier": 1.51722193,
+        "paring_spatial_halfnoise": 0.20658339,
+        "paring_y_noise_multiplier": 1.02811624
+      }
+    },
+    {
+      "source_run": "mobo_old_jackson",
+      "trial": 17,
+      "metrics": {
+        "dist_to_needles": 0.078282,
+        "dup_fraction": 0.458949,
+        "runtime_s": 699.548
+      },
+      "hparams": {
+        "nat_grad_step": 0.00101169,
+        "nat_grad_max_steps": 31,
+        "n_restarts": 64,
+        "raw": 393,
+        "ucb_beta": 1.17833392,
+        "max_zooms": 3,
+        "max_iterations": 9,
+        "top_m_points": 3,
+        "n_consecutive_converged": 2,
+        "convergence_pi_threshold": 0.00034302,
+        "input_noise_threshold_mult": 4.97738817,
+        "output_noise_threshold_mult": 1.38145401,
+        "max_penalty_radius": 2.83689502,
+        "needle_shrink_factor": 0.63319747,
+        "needle_stop_noise_multiplier": 7.44283686,
+        "paring_spatial_halfnoise": 0.46207453,
+        "paring_y_noise_multiplier": 2.99974589
+      }
+    },
+    {
+      "source_run": "mobo_old_jackson",
+      "trial": 9,
+      "metrics": {
+        "dist_to_needles": 1.458213,
+        "dup_fraction": 0.427163,
+        "runtime_s": 278.62
+      },
+      "hparams": {
+        "nat_grad_step": 0.00131206,
+        "nat_grad_max_steps": 43,
+        "n_restarts": 73,
+        "raw": 456,
+        "ucb_beta": 1.83604238,
+        "max_zooms": 3,
+        "max_iterations": 8,
+        "top_m_points": 3,
+        "n_consecutive_converged": 2,
+        "convergence_pi_threshold": 0.0003774,
+        "input_noise_threshold_mult": 4.79976657,
+        "output_noise_threshold_mult": 1.61346586,
+        "max_penalty_radius": 2.55677361,
+        "needle_shrink_factor": 0.6524708,
+        "needle_stop_noise_multiplier": 7.50191485,
+        "paring_spatial_halfnoise": 0.53516094,
+        "paring_y_noise_multiplier": 2.7476734
+      }
+    },
+    {
+      "source_run": "mobo_old_jackson",
+      "trial": 13,
+      "metrics": {
+        "dist_to_needles": 2.530119,
+        "dup_fraction": 0.474501,
+        "runtime_s": 267.527
+      },
+      "hparams": {
+        "nat_grad_step": 0.00163607,
+        "nat_grad_max_steps": 10,
+        "n_restarts": 89,
+        "raw": 542,
+        "ucb_beta": 1.94650654,
+        "max_zooms": 3,
+        "max_iterations": 9,
+        "top_m_points": 4,
+        "n_consecutive_converged": 2,
+        "convergence_pi_threshold": 0.00037646,
+        "input_noise_threshold_mult": 4.99753958,
+        "output_noise_threshold_mult": 1.42929983,
+        "max_penalty_radius": 2.71762232,
+        "needle_shrink_factor": 0.5867373,
+        "needle_stop_noise_multiplier": 6.84560464,
+        "paring_spatial_halfnoise": 0.82397688,
+        "paring_y_noise_multiplier": 2.79757276
+      }
+    },
+    {
+      "source_run": "mobo_old_jackson",
+      "trial": 14,
+      "metrics": {
+        "dist_to_needles": 3.64862,
+        "dup_fraction": 0.502203,
+        "runtime_s": 263.289
+      },
+      "hparams": {
+        "nat_grad_step": 0.00109603,
+        "nat_grad_max_steps": 55,
+        "n_restarts": 56,
+        "raw": 365,
+        "ucb_beta": 1.84132113,
+        "max_zooms": 3,
+        "max_iterations": 8,
+        "top_m_points": 2,
+        "n_consecutive_converged": 2,
+        "convergence_pi_threshold": 0.00051356,
+        "input_noise_threshold_mult": 4.4726913,
+        "output_noise_threshold_mult": 1.17982709,
+        "max_penalty_radius": 2.63095392,
+        "needle_shrink_factor": 0.68122669,
+        "needle_stop_noise_multiplier": 7.89579893,
+        "paring_spatial_halfnoise": 0.1,
+        "paring_y_noise_multiplier": 2.84999767
+      }
+    }
+  ]
+}
