@@ -31,7 +31,10 @@ Workflow
 Usage
 -----
   cd <repo_root>
-  conda run -n zombi-hop python interactive_testing/interactive_test_zombi.py
+  python interactive_testing/interactive_test_zombi.py
+
+  # Load hyperparameters from a previous hparam opt run
+  python interactive_testing/interactive_test_zombi.py --mobo-hparams path/to/mobo_00_00_00_00 
 """
 
 from __future__ import annotations
@@ -39,6 +42,9 @@ from __future__ import annotations
 import os
 import time
 import sys
+import json
+import glob
+import argparse
 import queue
 import threading
 import warnings
@@ -920,9 +926,57 @@ def generate_init_data(
     )
 
 
+# ── MOBO hyperparameter loading ───────────────────────────────────────────────
+
+def load_mobo_hparams(path: str) -> dict:
+    """
+    Load the latest set of ZoMBI hyperparameters from a MOBO run.
+
+    ``path`` may be either a ``mobo_*`` run directory containing
+    ``mobo_progress.json`` or the path to a ``mobo_progress.json`` file directly.
+    The "latest" hyperparameters are taken from the trial with the highest
+    ``trial`` index (falling back to the last entry in ``trials``).
+
+    Returns the ``hparams`` dict for that trial.
+    """
+    if os.path.isdir(path):
+        progress_path = os.path.join(path, "mobo_progress.json")
+    else:
+        progress_path = path
+    if not os.path.exists(progress_path):
+        # Tolerate being handed a parent dir: search for a mobo_progress.json.
+        matches = glob.glob(os.path.join(path, "**", "mobo_progress.json"), recursive=True)
+        if not matches:
+            raise FileNotFoundError(
+                f"Could not find mobo_progress.json at or under: {path}"
+            )
+        progress_path = matches[0]
+
+    with open(progress_path, "r") as f:
+        progress = json.load(f)
+
+    trials = progress.get("trials", [])
+    if not trials:
+        raise ValueError(f"No trials found in {progress_path}")
+
+    latest = max(trials, key=lambda t: t.get("trial", -1))
+    hparams = latest.get("hparams")
+    if not hparams:
+        raise ValueError(
+            f"Trial {latest.get('trial')} in {progress_path} has no hparams."
+        )
+
+    print(f"    Loaded hyperparameters from {progress_path}")
+    print(f"    Using trial {latest.get('trial')} (phase={latest.get('phase')}, "
+          f"pareto={latest.get('pareto')}):")
+    for k, v in hparams.items():
+        print(f"      {k} = {v}")
+    return hparams
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main() -> None:
+def main(mobo_hparams_path: str | None = None) -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(script_dir, "campaign1a.csv")
     if not os.path.exists(csv_path):
@@ -967,6 +1021,8 @@ def main() -> None:
     print("\n[3] Initialising ZoMBI-Hop …")
     dim = 3
     zparams = dict(ZOMBI_PARAMS)
+    if mobo_hparams_path is not None:
+        zparams.update(load_mobo_hparams(mobo_hparams_path))
 
     plot_state: dict = {"line_0": None, "line_1": None, "fig": None, "iter": 0}
     dh_ref: list = [None]   # filled with optimizer.data_handler after construction
@@ -1111,4 +1167,16 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Interactive ZoMBI-Hop simulator on an RF surrogate."
+    )
+    parser.add_argument(
+        "--mobo-hparams",
+        metavar="PATH",
+        default=None,
+        help="Path to a mobo_* run directory (or a mobo_progress.json file). "
+             "The latest trial's hyperparameters are loaded and used to "
+             "override the built-in ZoMBI defaults.",
+    )
+    args = parser.parse_args()
+    main(mobo_hparams_path=args.mobo_hparams)
