@@ -1,0 +1,62 @@
+{
+  "maximize": true,
+  "csv_path": "C:\\Users\\AMLS at MIT\\MIT Dropbox\\Buonassisi-Group\\Projects - Active\\ZoMBI-Hop\\06_Code\\ZoMBI-Hop\\interactive_testing\\campaign1a.csv",
+  "true_optima": [
+    [
+      0.4194391863193729,
+      0.21909035925136341,
+      0.3614704544292636
+    ],
+    [
+      0.873739884506569,
+      0.04771457350751727,
+      0.07854554198591363
+    ],
+    [
+      0.3898334827341424,
+      0.508885937672889,
+      0.10128057959296857
+    ],
+    [
+      0.43496512267232446,
+      0.5496422175835811,
+      0.015392659744094392
+    ],
+    [
+      0.31245504190260986,
+      0.6721522983532957,
+      0.015392659744094397
+    ],
+    [
+      0.2530492462555694,
+      0.7265058634209904,
+      0.02044489032343997
+    ],
+    [
+      0.06120376481845916,
+      0.6834226229185334,
+      0.2553736122630075
+    ]
+  ],
+  "n_init_trials": 8,
+  "hparam_names": [
+    "nat_grad_step",
+    "nat_grad_max_steps",
+    "n_restarts",
+    "raw",
+    "ucb_beta",
+    "max_zooms",
+    "max_iterations",
+    "top_m_points",
+    "n_consecutive_converged",
+    "convergence_pi_threshold",
+    "input_noise_threshold_mult",
+    "output_noise_threshold_mult",
+    "max_penalty_radius",
+    "needle_shrink_factor",
+    "needle_stop_noise_multiplier",
+    "paring_spatial_halfnoise",
+    "paring_y_noise_multiplier"
+  ],
+  "created": "2026-06-04T13:53:04"
+}

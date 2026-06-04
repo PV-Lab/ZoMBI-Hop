@@ -1224,10 +1224,17 @@ def regenerate_videos(run_dir: str, force: bool = False) -> None:
 # ─── Running summary (mobo_progress.json / mobo_results.json) ───────────────────
 
 def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
-                   prior_count: int = 0) -> dict:
+                   prior_count: int = 0,
+                   Y_prior: list[torch.Tensor] | None = None) -> dict:
     n = len(Y_obs)
-    Y_stk = torch.stack(Y_obs)
-    pareto_mask = is_non_dominated(Y_stk)
+    # Pareto membership is computed against the FULL landscape (prior history +
+    # this run's trials), so a resumed run's flags match the per-trial trial.json
+    # and don't over-report against the smaller within-run batch. The slice
+    # ``[prior_count:]`` keeps only this run's trials, which are the ones written
+    # out below. With no prior (fresh run) this reduces to the old behaviour.
+    Y_prior = Y_prior or []
+    global_mask = is_non_dominated(torch.stack(Y_prior + Y_obs))
+    pareto_mask = global_mask[prior_count:]
     metrics_all = [
         {
             "dist_to_needles": round(-Y_obs[i][0].item(), 6),
@@ -1266,11 +1273,13 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
     }, pareto_mask
 
 
-def save_running_summary(X_obs, Y_obs, run_dir: str, prior_count: int = 0) -> torch.Tensor:
+def save_running_summary(X_obs, Y_obs, run_dir: str, prior_count: int = 0,
+                         Y_prior: list[torch.Tensor] | None = None) -> torch.Tensor:
     """Write mobo_progress.json + mobo_results.json + mobo_results.pt. Returns pareto mask."""
     if not Y_obs:
         return torch.zeros(0, dtype=torch.bool)
-    summary, pareto_mask = _build_summary(X_obs, Y_obs, prior_count=prior_count)
+    summary, pareto_mask = _build_summary(X_obs, Y_obs, prior_count=prior_count,
+                                          Y_prior=Y_prior)
     summary_txt = json.dumps(summary, indent=2)
     _atomic_write_text(os.path.join(run_dir, "mobo_progress.json"), summary_txt)
     _atomic_write_text(os.path.join(run_dir, "mobo_results.json"), summary_txt)
@@ -1396,7 +1405,8 @@ def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, run_dir,
                 X_obs.append(x_new.detach().cpu())
                 Y_obs.append(torch.tensor([-res["dist"], -res["dup"], -res["runtime"]],
                                           dtype=DTYPE, device="cpu"))
-                save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior)
+                save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior,
+                                     Y_prior=Y_prior)
                 # Pareto status reported against the FULL landscape (prior + this run).
                 global_mask = is_non_dominated(torch.stack(Y_prior + Y_obs))
                 is_pareto = bool(global_mask[-1].item())
@@ -1425,7 +1435,8 @@ def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, run_dir,
         print("\n[!] Interrupted by user — finalising results …")
 
     if Y_obs:
-        save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior)
+        save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior,
+                             Y_prior=Y_prior)
         # Pareto plot spans the full landscape (prior history + this run's trials).
         save_pareto_plot(X_prior + X_obs, Y_prior + Y_obs, run_dir)
     print(f"\nDone. {len(Y_obs)} trials completed this run "
