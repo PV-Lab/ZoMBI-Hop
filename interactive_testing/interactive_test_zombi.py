@@ -13,11 +13,13 @@ Workflow
 3. Open an interactive ternary plot.  Left-click near a local minimum or
    maximum (per your choice); L-BFGS-B refinement (gradient-based on the RF)
    snaps to a nearby extremum.  Press Enter / Q when done selecting.
+   (Skipped under ``--background``, which has no window to click on.)
 4. Run ZoMBI-Hop (with LineBO), exactly as in ``scripts/run_zombi_main.py``,
    but evaluating the RF surrogate instead of a physical instrument.
    0.01 Gaussian noise is added to both inputs and outputs at every sample.
 5. After every objective call, save a two-panel ternary figure to
-   ``interactive_testing/plots/`` and display it (non-blocking):
+   ``interactive_testing/plots/`` and display it (non-blocking; PNGs are still
+   saved but not displayed under ``--background``):
      Left  – reference RF landscape + blue ★ for confirmed extrema (min or max).
      Right – ZoMBI-Hop exploration:
                • all sampled points (older = more transparent),
@@ -26,6 +28,8 @@ Workflow
                • dashed-red boundary for current search bounds,
                • orange solid line for LineBO's main suggested line,
                • dotted cornflower-blue line for LineBO's cache line,
+               • thin dim-grey lines for every candidate line sampled this step
+                 (only with ``--show-sampling``),
                • blue ★ for confirmed reference extrema.
 
 Usage
@@ -33,8 +37,24 @@ Usage
   cd <repo_root>
   python interactive_testing/interactive_test_zombi.py
 
-  # Load hyperparameters from a previous hparam opt run
-  python interactive_testing/interactive_test_zombi.py --mobo-hparams path/to/mobo_00_00_00_00 
+Flags
+-----
+  --mobo-hparams PATH
+      Load the latest trial's ZoMBI hyperparameters from a previous hparam-opt
+      run (a ``mobo_*`` directory or a ``mobo_progress.json`` file) and use them
+      to override the built-in defaults.
+        python interactive_testing/interactive_test_zombi.py --mobo-hparams path/to/mobo_00_00_00_00
+
+  --show-sampling
+      Overlay a thin, semi-transparent line for every candidate line the
+      acquisition function was integrated over at each step.
+        python interactive_testing/interactive_test_zombi.py --show-sampling
+
+  --background
+      Run headless on the Agg backend: no plot window ever pops up or steals
+      focus, and per-iteration PNGs are still saved to ``interactive_testing/
+      plots/``. Skips the interactive extrema picker (step 3).
+        python interactive_testing/interactive_test_zombi.py --background
 """
 
 from __future__ import annotations
@@ -65,9 +85,15 @@ from scipy.spatial import ConvexHull
 
 import matplotlib
 
-matplotlib.use("TkAgg")  # must be called before pyplot import
+# --background runs fully headless on the non-interactive Agg backend, so no plot
+# window ever pops up or steals focus. Per-iteration PNGs are still written to
+# interactive_testing/plots/. Detected from argv here because the backend must be
+# chosen before pyplot is imported (argparse runs much later, in __main__).
+_BACKGROUND = "--background" in sys.argv
+matplotlib.use("Agg" if _BACKGROUND else "TkAgg")  # must be called before pyplot import
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.lines import Line2D
 
 from src import ZoMBIHop, LineBO
 from src.core.linebo import line_simplex_segment, zero_sum_dirs
@@ -480,6 +506,14 @@ def make_linebo_wrapper(
             if n_valid > 1 else None
         )
 
+        # ── capture every candidate line the acquisition was integrated over ──
+        # (all ranked lines for this step, used by the --show-sampling overlay).
+        xl_np = x_left_ranked.cpu().numpy()
+        xr_np = x_right_ranked.cpu().numpy()
+        plot_state["sampling_lines"] = [
+            (xl_np[i], xr_np[i]) for i in range(n_valid)
+        ]
+
         # ── call simulated objective ───────────────────────────────────────────
         endpoints_ranked = torch.stack([x_left_ranked, x_right_ranked], dim=1)
         x_actual, y = sim_obj(endpoints_ranked)
@@ -523,6 +557,7 @@ def make_plotting_wrapper(
     plot_queue: "queue.Queue",
     *,
     maximize: bool,
+    show_sampling: bool = False,
 ):
     """
     Wrap ``inner_wrapper`` so that after every objective call a snapshot of
@@ -579,6 +614,7 @@ def make_plotting_wrapper(
             trust_ellipsoid=_clone(curr_bounds),
             line_0=plot_state.get("line_0"),
             line_1=plot_state.get("line_1"),
+            sampling_lines=plot_state.get("sampling_lines") if show_sampling else None,
             iteration_num=plot_state["iter"],
             save_dir=save_dir,
         )
@@ -701,6 +737,7 @@ def _plot_iteration(
     line_1: tuple | None,
     iteration_num: int,
     save_dir: str | None = None,
+    sampling_lines: list | None = None,
 ) -> plt.Figure:
     """
     Generate the two-panel ternary figure for one iteration and optionally save it.
@@ -719,6 +756,9 @@ def _plot_iteration(
     line_0, line_1      : each is (left_np, right_np) or None.
     iteration_num       : counter shown in the title and filename.
     save_dir            : directory to write the PNG, or None.
+    sampling_lines      : list of (left_np, right_np) for every candidate line the
+                          acquisition was integrated over this step, or None to skip
+                          the thin sampling overlay (``--show-sampling``).
     """
     fig, (ax_ref, ax_exp) = plt.subplots(1, 2, figsize=(16, 6.8))
     fig.suptitle(
@@ -785,6 +825,24 @@ def _plot_iteration(
         for i, nx in enumerate(nx_np):
             Mi = M_list[i] if i < len(M_list) else None
             _draw_needle_ellipsoid(ax_exp, nx, Mi, needle_B)
+
+    # Sampling overlay: every candidate line the acquisition was integrated over.
+    # Thin and semi-transparent so the chosen main/cache lines remain readable.
+    if sampling_lines:
+        for k, sl in enumerate(sampling_lines):
+            sxy = comp_to_xy(np.array(sl))  # (2, 2)
+            ax_exp.plot(
+                sxy[:, 0], sxy[:, 1],
+                "-", color="dimgray", lw=0.8, alpha=0.35,
+                zorder=6,
+                label="Sampled lines" if k == 0 else None,
+            )
+        # Register one legend handle for the whole sampling set.
+        h_samp = Line2D(
+            [], [], color="dimgray", lw=0.8, alpha=0.6,
+            label=f"Sampled lines ({len(sampling_lines)})",
+        )
+        legend_handles.append(h_samp)
 
     # LineBO suggested lines
     if line_0 is not None:
@@ -862,12 +920,15 @@ def _plot_iteration(
         fig.savefig(tmp_path, dpi=120, bbox_inches="tight", format="png")
         os.replace(tmp_path, final_path)
 
-    plt.show(block=False)
-    fig.canvas.draw()
-    try:
-        fig.canvas.flush_events()
-    except Exception:
-        pass
+    # Headless (Agg) mode: the PNG is already written above; skip the GUI
+    # show/draw/flush so no window pops up or steals focus.
+    if not matplotlib.get_backend().lower().startswith("agg"):
+        plt.show(block=False)
+        fig.canvas.draw()
+        try:
+            fig.canvas.flush_events()
+        except Exception:
+            pass
     return fig
 
 
@@ -976,7 +1037,11 @@ def load_mobo_hparams(path: str) -> dict:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main(mobo_hparams_path: str | None = None) -> None:
+def main(
+    mobo_hparams_path: str | None = None,
+    show_sampling: bool = False,
+    background: bool = False,
+) -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(script_dir, "campaign1a.csv")
     if not os.path.exists(csv_path):
@@ -1008,14 +1073,21 @@ def main(mobo_hparams_path: str | None = None) -> None:
     print(f"\n    Mode selected: {mode_str}")
 
     # ── Step 2: interactive reference extrema ─────────────────────────────────
+    # The picker needs a GUI to click on, so it is skipped under --background
+    # (Agg has no window). Reference extrema are display-only overlays, so an
+    # empty list just omits the blue ★ markers.
     goal_pl = "maxima" if maximize else "minima"
-    print(f"\n[2] Opening interactive ternary — click near reference {goal_pl}, then Enter / Q.")
-    plt.ion()   # interactive mode: keeps Tk root alive across multiple figures
-    picker = ExtremaPicker(rf, grid_pts, grid_vals, maximize=maximize)
-    true_minima = picker.run()
-    print(f"    {len(true_minima)} reference {goal_pl} confirmed:")
-    for i, (c, v) in enumerate(true_minima):
-        print(f"      #{i + 1}  comp={np.round(c, 4)}  y={v:.5f}")
+    if background:
+        print("\n[2] --background: skipping interactive extrema picker (headless).")
+        true_minima: list = []
+    else:
+        print(f"\n[2] Opening interactive ternary — click near reference {goal_pl}, then Enter / Q.")
+        plt.ion()   # interactive mode: keeps Tk root alive across multiple figures
+        picker = ExtremaPicker(rf, grid_pts, grid_vals, maximize=maximize)
+        true_minima = picker.run()
+        print(f"    {len(true_minima)} reference {goal_pl} confirmed:")
+        for i, (c, v) in enumerate(true_minima):
+            print(f"      #{i + 1}  comp={np.round(c, 4)}  y={v:.5f}")
 
     # ── Step 3: ZoMBI-Hop setup ───────────────────────────────────────────────
     print("\n[3] Initialising ZoMBI-Hop …")
@@ -1041,6 +1113,7 @@ def main(mobo_hparams_path: str | None = None) -> None:
         save_dir=save_dir if SAVE_PLOTS else None,
         plot_queue=plot_queue,
         maximize=maximize,
+        show_sampling=show_sampling,
     )
 
     print(f"    Generating initial data ({N_INIT_LINES} lines × {NUM_EXPERIMENTS} pts) …")
@@ -1152,8 +1225,9 @@ def main(mobo_hparams_path: str | None = None) -> None:
     print(f"\n  Plots saved to: {save_dir}")
     # Keep the last iteration figure open using flush_events + sleep so we
     # don't start a nested Tk mainloop (which conda run intercepts).
+    # In --background there is no window to keep open, so just exit.
     last_fig = plot_state.get("fig")
-    if last_fig is not None:
+    if last_fig is not None and not background:
         print("  Close the final plot window (or press Ctrl+C) to exit.")
         try:
             while plt.fignum_exists(last_fig.number):
@@ -1178,5 +1252,22 @@ if __name__ == "__main__":
              "The latest trial's hyperparameters are loaded and used to "
              "override the built-in ZoMBI defaults.",
     )
+    parser.add_argument(
+        "--show-sampling",
+        action="store_true",
+        help="Overlay a very thin, semi-transparent line for every candidate "
+             "line the acquisition function was integrated over at each step.",
+    )
+    parser.add_argument(
+        "--background",
+        action="store_true",
+        help="Run headless (Agg backend): no plot window pops up or steals focus "
+             "during the run, and per-iteration PNGs are still saved to "
+             "interactive_testing/plots/. Skips the interactive extrema picker.",
+    )
     args = parser.parse_args()
-    main(mobo_hparams_path=args.mobo_hparams)
+    main(
+        mobo_hparams_path=args.mobo_hparams,
+        show_sampling=args.show_sampling,
+        background=args.background,
+    )
