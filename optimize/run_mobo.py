@@ -48,6 +48,8 @@ Usage
   python optimize/run_mobo.py --resume   # crawl every runs/mobo_*/mobo_progress.json,
                                          #   collect all (X,Y) pairs, and seed a NEW
                                          #   runs/mobo_* run from the full landscape
+  python optimize/run_mobo.py --resume-scratch  # same prior-seeding as --resume, but
+                                         #   re-prompt for run config (max/min + optima)
   python optimize/make_videos.py                       # newest run
   python optimize/make_videos.py <run_dir>             # specific run
   python optimize/make_videos.py <run_dir> --force     # rebuild all
@@ -91,7 +93,6 @@ from botorch.fit import fit_gpytorch_mll
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from botorch.acquisition.multi_objective.logei import qLogNoisyExpectedHypervolumeImprovement as qLogNEHVI
 from botorch.optim import optimize_acqf
-from botorch.utils.multi_objective.pareto import is_non_dominated
 from botorch.utils.sampling import draw_sobol_samples
 
 warnings.filterwarnings("ignore", category=InputDataWarning)
@@ -145,7 +146,8 @@ ZOMBI_FIXED = dict(
 )
 
 RF_N_ESTIMATORS = 500
-TERNARY_GRID_N  = 80
+TERNARY_GRID_N  = 80     # render/metric grid (kept coarse: drawn every trial frame)
+PICKER_GRID_N   = 120    # interactive extrema picker only (matches interactive_test_zombi.py)
 _SQRT3_2        = math.sqrt(3) / 2
 CORNER_LABELS   = ("FAPbI3", "MAPbI3", "MAPbBr3")
 
@@ -285,16 +287,36 @@ def write_run_config(run_dir, maximize, csv_path, true_optima) -> None:
 def load_latest_run_config(runs_dir: str) -> dict:
     """Return the run_config.json from the most recently created runs/mobo_* run.
 
-    Used on resume to reuse the static config (min/max, csv_path,
-    reference optima) without re-prompting interactively.
+    Used on resume to reuse the static config (min/max, csv_path, reference
+    optima) without re-prompting interactively.
+
+    Recency is decided by the ``created`` timestamp that ``write_run_config``
+    stamps in at run start — *before* any trial runs — so the newest run's config
+    is chosen regardless of whether that run completed (or even started) any
+    trials. This is also more robust than file mtime, which Dropbox sync can
+    rewrite; mtime is only a fallback when ``created`` is missing/unparseable.
     """
     cands = glob.glob(os.path.join(runs_dir, "mobo_*", "run_config.json"))
     if not cands:
         sys.exit(f"No runs/mobo_*/run_config.json found under {runs_dir} — nothing to resume.")
-    latest = max(cands, key=os.path.getmtime)
+
+    def created_key(cfg_path: str):
+        # (1, created_ts) sorts above (0, mtime) so a parseable timestamp always
+        # wins over a fallback; within each tier, larger = more recent.
+        try:
+            with open(cfg_path) as f:
+                created = json.load(f).get("created")
+            if created:
+                return (1, datetime.datetime.fromisoformat(created).timestamp())
+        except Exception:
+            pass
+        return (0, os.path.getmtime(cfg_path))
+
+    latest = max(cands, key=created_key)
     with open(latest) as f:
         cfg = json.load(f)
-    print(f"  [resume] reusing config from {os.path.basename(os.path.dirname(latest))}")
+    print(f"  [resume] reusing config from {os.path.basename(os.path.dirname(latest))} "
+          f"(created {cfg.get('created', '?')})")
     return cfg
 
 
@@ -336,6 +358,140 @@ def collect_all_observations(runs_dir: str):
         if used:
             n_runs += 1
             print(f"  [collect] {os.path.basename(os.path.dirname(path))}: {used} trial(s)")
+    return X_obs, Y_obs, n_runs
+
+
+def _read_needles_csv(path: str) -> np.ndarray:
+    """Read a trial's needles.csv → (N, 3) array of FA/MA/Br needle coords.
+
+    A trial that discovered no needles still writes a header-only file, so an
+    empty result is meaningful (0 needles → max distance penalty on rescore).
+    """
+    import csv as _csv
+    pts = []
+    with open(path, newline="") as f:
+        for row in _csv.DictReader(f):
+            pts.append([float(row["FA"]), float(row["MA"]), float(row["Br"])])
+    return np.array(pts, dtype=float) if pts else np.empty((0, 3))
+
+
+def collect_rederived_observations(runs_dir: str, new_maximize: bool,
+                                   new_optima: list[np.ndarray]):
+    """Crawl prior runs and rebuild (X, Y) under a freshly-picked run config.
+
+    Used by ``--resume-scratch``. ``dist_to_needles`` is the only objective that
+    depends on the picked optima, and it is a post-hoc geometric score over the
+    needles a trial discovered — those are persisted per trial in needles.csv, so
+    it can be recomputed against ``new_optima`` with no ZoMBI re-runs. ``dup`` and
+    ``runtime`` don't depend on the config and are reused as stored.
+
+    Trials whose needles.csv is missing (older runs that never wrote per-trial
+    dirs) cannot be re-scored. Rather than drop them, the stored
+    ``dist_to_needles`` is reused as-is with a per-run warning — an approximation
+    that is reasonable only when the new optima are close to the run's original
+    ones.
+
+    This is only valid when the search direction is unchanged: flipping max/min
+    changes which points are "good", so the stored needles would be invalid. If
+    any prior run's direction differs from ``new_maximize`` (case 2), this aborts
+    via ``sys.exit`` and nothing is run.
+
+    Returns (X_obs, Y_obs, n_runs).
+    """
+    run_dirs = sorted(glob.glob(os.path.join(runs_dir, "mobo_*")))
+
+    # ── Pass 1: verify every prior run's direction matches the new selection ──
+    mismatched, no_config = [], []
+    for rd in run_dirs:
+        if not os.path.exists(os.path.join(rd, "mobo_progress.json")):
+            continue
+        cfg_path = os.path.join(rd, "run_config.json")
+        if not os.path.exists(cfg_path):
+            no_config.append(os.path.basename(rd))
+            continue
+        try:
+            with open(cfg_path) as f:
+                prior_max = bool(json.load(f).get("maximize"))
+        except Exception:
+            no_config.append(os.path.basename(rd))
+            continue
+        if prior_max != new_maximize:
+            mismatched.append((os.path.basename(rd), prior_max))
+
+    if mismatched:
+        new_dir = "maximize" if new_maximize else "minimize"
+        print("\n" + "=" * 70)
+        print("  [resume-scratch] ABORT — direction flip detected (case 2).")
+        print(f"  You selected '{new_dir}', but these prior runs used the opposite "
+              f"direction:")
+        for name, pm in mismatched:
+            print(f"    - {name}: {'maximize' if pm else 'minimize'}")
+        print("  Flipping max/min changes the entire ZoMBI search, so the stored "
+              "needles are\n  invalid and dist_to_needles cannot be re-derived "
+              "without re-running every\n  trial. Nothing has been run. Re-pick the "
+              "matching direction, or start a\n  fresh run instead.")
+        print("=" * 70)
+        sys.exit(1)
+    if no_config:
+        print(f"  [resume-scratch] WARNING: skipping run(s) without a readable "
+              f"run_config.json (direction unverifiable): {', '.join(no_config)}")
+
+    # ── Pass 2: re-derive dist from saved needles; reuse stored dist if absent ──
+    X_obs, Y_obs = [], []
+    n_runs = 0
+    for rd in run_dirs:
+        run_name = os.path.basename(rd)
+        prog_path = os.path.join(rd, "mobo_progress.json")
+        if not os.path.exists(prog_path) or not os.path.exists(os.path.join(rd, "run_config.json")):
+            continue
+        try:
+            with open(prog_path) as f:
+                data = json.load(f)
+        except Exception as exc:
+            print(f"  [resume-scratch] {prog_path} unreadable ({exc}); skipping.")
+            continue
+        n_rederived = n_reused = 0
+        for t in data.get("trials", []):
+            hp, m = t.get("hparams", {}), t.get("metrics", {})
+            if not all(name in hp for name in HPARAM_NAMES):
+                continue  # stale / different hyperparameter set
+            needles_path = os.path.join(rd, f"trial_{t.get('trial')}", "needles.csv")
+            try:
+                if os.path.exists(needles_path):
+                    needles = _read_needles_csv(needles_path)
+                    dist = metric_dist_to_needles(needles, new_optima)
+                    rederived = True
+                else:
+                    # No saved needles → cannot re-score; reuse stored dist as-is.
+                    dist = float(m["dist_to_needles"])
+                    rederived = False
+                x = hparams_to_norm(hp)
+                y = torch.tensor([-float(dist),
+                                  -float(m["dup_fraction"]),
+                                  -float(m["runtime_s"])], dtype=DTYPE)
+            except (KeyError, ValueError, TypeError) as exc:
+                print(f"  [resume-scratch] {run_name} trial "
+                      f"{t.get('trial')}: could not build observation ({exc}); skipping.")
+                continue
+            X_obs.append(x)
+            Y_obs.append(y)
+            if rederived:
+                n_rederived += 1
+            else:
+                n_reused += 1
+        used = n_rederived + n_reused
+        if used:
+            n_runs += 1
+            parts = []
+            if n_rederived:
+                parts.append(f"{n_rederived} re-derived")
+            if n_reused:
+                parts.append(f"{n_reused} reused as-is")
+            print(f"  [resume-scratch] {run_name}: {used} trial(s) ({', '.join(parts)})")
+            if n_reused:
+                print(f"  [resume-scratch]   WARNING: {run_name} has no saved needles — "
+                      f"its dist_to_needles was NOT re-scored to the new optima; reused as "
+                      f"stored (assumed close enough).")
     return X_obs, Y_obs, n_runs
 
 
@@ -460,8 +616,13 @@ class ExtremaPicker:
         draw_ternary_frame(ax)
         goal = "maximum" if self.maximize else "minimum"
         ax.set_title(f"RF landscape — click near {goal}, then Enter / Q", fontsize=10)
-        gxy = comp_to_xy(self.grid_pts)
-        sc = ax.scatter(gxy[:, 0], gxy[:, 1], c=self.grid_vals,
+        # High-resolution landscape for picking — evaluated on a denser grid than
+        # the coarse render/metric grid so the displayed surface matches the
+        # interactive_test_zombi.py picker.
+        pick_pts  = ternary_grid(PICKER_GRID_N)
+        pick_vals = self.rf.predict(pick_pts)
+        gxy = comp_to_xy(pick_pts)
+        sc = ax.scatter(gxy[:, 0], gxy[:, 1], c=pick_vals,
                         cmap="viridis", s=8, alpha=0.80, zorder=2, rasterized=True)
         fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
         ax.text(0.5, -0.07, "Click extrema.  Enter / Q when done.",
@@ -958,12 +1119,11 @@ def plot_hparam_edge_proximity(path: str, x_norm: torch.Tensor) -> None:
     fig.clear()
 
 
-def write_trial_json(path: str, trial_num: int, phase: str, is_pareto: bool,
+def write_trial_json(path: str, trial_num: int, phase: str,
                      metrics: dict, hparams: dict) -> None:
     obj = {
         "trial": trial_num,
         "phase": phase,
-        "pareto": bool(is_pareto),
         "metrics": {
             "dist_to_needles": round(metrics["dist"], 6),
             "dup_fraction":    round(metrics["dup"], 6),
@@ -1109,17 +1269,8 @@ def run_single_trial(
 # ─── Running summary (mobo_progress.json / mobo_results.json) ───────────────────
 
 def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
-                   prior_count: int = 0,
-                   Y_prior: list[torch.Tensor] | None = None) -> dict:
+                   prior_count: int = 0) -> dict:
     n = len(Y_obs)
-    # Pareto membership is computed against the FULL landscape (prior history +
-    # this run's trials), so a resumed run's flags match the per-trial trial.json
-    # and don't over-report against the smaller within-run batch. The slice
-    # ``[prior_count:]`` keeps only this run's trials, which are the ones written
-    # out below. With no prior (fresh run) this reduces to the old behaviour.
-    Y_prior = Y_prior or []
-    global_mask = is_non_dominated(torch.stack(Y_prior + Y_obs))
-    pareto_mask = global_mask[prior_count:]
     metrics_all = [
         {
             "dist_to_needles": round(-Y_obs[i][0].item(), 6),
@@ -1129,11 +1280,12 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
         for i in range(n)
     ]
     # A resumed run is seeded with prior history, so it never runs Sobol init.
+    # Pareto membership is intentionally NOT recorded here — it is determined
+    # across all runs after the fact by optimize/pareto.py.
     trials = [
         {
             "trial":   i + 1,
             "phase":   "sobol" if (prior_count == 0 and i < N_INIT_TRIALS) else "mobo",
-            "pareto":  bool(pareto_mask[i].item()),
             "metrics": metrics_all[i],
             "hparams": {
                 k: (round(v, 8) if isinstance(v, float) else v)
@@ -1147,7 +1299,6 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
     runtimes = [m["runtime_s"]       for m in metrics_all]
     return {
         "n_trials": n,
-        "n_pareto": int(pareto_mask.sum().item()),
         "averages": {
             "dist_to_needles": round(float(np.mean(dists)),    6),
             "dup_fraction":    round(float(np.mean(dups)),     6),
@@ -1155,16 +1306,14 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
         },
         "best_dist": {"value": round(min(dists), 6), "trial": int(np.argmin(dists)) + 1},
         "trials": trials,
-    }, pareto_mask
+    }
 
 
-def save_running_summary(X_obs, Y_obs, run_dir: str, prior_count: int = 0,
-                         Y_prior: list[torch.Tensor] | None = None) -> torch.Tensor:
-    """Write mobo_progress.json + mobo_results.json + mobo_results.pt. Returns pareto mask."""
+def save_running_summary(X_obs, Y_obs, run_dir: str, prior_count: int = 0) -> None:
+    """Write mobo_progress.json + mobo_results.json + mobo_results.pt."""
     if not Y_obs:
-        return torch.zeros(0, dtype=torch.bool)
-    summary, pareto_mask = _build_summary(X_obs, Y_obs, prior_count=prior_count,
-                                          Y_prior=Y_prior)
+        return
+    summary = _build_summary(X_obs, Y_obs, prior_count=prior_count)
     summary_txt = json.dumps(summary, indent=2)
     _atomic_write_text(os.path.join(run_dir, "mobo_progress.json"), summary_txt)
     _atomic_write_text(os.path.join(run_dir, "mobo_results.json"), summary_txt)
@@ -1174,35 +1323,7 @@ def save_running_summary(X_obs, Y_obs, run_dir: str, prior_count: int = 0,
          "hparam_names": HPARAM_NAMES},
         os.path.join(run_dir, "mobo_results.pt"),
     )
-    print(f"  [summary] {len(Y_obs)} trials, {int(pareto_mask.sum().item())} Pareto", flush=True)
-    return pareto_mask
-
-
-def save_pareto_plot(X_obs, Y_obs, run_dir: str) -> None:
-    if not Y_obs:
-        return
-    Y = torch.stack(Y_obs)
-    pareto_mask = is_non_dominated(Y).cpu().numpy()
-    Y_np = (-Y).cpu().numpy()   # dist, dup, runtime
-    pairs = [
-        (0, 2, "dist_to_needles", "runtime (s)"),
-        (0, 1, "dist_to_needles", "dup_fraction"),
-        (1, 2, "dup_fraction",    "runtime (s)"),
-    ]
-    fig = Figure(figsize=(15, 5))
-    FigureCanvasAgg(fig)
-    axes = fig.subplots(1, 3)
-    fig.suptitle("MOBO Pareto front  (★ = Pareto-optimal)", fontsize=12)
-    for ax, (ix, iy, xl, yl) in zip(axes, pairs):
-        ax.scatter(Y_np[~pareto_mask, ix], Y_np[~pareto_mask, iy], c="steelblue",
-                   alpha=0.6, edgecolors="k", linewidths=0.3, label="dominated")
-        ax.scatter(Y_np[pareto_mask, ix], Y_np[pareto_mask, iy], marker="*", s=220,
-                   c="gold", zorder=5, edgecolors="k", linewidths=0.5, label="Pareto")
-        ax.set_xlabel(xl); ax.set_ylabel(yl); ax.legend(fontsize=8)
-    fig.tight_layout()
-    fig.savefig(os.path.join(run_dir, "pareto_front.png"), dpi=120, bbox_inches="tight")
-    fig.clear()
-    print(f"  Pareto plot saved to {os.path.join(run_dir, 'pareto_front.png')}")
+    print(f"  [summary] {len(Y_obs)} trials recorded", flush=True)
 
 
 # ─── MOBO loop (unbounded, resumable) ───────────────────────────────────────────
@@ -1213,9 +1334,9 @@ def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, run_dir,
 
     ``X_prior``/``Y_prior`` seed the GP with (X, Y) pairs harvested from past runs
     (see ``collect_all_observations``) so resume continues from the full landscape.
-    Prior data only feeds GP fitting + the Pareto plot; the run's own
-    progress.json / results record only this run's trials, so re-crawling later
-    never double-counts.  When prior history is present, Sobol init is skipped.
+    Prior data only feeds GP fitting; the run's own progress.json / results
+    record only this run's trials, so re-crawling later never double-counts.
+    When prior history is present, Sobol init is skipped.
     """
     bounds = torch.zeros(2, N_HPARAMS, dtype=DTYPE, device=DEVICE)
     bounds[1] = 1.0
@@ -1290,14 +1411,10 @@ def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, run_dir,
                 X_obs.append(x_new.detach().cpu())
                 Y_obs.append(torch.tensor([-res["dist"], -res["dup"], -res["runtime"]],
                                           dtype=DTYPE, device="cpu"))
-                save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior,
-                                     Y_prior=Y_prior)
-                # Pareto status reported against the FULL landscape (prior + this run).
-                global_mask = is_non_dominated(torch.stack(Y_prior + Y_obs))
-                is_pareto = bool(global_mask[-1].item())
+                save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior)
                 write_trial_json(
                     os.path.join(trial_dir, "trial.json"),
-                    trial_num, phase, is_pareto,
+                    trial_num, phase,
                     {"dist": res["dist"], "dup": res["dup"], "runtime": res["runtime"]},
                     hparams,
                 )
@@ -1320,16 +1437,60 @@ def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, run_dir,
         print("\n[!] Interrupted by user — finalising results …")
 
     if Y_obs:
-        save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior,
-                             Y_prior=Y_prior)
-        # Pareto plot spans the full landscape (prior history + this run's trials).
-        save_pareto_plot(X_prior + X_obs, Y_prior + Y_obs, run_dir)
+        save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior)
     print(f"\nDone. {len(Y_obs)} trials completed this run "
           f"({n_prior} prior + {len(Y_obs)} new = {n_prior + len(Y_obs)} total). Results in {run_dir}")
     print(f"Resume (crawls all runs) with:  python optimize/run_mobo.py --resume")
+    print(f"Pareto front across all runs:   python optimize/pareto.py")
 
 
 # ─── Main ───────────────────────────────────────────────────────────────────────
+
+def _interactive_run_config(script_dir: str):
+    """Interactive run-config creation: locate campaign1a.csv, train the RF,
+    prompt max/min, and interactively pick the reference optima.
+
+    Shared by the fresh run and ``--resume-scratch``. Returns
+    ``(rf_fn, grid_pts, grid_vals, csv_path, rf_maximize, true_optima)``.
+    """
+    csv_candidates = [
+        os.path.join(script_dir, "..", "interactive_testing", "data", "campaign1a.csv"),
+        os.path.join(script_dir, "..", "interactive_testing", "campaign1a.csv"),
+    ]
+    csv_path = next((os.path.normpath(p) for p in csv_candidates if os.path.exists(p)), None)
+    if csv_path is None:
+        sys.exit("campaign1a.csv not found. Tried:\n" +
+                 "\n".join(f"  {os.path.normpath(p)}" for p in csv_candidates))
+    print(f"\n[RF] Loading {csv_path} …  Training RF ({RF_N_ESTIMATORS} trees) …")
+    rf, rf_fn, grid_pts, grid_vals = build_rf_and_grid(csv_path)
+    print("  RF trained.")
+
+    raw_mm = input("  Maximize or minimize RF?  [max/min, default min]: ").strip().lower()
+    rf_maximize = raw_mm in ("max", "x", "maximize")
+    goal = "maxima" if rf_maximize else "minima"
+
+    plt.ion()
+    print(f"  Click near reference {goal}, then Enter / Q.")
+    picker  = ExtremaPicker(rf, grid_pts, grid_vals, maximize=rf_maximize)
+    extrema = picker.run()
+    if not extrema:
+        print("  No extrema selected — using centroid as fallback.")
+        extrema = [(np.array([1/3, 1/3, 1/3]), 0.0)]
+    true_optima = [x for x, _ in extrema]
+    print(f"  RF ready: {len(true_optima)} reference {goal}")
+    return rf_fn, grid_pts, grid_vals, csv_path, rf_maximize, true_optima
+
+
+def _launch_run(runs_dir, rf_fn, true_optima, grid_pts, grid_vals, rf_maximize,
+                csv_path, max_trials, X_prior=None, Y_prior=None) -> None:
+    """Create a fresh runs/mobo_* folder, persist its config, and run MOBO."""
+    run_dir = os.path.join(runs_dir, datetime.datetime.now().strftime("mobo_%d_%m_%H_%M"))
+    os.makedirs(run_dir, exist_ok=True)
+    write_run_config(run_dir, rf_maximize, csv_path, true_optima)
+    print(f"\n[run] Output folder: {run_dir}")
+    run_mobo(rf_fn, true_optima, grid_pts, grid_vals, rf_maximize, run_dir,
+             max_trials=max_trials, X_prior=X_prior, Y_prior=Y_prior)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ZoMBI-Hop MOBO hyperparameter optimisation (RF surrogate).")
@@ -1340,7 +1501,16 @@ def main() -> None:
                              "runs/mobo_*/mobo_progress.json, collect all (X,Y) pairs, and "
                              "seed a NEW runs/mobo_* run with them (reusing the latest run's "
                              "saved RF settings + picked optima). Non-interactive.")
+    parser.add_argument("--resume-scratch", action="store_true",
+                        help="Like --resume (seed a NEW run with ALL prior (X,Y) pairs), but "
+                             "RE-PROMPT for run config (max/min + interactive optima picking) "
+                             "instead of reusing the latest saved config. Note: prior Y values "
+                             "were computed under the previous run's optima/direction, so a "
+                             "different selection makes the seeded history inconsistent.")
     args = parser.parse_args()
+
+    if args.resume and args.resume_scratch:
+        sys.exit("Use only one of --resume / --resume-scratch.")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     runs_dir   = os.path.join(script_dir, "runs")
@@ -1372,13 +1542,30 @@ def main() -> None:
         _, rf_fn, grid_pts, grid_vals = build_rf_and_grid(csv_path)
         print(f"  RF ready: reusing {len(true_optima)} saved reference optima")
 
-        run_dir = os.path.join(runs_dir, datetime.datetime.now().strftime("mobo_%d_%m_%H_%M"))
-        os.makedirs(run_dir, exist_ok=True)
-        write_run_config(run_dir, rf_maximize, csv_path, true_optima)
-        print(f"[run] New output folder: {run_dir}")
+        _launch_run(runs_dir, rf_fn, true_optima, grid_pts, grid_vals, rf_maximize,
+                    csv_path, args.max_trials, X_prior=X_prior, Y_prior=Y_prior)
+        return
 
-        run_mobo(rf_fn, true_optima, grid_pts, grid_vals, rf_maximize, run_dir,
-                 max_trials=args.max_trials, X_prior=X_prior, Y_prior=Y_prior)
+    # ── Resume-from-scratch: seed with all prior (X,Y), but re-pick config ──
+    if args.resume_scratch:
+        print("=" * 70)
+        print("ZoMBI-Hop MOBO — RESUMING FROM SCRATCH (prior data + fresh config)")
+        print(f"Device: {DEVICE}   |   time limit/trial: {TIME_LIMIT_HOURS} h")
+        print("=" * 70)
+
+        # Re-pick the run config first; the new optima/direction determine how the
+        # prior (X,Y) pairs are re-derived (see collect_rederived_observations).
+        rf_fn, grid_pts, grid_vals, csv_path, rf_maximize, true_optima = \
+            _interactive_run_config(script_dir)
+
+        print("\n[collect] Re-deriving prior trials against the freshly-picked optima …")
+        X_prior, Y_prior, n_runs = collect_rederived_observations(
+            runs_dir, rf_maximize, true_optima)
+        print(f"  [collect] {len(Y_prior)} trial(s) from {n_runs} run(s) -> prior history "
+              f"(dist re-scored where needles saved, else reused; dup/runtime reused).")
+
+        _launch_run(runs_dir, rf_fn, true_optima, grid_pts, grid_vals, rf_maximize,
+                    csv_path, args.max_trials, X_prior=X_prior, Y_prior=Y_prior)
         return
 
     # ── Fresh run ──
@@ -1387,41 +1574,11 @@ def main() -> None:
     print(f"Device: {DEVICE}   |   time limit/trial: {TIME_LIMIT_HOURS} h")
     print("=" * 70)
 
-    # RF surrogate on campaign1a.csv
-    csv_candidates = [
-        os.path.join(script_dir, "..", "interactive_testing", "data", "campaign1a.csv"),
-        os.path.join(script_dir, "..", "interactive_testing", "campaign1a.csv"),
-    ]
-    csv_path = next((os.path.normpath(p) for p in csv_candidates if os.path.exists(p)), None)
-    if csv_path is None:
-        sys.exit("campaign1a.csv not found. Tried:\n" +
-                 "\n".join(f"  {os.path.normpath(p)}" for p in csv_candidates))
-    print(f"\n[RF] Loading {csv_path} …  Training RF ({RF_N_ESTIMATORS} trees) …")
-    rf, rf_fn, grid_pts, grid_vals = build_rf_and_grid(csv_path)
-    print("  RF trained.")
+    rf_fn, grid_pts, grid_vals, csv_path, rf_maximize, true_optima = \
+        _interactive_run_config(script_dir)
 
-    raw_mm = input("  Maximize or minimize RF?  [max/min, default min]: ").strip().lower()
-    rf_maximize = raw_mm in ("max", "x", "maximize")
-    goal = "maxima" if rf_maximize else "minima"
-
-    plt.ion()
-    print(f"  Click near reference {goal}, then Enter / Q.")
-    picker  = ExtremaPicker(rf, grid_pts, grid_vals, maximize=rf_maximize)
-    extrema = picker.run()
-    if not extrema:
-        print("  No extrema selected — using centroid as fallback.")
-        extrema = [(np.array([1/3, 1/3, 1/3]), 0.0)]
-    true_optima = [x for x, _ in extrema]
-    print(f"  RF ready: {len(true_optima)} reference {goal}")
-
-    # Run directory: runs/mobo_DD_MM_HH_MM (military time)
-    run_dir = os.path.join(runs_dir, datetime.datetime.now().strftime("mobo_%d_%m_%H_%M"))
-    os.makedirs(run_dir, exist_ok=True)
-    write_run_config(run_dir, rf_maximize, csv_path, true_optima)
-    print(f"\n[run] Output folder: {run_dir}")
-
-    run_mobo(rf_fn, true_optima, grid_pts, grid_vals, rf_maximize, run_dir,
-             max_trials=args.max_trials)
+    _launch_run(runs_dir, rf_fn, true_optima, grid_pts, grid_vals, rf_maximize,
+                csv_path, args.max_trials)
 
 
 if __name__ == "__main__":
