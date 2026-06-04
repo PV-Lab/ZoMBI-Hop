@@ -48,9 +48,9 @@ Usage
   python optimize/run_mobo.py --resume   # crawl every runs/mobo_*/mobo_progress.json,
                                          #   collect all (X,Y) pairs, and seed a NEW
                                          #   runs/mobo_* run from the full landscape
-  python optimize/run_mobo.py --make-videos            # newest run
-  python optimize/run_mobo.py --make-videos <run_dir>  # specific run
-  python optimize/run_mobo.py --make-videos <run_dir> --force-videos   # rebuild all
+  python optimize/make_videos.py                       # newest run
+  python optimize/make_videos.py <run_dir>             # specific run
+  python optimize/make_videos.py <run_dir> --force     # rebuild all
 """
 
 from __future__ import annotations
@@ -148,11 +148,6 @@ RF_N_ESTIMATORS = 500
 TERNARY_GRID_N  = 80
 _SQRT3_2        = math.sqrt(3) / 2
 CORNER_LABELS   = ("FAPbI3", "MAPbI3", "MAPbBr3")
-
-# Video timelapse target
-VIDEO_TARGET_DURATION_S = 30.0
-VIDEO_MIN_FPS           = 1.0
-VIDEO_MAX_FPS           = 60.0
 
 # ─── Hyperparameter search space ──────────────────────────────────────────────
 # Each entry: (lo, hi, transform) — transform ∈ {"log", "linear", "int"}
@@ -285,23 +280,6 @@ def write_run_config(run_dir, maximize, csv_path, true_optima) -> None:
         "created":       datetime.datetime.now().isoformat(timespec="seconds"),
     }
     _atomic_write_text(os.path.join(run_dir, "run_config.json"), json.dumps(cfg, indent=2))
-
-
-def resolve_run_dir(arg: str, runs_dir: str) -> str:
-    """Resolve a --make-videos argument to a run directory under runs/.
-
-    arg == "__latest__"  → newest mobo_* folder under runs_dir.
-    otherwise            → the given path (absolute, cwd-relative, or runs-relative).
-    """
-    if arg == "__latest__":
-        cands = [c for c in glob.glob(os.path.join(runs_dir, "mobo_*")) if os.path.isdir(c)]
-        if not cands:
-            sys.exit(f"No mobo_* run found under {runs_dir}.")
-        return max(cands, key=os.path.getmtime)
-    for cand in (arg, os.path.join(runs_dir, arg), os.path.join(os.path.dirname(runs_dir), arg)):
-        if os.path.isdir(cand):
-            return os.path.abspath(cand)
-    sys.exit(f"Run directory not found: {arg}")
 
 
 def load_latest_run_config(runs_dir: str) -> dict:
@@ -812,69 +790,6 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
     fig.clear()
 
 
-def make_video_from_dir(plots_dir: str, out_path: str) -> bool:
-    """Compile iter_*.png frames in plots_dir into a ~30s MP4 at out_path.
-
-    Returns True on success. Tries imageio+ffmpeg (h264) then OpenCV; both paths
-    verify the output is non-empty, since ffmpeg/cv2 can fail without raising.
-    """
-    frames = sorted(glob.glob(os.path.join(plots_dir, "iter_*.png")))
-    if not frames:
-        print(f"    [video] no frames in {plots_dir} — skipping.")
-        return False
-    fps = max(VIDEO_MIN_FPS, min(VIDEO_MAX_FPS, len(frames) / VIDEO_TARGET_DURATION_S))
-
-    def _even(img):
-        """Crop to even height/width (libx264 requirement)."""
-        h, w = img.shape[:2]
-        return img[: h - (h % 2), : w - (w % 2)]
-
-    def _ok() -> bool:
-        return os.path.exists(out_path) and os.path.getsize(out_path) > 0
-
-    # Prefer imageio + imageio-ffmpeg (h264); fall back to OpenCV.
-    try:
-        import imageio.v2 as iio
-        from PIL import Image as PILImage
-        imgs = [iio.imread(f)[:, :, :3] for f in frames]
-        h, w = imgs[0].shape[:2]
-        fixed = []
-        for img in imgs:
-            if img.shape[:2] != (h, w):
-                img = np.array(PILImage.fromarray(img).resize((w, h), PILImage.LANCZOS))
-            fixed.append(_even(img))
-        iio.mimwrite(out_path, fixed, fps=fps, codec="libx264", macro_block_size=None)
-        if not _ok():
-            raise RuntimeError("imageio/ffmpeg produced an empty file")
-        print(f"    [video] {out_path}  ({len(frames)} frames @ {fps:.2f} fps)")
-        return True
-    except Exception as exc:
-        print(f"    [video] imageio failed ({exc}); trying OpenCV …")
-
-    try:
-        import cv2
-        first = _even(cv2.imread(frames[0]))
-        h, w = first.shape[:2]
-        writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-        if not writer.isOpened():
-            raise RuntimeError("cv2.VideoWriter failed to open (codec unavailable?)")
-        for path in frames:
-            img = cv2.imread(path)
-            if img is None:
-                continue
-            if img.shape[:2] != (h, w):
-                img = cv2.resize(img, (w, h))
-            writer.write(img)
-        writer.release()
-        if not _ok():
-            raise RuntimeError("OpenCV produced an empty file")
-        print(f"    [video] {out_path}  ({len(frames)} frames @ {fps:.2f} fps, OpenCV)")
-        return True
-    except Exception as exc:
-        print(f"    [video] OpenCV failed too ({exc}) — no video written.")
-        return False
-
-
 # ─── Per-trial artifact writers ────────────────────────────────────────────────
 
 def _activation_zoom_per_point(n_points: int, snap_records: list[tuple]) -> tuple:
@@ -1191,36 +1106,6 @@ def run_single_trial(
     return {"dist": dist, "dup": dup, "runtime": runtime, "payloads": payloads}
 
 
-def regenerate_videos(run_dir: str, force: bool = False) -> None:
-    """Rebuild zombihop_timelapse.mp4 for every trial_* folder from its frames.
-
-    Skips trials that already have a non-empty video unless force=True.
-    """
-    trial_dirs = sorted(
-        glob.glob(os.path.join(run_dir, "trial_*")),
-        key=lambda p: int(p.split("_")[-1]) if p.split("_")[-1].isdigit() else 0,
-    )
-    if not trial_dirs:
-        print(f"No trial_* folders found in {run_dir}")
-        return
-    n_ok = n_skip = n_fail = 0
-    for tdir in trial_dirs:
-        plots_dir = os.path.join(tdir, "plots")
-        out_path  = os.path.join(tdir, "zombihop_timelapse.mp4")
-        name = os.path.basename(tdir)
-        if not os.path.isdir(plots_dir) or not glob.glob(os.path.join(plots_dir, "iter_*.png")):
-            print(f"  {name}: no frames — skipping."); continue
-        if not force and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            print(f"  {name}: video already present — skipping (use --force-videos to rebuild).")
-            n_skip += 1; continue
-        print(f"  {name}: building video …")
-        if make_video_from_dir(plots_dir, out_path):
-            n_ok += 1
-        else:
-            n_fail += 1
-    print(f"\nVideos: {n_ok} written, {n_skip} skipped, {n_fail} failed.  ({run_dir})")
-
-
 # ─── Running summary (mobo_progress.json / mobo_results.json) ───────────────────
 
 def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
@@ -1455,25 +1340,11 @@ def main() -> None:
                              "runs/mobo_*/mobo_progress.json, collect all (X,Y) pairs, and "
                              "seed a NEW runs/mobo_* run with them (reusing the latest run's "
                              "saved RF settings + picked optima). Non-interactive.")
-    parser.add_argument("--make-videos", nargs="?", const="__latest__", default=None,
-                        metavar="RUN_DIR",
-                        help="Regenerate zombihop_timelapse.mp4 for every trial in a run from "
-                             "its saved frames, then exit. Give a runs/mobo_* folder, or pass "
-                             "with no value for the newest run. No optimisation is run.")
-    parser.add_argument("--force-videos", action="store_true",
-                        help="With --make-videos, rebuild videos even if one already exists.")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     runs_dir   = os.path.join(script_dir, "runs")
     os.makedirs(runs_dir, exist_ok=True)
-
-    # ── Video regeneration only (no optimisation, no GUI) ──
-    if args.make_videos is not None:
-        run_dir = resolve_run_dir(args.make_videos, runs_dir)
-        print(f"Regenerating videos for {run_dir}")
-        regenerate_videos(run_dir, force=args.force_videos)
-        return
 
     # ── Resume path: crawl all prior runs, seed a new run, rebuild RF, no GUI ──
     if args.resume:
