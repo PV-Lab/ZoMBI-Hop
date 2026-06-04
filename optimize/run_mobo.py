@@ -18,7 +18,7 @@ MOBO engine: qLogNEHVI (BoTorch, maximises negated objectives).
 
 Run layout
 ----------
-Each run creates a folder ``mobo_DD_MM_HH_MM/`` (start date/time, military
+Each run creates a folder ``runs/mobo_DD_MM_HH_MM/`` (start date/time, military
 clock) containing:
   • mobo_progress.json / mobo_results.json / mobo_results.pt  – running summary
   • pareto_front.png                                          – on exit
@@ -37,15 +37,17 @@ clock) containing:
         ├─ plots/iter_0000.png …      (one frame per iteration)
         └─ zombihop_timelapse.mp4
 
-Each trial runs ZoMBI-Hop for up to ITER_CAP objective calls (1000 normally,
-5 with ``--smoke``).  The number of trials is unbounded — the MOBO loop runs
-Sobol init then BO indefinitely until you press Ctrl+C.
+Each trial runs ZoMBI-Hop until its wall-clock budget (TIME_LIMIT_HOURS) expires.
+The number of trials is unbounded — the MOBO loop runs Sobol init then BO
+indefinitely until you press Ctrl+C.
 
 Usage
 -----
   conda activate zombi-hop
-  python optimize/run_mobo.py            # 1000 iterations / trial
-  python optimize/run_mobo.py --smoke    # 5 iterations / trial (quick check)
+  python optimize/run_mobo.py            # TIME_LIMIT_HOURS per trial
+  python optimize/run_mobo.py --resume   # crawl every runs/mobo_*/mobo_progress.json,
+                                         #   collect all (X,Y) pairs, and seed a NEW
+                                         #   runs/mobo_* run from the full landscape
   python optimize/run_mobo.py --make-videos            # newest run
   python optimize/run_mobo.py --make-videos <run_dir>  # specific run
   python optimize/run_mobo.py --make-videos <run_dir> --force-videos   # rebuild all
@@ -123,9 +125,8 @@ N_INIT_TRIALS    = 8       # Sobol initial designs before BO begins
 N_MOBO_RESTARTS  = 10
 N_MOBO_SAMPLES   = 512
 
-# Per-trial ZoMBI iteration budget (one objective/LineBO call == one iteration)
-DEFAULT_ITER_CAP = 1000
-SMOKE_ITER_CAP   = 5
+# Per-trial wall-clock budget (hours) passed to ZoMBIHop.run(time_limit_hours=…).
+TIME_LIMIT_HOURS = 0.4
 
 # pct_matched: a true optimum counts as "found" if a needle is within this
 # Euclidean (composition L2) radius of it.
@@ -199,6 +200,24 @@ def norm_to_hparams(x_norm: torch.Tensor) -> dict:
     return params
 
 
+def hparams_to_norm(hparams: dict) -> torch.Tensor:
+    """Inverse of norm_to_hparams: map a stored hyperparameter dict → [0,1] vector.
+
+    Used when crawling past runs' mobo_progress.json (which stores unnormalised
+    hparams) to reconstruct the normalised MOBO design points for resume.
+    """
+    v = torch.zeros(N_HPARAMS, dtype=DTYPE)
+    for i, name in enumerate(HPARAM_NAMES):
+        lo, hi, tfm = HPARAM_SPACE[name]
+        val = float(hparams[name])
+        if tfm == "log":
+            u = (math.log(val) - math.log(lo)) / (math.log(hi) - math.log(lo))
+        else:  # "int" or "linear"
+            u = (val - lo) / (hi - lo)
+        v[i] = min(1.0, max(0.0, u))
+    return v
+
+
 # ─── Crash-safe persistence helpers ─────────────────────────────────────────────
 
 def _atomic_write_text(path: str, text: str) -> None:
@@ -255,11 +274,10 @@ def build_rf_and_grid(csv_path: str):
 
 # ─── Run-config persistence + resume ────────────────────────────────────────────
 
-def write_run_config(run_dir, maximize, iter_cap, csv_path, true_optima) -> None:
+def write_run_config(run_dir, maximize, csv_path, true_optima) -> None:
     """Persist the static run state needed for a fully non-interactive resume."""
     cfg = {
         "maximize":      bool(maximize),
-        "iter_cap":      int(iter_cap),
         "csv_path":      os.path.abspath(csv_path),
         "true_optima":   [list(map(float, np.asarray(t).ravel())) for t in true_optima],
         "n_init_trials": N_INIT_TRIALS,
@@ -269,50 +287,78 @@ def write_run_config(run_dir, maximize, iter_cap, csv_path, true_optima) -> None
     _atomic_write_text(os.path.join(run_dir, "run_config.json"), json.dumps(cfg, indent=2))
 
 
-def resolve_resume_dir(arg: str, script_dir: str) -> str:
-    """Resolve a --resume argument to a run directory.
+def resolve_run_dir(arg: str, runs_dir: str) -> str:
+    """Resolve a --make-videos argument to a run directory under runs/.
 
-    arg == "__latest__"  → newest resumable mobo_* folder under script_dir.
-    otherwise            → the given path (absolute, cwd-relative, or script-relative).
+    arg == "__latest__"  → newest mobo_* folder under runs_dir.
+    otherwise            → the given path (absolute, cwd-relative, or runs-relative).
     """
     if arg == "__latest__":
-        cands = [c for c in glob.glob(os.path.join(script_dir, "mobo_*"))
-                 if os.path.isdir(c) and os.path.exists(os.path.join(c, "run_config.json"))]
+        cands = [c for c in glob.glob(os.path.join(runs_dir, "mobo_*")) if os.path.isdir(c)]
         if not cands:
-            sys.exit(f"No resumable mobo_* run (with run_config.json) found under {script_dir}.")
+            sys.exit(f"No mobo_* run found under {runs_dir}.")
         return max(cands, key=os.path.getmtime)
-    for cand in (arg, os.path.join(script_dir, arg)):
+    for cand in (arg, os.path.join(runs_dir, arg), os.path.join(os.path.dirname(runs_dir), arg)):
         if os.path.isdir(cand):
             return os.path.abspath(cand)
-    sys.exit(f"Resume directory not found: {arg}")
+    sys.exit(f"Run directory not found: {arg}")
 
 
-def load_resume_state(run_dir: str):
-    """Load (cfg, X_obs, Y_obs) from a run directory. Falls back to mobo_results.pt.bak."""
-    cfg_path = os.path.join(run_dir, "run_config.json")
-    if not os.path.exists(cfg_path):
-        sys.exit(f"{run_dir} has no run_config.json — cannot resume (not a v2 run?).")
-    with open(cfg_path) as f:
+def load_latest_run_config(runs_dir: str) -> dict:
+    """Return the run_config.json from the most recently created runs/mobo_* run.
+
+    Used on resume to reuse the static config (min/max, csv_path,
+    reference optima) without re-prompting interactively.
+    """
+    cands = glob.glob(os.path.join(runs_dir, "mobo_*", "run_config.json"))
+    if not cands:
+        sys.exit(f"No runs/mobo_*/run_config.json found under {runs_dir} — nothing to resume.")
+    latest = max(cands, key=os.path.getmtime)
+    with open(latest) as f:
         cfg = json.load(f)
+    print(f"  [resume] reusing config from {os.path.basename(os.path.dirname(latest))}")
+    return cfg
 
-    if cfg.get("hparam_names") != HPARAM_NAMES:
-        sys.exit("Hyperparameter space changed since this run started — cannot resume "
-                 "(stored names differ from current HPARAM_SPACE).")
 
+def collect_all_observations(runs_dir: str):
+    """Crawl every runs/mobo_*/mobo_progress.json and collect all (X_norm, Y) pairs.
+
+    X = normalised hyperparameter vector (inverted from the stored hparams),
+    Y = (-dist_to_needles, -dup_fraction, -runtime_s)  [the maximised objectives].
+
+    Each run's progress.json records only its own trials, so the union across all
+    runs has no double-counting.  Trials whose hparam keys don't cover the current
+    HPARAM_SPACE are skipped (stale hyperparameter set).
+    Returns (X_obs, Y_obs, n_runs).
+    """
     X_obs, Y_obs = [], []
-    results_path = os.path.join(run_dir, "mobo_results.pt")
-    for path in (results_path, results_path + ".bak"):
-        if not os.path.exists(path):
-            continue
+    n_runs = 0
+    for path in sorted(glob.glob(os.path.join(runs_dir, "mobo_*", "mobo_progress.json"))):
         try:
-            data = torch.load(path, map_location="cpu")
-            Xs, Ys = data["X_obs"], data["Y_obs"]
-            X_obs = [Xs[i].to(dtype=DTYPE).cpu() for i in range(Xs.shape[0])]
-            Y_obs = [Ys[i].to(dtype=DTYPE).cpu() for i in range(Ys.shape[0])]
-            break
+            with open(path) as f:
+                data = json.load(f)
         except Exception as exc:
-            print(f"  [resume] {os.path.basename(path)} unreadable ({exc}); trying backup …")
-    return cfg, X_obs, Y_obs
+            print(f"  [collect] {path} unreadable ({exc}); skipping.")
+            continue
+        used = 0
+        for t in data.get("trials", []):
+            hp, m = t.get("hparams", {}), t.get("metrics", {})
+            if not all(name in hp for name in HPARAM_NAMES):
+                continue  # stale / different hyperparameter set
+            try:
+                x = hparams_to_norm(hp)
+                y = torch.tensor([-float(m["dist_to_needles"]),
+                                  -float(m["dup_fraction"]),
+                                  -float(m["runtime_s"])], dtype=DTYPE)
+            except (KeyError, ValueError, TypeError):
+                continue
+            X_obs.append(x)
+            Y_obs.append(y)
+            used += 1
+        if used:
+            n_runs += 1
+            print(f"  [collect] {os.path.basename(os.path.dirname(path))}: {used} trial(s)")
+    return X_obs, Y_obs, n_runs
 
 
 def load_or_make_sobol(run_dir: str, bounds: torch.Tensor) -> torch.Tensor:
@@ -625,10 +671,6 @@ def _gen_init_data(fn_callable, maximize: bool):
 
 
 # ─── Per-iteration plotting (rendered AFTER the timed run) ──────────────────────
-
-class _StopZombi(Exception):
-    """Raised inside the objective wrapper to hard-stop ZoMBI at the iteration cap."""
-
 
 def _draw_bounds_region(ax, bounds, n_sample: int = 5000) -> None:
     """Draw the trust-region (tensor bounds) as a dashed-red convex hull."""
@@ -1029,11 +1071,10 @@ def run_single_trial(
     grid_pts: np.ndarray,
     grid_vals: np.ndarray,
     maximize: bool,
-    iter_cap: int,
     trial_dir: str,
 ) -> dict:
-    """Run one capped ZoMBI trial on the RF surrogate, then write all per-trial
-    artifacts.  Returns {"dist", "dup", "runtime", "payloads", ...}."""
+    """Run one time-limited ZoMBI trial on the RF surrogate, then write all
+    per-trial artifacts.  Returns {"dist", "dup", "runtime", "payloads", ...}."""
     # Wipe any partial folder left by a crashed/interrupted attempt at this trial
     # number so resumed runs never mix stale frames with fresh ones.
     if os.path.isdir(trial_dir):
@@ -1049,9 +1090,7 @@ def run_single_trial(
     sim_obj = make_sim_obj(rf_fn, DEVICE, DTYPE, maximize=maximize)
     inner   = make_linebo_wrapper(sim_obj, 3, NUM_LINES, DEVICE, DTYPE, plot_state)
 
-    def capped_wrapper(x_tell, bounds, acq_fn):
-        if call_counter[0] >= iter_cap:
-            raise _StopZombi()
+    def obj_wrapper(x_tell, bounds, acq_fn):
         x_req, x_act, y = inner(x_tell, bounds, acq_fn)
         call_counter[0] += 1
         dh = dh_ref[0]
@@ -1089,7 +1128,7 @@ def run_single_trial(
     # capture activation/zoom in-memory because take_snapshot updates the
     # current_* counters before the save_enabled early-return.
     optimizer = ZoMBIHop(
-        objective=capped_wrapper,
+        objective=obj_wrapper,
         X_init_actual=X_a, X_init_expected=X_e, Y_init=Y,
         **ZOMBI_FIXED, **hparams,
         device=str(DEVICE), dtype=DTYPE,
@@ -1108,9 +1147,7 @@ def run_single_trial(
 
     t0 = time.time()
     try:
-        optimizer.run(max_activations=float("inf"), time_limit_hours=None)
-    except _StopZombi:
-        pass
+        optimizer.run(max_activations=float("inf"), time_limit_hours=TIME_LIMIT_HOURS)
     except Exception as exc:
         print(f"    [trial] ZoMBI crashed: {exc}")
     runtime = time.time() - t0
@@ -1150,16 +1187,6 @@ def run_single_trial(
                          os.path.join(plots_dir, f"iter_{p['iter_num'] - 1:04d}.png"))
         except Exception as exc:
             print(f"    [trial] frame {p['iter_num']} failed: {exc}")
-    try:
-        ok = make_video_from_dir(plots_dir, os.path.join(trial_dir, "zombihop_timelapse.mp4"))
-    except Exception as exc:
-        ok = False
-        print(f"    [trial] video failed: {exc}")
-    if not ok:
-        # Persist so a missing video is never silent; regenerate later with --make-videos.
-        _log_error(os.path.dirname(trial_dir), int(os.path.basename(trial_dir).split("_")[-1]),
-                   RuntimeError(f"video not written for {trial_dir} "
-                                f"({len(payloads)} frames present; rerun with --make-videos)"))
 
     return {"dist": dist, "dup": dup, "runtime": runtime, "payloads": payloads}
 
@@ -1196,7 +1223,8 @@ def regenerate_videos(run_dir: str, force: bool = False) -> None:
 
 # ─── Running summary (mobo_progress.json / mobo_results.json) ───────────────────
 
-def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor]) -> dict:
+def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
+                   prior_count: int = 0) -> dict:
     n = len(Y_obs)
     Y_stk = torch.stack(Y_obs)
     pareto_mask = is_non_dominated(Y_stk)
@@ -1208,10 +1236,11 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor]) -> dict
         }
         for i in range(n)
     ]
+    # A resumed run is seeded with prior history, so it never runs Sobol init.
     trials = [
         {
             "trial":   i + 1,
-            "phase":   "sobol" if i < N_INIT_TRIALS else "mobo",
+            "phase":   "sobol" if (prior_count == 0 and i < N_INIT_TRIALS) else "mobo",
             "pareto":  bool(pareto_mask[i].item()),
             "metrics": metrics_all[i],
             "hparams": {
@@ -1237,11 +1266,11 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor]) -> dict
     }, pareto_mask
 
 
-def save_running_summary(X_obs, Y_obs, run_dir: str) -> torch.Tensor:
+def save_running_summary(X_obs, Y_obs, run_dir: str, prior_count: int = 0) -> torch.Tensor:
     """Write mobo_progress.json + mobo_results.json + mobo_results.pt. Returns pareto mask."""
     if not Y_obs:
         return torch.zeros(0, dtype=torch.bool)
-    summary, pareto_mask = _build_summary(X_obs, Y_obs)
+    summary, pareto_mask = _build_summary(X_obs, Y_obs, prior_count=prior_count)
     summary_txt = json.dumps(summary, indent=2)
     _atomic_write_text(os.path.join(run_dir, "mobo_progress.json"), summary_txt)
     _atomic_write_text(os.path.join(run_dir, "mobo_results.json"), summary_txt)
@@ -1284,30 +1313,34 @@ def save_pareto_plot(X_obs, Y_obs, run_dir: str) -> None:
 
 # ─── MOBO loop (unbounded, resumable) ───────────────────────────────────────────
 
-def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, iter_cap, run_dir,
-             max_trials=None, X_obs=None, Y_obs=None) -> None:
-    """Unbounded MOBO loop.  Pass X_obs/Y_obs to resume from completed trials.
+def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, run_dir,
+             max_trials=None, X_prior=None, Y_prior=None) -> None:
+    """Unbounded MOBO loop, writing trials into a fresh ``run_dir``.
 
-    Trial numbering keys off ``len(Y_obs)`` (recorded trials), so a crashed
-    attempt leaves no gap: the next attempt reuses its number and overwrites the
-    partial folder.  ``mobo_results.pt`` (written atomically per completed trial)
-    is the single source of truth for resume.
+    ``X_prior``/``Y_prior`` seed the GP with (X, Y) pairs harvested from past runs
+    (see ``collect_all_observations``) so resume continues from the full landscape.
+    Prior data only feeds GP fitting + the Pareto plot; the run's own
+    progress.json / results record only this run's trials, so re-crawling later
+    never double-counts.  When prior history is present, Sobol init is skipped.
     """
     bounds = torch.zeros(2, N_HPARAMS, dtype=DTYPE, device=DEVICE)
     bounds[1] = 1.0
 
     # maximised objectives Y = (-dist, -dup, -runtime)
-    X_obs = list(X_obs) if X_obs is not None else []
-    Y_obs = list(Y_obs) if Y_obs is not None else []
+    X_prior = [x.detach().cpu() for x in X_prior] if X_prior else []
+    Y_prior = [y.detach().cpu() for y in Y_prior] if Y_prior else []
+    n_prior = len(Y_prior)
+    X_obs: list[torch.Tensor] = []   # this run's own trials only (written to disk)
+    Y_obs: list[torch.Tensor] = []
 
     X_sobol = load_or_make_sobol(run_dir, bounds)
-    n_resume = len(Y_obs)
 
     print(f"\n{'='*70}")
     print(f"MOBO  |  {N_INIT_TRIALS} Sobol init, then BO until Ctrl+C")
-    print(f"Iterations / trial: {iter_cap}    Run dir: {run_dir}")
-    if n_resume:
-        print(f"RESUMING — {n_resume} trial(s) already completed; continuing at trial {n_resume + 1}")
+    print(f"Time limit / trial: {TIME_LIMIT_HOURS} h    Run dir: {run_dir}")
+    if n_prior:
+        print(f"PRIOR HISTORY — seeding GP with {n_prior} (X,Y) pair(s) from past runs; "
+              f"skipping Sobol init")
     print(f"Hyperparameters ({N_HPARAMS}): {HPARAM_NAMES}")
     print(f"{'='*70}")
 
@@ -1315,17 +1348,18 @@ def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, iter_cap, run_di
     try:
         while max_trials is None or len(Y_obs) < max_trials:
             n_done    = len(Y_obs)
-            phase     = "sobol" if n_done < N_INIT_TRIALS else "mobo"
+            use_sobol = (n_prior == 0 and n_done < N_INIT_TRIALS)
+            phase     = "sobol" if use_sobol else "mobo"
             trial_num = n_done + 1
             trial_dir = os.path.join(run_dir, f"trial_{trial_num}")
 
             try:
                 # ── Pick the next hyperparameter vector ──
-                if n_done < N_INIT_TRIALS:
+                if use_sobol:
                     x_new = X_sobol[n_done].clone()
                 else:
-                    X_t = torch.stack(X_obs).to(DEVICE)
-                    Y_t = torch.stack(Y_obs).to(DEVICE)
+                    X_t = torch.stack(X_prior + X_obs).to(DEVICE)
+                    Y_t = torch.stack(Y_prior + Y_obs).to(DEVICE)
                     span = (Y_t.max(dim=0).values - Y_t.min(dim=0).values).clamp(min=1e-6)
                     ref_point = (Y_t.min(dim=0).values - 0.1 * span).tolist()
                     model = SingleTaskGP(
@@ -1349,7 +1383,7 @@ def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, iter_cap, run_di
 
                 # ── Run the trial + write its artifacts ──
                 res = run_single_trial(hparams, rf_fn, true_optima, grid_pts, grid_vals,
-                                       maximize, iter_cap, trial_dir)
+                                       maximize, trial_dir)
                 try:
                     plot_hparam_edge_proximity(
                         os.path.join(trial_dir, "hparam_edge_proximity.png"), x_new)
@@ -1357,13 +1391,15 @@ def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, iter_cap, run_di
                     print(f"    [trial] hparam_edge_proximity failed: {exc}")
 
                 # ── Record (this is the point the trial becomes "done") ──
-                # Keep observations on CPU so fresh + resumed entries share a device
+                # Keep observations on CPU so prior + new entries share a device
                 # (zombihop sets the global default device to CUDA on import).
                 X_obs.append(x_new.detach().cpu())
                 Y_obs.append(torch.tensor([-res["dist"], -res["dup"], -res["runtime"]],
                                           dtype=DTYPE, device="cpu"))
-                pareto_mask = save_running_summary(X_obs, Y_obs, run_dir)
-                is_pareto = bool(pareto_mask[-1].item()) if pareto_mask.numel() else False
+                save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior)
+                # Pareto status reported against the FULL landscape (prior + this run).
+                global_mask = is_non_dominated(torch.stack(Y_prior + Y_obs))
+                is_pareto = bool(global_mask[-1].item())
                 write_trial_json(
                     os.path.join(trial_dir, "trial.json"),
                     trial_num, phase, is_pareto,
@@ -1389,77 +1425,84 @@ def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, iter_cap, run_di
         print("\n[!] Interrupted by user — finalising results …")
 
     if Y_obs:
-        save_running_summary(X_obs, Y_obs, run_dir)
-        save_pareto_plot(X_obs, Y_obs, run_dir)
-    print(f"\nDone. {len(Y_obs)} trials completed. Results in {run_dir}")
-    print(f"Resume with:  python optimize/run_mobo.py --resume \"{run_dir}\"")
+        save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior)
+        # Pareto plot spans the full landscape (prior history + this run's trials).
+        save_pareto_plot(X_prior + X_obs, Y_prior + Y_obs, run_dir)
+    print(f"\nDone. {len(Y_obs)} trials completed this run "
+          f"({n_prior} prior + {len(Y_obs)} new = {n_prior + len(Y_obs)} total). Results in {run_dir}")
+    print(f"Resume (crawls all runs) with:  python optimize/run_mobo.py --resume")
 
 
 # ─── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ZoMBI-Hop MOBO hyperparameter optimisation (RF surrogate).")
-    parser.add_argument("--smoke", action="store_true",
-                        help=f"Smoke test: {SMOKE_ITER_CAP} iterations/trial instead of {DEFAULT_ITER_CAP}.")
     parser.add_argument("--max-trials", type=int, default=None,
                         help="Optional cap on total number of trials (default: unbounded, Ctrl+C to stop).")
-    parser.add_argument("--resume", nargs="?", const="__latest__", default=None,
-                        metavar="RUN_DIR",
-                        help="Resume a previous run. Give a mobo_* folder, or pass --resume "
-                             "with no value to resume the newest one. Non-interactive "
-                             "(reuses the saved RF settings + picked optima).")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume optimisation using ALL prior data: crawl every "
+                             "runs/mobo_*/mobo_progress.json, collect all (X,Y) pairs, and "
+                             "seed a NEW runs/mobo_* run with them (reusing the latest run's "
+                             "saved RF settings + picked optima). Non-interactive.")
     parser.add_argument("--make-videos", nargs="?", const="__latest__", default=None,
                         metavar="RUN_DIR",
                         help="Regenerate zombihop_timelapse.mp4 for every trial in a run from "
-                             "its saved frames, then exit. Give a mobo_* folder, or pass with "
-                             "no value for the newest run. No optimisation is run.")
+                             "its saved frames, then exit. Give a runs/mobo_* folder, or pass "
+                             "with no value for the newest run. No optimisation is run.")
     parser.add_argument("--force-videos", action="store_true",
                         help="With --make-videos, rebuild videos even if one already exists.")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    runs_dir   = os.path.join(script_dir, "runs")
+    os.makedirs(runs_dir, exist_ok=True)
 
     # ── Video regeneration only (no optimisation, no GUI) ──
     if args.make_videos is not None:
-        run_dir = resolve_resume_dir(args.make_videos, script_dir)
+        run_dir = resolve_run_dir(args.make_videos, runs_dir)
         print(f"Regenerating videos for {run_dir}")
         regenerate_videos(run_dir, force=args.force_videos)
         return
 
-    # ── Resume path: load saved config, rebuild RF, no GUI ──
-    if args.resume is not None:
-        run_dir = resolve_resume_dir(args.resume, script_dir)
-        cfg, X_obs, Y_obs = load_resume_state(run_dir)
-        iter_cap    = cfg["iter_cap"]
+    # ── Resume path: crawl all prior runs, seed a new run, rebuild RF, no GUI ──
+    if args.resume:
+        cfg         = load_latest_run_config(runs_dir)
         rf_maximize = cfg["maximize"]
         csv_path    = cfg["csv_path"]
         true_optima = [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
+        if cfg.get("hparam_names") != HPARAM_NAMES:
+            print("  [resume] WARNING: latest run's hparam_names differ from the current "
+                  "HPARAM_SPACE; only matching trials are collected.")
 
         print("=" * 70)
-        print("ZoMBI-Hop MOBO — RESUMING")
-        print(f"Run dir: {run_dir}")
-        print(f"Device: {DEVICE}   |   iterations/trial: {iter_cap}   |   "
-              f"{'maximize' if rf_maximize else 'minimize'}   |   "
-              f"{len(Y_obs)} trial(s) already done")
+        print("ZoMBI-Hop MOBO — RESUMING (crawling all prior runs)")
+        print(f"Device: {DEVICE}   |   time limit/trial: {TIME_LIMIT_HOURS} h   |   "
+              f"{'maximize' if rf_maximize else 'minimize'}")
         print("=" * 70)
-        if args.smoke:
-            print("  [note] --smoke ignored on resume; using the run's saved iter_cap.")
+
+        print("\n[collect] Crawling runs/mobo_*/mobo_progress.json for all (X,Y) pairs …")
+        X_prior, Y_prior, n_runs = collect_all_observations(runs_dir)
+        print(f"  [collect] {len(Y_prior)} trial(s) from {n_runs} run(s) -> prior history.")
+
         if not os.path.exists(csv_path):
             sys.exit(f"Saved CSV path no longer exists: {csv_path}")
         print(f"\n[RF] Rebuilding surrogate from {csv_path} …")
         _, rf_fn, grid_pts, grid_vals = build_rf_and_grid(csv_path)
         print(f"  RF ready: reusing {len(true_optima)} saved reference optima")
 
-        run_mobo(rf_fn, true_optima, grid_pts, grid_vals, rf_maximize, iter_cap, run_dir,
-                 max_trials=args.max_trials, X_obs=X_obs, Y_obs=Y_obs)
+        run_dir = os.path.join(runs_dir, datetime.datetime.now().strftime("mobo_%d_%m_%H_%M"))
+        os.makedirs(run_dir, exist_ok=True)
+        write_run_config(run_dir, rf_maximize, csv_path, true_optima)
+        print(f"[run] New output folder: {run_dir}")
+
+        run_mobo(rf_fn, true_optima, grid_pts, grid_vals, rf_maximize, run_dir,
+                 max_trials=args.max_trials, X_prior=X_prior, Y_prior=Y_prior)
         return
 
     # ── Fresh run ──
-    iter_cap = SMOKE_ITER_CAP if args.smoke else DEFAULT_ITER_CAP
     print("=" * 70)
     print("ZoMBI-Hop Hyperparameter Optimisation (MOBO)  —  RF surrogate")
-    print(f"Device: {DEVICE}   |   iterations/trial: {iter_cap}"
-          + ("   [SMOKE TEST]" if args.smoke else ""))
+    print(f"Device: {DEVICE}   |   time limit/trial: {TIME_LIMIT_HOURS} h")
     print("=" * 70)
 
     # RF surrogate on campaign1a.csv
@@ -1489,13 +1532,13 @@ def main() -> None:
     true_optima = [x for x, _ in extrema]
     print(f"  RF ready: {len(true_optima)} reference {goal}")
 
-    # Run directory: mobo_DD_MM_HH_MM (military time)
-    run_dir = os.path.join(script_dir, datetime.datetime.now().strftime("mobo_%d_%m_%H_%M"))
+    # Run directory: runs/mobo_DD_MM_HH_MM (military time)
+    run_dir = os.path.join(runs_dir, datetime.datetime.now().strftime("mobo_%d_%m_%H_%M"))
     os.makedirs(run_dir, exist_ok=True)
-    write_run_config(run_dir, rf_maximize, iter_cap, csv_path, true_optima)
+    write_run_config(run_dir, rf_maximize, csv_path, true_optima)
     print(f"\n[run] Output folder: {run_dir}")
 
-    run_mobo(rf_fn, true_optima, grid_pts, grid_vals, rf_maximize, iter_cap, run_dir,
+    run_mobo(rf_fn, true_optima, grid_pts, grid_vals, rf_maximize, run_dir,
              max_trials=args.max_trials)
 
 

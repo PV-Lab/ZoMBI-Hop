@@ -1,6 +1,12 @@
 interactive_testing/*
 !interactive_testing/*.py
-runs/
+runs/run_*/
+optimize/runs/mobo_*/*
+optimize/runs/IGNORE_*/
+
+# Leave the progress json so we can resume training
+!optimize/runs/mobo_*/mobo_progress.json
+!optimize/runs/mobo_*/run_config.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
