@@ -46,6 +46,13 @@ from src.core.zombihop import ZoMBIHop
 from src.core.linebo import LineBO
 from src.utils.gp_simplex import GPSimplex
 from src.utils.simplex import random_simplex, proj_simplex
+from synthetic_data.ackley import (
+    Ackley,
+    CENTER_CENTROID,
+    CENTER_EDGE,
+    CENTER_VERTEX,
+    MULTIMODAL_CENTERS,
+)
 
 # ── Perovskite CSV dataset ─────────────────────────────────────────────────────
 # FAPbI3 / MAPbI3 / MAPbBr3 validation campaign dataset
@@ -57,16 +64,12 @@ CSV_PEROVSKITE_PATH: str = _CSV_DEFAULT
 
 # ── Simplex / optimisation constants ──────────────────────────────────────────
 _D = 3          # dimensionality (3-element simplex)
-_ACKLEY_A = 20.0
-_ACKLEY_B = 0.2
-_ACKLEY_B_SKINNY = 1.2   # larger b → skinnier peaks (used in multimodal_ackley)
-_ACKLEY_C = 2.0 * np.pi
-_ACKLEY_SCALE = 30.0   # vertical scaling so Y values are numerically healthy
 
-ACKLEY_CENTER_EQUAL  = np.array([1.0 / 3, 1.0 / 3, 1.0 / 3])
-ACKLEY_CENTER_EDGE   = np.array([0.5, 0.5, 0.0])
-ACKLEY_CENTER_VERTEX = np.array([1.0, 0.0, 0.0])
-MULTIMODAL_CENTERS   = [ACKLEY_CENTER_EQUAL, ACKLEY_CENTER_EDGE, ACKLEY_CENTER_VERTEX]
+# Ackley peak locations re-exported from the shared ``synthetic_data.ackley``
+# module under their historical names (kept for backwards compatibility).
+ACKLEY_CENTER_EQUAL  = CENTER_CENTROID
+ACKLEY_CENTER_EDGE   = CENTER_EDGE
+ACKLEY_CENTER_VERTEX = CENTER_VERTEX
 
 
 # =============================================================================
@@ -499,34 +502,15 @@ def build_csv_rf_objectives(
 # =============================================================================
 # 6.  Ackley test functions
 # =============================================================================
+#
+# The Ackley objectives live in ``synthetic_data/ackley.py`` (the ``Ackley``
+# class).  The thin module-level wrappers below preserve the original
+# ``f(x: np.ndarray) -> float`` call signature used throughout this harness.
 
-def _ackley_negated(
-    x: np.ndarray,
-    center: np.ndarray,
-    a: float = _ACKLEY_A,
-    b: float = _ACKLEY_B,
-    c: float = _ACKLEY_C,
-    scale: float = _ACKLEY_SCALE,
-) -> float:
-    """
-    Negated Ackley centred at ``center``.
-
-    Maximum is at ``x == center`` (value ≈ 0).  The function is negative
-    away from the centre; ZoMBI-Hop's maximisation finds the peak correctly.
-
-    Parameters
-    ----------
-    x : np.ndarray (3,)
-        Query point on the 3-simplex.
-    center : np.ndarray (3,)
-        Peak location.
-    """
-    x = np.asarray(x, dtype=float)
-    d = x.shape[0]
-    delta = x - center
-    t1 = -a * np.exp(-b * np.sqrt(np.sum(delta ** 2) / d))
-    t2 = -np.exp(np.sum(np.cos(c * delta)) / d)
-    return scale * (t1 + t2 + a + np.e)
+_ACKLEY_CENTROID   = Ackley("centroid")
+_ACKLEY_EDGE       = Ackley("edge")
+_ACKLEY_VERTEX     = Ackley("vertex")
+_ACKLEY_MULTIMODAL = Ackley("multimodal")
 
 
 def multimodal_ackley(x: np.ndarray) -> float:
@@ -537,24 +521,22 @@ def multimodal_ackley(x: np.ndarray) -> float:
 
         [1/3, 1/3, 1/3],  [0.5, 0.5, 0],  [1, 0, 0]
     """
-    return sum(
-        _ackley_negated(x, c, b=_ACKLEY_B_SKINNY) for c in MULTIMODAL_CENTERS
-    )
+    return _ACKLEY_MULTIMODAL(x)
 
 
 def ackley_equal(x: np.ndarray) -> float:
     """Negated Ackley peaked at the centroid [1/3, 1/3, 1/3]."""
-    return _ackley_negated(x, ACKLEY_CENTER_EQUAL)
+    return _ACKLEY_CENTROID(x)
 
 
 def ackley_edge(x: np.ndarray) -> float:
     """Negated Ackley peaked at the edge midpoint [0.5, 0.5, 0]."""
-    return _ackley_negated(x, ACKLEY_CENTER_EDGE)
+    return _ACKLEY_EDGE(x)
 
 
 def ackley_vertex(x: np.ndarray) -> float:
     """Negated Ackley peaked at a simplex vertex [1, 0, 0]."""
-    return _ackley_negated(x, ACKLEY_CENTER_VERTEX)
+    return _ACKLEY_VERTEX(x)
 
 
 # =============================================================================
