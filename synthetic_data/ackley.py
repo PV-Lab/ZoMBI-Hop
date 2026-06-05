@@ -90,7 +90,10 @@ def _negated_ackley(
     delta = X - np.asarray(center, dtype=float)
     t1 = -a * np.exp(-b * np.sqrt(np.sum(delta ** 2, axis=1) / d))
     t2 = -np.exp(np.sum(np.cos(c * delta), axis=1) / d)
-    return scale * (t1 + t2 + a + np.e)
+    # Standard Ackley: 0 at the centre, > 0 away (the centre is a *minimum*).
+    ackley = t1 + t2 + a + np.e
+    # Negate so the centre becomes the maximum (value 0, decreasing away).
+    return -scale * ackley
 
 
 class Ackley:
