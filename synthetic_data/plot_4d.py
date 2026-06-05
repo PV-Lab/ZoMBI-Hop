@@ -12,7 +12,10 @@ For a fixed slice x4 = s, a ternary node (a, b, c) with a + b + c = 1 correspond
 the 4D composition ((1-s)*a, (1-s)*b, (1-s)*c, s), which sums to 1.
 
 Usage:
-    python plot_simplex.py --ackley {centroid|edge|vertex|multimodal}
+    python plot_4d.py --ackley {centroid|edge|vertex|multimodal|realistic}
+
+The variant catalogue is defined once in ``synthetic_data/ackley.py``; adding a
+new mode there makes it available here (and in point_cloud_4d.py) automatically.
 """
 
 import argparse
@@ -26,43 +29,13 @@ import plotly.graph_objects as go
 HERE = Path(__file__).resolve().parent
 # Make the repo root importable so this runs from any working directory.
 sys.path.insert(0, str(HERE.parent))
-from synthetic_data.ackley import _negated_ackley, ACKLEY_B, ACKLEY_B_SKINNY  # noqa: E402
+from synthetic_data.ackley import Ackley  # noqa: E402
 
+DIM = 4          # plot the 4-element simplex (x1 + x2 + x3 + x4 = 1)
 N_SLICES = 40    # number of exact x4 cross-sections the slider steps through
 GRID_N = 200     # resolution of the x1/x2/x3 ternary grid per slice
 MARKER_SIZE = 4.0  # heatmap cell size in px; tune alongside GRID_N + FIG_W so cells just touch
 FIG_W, FIG_H = 900, 820
-
-# Canonical peak locations of each variant, lifted to the 4-element simplex.
-# These mirror the 3-simplex centres in synthetic_data/ackley.py with a 4th
-# coordinate appended (centroid spread across all four).
-CENTERS_4D = {
-    "centroid":   [np.array([0.25, 0.25, 0.25, 0.25])],
-    "edge":       [np.array([0.5, 0.5, 0.0, 0.0])],
-    "vertex":     [np.array([1.0, 0.0, 0.0, 0.0])],
-    "multimodal": [np.array([0.25, 0.25, 0.25, 0.25]),
-                   np.array([0.5, 0.5, 0.0, 0.0]),
-                   np.array([1.0, 0.0, 0.0, 0.0])],
-}
-
-
-def make_predict(variant):
-    """Return a ``predict((N, 4)) -> (N,)`` closure for the chosen variant.
-
-    Matches ``synthetic_data.ackley.Ackley.predict`` semantics: a single negated
-    Ackley for the unimodal variants, or the sum of three skinnier-peaked Ackleys
-    for ``"multimodal"``.
-    """
-    centers = CENTERS_4D[variant]
-    b = ACKLEY_B_SKINNY if variant == "multimodal" else ACKLEY_B
-
-    def predict(X):
-        total = np.zeros(X.shape[0], dtype=float)
-        for center in centers:
-            total = total + _negated_ackley(X, center, b=b)
-        return total
-
-    return predict
 
 
 def build_grid(grid_n):
@@ -81,13 +54,14 @@ def main():
         description="Plot a 4D negated-Ackley objective as x4-sliced ternary cross-sections."
     )
     parser.add_argument(
-        "--ackley", required=True, choices=sorted(CENTERS_4D),
+        "--ackley", required=True, choices=sorted(Ackley.VARIANTS),
         help="Which analytic Ackley variant to plot (lifted to the 4-element simplex).",
     )
     args = parser.parse_args()
 
     variant = args.ackley
-    predict = make_predict(variant)
+    fn = Ackley(variant, dim=DIM)
+    predict = fn.predict
 
     ga, gb, gc = build_grid(GRID_N)
     n_nodes = len(ga)
@@ -112,7 +86,7 @@ def main():
 
     # Assign each known peak to the slice whose x4 is closest, for an overlay star.
     peaks_by_slice = {}
-    for center in CENTERS_4D[variant]:
+    for center in fn.centers:
         s_idx = int(np.argmin(np.abs(slice_values - center[3])))
         scale = 1.0 - center[3]
         tern = center[:3] / scale if scale > 1e-9 else center[:3]

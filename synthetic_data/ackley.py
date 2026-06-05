@@ -8,7 +8,7 @@ These are the analytic synthetic objectives originally defined inline in
 ``Ackley`` class so they can be shared between the benchmark harness and the
 interactive simulator (``interactive_testing/interactive_test_zombi.py``).
 
-Four variants are provided, each a *negated* Ackley function whose global
+Five variants are provided, each a *negated* Ackley function whose global
 maximum (value ≈ 0) sits at a canonical simplex location:
 
     "centroid"    peak at [1/3, 1/3, 1/3]   (simplex centroid)
@@ -16,6 +16,12 @@ maximum (value ≈ 0) sits at a canonical simplex location:
     "vertex"      peak at [1,   0,   0]     (simplex vertex)
     "multimodal"  sum of three skinnier-peaked Ackleys, with maxima at all
                   three locations above
+    "realistic"   sum of several Ackleys at scattered interior locations, each
+                  with its *own* basin width (the per-peak ``b``): a couple of
+                  broad basins and a couple of very pointy/spiky ones. No basin
+                  is wider than the widest of the other variants (b ≥ ACKLEY_B).
+                  The peak locations are still known analytically (see
+                  ``REALISTIC_PEAKS`` / ``known_maxima``).
 
 Because the functions are negated, the maximum is at the centre and the value
 decreases (becomes more negative) away from it, so ZoMBI-Hop's internal
@@ -45,20 +51,98 @@ ACKLEY_B_SKINNY = 1.2     # larger b → skinnier peaks (used by "multimodal")
 ACKLEY_C = 2.0 * np.pi
 ACKLEY_SCALE = 30.0       # vertical scale so Y values are numerically healthy
 
-# ── Canonical peak locations on the 3-simplex ─────────────────────────────────
-CENTER_CENTROID = np.array([1.0 / 3, 1.0 / 3, 1.0 / 3])
-CENTER_EDGE     = np.array([0.5, 0.5, 0.0])
-CENTER_VERTEX   = np.array([1.0, 0.0, 0.0])
-MULTIMODAL_CENTERS = [CENTER_CENTROID, CENTER_EDGE, CENTER_VERTEX]
+# ── Dimension-general variant registry ────────────────────────────────────────
+# Each variant is defined *generatively* as a function of the simplex dimension
+# ``dim``, so the same catalogue works on the 3-simplex (the benchmark default),
+# the 4-simplex (the interactive plots in plot_4d.py / point_cloud_4d.py), or any
+# higher d.  To add a new mode, add one entry to ``_VARIANT_SPECS`` below: every
+# consumer -- the ``Ackley`` class and both visualisers -- picks it up
+# automatically, so nothing downstream needs editing.
+#
+# A spec is ``(peaks_builder, combine)`` where ``peaks_builder(dim)`` returns a
+# list of ``(center, b)`` tuples -- one negated-Ackley peak per centre, each with
+# its own basin width ``b`` (larger b → skinnier/spikier).  ``combine`` is how
+# the peaks are merged (see ``Ackley.predict``): ``"sum"`` adds them (basins
+# blend) or ``"max"`` takes the pointwise maximum (every listed centre stays an
+# exact global maximum regardless of basin width).
 
-VARIANTS = ("centroid", "edge", "vertex", "multimodal")
 
-# Map each single-peak variant to its centre.
-_VARIANT_CENTER = {
-    "centroid": CENTER_CENTROID,
-    "edge":     CENTER_EDGE,
-    "vertex":   CENTER_VERTEX,
+def _uniform_center(dim: int) -> np.ndarray:
+    """Simplex centroid [1/dim, ..., 1/dim]."""
+    return np.full(dim, 1.0 / dim)
+
+
+def _edge_center(dim: int) -> np.ndarray:
+    """Edge midpoint [0.5, 0.5, 0, ..., 0]."""
+    c = np.zeros(dim)
+    c[0] = c[1] = 0.5
+    return c
+
+
+def _vertex_center(dim: int) -> np.ndarray:
+    """Simplex vertex [1, 0, ..., 0]."""
+    c = np.zeros(dim)
+    c[0] = 1.0
+    return c
+
+
+# "realistic": scattered interior maxima with *per-peak* basin widths.  Larger b
+# → skinnier (more spiky) basin; smaller b → broader.  The basin-width mix (a
+# couple of broad basins plus some pointy ones, all ≥ ACKLEY_B so none is wider
+# than the other variants) is the defining character and is shared across
+# dimensions; only the peak *locations* are dimension-specific.  Explicit,
+# hand-placed locations are given for the dimensions actually used (3 and 4); any
+# other dim falls back to a deterministic seeded scatter so the variant still
+# works everywhere.  Either way the locations are known analytically (see
+# ``Ackley.known_maxima``).
+_REALISTIC_BASIN_WIDTHS = (0.20, 0.60, 0.90, 1.20, 2.50)
+_REALISTIC_CENTERS_BY_DIM = {
+    3: [
+        np.array([0.60, 0.30, 0.10]),   # broad basin (widest allowed)
+        np.array([0.20, 0.70, 0.10]),   # moderately wide
+        np.array([0.34, 0.33, 0.33]),   # medium, near the centroid
+        np.array([0.10, 0.25, 0.65]),   # skinny (≈ multimodal width)
+        np.array([0.45, 0.10, 0.45]),   # very pointy / spiky
+    ],
+    4: [
+        np.array([0.50, 0.25, 0.15, 0.10]),   # broad basin (widest allowed)
+        np.array([0.15, 0.60, 0.15, 0.10]),   # moderately wide
+        np.array([0.25, 0.25, 0.25, 0.25]),   # medium, the centroid
+        np.array([0.10, 0.20, 0.55, 0.15]),   # skinny
+        np.array([0.35, 0.10, 0.15, 0.40]),   # very pointy / spiky
+    ],
 }
+
+
+def _realistic_peaks(dim: int) -> list[tuple[np.ndarray, float]]:
+    centers = _REALISTIC_CENTERS_BY_DIM.get(dim)
+    if centers is None:
+        # Deterministic fallback for unlisted dimensions: a fixed-seed Dirichlet
+        # scatter, one interior point per basin width.
+        rng = np.random.default_rng(0)
+        centers = list(rng.dirichlet(np.ones(dim), size=len(_REALISTIC_BASIN_WIDTHS)))
+    return [(c.copy(), b) for c, b in zip(centers, _REALISTIC_BASIN_WIDTHS)]
+
+
+# variant -> (peaks_builder, combine).  See the block comment above.
+_VARIANT_SPECS = {
+    "centroid":   (lambda dim: [(_uniform_center(dim), ACKLEY_B)], "sum"),
+    "edge":       (lambda dim: [(_edge_center(dim), ACKLEY_B)], "sum"),
+    "vertex":     (lambda dim: [(_vertex_center(dim), ACKLEY_B)], "sum"),
+    "multimodal": (lambda dim: [(_uniform_center(dim), ACKLEY_B_SKINNY),
+                                (_edge_center(dim), ACKLEY_B_SKINNY),
+                                (_vertex_center(dim), ACKLEY_B_SKINNY)], "sum"),
+    "realistic":  (_realistic_peaks, "max"),
+}
+
+VARIANTS = tuple(_VARIANT_SPECS)
+
+# ── Backwards-compatible 3-simplex names (re-exported by run_zombi_test.py) ────
+CENTER_CENTROID = _uniform_center(3)
+CENTER_EDGE     = _edge_center(3)
+CENTER_VERTEX   = _vertex_center(3)
+MULTIMODAL_CENTERS = [CENTER_CENTROID, CENTER_EDGE, CENTER_VERTEX]
+REALISTIC_PEAKS = _realistic_peaks(3)
 
 
 def _negated_ackley(
@@ -98,38 +182,55 @@ def _negated_ackley(
 
 class Ackley:
     """
-    A negated Ackley objective on the 3-element simplex.
+    A negated Ackley objective on the ``dim``-element probability simplex.
 
     Parameters
     ----------
     variant : str
-        One of ``"centroid"``, ``"edge"``, ``"vertex"``, ``"multimodal"``
-        (see the module docstring).  Case-insensitive.
+        One of ``Ackley.VARIANTS`` (``"centroid"``, ``"edge"``, ``"vertex"``,
+        ``"multimodal"``, ``"realistic"`` -- see the module docstring).
+        Case-insensitive.
+    dim : int, default 3
+        Simplex dimensionality.  The variant's peaks are generated for this
+        ``dim`` from the shared registry, so ``Ackley(v)`` is the 3-simplex
+        benchmark objective and ``Ackley(v, dim=4)`` is its 4-simplex analogue
+        (used by plot_4d.py / point_cloud_4d.py).
 
     Attributes
     ----------
     variant : str
         The (lower-cased) variant name.
+    dim : int
+        The simplex dimensionality the peaks were generated for.
     centers : list of np.ndarray
-        Peak location(s): a single-element list for the unimodal variants,
-        all three canonical centres for ``"multimodal"``.
+        Peak location(s), each of length ``dim``: a single-element list for the
+        unimodal variants, all canonical centres for the multi-peak ones.
+    basin_widths : list of float
+        The per-peak ``b`` parallel to ``centers`` (larger = skinnier).
+    combine : str
+        How the per-peak Ackleys are merged: ``"sum"`` (peaks add, so centres
+        are pulled slightly off the listed locations — used by ``"multimodal"``)
+        or ``"max"`` (the pointwise maximum, so every listed centre is exactly a
+        global maximum with value 0 — used by ``"realistic"``).
     """
 
     VARIANTS = VARIANTS
 
-    def __init__(self, variant: str = "centroid") -> None:
+    def __init__(self, variant: str = "centroid", dim: int = 3) -> None:
         variant = str(variant).strip().lower()
-        if variant not in VARIANTS:
+        if variant not in _VARIANT_SPECS:
             raise ValueError(
                 f"Unknown Ackley variant {variant!r}; expected one of {VARIANTS}."
             )
+        if dim < 2:
+            raise ValueError(f"dim must be ≥ 2 (got {dim}).")
         self.variant = variant
-        if variant == "multimodal":
-            self.centers = list(MULTIMODAL_CENTERS)
-            self._b = ACKLEY_B_SKINNY
-        else:
-            self.centers = [_VARIANT_CENTER[variant]]
-            self._b = ACKLEY_B
+        self.dim = dim
+        peaks_builder, combine = _VARIANT_SPECS[variant]
+        peaks = peaks_builder(dim)
+        self.centers = [c.copy() for c, _ in peaks]
+        self.basin_widths = [b for _, b in peaks]
+        self.combine = combine
 
     # ── sklearn-compatible interface ──────────────────────────────────────────
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -139,17 +240,18 @@ class Ackley:
         Mirrors ``RandomForestRegressor.predict``: accepts ``(N, d)`` (or a
         single ``(d,)`` point) and returns a 1-D array of shape ``(N,)``.
 
-        For ``"multimodal"`` the value is the sum of three skinnier-peaked
-        negated Ackleys; for the unimodal variants it is a single negated
-        Ackley peaked at ``self.centers[0]``.
+        Each centre contributes one negated Ackley with its own basin width;
+        the contributions are merged per ``self.combine`` (``"sum"`` for the
+        unimodal variants and ``"multimodal"``, ``"max"`` for ``"realistic"``).
+        For a single centre both reduce to that one negated Ackley.
         """
         X = np.atleast_2d(np.asarray(X, dtype=float))
-        if self.variant == "multimodal":
-            total = np.zeros(X.shape[0], dtype=float)
-            for center in self.centers:
-                total = total + _negated_ackley(X, center, b=self._b)
-            return total
-        return _negated_ackley(X, self.centers[0], b=self._b)
+        terms = np.stack(
+            [_negated_ackley(X, center, b=b)
+             for center, b in zip(self.centers, self.basin_widths)],
+            axis=0,
+        )
+        return terms.max(axis=0) if self.combine == "max" else terms.sum(axis=0)
 
     # Allow ``fn(x)`` as a convenient alias for a single point, matching the
     # scalar ``f(x: np.ndarray) -> float`` signature used by run_zombi_test.py.
