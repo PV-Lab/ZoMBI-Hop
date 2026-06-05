@@ -5,9 +5,10 @@ Multi-objective Bayesian optimisation (MOBO) of ZoMBI-Hop hyperparameters,
 evaluated on the Random-Forest surrogate built from campaign1a.csv.
 
 Three objectives (all minimised):
-  1. dist_to_needles    – mean greedy distance from discovered needles to the
-                          nearest true optimum (no-repeat matching; unmatched
-                          true optima incur UNMATCHED_PENALTY)
+  1. dist_to_needles    – symmetric greedy matching distance between needles and
+                          true optima (no-repeat matching; both unmatched true
+                          optima AND unmatched/spurious needles incur
+                          UNMATCHED_PENALTY, mean over max(#needles, #optima))
   2. dup_fraction       – fraction of sampled points whose nearest neighbour
                           in input space is within noise/2
   3. runtime            – wall-clock seconds for the (timed) ZoMBI run only
@@ -149,8 +150,8 @@ N_MOBO_SAMPLES   = 512
 # Per-trial wall-clock budget (hours) passed to ZoMBIHop.run(time_limit_hours=…).
 TIME_LIMIT_HOURS = 0.4
 
-# pct_matched: a true optimum counts as "found" if a needle is within this
-# Euclidean (composition L2) radius of it.
+# pct_matched: a needle counts as "valid" if it is within this Euclidean
+# (composition L2) radius of some true optimum.
 MATCH_RADIUS = 0.05
 
 # Resumability: abort the overnight run only after this many trials fail back-to-back
@@ -727,17 +728,33 @@ class ExtremaPicker:
 
 # ─── Metrics ──────────────────────────────────────────────────────────────────
 
-UNMATCHED_PENALTY = 10.0   # added to total distance for each unmatched true optimum
+UNMATCHED_PENALTY = 10.0   # per-term penalty for an unmatched optimum OR needle
 
 
 def metric_dist_to_needles(
     discovered: np.ndarray,
     true_optima: list[np.ndarray],
 ) -> float:
-    """Greedy no-repeat matching; unmatched true optima add UNMATCHED_PENALTY."""
-    if not true_optima:
+    """Symmetric greedy matching distance between needles and true optima.
+
+    Each true optimum is greedily matched (no repeats) to its nearest discovered
+    needle and contributes that Euclidean (composition L2) distance.  Two kinds of
+    leftovers each contribute UNMATCHED_PENALTY:
+
+      • a true optimum with no needle left to match  (missed optimum — recall),
+      • a needle matched to no optimum               (spurious/duplicate — precision).
+
+    The score is the mean over ``max(#needles, #optima)`` terms.  Including a
+    per-needle penalty is what makes the metric symmetric: spawning extra needles
+    near already-matched optima now *raises* the score instead of lowering it, so
+    "needle spam" is penalised rather than rewarded.  When the needle and optimum
+    counts are equal and all match, this reduces to the old mean-distance score.
+    """
+    n_opt = len(true_optima)
+    if n_opt == 0:
         return 0.0
-    if len(discovered) == 0:
+    n_disc = len(discovered)
+    if n_disc == 0:
         return UNMATCHED_PENALTY
     used: set[int] = set()
     total = 0.0
@@ -753,8 +770,10 @@ def metric_dist_to_needles(
             used.add(best_j)
             total += best_d
         else:
-            total += UNMATCHED_PENALTY
-    return total / len(true_optima)
+            total += UNMATCHED_PENALTY          # fewer needles than optima (missed)
+    # Every needle not claimed by an optimum is a false positive (precision term).
+    total += (n_disc - len(used)) * UNMATCHED_PENALTY
+    return total / max(n_disc, n_opt)
 
 
 def metric_dup_fraction(X_all: np.ndarray, threshold: float) -> float:
@@ -773,18 +792,23 @@ def metric_pct_matched(
     true_optima: list[np.ndarray],
     radius: float = MATCH_RADIUS,
 ) -> float:
-    """Percentage of TRUE optima that have at least one needle within `radius`."""
-    if not true_optima:
-        return 100.0
-    if len(discovered) == 0:
+    """Percentage of DISCOVERED needles that lie within `radius` of a true optimum.
+
+    A precision-style score (true positives / all needles): spurious or spammed
+    needles that sit far from every true optimum drag it down, so — unlike a
+    coverage/recall score over the fixed set of true optima — it is NOT monotonic
+    in needle count.  Returns 0.0 when there are no needles (no valid needles yet)
+    or no reference optima (nothing to validate against).
+    """
+    if len(discovered) == 0 or not true_optima:
         return 0.0
     disc = np.asarray(discovered, dtype=float)
-    matched = 0
-    for t in true_optima:
-        dmin = float(np.linalg.norm(disc - np.asarray(t), axis=1).min())
-        if dmin <= radius:
-            matched += 1
-    return 100.0 * matched / len(true_optima)
+    opt  = np.asarray(true_optima, dtype=float)
+    valid = 0
+    for d in disc:
+        if float(np.linalg.norm(opt - d, axis=1).min()) <= radius:
+            valid += 1
+    return 100.0 * valid / len(disc)
 
 
 def metric_avg_pairwise_dist(discovered: np.ndarray) -> float:
