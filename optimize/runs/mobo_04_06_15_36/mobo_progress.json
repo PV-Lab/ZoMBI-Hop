@@ -1,20 +1,20 @@
 {
   "n_trials": 29,
   "averages": {
-    "dist_to_needles": 0.477932,
+    "dist_to_needles": 3.000476,
     "dup_fraction": 0.747111,
     "runtime_s": 1416.707
   },
   "best_dist": {
-    "value": 0.048262,
-    "trial": 16
+    "value": 0.24715,
+    "trial": 9
   },
   "trials": [
     {
       "trial": 1,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.073845,
+        "dist_to_needles": 3.796153,
         "dup_fraction": 0.66018,
         "runtime_s": 1502.324
       },
@@ -42,7 +42,7 @@
       "trial": 2,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.165628,
+        "dist_to_needles": 4.380359,
         "dup_fraction": 0.75025,
         "runtime_s": 1527.147
       },
@@ -70,7 +70,7 @@
       "trial": 3,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.27587,
+        "dist_to_needles": 1.159882,
         "dup_fraction": 0.494271,
         "runtime_s": 440.456
       },
@@ -126,7 +126,7 @@
       "trial": 5,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.155837,
+        "dist_to_needles": 2.708027,
         "dup_fraction": 0.711351,
         "runtime_s": 1479.896
       },
@@ -154,7 +154,7 @@
       "trial": 6,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.080198,
+        "dist_to_needles": 3.158757,
         "dup_fraction": 0.692397,
         "runtime_s": 1460.496
       },
@@ -182,7 +182,7 @@
       "trial": 7,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.223868,
+        "dist_to_needles": 1.499015,
         "dup_fraction": 0.807668,
         "runtime_s": 1528.541
       },
@@ -210,7 +210,7 @@
       "trial": 8,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.06814,
+        "dist_to_needles": 4.772705,
         "dup_fraction": 0.702796,
         "runtime_s": 1554.737
       },
@@ -266,7 +266,7 @@
       "trial": 10,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.159016,
+        "dist_to_needles": 1.053651,
         "dup_fraction": 0.794643,
         "runtime_s": 1441.746
       },
@@ -294,7 +294,7 @@
       "trial": 11,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.294533,
+        "dist_to_needles": 2.534256,
         "dup_fraction": 0.70964,
         "runtime_s": 1461.491
       },
@@ -322,7 +322,7 @@
       "trial": 12,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.048996,
+        "dist_to_needles": 3.137239,
         "dup_fraction": 0.751377,
         "runtime_s": 1492.055
       },
@@ -350,7 +350,7 @@
       "trial": 13,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.094804,
+        "dist_to_needles": 3.609551,
         "dup_fraction": 0.767708,
         "runtime_s": 1441.229
       },
@@ -378,7 +378,7 @@
       "trial": 14,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.094701,
+        "dist_to_needles": 4.339829,
         "dup_fraction": 0.671171,
         "runtime_s": 1441.697
       },
@@ -406,7 +406,7 @@
       "trial": 15,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.097542,
+        "dist_to_needles": 4.341453,
         "dup_fraction": 0.698079,
         "runtime_s": 1540.46
       },
@@ -434,7 +434,7 @@
       "trial": 16,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.048262,
+        "dist_to_needles": 5.476483,
         "dup_fraction": 0.695819,
         "runtime_s": 1468.309
       },
@@ -490,7 +490,7 @@
       "trial": 18,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.094476,
+        "dist_to_needles": 2.380366,
         "dup_fraction": 0.822068,
         "runtime_s": 1440.4
       },
@@ -518,7 +518,7 @@
       "trial": 19,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.054321,
+        "dist_to_needles": 5.374103,
         "dup_fraction": 0.689547,
         "runtime_s": 1442.882
       },
@@ -546,7 +546,7 @@
       "trial": 20,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.103379,
+        "dist_to_needles": 4.178458,
         "dup_fraction": 0.72567,
         "runtime_s": 1577.657
       },
@@ -574,7 +574,7 @@
       "trial": 21,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.140207,
+        "dist_to_needles": 4.522337,
         "dup_fraction": 0.742197,
         "runtime_s": 823.963
       },
@@ -658,7 +658,7 @@
       "trial": 24,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.140788,
+        "dist_to_needles": 3.639218,
         "dup_fraction": 0.756524,
         "runtime_s": 1453.723
       },
@@ -686,7 +686,7 @@
       "trial": 25,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.201373,
+        "dist_to_needles": 1.834478,
         "dup_fraction": 0.726554,
         "runtime_s": 1509.946
       },
@@ -742,7 +742,7 @@
       "trial": 27,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.13283,
+        "dist_to_needles": 1.029845,
         "dup_fraction": 0.796978,
         "runtime_s": 1440.905
       },
@@ -770,7 +770,7 @@
       "trial": 28,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.122134,
+        "dist_to_needles": 2.683062,
         "dup_fraction": 0.769682,
         "runtime_s": 1440.903
       },
@@ -798,7 +798,7 @@
       "trial": 29,
       "phase": "mobo",
       "metrics": {
-        "dist_to_needles": 0.065591,
+        "dist_to_needles": 4.480884,
         "dup_fraction": 0.626476,
         "runtime_s": 1498.247
       },
