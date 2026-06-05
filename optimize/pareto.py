@@ -27,6 +27,8 @@ Usage
   python optimize/pareto.py <runs_dir>      # crawl a specific runs directory
   python optimize/pareto.py --out <dir>     # write pareto.json / .png elsewhere
   python optimize/pareto.py --no-interactive # save static PNG instead of live window
+  python optimize/pareto.py --only mobo_00_01,mobo_00_02          # only these runs
+  python optimize/pareto.py --only mobo_00_01/trial_3,mobo_00_02  # specific trials
 """
 
 from __future__ import annotations
@@ -49,18 +51,82 @@ import matplotlib.pyplot as plt
 
 OBJECTIVES = ("dist_to_needles", "dup_fraction", "runtime_s")
 
+HPARAM_SPACE: dict[str, tuple] = {
+    "nat_grad_step":               (0.001,  0.5,   "log"),
+    "nat_grad_max_steps":          (10,     200,   "int"),
+    "n_restarts":                  (20,     300,   "int"),
+    "raw":                         (200,    2000,  "int"),
+    "ucb_beta":                    (0.05,   3.0,   "linear"),
+    "max_zooms":                   (2,      10,    "int"),
+    "max_iterations":              (2,      10,    "int"),
+    "top_m_points":                (2,      8,     "int"),
+    "n_consecutive_converged":     (1,      5,     "int"),
+    "convergence_pi_threshold":    (1e-4,   0.05,  "log"),
+    "input_noise_threshold_mult":  (0.5,    6.0,   "linear"),
+    "output_noise_threshold_mult": (0.1,    2.0,   "linear"),
+    "max_penalty_radius":          (0.2,    5.0,   "linear"),
+    "needle_shrink_factor":        (0.55,   0.99,  "linear"),
+    "needle_stop_noise_multiplier":(1.0,    8.0,   "linear"),
+    "paring_spatial_halfnoise":    (0.1,    2.0,   "linear"),
+    "paring_y_noise_multiplier":   (0.1,    5.0,   "linear"),
+}
+HPARAM_NAMES = list(HPARAM_SPACE.keys())
+
 
 # ─── Collection ────────────────────────────────────────────────────────────────
 
-def collect_trials(runs_dir: str, *, exclude_old: bool = False) -> list[dict]:
+def _parse_only(only_str: str) -> tuple[set[str], dict[str, set[int]]]:
+    """Parse ``--only`` into (run_names, {run_name: {trial_nums}}).
+
+    Entries like ``mobo_00_01`` add the full run. Entries like
+    ``mobo_00_01/trial_3`` add only that trial from that run. Full paths
+    (e.g. ``optimize/runs/mobo_00_01/trial_3``) and backslashes are handled.
+    """
+    import re
+    run_names: set[str] = set()
+    run_trials: dict[str, set[int]] = {}
+    for part in only_str.split(","):
+        part = part.strip().replace("\\", "/").rstrip("/")
+        segments = part.split("/")
+        mobo_seg = None
+        trial_seg = None
+        for seg in segments:
+            if seg.startswith("mobo_"):
+                mobo_seg = seg
+            elif re.fullmatch(r"trial_\d+", seg):
+                trial_seg = seg
+        if mobo_seg is None:
+            print(f"  [--only] skipping unrecognised entry: {part}")
+            continue
+        if trial_seg is not None:
+            num = int(trial_seg.replace("trial_", ""))
+            run_trials.setdefault(mobo_seg, set()).add(num)
+        else:
+            run_names.add(mobo_seg)
+    return run_names, run_trials
+
+
+def collect_trials(
+    runs_dir: str,
+    *,
+    exclude_old: bool = False,
+    only_runs: set[str] | None = None,
+    only_trials: dict[str, set[int]] | None = None,
+) -> list[dict]:
     """Crawl ``runs_dir/mobo_*/mobo_progress.json`` → list of trial records.
 
     Each record: {source_run, trial, metrics{...}, hparams{...}}. Trials missing
     any of the three objective metrics are skipped.
+
+    *only_runs*: if set, include only these run directories (all trials).
+    *only_trials*: if set, maps run names to specific trial numbers to include.
     """
+    has_filter = only_runs or only_trials
     records: list[dict] = []
     for path in sorted(glob.glob(os.path.join(runs_dir, "mobo_*", "mobo_progress.json"))):
         run_name = os.path.basename(os.path.dirname(path))
+        if has_filter and run_name not in (only_runs or set()) and run_name not in (only_trials or {}):
+            continue
         if exclude_old and run_name == "mobo_old_jackson":
             continue
         try:
@@ -69,8 +135,11 @@ def collect_trials(runs_dir: str, *, exclude_old: bool = False) -> list[dict]:
         except Exception as exc:
             print(f"  [collect] {run_name}: unreadable ({exc}); skipping.")
             continue
+        trial_filter = (only_trials or {}).get(run_name)
         used = 0
         for t in data.get("trials", []):
+            if trial_filter is not None and t.get("trial") not in trial_filter:
+                continue
             m = t.get("metrics", {})
             if not all(k in m for k in OBJECTIVES):
                 continue
@@ -157,6 +226,16 @@ def _final_plot_for_trial(runs_dir: str, source_run: str, trial: int) -> str | N
     return pngs[-1] if pngs else None
 
 
+def _hparam_normalised(value: float, name: str) -> float:
+    """Map a raw hyperparameter value to [0, 1] within its HPARAM_SPACE bounds."""
+    lo, hi, tfm = HPARAM_SPACE[name]
+    if tfm == "log":
+        import math
+        return (math.log(value) - math.log(lo)) / (math.log(hi) - math.log(lo))
+    else:
+        return (value - lo) / (hi - lo)
+
+
 def plot_pareto_interactive(
     M: np.ndarray,
     mask: np.ndarray,
@@ -168,6 +247,19 @@ def plot_pareto_interactive(
     pareto_M = M[pareto_idx]
     n_pareto = len(pareto_idx)
 
+    # --- Build hparam matrix for Pareto points (normalised to [0,1]) ---
+    available_hparams = [
+        name for name in HPARAM_NAMES
+        if all(name in records[i]["hparams"] for i in pareto_idx)
+    ]
+    hp_norm = np.full((n_pareto, len(available_hparams)), np.nan)
+    for j, name in enumerate(available_hparams):
+        for k, ri in enumerate(pareto_idx):
+            hp_norm[k, j] = _hparam_normalised(
+                float(records[ri]["hparams"][name]), name,
+            )
+
+    # --- Figure 1: Pareto scatter ---
     fig, axes = plt.subplots(1, 3, figsize=(15, 6.5))
     fig.suptitle(
         f"MOBO Pareto front across all runs  "
@@ -199,6 +291,48 @@ def plot_pareto_interactive(
 
     tooltip = fig.text(0.5, 0.01, "", ha="center", fontsize=9, color="gray")
 
+    # --- Figure 2: Hyperparameter number lines ---
+    n_hp = len(available_hparams)
+    fig_hp, ax_hp = plt.subplots(figsize=(10, max(4, n_hp * 0.45 + 1.5)))
+    fig_hp.suptitle("Pareto-optimal hyperparameters  —  hover a star on the other figure", fontsize=11)
+
+    for j in range(n_hp):
+        ax_hp.axhline(j, color="lightgray", linewidth=1.0, zorder=0)
+        lo, hi, tfm = HPARAM_SPACE[available_hparams[j]]
+        ax_hp.text(-0.02, j, f"{lo}", ha="right", va="center", fontsize=7, color="gray",
+                   transform=ax_hp.get_yaxis_transform())
+        ax_hp.text(1.02, j, f"{hi}", ha="left", va="center", fontsize=7, color="gray",
+                   transform=ax_hp.get_yaxis_transform())
+
+    hp_dots = []
+    for j in range(n_hp):
+        dots = ax_hp.scatter(
+            hp_norm[:, j], np.full(n_pareto, j),
+            c="gold", edgecolors="k", linewidths=0.3, s=50, alpha=0.5, zorder=2,
+        )
+        hp_dots.append(dots)
+
+    hp_highlight = []
+    for j in range(n_hp):
+        hl = ax_hp.scatter([], [], c="red", edgecolors="k", linewidths=0.8,
+                           s=120, zorder=5, marker="D")
+        hp_highlight.append(hl)
+
+    hp_val_labels = []
+    for j in range(n_hp):
+        lbl = ax_hp.text(0, j, "", fontsize=7, color="red", fontweight="bold",
+                         ha="center", va="bottom", zorder=6)
+        hp_val_labels.append(lbl)
+
+    ax_hp.set_xlim(-0.05, 1.05)
+    ax_hp.set_ylim(-0.8, n_hp - 0.2)
+    ax_hp.set_yticks(range(n_hp))
+    ax_hp.set_yticklabels(available_hparams, fontsize=8)
+    ax_hp.set_xlabel("normalised value (0 = lower bound, 1 = upper bound)", fontsize=9)
+    ax_hp.invert_yaxis()
+    fig_hp.tight_layout()
+
+    # --- Shared interaction state ---
     active_idx = [None]
 
     def _nearest_pareto(event) -> int | None:
@@ -224,6 +358,26 @@ def plot_pareto_interactive(
             return best
         return None
 
+    def _update_hp_highlight(idx: int | None) -> None:
+        if idx is None:
+            for hl in hp_highlight:
+                hl.set_offsets(np.empty((0, 2)))
+            for lbl in hp_val_labels:
+                lbl.set_text("")
+        else:
+            rec = records[pareto_idx[idx]]
+            for j, name in enumerate(available_hparams):
+                val_norm = hp_norm[idx, j]
+                hp_highlight[j].set_offsets([[val_norm, j]])
+                raw_val = rec["hparams"].get(name)
+                if raw_val is not None:
+                    txt = f"{raw_val:.4g}" if isinstance(raw_val, float) else str(raw_val)
+                    hp_val_labels[j].set_position((val_norm, j))
+                    hp_val_labels[j].set_text(txt)
+                else:
+                    hp_val_labels[j].set_text("")
+        fig_hp.canvas.draw_idle()
+
     def _on_motion(event):
         idx = _nearest_pareto(event)
         if idx == active_idx[0]:
@@ -244,6 +398,7 @@ def plot_pareto_interactive(
                 f"runtime={m['runtime_s']:.1f}s"
             )
         fig.canvas.draw_idle()
+        _update_hp_highlight(idx)
 
     def _on_click(event):
         idx = _nearest_pareto(event)
@@ -263,6 +418,7 @@ def plot_pareto_interactive(
     fig.tight_layout()
     fig.subplots_adjust(bottom=0.12)
     print("  Interactive Pareto plot open. Hover stars to highlight, click to open trial image.")
+    print("  Hyperparameter figure shows values for the hovered Pareto point.")
     plt.show()
 
 
@@ -278,6 +434,9 @@ def main() -> None:
                              "(default: the runs directory).")
     parser.add_argument("--no-interactive", action="store_true",
                         help="Save a static PNG instead of opening the interactive window.")
+    parser.add_argument("--only", default=None,
+                        help="Comma-separated list of runs or specific trials to include "
+                             "(e.g. mobo_00_01,mobo_00_02/trial_3).")
     parser.add_argument("--no-old", action="store_true",
                         help="Exclude trials from mobo_old_jackson.")
     args = parser.parse_args()
@@ -291,7 +450,10 @@ def main() -> None:
     print(f"MOBO Pareto collection  |  runs: {runs_dir}")
     print("=" * 70)
 
-    records = collect_trials(runs_dir, exclude_old=args.no_old)
+    only_runs, only_trials = _parse_only(args.only) if args.only else (None, None)
+    records = collect_trials(runs_dir, exclude_old=args.no_old,
+                             only_runs=only_runs or None,
+                             only_trials=only_trials or None)
     if not records:
         sys.exit(f"No usable trials found under {runs_dir}/mobo_*/mobo_progress.json.")
 
