@@ -1,26 +1,38 @@
 """
 interactive_test_zombi.py
 =========================
-Interactive ZoMBI-Hop simulator using a Random-Forest surrogate built from
-campaign1a.csv.
+Interactive ZoMBI-Hop simulator.
+
+By default the objective is a Random-Forest surrogate built from
+``campaign1a.csv``.  Passing ``--ackley {centroid|edge|vertex|multimodal}``
+swaps the RF for one of the analytic negated-Ackley test functions defined in
+``synthetic_data/ackley.py`` (the same objectives used by
+``scripts/run_zombi_test.py``), which is handy for visualising a ZoMBI-Hop run
+against a landscape with known optima.
 
 Workflow
 --------
-1. Load ``data/campaign1a.csv``, train a 500-tree Random-Forest on
-   (FAPbI3, MAPbI3, MAPbBr3) → Objective.
+1. Build the objective:
+     * default — load ``data/campaign1a.csv`` and train a 500-tree
+       Random-Forest on (FAPbI3, MAPbI3, MAPbBr3) → Objective; or
+     * ``--ackley VARIANT`` — use the analytic Ackley surrogate (no CSV / RF
+       training). Its peaks are maxima, so the run is forced to **maximize**
+       and the analytic optima are used as the reference extrema (no clicking).
 2. Choose **minimize** or **maximize** at the prompt (ZoMBI always runs as a
-   maximiser internally; minimizing RF uses negated observations).
+   maximiser internally; minimizing uses negated observations).  Skipped under
+   ``--ackley`` (always maximizes the Ackley peaks).
 3. Open an interactive ternary plot.  Left-click near a local minimum or
-   maximum (per your choice); L-BFGS-B refinement (gradient-based on the RF)
-   snaps to a nearby extremum.  Press Enter / Q when done selecting.
-   (Skipped under ``--background``, which has no window to click on.)
+   maximum (per your choice); L-BFGS-B refinement (gradient-based on the
+   surrogate) snaps to a nearby extremum.  Press Enter / Q when done selecting.
+   (Skipped under ``--background``, which has no window to click on, and under
+   ``--ackley``, whose reference optima are known analytically.)
 4. Run ZoMBI-Hop (with LineBO), exactly as in ``scripts/run_zombi_main.py``,
-   but evaluating the RF surrogate instead of a physical instrument.
+   but evaluating the surrogate (RF or Ackley) instead of a physical instrument.
    0.01 Gaussian noise is added to both inputs and outputs at every sample.
 5. After every objective call, save a two-panel ternary figure to
    ``interactive_testing/plots/`` and display it (non-blocking; PNGs are still
    saved but not displayed under ``--background``):
-     Left  – reference RF landscape + blue ★ for confirmed extrema (min or max).
+     Left  – reference surrogate landscape + blue ★ for confirmed extrema (min or max).
      Right – ZoMBI-Hop exploration:
                • all sampled points (older = more transparent),
                • red ★ + faded-purple ellipse per discovered needle,
@@ -39,6 +51,13 @@ Usage
 
 Flags
 -----
+  --ackley {centroid,edge,vertex,multimodal}
+      Use an analytic negated-Ackley objective (from ``synthetic_data/ackley.py``)
+      instead of the campaign1a RF surrogate. The chosen variant's peak(s) are
+      the maxima, so the run is forced to maximize and the analytic optima are
+      drawn as reference extrema (the interactive picker / CSV load are skipped).
+        python interactive_testing/interactive_test_zombi.py --ackley centroid
+
   --mobo-hparams PATH
       Load the latest trial's ZoMBI hyperparameters from a previous hparam-opt
       run (a ``mobo_*`` directory or a ``mobo_progress.json`` file) and use them
@@ -98,6 +117,7 @@ from matplotlib.lines import Line2D
 from src import ZoMBIHop, LineBO
 from src.core.linebo import line_simplex_segment, zero_sum_dirs
 from src.utils.simplex import Ellipsoid, composition_to_ilr, ilr_to_composition, proj_simplex
+from synthetic_data.ackley import Ackley
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 COMPOSITION_COLS = ["FAPbI3", "MAPbI3", "MAPbBr3"]
@@ -1041,6 +1061,7 @@ def main(
     mobo_hparams_path: str | None = None,
     show_sampling: bool = False,
     background: bool = False,
+    ackley: str | None = None,
 ) -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(script_dir, "campaign1a.csv")
@@ -1049,35 +1070,57 @@ def main(
     save_dir = os.path.join(script_dir, "plots")
     ckpt_dir = os.path.join(script_dir, "checkpoints")
 
+    surrogate_name = f"Ackley ({ackley})" if ackley else "RF Surrogate on campaign1a.csv"
     print("=" * 70)
-    print("ZoMBI-Hop Interactive Test — RF Surrogate on campaign1a.csv")
+    print(f"ZoMBI-Hop Interactive Test — {surrogate_name}")
     print(f"Device : {DEVICE}")
     print(f"Noise  : {NOISE_LEVEL}  (applied to both inputs and outputs)")
     print("=" * 70)
 
-    # ── Step 1: data + RF ─────────────────────────────────────────────────────
-    print("\n[1] Loading data and training RF …")
-    X_data, y_data = load_data(csv_path)
-    print(f"    {X_data.shape[0]} samples loaded.")
-    rf = train_rf(X_data, y_data)
-    print(f"    Train R² = {rf.score(X_data, y_data):.4f}")
+    # ── Step 1: build the objective surrogate ─────────────────────────────────
+    # ``rf`` is any object exposing a scikit-learn-style ``predict((N, d)) → (N,)``
+    # method: either a trained RandomForestRegressor (default) or an analytic
+    # ``Ackley`` instance (``--ackley``). Everything downstream is agnostic to which.
+    if ackley:
+        print(f"\n[1] Using analytic Ackley objective ('{ackley}') — no CSV / RF training.")
+        rf = Ackley(ackley)
+        grid_pts = ternary_grid(TERNARY_GRID_N)
+        grid_vals = rf.predict(grid_pts)
+        # Ackley peaks are maxima; ZoMBI maximizes them directly.
+        maximize = True
+        print("    Mode forced: MAXIMIZE (Ackley peaks are maxima).")
+    else:
+        print("\n[1] Loading data and training RF …")
+        X_data, y_data = load_data(csv_path)
+        print(f"    {X_data.shape[0]} samples loaded.")
+        rf = train_rf(X_data, y_data)
+        print(f"    Train R² = {rf.score(X_data, y_data):.4f}")
 
-    print("    Building ternary evaluation grid …")
-    grid_pts = ternary_grid(TERNARY_GRID_N)
-    grid_vals = rf.predict(grid_pts)
+        print("    Building ternary evaluation grid …")
+        grid_pts = ternary_grid(TERNARY_GRID_N)
+        grid_vals = rf.predict(grid_pts)
 
-    maximize = prompt_minimize_or_maximize()
-    mode_str = "MAXIMIZE (RF ascent; ZoMBI maximizes RF directly)" if maximize else (
-        "MINIMIZE (RF negated for ZoMBI; GP still uses natural-gradient ascent on acquisition)"
-    )
-    print(f"\n    Mode selected: {mode_str}")
+        maximize = prompt_minimize_or_maximize()
+        mode_str = "MAXIMIZE (RF ascent; ZoMBI maximizes RF directly)" if maximize else (
+            "MINIMIZE (RF negated for ZoMBI; GP still uses natural-gradient ascent on acquisition)"
+        )
+        print(f"\n    Mode selected: {mode_str}")
 
-    # ── Step 2: interactive reference extrema ─────────────────────────────────
+    # ── Step 2: reference extrema ─────────────────────────────────────────────
     # The picker needs a GUI to click on, so it is skipped under --background
     # (Agg has no window). Reference extrema are display-only overlays, so an
     # empty list just omits the blue ★ markers.
+    # Under --ackley the optima are known analytically, so the picker is skipped
+    # and the analytic maxima are used directly.
     goal_pl = "maxima" if maximize else "minima"
-    if background:
+    if ackley:
+        true_minima = rf.known_maxima
+        if not background:
+            plt.ion()   # keep Tk root alive for the live per-iteration figures
+        print(f"\n[2] --ackley: using {len(true_minima)} analytic reference {goal_pl}:")
+        for i, (c, v) in enumerate(true_minima):
+            print(f"      #{i + 1}  comp={np.round(c, 4)}  y={v:.5f}")
+    elif background:
         print("\n[2] --background: skipping interactive extrema picker (headless).")
         true_minima: list = []
     else:
@@ -1242,7 +1285,17 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Interactive ZoMBI-Hop simulator on an RF surrogate."
+        description="Interactive ZoMBI-Hop simulator on an RF or Ackley surrogate."
+    )
+    parser.add_argument(
+        "--ackley",
+        choices=Ackley.VARIANTS,
+        default=None,
+        metavar="{centroid,edge,vertex,multimodal}",
+        help="Use an analytic negated-Ackley objective from synthetic_data/ackley.py "
+             "instead of the campaign1a RF surrogate. The variant's peak(s) are the "
+             "maxima, so the run is forced to maximize, the analytic optima are used "
+             "as reference extrema, and the interactive picker / CSV load are skipped.",
     )
     parser.add_argument(
         "--mobo-hparams",
@@ -1270,4 +1323,5 @@ if __name__ == "__main__":
         mobo_hparams_path=args.mobo_hparams,
         show_sampling=args.show_sampling,
         background=args.background,
+        ackley=args.ackley,
     )
