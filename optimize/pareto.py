@@ -27,6 +27,8 @@ Usage
   python optimize/pareto.py <runs_dir>      # crawl a specific runs directory
   python optimize/pareto.py --out <dir>     # write pareto.json / .png elsewhere
   python optimize/pareto.py --no-interactive # save static PNG instead of live window
+  python optimize/pareto.py --with-old       # include mobo_old_jackson (excluded by default)
+  python optimize/pareto.py --show-numberline # show hyperparameter number-line figure
   python optimize/pareto.py --only mobo_00_01,mobo_00_02          # only these runs
   python optimize/pareto.py --only mobo_00_01/trial_3,mobo_00_02  # specific trials
 """
@@ -241,6 +243,8 @@ def plot_pareto_interactive(
     mask: np.ndarray,
     records: list[dict],
     runs_dir: str,
+    *,
+    show_numberline: bool = False,
 ) -> None:
     """Interactive Pareto plot: hover highlights across all subplots, click opens trial image."""
     pareto_idx = np.where(mask)[0]
@@ -248,16 +252,17 @@ def plot_pareto_interactive(
     n_pareto = len(pareto_idx)
 
     # --- Build hparam matrix for Pareto points (normalised to [0,1]) ---
-    available_hparams = [
-        name for name in HPARAM_NAMES
-        if all(name in records[i]["hparams"] for i in pareto_idx)
-    ]
-    hp_norm = np.full((n_pareto, len(available_hparams)), np.nan)
-    for j, name in enumerate(available_hparams):
-        for k, ri in enumerate(pareto_idx):
-            hp_norm[k, j] = _hparam_normalised(
-                float(records[ri]["hparams"][name]), name,
-            )
+    if show_numberline:
+        available_hparams = [
+            name for name in HPARAM_NAMES
+            if all(name in records[i]["hparams"] for i in pareto_idx)
+        ]
+        hp_norm = np.full((n_pareto, len(available_hparams)), np.nan)
+        for j, name in enumerate(available_hparams):
+            for k, ri in enumerate(pareto_idx):
+                hp_norm[k, j] = _hparam_normalised(
+                    float(records[ri]["hparams"][name]), name,
+                )
 
     # --- Figure 1: Pareto scatter ---
     fig, axes = plt.subplots(1, 3, figsize=(15, 6.5))
@@ -291,46 +296,48 @@ def plot_pareto_interactive(
 
     tooltip = fig.text(0.5, 0.01, "", ha="center", fontsize=9, color="gray")
 
-    # --- Figure 2: Hyperparameter number lines ---
-    n_hp = len(available_hparams)
-    fig_hp, ax_hp = plt.subplots(figsize=(10, max(4, n_hp * 0.45 + 1.5)))
-    fig_hp.suptitle("Pareto-optimal hyperparameters  —  hover a star on the other figure", fontsize=11)
+    # --- Figure 2: Hyperparameter number lines (optional) ---
+    fig_hp = None
+    if show_numberline:
+        n_hp = len(available_hparams)
+        fig_hp, ax_hp = plt.subplots(figsize=(10, max(4, n_hp * 0.45 + 1.5)))
+        fig_hp.suptitle("Pareto-optimal hyperparameters  —  hover a star on the other figure", fontsize=11)
 
-    for j in range(n_hp):
-        ax_hp.axhline(j, color="lightgray", linewidth=1.0, zorder=0)
-        lo, hi, tfm = HPARAM_SPACE[available_hparams[j]]
-        ax_hp.text(-0.02, j, f"{lo}", ha="right", va="center", fontsize=7, color="gray",
-                   transform=ax_hp.get_yaxis_transform())
-        ax_hp.text(1.02, j, f"{hi}", ha="left", va="center", fontsize=7, color="gray",
-                   transform=ax_hp.get_yaxis_transform())
+        for j in range(n_hp):
+            ax_hp.axhline(j, color="lightgray", linewidth=1.0, zorder=0)
+            lo, hi, tfm = HPARAM_SPACE[available_hparams[j]]
+            ax_hp.text(-0.02, j, f"{lo}", ha="right", va="center", fontsize=7, color="gray",
+                       transform=ax_hp.get_yaxis_transform())
+            ax_hp.text(1.02, j, f"{hi}", ha="left", va="center", fontsize=7, color="gray",
+                       transform=ax_hp.get_yaxis_transform())
 
-    hp_dots = []
-    for j in range(n_hp):
-        dots = ax_hp.scatter(
-            hp_norm[:, j], np.full(n_pareto, j),
-            c="gold", edgecolors="k", linewidths=0.3, s=50, alpha=0.5, zorder=2,
-        )
-        hp_dots.append(dots)
+        hp_dots = []
+        for j in range(n_hp):
+            dots = ax_hp.scatter(
+                hp_norm[:, j], np.full(n_pareto, j),
+                c="gold", edgecolors="k", linewidths=0.3, s=50, alpha=0.5, zorder=2,
+            )
+            hp_dots.append(dots)
 
-    hp_highlight = []
-    for j in range(n_hp):
-        hl = ax_hp.scatter([], [], c="red", edgecolors="k", linewidths=0.8,
-                           s=120, zorder=5, marker="D")
-        hp_highlight.append(hl)
+        hp_highlight = []
+        for j in range(n_hp):
+            hl = ax_hp.scatter([], [], c="red", edgecolors="k", linewidths=0.8,
+                               s=120, zorder=5, marker="D")
+            hp_highlight.append(hl)
 
-    hp_val_labels = []
-    for j in range(n_hp):
-        lbl = ax_hp.text(0, j, "", fontsize=7, color="red", fontweight="bold",
-                         ha="center", va="bottom", zorder=6)
-        hp_val_labels.append(lbl)
+        hp_val_labels = []
+        for j in range(n_hp):
+            lbl = ax_hp.text(0, j, "", fontsize=7, color="red", fontweight="bold",
+                             ha="center", va="bottom", zorder=6)
+            hp_val_labels.append(lbl)
 
-    ax_hp.set_xlim(-0.05, 1.05)
-    ax_hp.set_ylim(-0.8, n_hp - 0.2)
-    ax_hp.set_yticks(range(n_hp))
-    ax_hp.set_yticklabels(available_hparams, fontsize=8)
-    ax_hp.set_xlabel("normalised value (0 = lower bound, 1 = upper bound)", fontsize=9)
-    ax_hp.invert_yaxis()
-    fig_hp.tight_layout()
+        ax_hp.set_xlim(-0.05, 1.05)
+        ax_hp.set_ylim(-0.8, n_hp - 0.2)
+        ax_hp.set_yticks(range(n_hp))
+        ax_hp.set_yticklabels(available_hparams, fontsize=8)
+        ax_hp.set_xlabel("normalised value (0 = lower bound, 1 = upper bound)", fontsize=9)
+        ax_hp.invert_yaxis()
+        fig_hp.tight_layout()
 
     # --- Shared interaction state ---
     active_idx = [None]
@@ -359,6 +366,8 @@ def plot_pareto_interactive(
         return None
 
     def _update_hp_highlight(idx: int | None) -> None:
+        if fig_hp is None:
+            return
         if idx is None:
             for hl in hp_highlight:
                 hl.set_offsets(np.empty((0, 2)))
@@ -418,7 +427,8 @@ def plot_pareto_interactive(
     fig.tight_layout()
     fig.subplots_adjust(bottom=0.12)
     print("  Interactive Pareto plot open. Hover stars to highlight, click to open trial image.")
-    print("  Hyperparameter figure shows values for the hovered Pareto point.")
+    if show_numberline:
+        print("  Hyperparameter figure shows values for the hovered Pareto point.")
     plt.show()
 
 
@@ -437,8 +447,10 @@ def main() -> None:
     parser.add_argument("--only", default=None,
                         help="Comma-separated list of runs or specific trials to include "
                              "(e.g. mobo_00_01,mobo_00_02/trial_3).")
-    parser.add_argument("--no-old", action="store_true",
-                        help="Exclude trials from mobo_old_jackson.")
+    parser.add_argument("--with-old", action="store_true",
+                        help="Include trials from mobo_old_jackson (excluded by default).")
+    parser.add_argument("--show-numberline", action="store_true",
+                        help="Show hyperparameter number-line figure in interactive mode.")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -451,7 +463,7 @@ def main() -> None:
     print("=" * 70)
 
     only_runs, only_trials = _parse_only(args.only) if args.only else (None, None)
-    records = collect_trials(runs_dir, exclude_old=args.no_old,
+    records = collect_trials(runs_dir, exclude_old=not args.with_old,
                              only_runs=only_runs or None,
                              only_trials=only_trials or None)
     if not records:
@@ -482,7 +494,8 @@ def main() -> None:
     if args.no_interactive:
         plot_pareto(M, mask, os.path.join(out_dir, "pareto_front.png"))
     else:
-        plot_pareto_interactive(M, mask, records, runs_dir)
+        plot_pareto_interactive(M, mask, records, runs_dir,
+                                show_numberline=args.show_numberline)
 
     print("\n  Pareto-optimal configurations (best dist first):")
     for r in pareto:
