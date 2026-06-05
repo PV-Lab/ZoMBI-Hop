@@ -1,3 +1,5 @@
+synthetic_data/*.html
+
 interactive_testing/*
 !interactive_testing/*.py
 runs/run_*/
