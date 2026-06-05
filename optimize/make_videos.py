@@ -9,6 +9,7 @@ Usage
   python optimize/make_videos.py                         # newest run
   python optimize/make_videos.py <run_dir>               # specific run
   python optimize/make_videos.py <run_dir> --force       # rebuild all
+  python optimize/make_videos.py <run_dir>/trial_5       # single trial
 """
 
 from __future__ import annotations
@@ -20,7 +21,10 @@ import sys
 
 import numpy as np
 
-VIDEO_TARGET_DURATION_S = 30.0
+import imageio.v2 as iio
+from PIL import Image as PILImage
+
+VIDEO_TARGET_DURATION_S = 60.0
 VIDEO_MIN_FPS           = 1.0
 VIDEO_MAX_FPS           = 60.0
 
@@ -62,46 +66,18 @@ def make_video_from_dir(plots_dir: str, out_path: str) -> bool:
     def _ok() -> bool:
         return os.path.exists(out_path) and os.path.getsize(out_path) > 0
 
-    try:
-        import imageio.v2 as iio
-        from PIL import Image as PILImage
-        imgs = [iio.imread(f)[:, :, :3] for f in frames]
-        h, w = imgs[0].shape[:2]
-        fixed = []
-        for img in imgs:
-            if img.shape[:2] != (h, w):
-                img = np.array(PILImage.fromarray(img).resize((w, h), PILImage.LANCZOS))
-            fixed.append(_even(img))
-        iio.mimwrite(out_path, fixed, fps=fps, codec="libx264", macro_block_size=None)
-        if not _ok():
-            raise RuntimeError("imageio/ffmpeg produced an empty file")
-        print(f"    [video] {out_path}  ({len(frames)} frames @ {fps:.2f} fps)")
-        return True
-    except Exception as exc:
-        print(f"    [video] imageio failed ({exc}); trying OpenCV …")
-
-    try:
-        import cv2
-        first = _even(cv2.imread(frames[0]))
-        h, w = first.shape[:2]
-        writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-        if not writer.isOpened():
-            raise RuntimeError("cv2.VideoWriter failed to open (codec unavailable?)")
-        for path in frames:
-            img = cv2.imread(path)
-            if img is None:
-                continue
-            if img.shape[:2] != (h, w):
-                img = cv2.resize(img, (w, h))
-            writer.write(img)
-        writer.release()
-        if not _ok():
-            raise RuntimeError("OpenCV produced an empty file")
-        print(f"    [video] {out_path}  ({len(frames)} frames @ {fps:.2f} fps, OpenCV)")
-        return True
-    except Exception as exc:
-        print(f"    [video] OpenCV failed too ({exc}) — no video written.")
-        return False
+    imgs = [iio.imread(f)[:, :, :3] for f in frames]
+    h, w = imgs[0].shape[:2]
+    fixed = []
+    for img in imgs:
+        if img.shape[:2] != (h, w):
+            img = np.array(PILImage.fromarray(img).resize((w, h), PILImage.LANCZOS))
+        fixed.append(_even(img))
+    iio.mimwrite(out_path, fixed, fps=fps, codec="libx264", macro_block_size=None)
+    if not _ok():
+        raise RuntimeError("imageio/ffmpeg produced an empty file")
+    print(f"    [video] {out_path}  ({len(frames)} frames @ {fps:.2f} fps)")
+    return True
 
 
 def regenerate_videos(run_dir: str, force: bool = False) -> None:
@@ -147,8 +123,15 @@ def main() -> None:
     runs_dir   = os.path.join(script_dir, "runs")
 
     run_dir = resolve_run_dir(args.run_dir, runs_dir)
-    print(f"Regenerating videos for {run_dir}")
-    regenerate_videos(run_dir, force=args.force)
+
+    if os.path.basename(run_dir).startswith("trial_"):
+        plots_dir = os.path.join(run_dir, "plots")
+        out_path  = os.path.join(run_dir, "zombihop_timelapse.mp4")
+        print(f"Building video for {run_dir}")
+        make_video_from_dir(plots_dir, out_path)
+    else:
+        print(f"Regenerating videos for {run_dir}")
+        regenerate_videos(run_dir, force=args.force)
 
 
 if __name__ == "__main__":
