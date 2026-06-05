@@ -87,41 +87,57 @@ def _vertex_center(dim: int) -> np.ndarray:
 
 
 # "realistic": scattered interior maxima with *per-peak* basin widths.  Larger b
-# → skinnier (more spiky) basin; smaller b → broader.  The basin-width mix (a
-# couple of broad basins plus some pointy ones, all ≥ ACKLEY_B so none is wider
-# than the other variants) is the defining character and is shared across
-# dimensions; only the peak *locations* are dimension-specific.  Explicit,
-# hand-placed locations are given for the dimensions actually used (3 and 4); any
-# other dim falls back to a deterministic seeded scatter so the variant still
-# works everywhere.  Either way the locations are known analytically (see
-# ``Ackley.known_maxima``).
-_REALISTIC_BASIN_WIDTHS = (0.20, 0.60, 0.90, 1.20, 2.50)
-_REALISTIC_CENTERS_BY_DIM = {
+# → skinnier (more spiky) basin; smaller b → broader.  The defining character is
+# a mix of basin widths (moderately wide through very pointy) at scattered,
+# analytically-known locations.  No basin may be broader than
+# ``_REALISTIC_BROADEST`` -- there is deliberately no very-wide basin.  The number
+# and placement of peaks are dimension-specific, so each entry below is an
+# explicit ``(center, b)`` list.  Dimensions that aren't listed fall back to a
+# deterministic seeded scatter so the variant still works everywhere; either way
+# the locations are recoverable via ``Ackley.known_maxima``.
+_REALISTIC_BROADEST = 0.60   # broadest allowed basin (smallest permitted b)
+_REALISTIC_PEAKS_BY_DIM = {
     3: [
-        np.array([0.60, 0.30, 0.10]),   # broad basin (widest allowed)
-        np.array([0.20, 0.70, 0.10]),   # moderately wide
-        np.array([0.34, 0.33, 0.33]),   # medium, near the centroid
-        np.array([0.10, 0.25, 0.65]),   # skinny (≈ multimodal width)
-        np.array([0.45, 0.10, 0.45]),   # very pointy / spiky
+        (np.array([0.20, 0.70, 0.10]), 7),   # least pointy here
+        (np.array([0.34, 0.33, 0.33]), 20),   # pointier
+        (np.array([0.10, 0.25, 0.65]), 5),   # pointier still
+        (np.array([0.45, 0.10, 0.45]), 10),   # very pointy / spiky
     ],
     4: [
-        np.array([0.50, 0.25, 0.15, 0.10]),   # broad basin (widest allowed)
-        np.array([0.15, 0.60, 0.15, 0.10]),   # moderately wide
-        np.array([0.25, 0.25, 0.25, 0.25]),   # medium, the centroid
-        np.array([0.10, 0.20, 0.55, 0.15]),   # skinny
-        np.array([0.35, 0.10, 0.15, 0.40]),   # very pointy / spiky
+        (np.array([0.15, 0.60, 0.15, 0.10]), 7),   # least pointy here
+        (np.array([0.25, 0.25, 0.25, 0.25]), 20),   # pointier
+        (np.array([0.10, 0.20, 0.55, 0.15]), 5),   # pointier still
+        (np.array([0.35, 0.10, 0.15, 0.40]), 10),   # very pointy / spiky
+    ],
+    # 10-simplex: ten well-separated optima, each dominated by a different
+    # component (0.64 on one axis, 0.04 on the other nine), with basin widths
+    # spanning moderately wide (0.60) to very pointy (2.50).
+    10: [
+        (np.array([0.64, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04]), 5.60),
+        (np.array([0.04, 0.64, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04]), 5.81),
+        (np.array([0.04, 0.04, 0.64, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04]), 5.02),
+        (np.array([0.04, 0.04, 0.04, 0.64, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04]), 5.23),
+        (np.array([0.04, 0.04, 0.04, 0.04, 0.64, 0.04, 0.04, 0.04, 0.04, 0.04]), 10.44),
+        (np.array([0.04, 0.04, 0.04, 0.04, 0.04, 0.64, 0.04, 0.04, 0.04, 0.04]), 10.65),
+        (np.array([0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.64, 0.04, 0.04, 0.04]), 10.86),
+        (np.array([0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.64, 0.04, 0.04]), 15.07),
+        (np.array([0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.64, 0.04]), 15.28),
+        (np.array([0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.64]), 15.50),
     ],
 }
 
 
 def _realistic_peaks(dim: int) -> list[tuple[np.ndarray, float]]:
-    centers = _REALISTIC_CENTERS_BY_DIM.get(dim)
-    if centers is None:
+    peaks = _REALISTIC_PEAKS_BY_DIM.get(dim)
+    if peaks is None:
         # Deterministic fallback for unlisted dimensions: a fixed-seed Dirichlet
-        # scatter, one interior point per basin width.
+        # scatter of ``dim`` interior points, with basin widths spanning the
+        # broadest-allowed (0.60) to very pointy (2.50).
         rng = np.random.default_rng(0)
-        centers = list(rng.dirichlet(np.ones(dim), size=len(_REALISTIC_BASIN_WIDTHS)))
-    return [(c.copy(), b) for c, b in zip(centers, _REALISTIC_BASIN_WIDTHS)]
+        centers = rng.dirichlet(np.ones(dim), size=dim)
+        widths = np.linspace(_REALISTIC_BROADEST, 2.50, dim)
+        peaks = list(zip(centers, widths))
+    return [(np.asarray(c, dtype=float).copy(), float(b)) for c, b in peaks]
 
 
 # variant -> (peaks_builder, combine).  See the block comment above.
