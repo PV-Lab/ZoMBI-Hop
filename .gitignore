@@ -1,8 +1,7 @@
 interactive_testing/*
 !interactive_testing/*.py
 runs/run_*/
-optimize/runs/mobo_*/*
-optimize/runs/IGNORE_*/
+optimize/runs/*
 
 # Leave the progress json so we can resume training
 !optimize/runs/mobo_*/mobo_progress.json
