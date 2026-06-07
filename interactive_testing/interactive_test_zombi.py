@@ -58,11 +58,13 @@ Flags
       drawn as reference extrema (the interactive picker / CSV load are skipped).
         python interactive_testing/interactive_test_zombi.py --ackley centroid
 
-  --mobo-hparams PATH
-      Load the latest trial's ZoMBI hyperparameters from a previous hparam-opt
-      run (a ``mobo_*`` directory or a ``mobo_progress.json`` file) and use them
-      to override the built-in defaults.
-        python interactive_testing/interactive_test_zombi.py --mobo-hparams path/to/mobo_00_00_00_00
+  --hparams PATH
+      Load ZoMBI hyperparameters from a previous hparam-opt run and use them to
+      override the built-in defaults. PATH may be a ``trial_*`` directory (or a
+      ``trial.json`` file) to use that specific trial's hyperparameters, or a
+      ``mobo_*`` directory (or ``mobo_progress.json`` file) to use the latest
+      trial's hyperparameters.
+        python interactive_testing/interactive_test_zombi.py --hparams path/to/mobo_00_00_00_00/trial_42
 
   --show-sampling
       Overlay a thin, semi-transparent line for every candidate line the
@@ -1007,19 +1009,39 @@ def generate_init_data(
     )
 
 
-# ── MOBO hyperparameter loading ───────────────────────────────────────────────
+# ── Hyperparameter loading ────────────────────────────────────────────────────
 
-def load_mobo_hparams(path: str) -> dict:
+def load_hparams(path: str) -> dict:
     """
-    Load the latest set of ZoMBI hyperparameters from a MOBO run.
+    Load a set of ZoMBI hyperparameters from a previous hparam-opt run.
 
-    ``path`` may be either a ``mobo_*`` run directory containing
-    ``mobo_progress.json`` or the path to a ``mobo_progress.json`` file directly.
-    The "latest" hyperparameters are taken from the trial with the highest
-    ``trial`` index (falling back to the last entry in ``trials``).
+    ``path`` may be any of:
+      * a ``trial_*`` directory containing a ``trial.json`` (or a ``trial.json``
+        file directly) — that specific trial's hyperparameters are used; or
+      * a ``mobo_*`` run directory containing ``mobo_progress.json`` (or a
+        ``mobo_progress.json`` file directly) — the latest trial's
+        hyperparameters are used (the trial with the highest ``trial`` index).
 
-    Returns the ``hparams`` dict for that trial.
+    Returns the ``hparams`` dict for the selected trial.
     """
+    # ── Single-trial source: a trial_* directory or a trial.json file ─────────
+    if os.path.isdir(path):
+        trial_path = os.path.join(path, "trial.json")
+    else:
+        trial_path = path
+    if os.path.basename(trial_path) == "trial.json" and os.path.exists(trial_path):
+        with open(trial_path, "r") as f:
+            trial = json.load(f)
+        hparams = trial.get("hparams")
+        if not hparams:
+            raise ValueError(f"Trial file {trial_path} has no hparams.")
+        print(f"    Loaded hyperparameters from {trial_path}")
+        print(f"    Using trial {trial.get('trial')} (phase={trial.get('phase')}):")
+        for k, v in hparams.items():
+            print(f"      {k} = {v}")
+        return hparams
+
+    # ── Whole-run source: a mobo_* directory or mobo_progress.json file ───────
     if os.path.isdir(path):
         progress_path = os.path.join(path, "mobo_progress.json")
     else:
@@ -1029,7 +1051,7 @@ def load_mobo_hparams(path: str) -> dict:
         matches = glob.glob(os.path.join(path, "**", "mobo_progress.json"), recursive=True)
         if not matches:
             raise FileNotFoundError(
-                f"Could not find mobo_progress.json at or under: {path}"
+                f"Could not find a trial.json or mobo_progress.json at or under: {path}"
             )
         progress_path = matches[0]
 
@@ -1058,7 +1080,7 @@ def load_mobo_hparams(path: str) -> dict:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(
-    mobo_hparams_path: str | None = None,
+    hparams_path: str | None = None,
     show_sampling: bool = False,
     background: bool = False,
     ackley: str | None = None,
@@ -1136,8 +1158,8 @@ def main(
     print("\n[3] Initialising ZoMBI-Hop …")
     dim = 3
     zparams = dict(ZOMBI_PARAMS)
-    if mobo_hparams_path is not None:
-        zparams.update(load_mobo_hparams(mobo_hparams_path))
+    if hparams_path is not None:
+        zparams.update(load_hparams(hparams_path))
 
     plot_state: dict = {"line_0": None, "line_1": None, "fig": None, "iter": 0}
     dh_ref: list = [None]   # filled with optimizer.data_handler after construction
@@ -1298,12 +1320,14 @@ if __name__ == "__main__":
              "as reference extrema, and the interactive picker / CSV load are skipped.",
     )
     parser.add_argument(
-        "--mobo-hparams",
+        "--hparams",
         metavar="PATH",
         default=None,
-        help="Path to a mobo_* run directory (or a mobo_progress.json file). "
-             "The latest trial's hyperparameters are loaded and used to "
-             "override the built-in ZoMBI defaults.",
+        help="Path to a trial_* directory (or a trial.json file) — that "
+             "specific trial's hyperparameters are used. A mobo_* run directory "
+             "(or mobo_progress.json file) is also accepted, in which case the "
+             "latest trial's hyperparameters are used. Either way they override "
+             "the built-in ZoMBI defaults.",
     )
     parser.add_argument(
         "--show-sampling",
@@ -1320,7 +1344,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     main(
-        mobo_hparams_path=args.mobo_hparams,
+        hparams_path=args.hparams,
         show_sampling=args.show_sampling,
         background=args.background,
         ackley=args.ackley,
