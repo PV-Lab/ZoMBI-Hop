@@ -18,18 +18,27 @@ import matplotlib.pyplot as plt
 def plot_metrics(csv_path: str, log_x: bool = False, log_y: bool = False):
     df = pd.read_csv(csv_path)
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    fig.suptitle("Hparam Opt Time Series Metrics")
-
     metrics = [
         ("dist_to_needles", "Distance to True Needles", "steelblue"),
         ("dup_fraction", "Duplicate Sample Fraction", "tomato"),
         ("pct_matched", "Pct Needles Matching True Needle", "seagreen"),
         ("avg_pairwise_dist", "Avg Pairwise Needle Distance", "mediumpurple"),
+        ("recent_needle_value", "Most Recent Needle Value", "darkorange"),
     ]
+    # Tolerate older CSVs written before a column existed.
+    metrics = [m for m in metrics if m[0] in df.columns]
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8))
+    fig.suptitle("Hparam Opt Time Series Metrics")
 
     for ax, (col, label, color) in zip(axes.flat, metrics):
-        ax.plot(df["iteration"], df[col], color=color)
+        # recent_needle_value is a step function (holds until a new needle is
+        # found) and is NaN until the first needle — steps-post + NaN gaps.
+        if col == "recent_needle_value":
+            ax.plot(df["iteration"], df[col], color=color,
+                    drawstyle="steps-post", marker="o", ms=3)
+        else:
+            ax.plot(df["iteration"], df[col], color=color)
         if log_x:
             ax.set_xscale("log")
         if log_y:
@@ -38,6 +47,10 @@ def plot_metrics(csv_path: str, log_x: bool = False, log_y: bool = False):
         ax.set_ylabel(label)
         ax.set_title(label)
         ax.grid(True, alpha=0.3)
+
+    # Hide any unused panels (5 metrics in a 2x3 grid leaves one blank).
+    for ax in axes.flat[len(metrics):]:
+        ax.axis("off")
 
     plt.tight_layout()
     plt.show()

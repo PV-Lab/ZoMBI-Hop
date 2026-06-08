@@ -31,7 +31,8 @@ clock) containing:
         │                              median_value, activation, zoom,
         │                              iteration, dist_to_centre)
         ├─ metrics_over_time.csv      (iteration, dist_to_needles, dup_fraction,
-        │                              pct_matched, avg_pairwise_dist)
+        │                              pct_matched, avg_pairwise_dist,
+        │                              recent_needle_value)
         ├─ dist_from_centre.png
         ├─ line_length_hist.png
         ├─ hparam_edge_proximity.png
@@ -1136,14 +1137,20 @@ def write_metrics_over_time_csv(path: str, payloads: list[dict], X_all: np.ndarr
         disc = needles if needles is not None else np.empty((0, 3))
         n_before = p.get("n_points_before", len(X_all))
         X_upto = X_all[:n_before] if n_before > 0 else np.empty((0, 3))
+        # Value of the most recently discovered needle as of this iteration
+        # (needles accumulate in chronological order, so the last one is newest).
+        nvals = p.get("needle_vals")
+        recent = float(nvals[-1]) if nvals is not None and len(nvals) > 0 else np.nan
         rows.append({
             "iteration": p["iter_num"],
             "dist_to_needles":  round(metric_dist_to_needles(disc, true_optima), 6),
             "dup_fraction":     round(metric_dup_fraction(X_upto, thr), 6),
             "pct_matched":      round(metric_pct_matched(disc, true_optima), 4),
             "avg_pairwise_dist":round(metric_avg_pairwise_dist(disc), 6),
+            "recent_needle_value": (round(recent, 6) if not math.isnan(recent) else np.nan),
         })
-    cols = ["iteration", "dist_to_needles", "dup_fraction", "pct_matched", "avg_pairwise_dist"]
+    cols = ["iteration", "dist_to_needles", "dup_fraction", "pct_matched",
+            "avg_pairwise_dist", "recent_needle_value"]
     pd.DataFrame(rows, columns=cols).to_csv(path, index=False)
 
 
@@ -1296,6 +1303,8 @@ def run_single_trial(
             pared_X=pared_X, pared_Y=pared_Y,
             needles=(needles.detach().cpu().numpy()
                      if needles is not None and needles.shape[0] > 0 else None),
+            needle_vals=(dh.needle_vals.detach().cpu().numpy().ravel()
+                         if dh.needle_vals is not None and dh.needle_vals.shape[0] > 0 else None),
             needle_M_list=[m.detach().cpu().clone() if m is not None else None
                            for m in dh.needle_M_list],
             needle_B=(dh.needle_B.detach().cpu().clone() if dh.needle_B is not None else None),
