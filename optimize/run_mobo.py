@@ -58,9 +58,9 @@ may not seed the new run with data harvested from past runs:
                     Sobol-init + BO run under someone else's config.
 
 Modifiers (combinable with any mode above):
-  --start-from-best DIR [DIR ...]  re-evaluate the hyperparameters of the given
-                    trial_* dir(s) (or trial.json files) as the first init
-                    trials; each seed replaces one Sobol init draw.
+  --start-from-best DIR [DIR ...]  copy the (hyperparameters, metrics) of the
+                    given trial_* dir(s) (or trial.json files) straight into the
+                    GP prior history; never re-evaluated, and skips Sobol init.
   --max-trials N    cap total trials (default: unbounded, Ctrl+C to stop).
 
 Usage
@@ -181,7 +181,7 @@ HPARAM_SPACE: dict[str, tuple] = {
     "nat_grad_step":               (0.001,  0.5,   "log"),
     "nat_grad_max_steps":          (10,     200,   "int"),
     "n_restarts":                  (20,     300,   "int"),
-    "raw":                         (200,    2000,  "int"),
+    "raw":                         (1,    300,  "int"),
     # Acquisition function
     "ucb_beta":                    (0.05,   3.0,   "linear"),
     # Zoom / convergence
@@ -560,16 +560,18 @@ def load_or_make_sobol(run_dir: str, bounds: torch.Tensor, n: int) -> torch.Tens
     return X_sobol
 
 
-def load_seed_designs(trial_paths: list[str]) -> list[torch.Tensor]:
-    """Load hyperparameters from one or more trial_* dirs → normalised [0,1] vectors.
+def load_seed_observations(trial_paths: list[str]):
+    """Load (X_norm, Y) pairs from one or more trial_* dirs → prior history.
 
     Each path is a trial directory (or its trial.json directly) produced by a
-    prior run. These seed the initial design for "start from best": each seed is
-    re-evaluated as an init point in place of one Sobol draw, so the search
-    begins at known-good hyperparameters. Trials whose hparams don't cover the
+    prior run. These seed the GP for "start from best": the stored (hyperparameters,
+    metrics) are COPIED straight into the prior history (exactly like
+    ``collect_all_observations``) and never re-evaluated, so the GP starts already
+    knowing these known-good points. Trials whose hparams/metrics don't cover the
     current HPARAM_SPACE abort the run (stale hyperparameter set).
+    Returns (X_obs, Y_obs).
     """
-    seeds = []
+    X_obs, Y_obs = [], []
     for p in trial_paths:
         json_path = p if p.lower().endswith(".json") else os.path.join(p, "trial.json")
         if not os.path.exists(json_path):
@@ -584,13 +586,19 @@ def load_seed_designs(trial_paths: list[str]) -> list[torch.Tensor]:
         if missing:
             sys.exit(f"--start-from-best: {json_path} is missing hparams {missing} "
                      f"(stale hyperparameter set?).")
-        seeds.append(hparams_to_norm(hp))
-        dist = data.get("metrics", {}).get("dist_to_needles", "?")
-        print(f"  [seed] {p}  (trial {data.get('trial', '?')}, dist_to_needles={dist})")
-    if len(seeds) > N_INIT_TRIALS:
-        print(f"  [seed] NOTE: {len(seeds)} seeds > N_INIT_TRIALS ({N_INIT_TRIALS}); "
-              f"all seeds run as init, no Sobol draws.")
-    return seeds
+        m = data.get("metrics", {})
+        try:
+            y = torch.tensor([-float(m["dist_to_needles"]),
+                              -float(m["dup_fraction"]),
+                              -float(m["runtime_s"])], dtype=DTYPE)
+        except (KeyError, ValueError, TypeError):
+            sys.exit(f"--start-from-best: {json_path} is missing metrics "
+                     f"(dist_to_needles/dup_fraction/runtime_s).")
+        X_obs.append(hparams_to_norm(hp))
+        Y_obs.append(y)
+        print(f"  [seed] {p}  (trial {data.get('trial', '?')}, "
+              f"dist_to_needles={m.get('dist_to_needles', '?')})")
+    return X_obs, Y_obs
 
 
 # ─── Ternary helpers (RF interactive picker + plotting) ────────────────────────
@@ -1374,7 +1382,7 @@ def run_single_trial(
 # ─── Running summary (mobo_progress.json / mobo_results.json) ───────────────────
 
 def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
-                   prior_count: int = 0, seed_count: int = 0) -> dict:
+                   prior_count: int = 0) -> dict:
     n = len(Y_obs)
     metrics_all = [
         {
@@ -1384,13 +1392,11 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
         }
         for i in range(n)
     ]
-    # Init phase = "start from best" seeds first, then Sobol (the latter only on a
-    # fresh run; a resumed run is seeded with prior history and skips Sobol).
+    # Init phase = Sobol, which only runs on a fresh run; a run seeded with prior
+    # history (resume or --start-from-best) skips Sobol entirely.
     # Pareto membership is intentionally NOT recorded here — it is determined
     # across all runs after the fact by optimize/pareto.py.
     def _phase(i: int) -> str:
-        if i < seed_count:
-            return "seed"
         if prior_count == 0 and i < N_INIT_TRIALS:
             return "sobol"
         return "mobo"
@@ -1421,12 +1427,11 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
     }
 
 
-def save_running_summary(X_obs, Y_obs, run_dir: str, prior_count: int = 0,
-                         seed_count: int = 0) -> None:
+def save_running_summary(X_obs, Y_obs, run_dir: str, prior_count: int = 0) -> None:
     """Write mobo_progress.json + mobo_results.json + mobo_results.pt."""
     if not Y_obs:
         return
-    summary = _build_summary(X_obs, Y_obs, prior_count=prior_count, seed_count=seed_count)
+    summary = _build_summary(X_obs, Y_obs, prior_count=prior_count)
     summary_txt = json.dumps(summary, indent=2)
     _atomic_write_text(os.path.join(run_dir, "mobo_progress.json"), summary_txt)
     _atomic_write_text(os.path.join(run_dir, "mobo_results.json"), summary_txt)
@@ -1442,19 +1447,15 @@ def save_running_summary(X_obs, Y_obs, run_dir: str, prior_count: int = 0,
 # ─── MOBO loop (unbounded, resumable) ───────────────────────────────────────────
 
 def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, run_dir,
-             max_trials=None, X_prior=None, Y_prior=None, X_seed=None) -> None:
+             max_trials=None, X_prior=None, Y_prior=None) -> None:
     """Unbounded MOBO loop, writing trials into a fresh ``run_dir``.
 
     ``X_prior``/``Y_prior`` seed the GP with (X, Y) pairs harvested from past runs
-    (see ``collect_all_observations``) so resume continues from the full landscape.
+    (see ``collect_all_observations``) or copied from chosen trials (``--start-from-best``,
+    see ``load_seed_observations``) so the run continues from the full landscape.
     Prior data only feeds GP fitting; the run's own progress.json / results
     record only this run's trials, so re-crawling later never double-counts.
     When prior history is present, Sobol init is skipped.
-
-    ``X_seed`` is a list of normalised hyperparameter vectors ("start from best",
-    see ``load_seed_designs``) that are RE-EVALUATED as the first init trials.
-    Each seed replaces one Sobol draw, so on a fresh run the init phase is
-    ``len(X_seed)`` seeds + ``N_INIT_TRIALS - len(X_seed)`` Sobol points.
     """
     bounds = torch.zeros(2, N_HPARAMS, dtype=DTYPE, device=DEVICE)
     bounds[1] = 1.0
@@ -1466,26 +1467,19 @@ def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, run_dir,
     X_obs: list[torch.Tensor] = []   # this run's own trials only (written to disk)
     Y_obs: list[torch.Tensor] = []
 
-    # ── Build the initial design: seeds first, then Sobol fills the remainder ──
-    # (one fewer Sobol draw per seed). Sobol only runs on a fresh run; a resumed
-    # run already has prior history, so it runs only the seeds (if any) as init.
-    X_seed  = [x.detach().to(device=DEVICE, dtype=DTYPE) for x in X_seed] if X_seed else []
-    n_seed  = len(X_seed)
-    n_sobol = max(0, N_INIT_TRIALS - n_seed) if n_prior == 0 else 0
+    # ── Build the initial design: Sobol only, and only on a fresh run. A run
+    # seeded with prior history (resume or --start-from-best) skips Sobol. ──
+    n_sobol = N_INIT_TRIALS if n_prior == 0 else 0
     X_sobol = load_or_make_sobol(run_dir, bounds, n_sobol)
-    init_design = [(x, "seed") for x in X_seed] + \
-                  [(X_sobol[i], "sobol") for i in range(X_sobol.shape[0])]
+    init_design = [(X_sobol[i], "sobol") for i in range(X_sobol.shape[0])]
     n_init = len(init_design)
 
     print(f"\n{'='*70}")
-    print(f"MOBO  |  {n_seed} seed + {X_sobol.shape[0]} Sobol init, then BO until Ctrl+C")
+    print(f"MOBO  |  {X_sobol.shape[0]} Sobol init, then BO until Ctrl+C")
     print(f"Time limit / trial: {TIME_LIMIT_HOURS} h    Run dir: {run_dir}")
-    if n_seed:
-        print(f"START FROM BEST — re-evaluating {n_seed} seed hyperparameter set(s) as "
-              f"init trials")
     if n_prior:
-        print(f"PRIOR HISTORY — seeding GP with {n_prior} (X,Y) pair(s) from past runs; "
-              f"skipping Sobol init")
+        print(f"PRIOR HISTORY — seeding GP with {n_prior} (X,Y) pair(s) "
+              f"(prior runs and/or --start-from-best); skipping Sobol init")
     print(f"Hyperparameters ({N_HPARAMS}): {HPARAM_NAMES}")
     print(f"{'='*70}")
 
@@ -1541,8 +1535,7 @@ def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, run_dir,
                 X_obs.append(x_new.detach().cpu())
                 Y_obs.append(torch.tensor([-res["dist"], -res["dup"], -res["runtime"]],
                                           dtype=DTYPE, device="cpu"))
-                save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior,
-                                     seed_count=n_seed)
+                save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior)
                 write_trial_json(
                     os.path.join(trial_dir, "trial.json"),
                     trial_num, phase,
@@ -1568,7 +1561,7 @@ def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, run_dir,
         print("\n[!] Interrupted by user — finalising results …")
 
     if Y_obs:
-        save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior, seed_count=n_seed)
+        save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior)
     print(f"\nDone. {len(Y_obs)} trials completed this run "
           f"({n_prior} prior + {len(Y_obs)} new = {n_prior + len(Y_obs)} total). Results in {run_dir}")
     print(f"Resume (crawls all runs) with:  python optimize/run_mobo.py --resume")
@@ -1613,14 +1606,14 @@ def _interactive_run_config(script_dir: str):
 
 
 def _launch_run(runs_dir, rf_fn, true_optima, grid_pts, grid_vals, rf_maximize,
-                csv_path, max_trials, X_prior=None, Y_prior=None, X_seed=None) -> None:
+                csv_path, max_trials, X_prior=None, Y_prior=None) -> None:
     """Create a fresh runs/mobo_* folder, persist its config, and run MOBO."""
     run_dir = os.path.join(runs_dir, datetime.datetime.now().strftime("mobo_%d_%m_%H_%M"))
     os.makedirs(run_dir, exist_ok=True)
     write_run_config(run_dir, rf_maximize, csv_path, true_optima)
     print(f"\n[run] Output folder: {run_dir}")
     run_mobo(rf_fn, true_optima, grid_pts, grid_vals, rf_maximize, run_dir,
-             max_trials=max_trials, X_prior=X_prior, Y_prior=Y_prior, X_seed=X_seed)
+             max_trials=max_trials, X_prior=X_prior, Y_prior=Y_prior)
 
 
 def main() -> None:
@@ -1640,9 +1633,10 @@ def main() -> None:
                              "different selection makes the seeded history inconsistent.")
     parser.add_argument("--start-from-best", nargs="+", metavar="TRIAL_DIR", default=None,
                         help="One or more trial_* directories (or trial.json files) whose "
-                             "hyperparameters seed the initial design: each seed is "
-                             "re-evaluated as an init trial in place of one Sobol draw. "
-                             "Combinable with any run mode.")
+                             "(hyperparameters, metrics) are COPIED straight into the GP "
+                             "prior history (never re-evaluated), so the run starts already "
+                             "knowing these points and skips Sobol init. Combinable with any "
+                             "run mode.")
     parser.add_argument("--copy-config", metavar="PATH", default=None,
                         help="Reuse another run's run_config.json (max/min, csv_path, picked "
                              "optima) for a NEW run, WITHOUT inheriting its data points. PATH "
@@ -1658,11 +1652,12 @@ def main() -> None:
     runs_dir   = os.path.join(script_dir, "runs")
     os.makedirs(runs_dir, exist_ok=True)
 
-    # "Start from best" seeds (normalised hparam vectors), shared by all run modes.
-    X_seed = None
+    # "Start from best" seeds: (X, Y) pairs copied straight into the GP prior
+    # history (never re-evaluated), shared by all run modes.
+    X_seed, Y_seed = [], []
     if args.start_from_best:
-        print("\n[seed] Loading 'start from best' seed hyperparameters …")
-        X_seed = load_seed_designs(args.start_from_best)
+        print("\n[seed] Loading 'start from best' (X,Y) pairs into prior history …")
+        X_seed, Y_seed = load_seed_observations(args.start_from_best)
 
     # ── Resume path: crawl all prior runs, seed a new run, rebuild RF, no GUI ──
     if args.resume:
@@ -1683,6 +1678,7 @@ def main() -> None:
         print("\n[collect] Crawling runs/mobo_*/mobo_progress.json for all (X,Y) pairs …")
         X_prior, Y_prior, n_runs = collect_all_observations(runs_dir)
         print(f"  [collect] {len(Y_prior)} trial(s) from {n_runs} run(s) -> prior history.")
+        X_prior += X_seed; Y_prior += Y_seed
 
         if not os.path.exists(csv_path):
             sys.exit(f"Saved CSV path no longer exists: {csv_path}")
@@ -1691,8 +1687,7 @@ def main() -> None:
         print(f"  RF ready: reusing {len(true_optima)} saved reference optima")
 
         _launch_run(runs_dir, rf_fn, true_optima, grid_pts, grid_vals, rf_maximize,
-                    csv_path, args.max_trials, X_prior=X_prior, Y_prior=Y_prior,
-                    X_seed=X_seed)
+                    csv_path, args.max_trials, X_prior=X_prior, Y_prior=Y_prior)
         return
 
     # ── Resume-from-scratch: seed with all prior (X,Y), but re-pick config ──
@@ -1712,10 +1707,10 @@ def main() -> None:
             runs_dir, rf_maximize, true_optima)
         print(f"  [collect] {len(Y_prior)} trial(s) from {n_runs} run(s) -> prior history "
               f"(dist re-scored where needles saved, else reused; dup/runtime reused).")
+        X_prior += X_seed; Y_prior += Y_seed
 
         _launch_run(runs_dir, rf_fn, true_optima, grid_pts, grid_vals, rf_maximize,
-                    csv_path, args.max_trials, X_prior=X_prior, Y_prior=Y_prior,
-                    X_seed=X_seed)
+                    csv_path, args.max_trials, X_prior=X_prior, Y_prior=Y_prior)
         return
 
     # ── Copy-config: reuse another run's config, but start with NO prior data ──
@@ -1741,7 +1736,7 @@ def main() -> None:
         print(f"  RF ready: reusing {len(true_optima)} saved reference optima")
 
         _launch_run(runs_dir, rf_fn, true_optima, grid_pts, grid_vals, rf_maximize,
-                    csv_path, args.max_trials, X_seed=X_seed)
+                    csv_path, args.max_trials, X_prior=X_seed, Y_prior=Y_seed)
         return
 
     # ── Fresh run ──
@@ -1754,7 +1749,7 @@ def main() -> None:
         _interactive_run_config(script_dir)
 
     _launch_run(runs_dir, rf_fn, true_optima, grid_pts, grid_vals, rf_maximize,
-                csv_path, args.max_trials, X_seed=X_seed)
+                csv_path, args.max_trials, X_prior=X_seed, Y_prior=Y_seed)
 
 
 if __name__ == "__main__":
