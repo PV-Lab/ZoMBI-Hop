@@ -86,57 +86,20 @@ def _vertex_center(dim: int) -> np.ndarray:
     return c
 
 
-# "realistic": scattered interior maxima with *per-peak* basin widths.  Larger b
-# → skinnier (more spiky) basin; smaller b → broader.  The defining character is
-# a mix of basin widths (moderately wide through very pointy) at scattered,
-# analytically-known locations.  No basin may be broader than
-# ``_REALISTIC_BROADEST`` -- there is deliberately no very-wide basin.  The number
-# and placement of peaks are dimension-specific, so each entry below is an
-# explicit ``(center, b)`` list.  Dimensions that aren't listed fall back to a
-# deterministic seeded scatter so the variant still works everywhere; either way
-# the locations are recoverable via ``Ackley.known_maxima``.
-_REALISTIC_BROADEST = 0.60   # broadest allowed basin (smallest permitted b)
-_REALISTIC_PEAKS_BY_DIM = {
-    3: [
-        (np.array([0.20, 0.70, 0.10]), 7),   # least pointy here
-        (np.array([0.34, 0.33, 0.33]), 20),   # pointier
-        (np.array([0.10, 0.25, 0.65]), 5),   # pointier still
-        (np.array([0.45, 0.10, 0.45]), 10),   # very pointy / spiky
-    ],
-    4: [
-        (np.array([0.15, 0.60, 0.15, 0.10]), 7),   # least pointy here
-        (np.array([0.25, 0.25, 0.25, 0.25]), 20),   # pointier
-        (np.array([0.10, 0.20, 0.55, 0.15]), 5),   # pointier still
-        (np.array([0.35, 0.10, 0.15, 0.40]), 10),   # very pointy / spiky
-    ],
-    # 10-simplex: ten well-separated optima, each dominated by a different
-    # component (0.64 on one axis, 0.04 on the other nine), with basin widths
-    # spanning moderately wide (0.60) to very pointy (2.50).
-    10: [
-        (np.array([0.64, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04]), 5.60),
-        (np.array([0.04, 0.64, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04]), 5.81),
-        (np.array([0.04, 0.04, 0.64, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04]), 5.02),
-        (np.array([0.04, 0.04, 0.04, 0.64, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04]), 5.23),
-        (np.array([0.04, 0.04, 0.04, 0.04, 0.64, 0.04, 0.04, 0.04, 0.04, 0.04]), 10.44),
-        (np.array([0.04, 0.04, 0.04, 0.04, 0.04, 0.64, 0.04, 0.04, 0.04, 0.04]), 10.65),
-        (np.array([0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.64, 0.04, 0.04, 0.04]), 10.86),
-        (np.array([0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.64, 0.04, 0.04]), 15.07),
-        (np.array([0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.64, 0.04]), 15.28),
-        (np.array([0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.64]), 15.50),
-    ],
-}
+# "realistic": procedurally generated optima placed randomly inside the simplex
+# via a deterministic Dirichlet draw (seed 0).  Configure the number of peaks
+# and basin width per dimension below.  All peaks within a given dimension share
+# the same basin width.  Locations are recoverable via ``Ackley.known_maxima``.
+REALISTIC_NUM_OPTIMA = {3: 10, 4: 10, 10: 30}
+REALISTIC_BASIN_WIDTH = {3: 50.0, 4: 50.0, 10: 20.0}
 
 
 def _realistic_peaks(dim: int) -> list[tuple[np.ndarray, float]]:
-    peaks = _REALISTIC_PEAKS_BY_DIM.get(dim)
-    if peaks is None:
-        # Deterministic fallback for unlisted dimensions: a fixed-seed Dirichlet
-        # scatter of ``dim`` interior points, with basin widths spanning the
-        # broadest-allowed (0.60) to very pointy (2.50).
-        rng = np.random.default_rng(0)
-        centers = rng.dirichlet(np.ones(dim), size=dim)
-        widths = np.linspace(_REALISTIC_BROADEST, 2.50, dim)
-        peaks = list(zip(centers, widths))
+    n_optima = REALISTIC_NUM_OPTIMA.get(dim, dim)
+    basin_width = REALISTIC_BASIN_WIDTH.get(dim, 10.0)
+    rng = np.random.default_rng(0)
+    centers = rng.dirichlet(np.ones(dim), size=n_optima)
+    peaks = [(c, basin_width) for c in centers]
     return [(np.asarray(c, dtype=float).copy(), float(b)) for c, b in peaks]
 
 
