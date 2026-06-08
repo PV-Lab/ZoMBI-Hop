@@ -13,7 +13,10 @@ configuration onto a higher-dimensional benchmark (``--dataset``).
 
 Datasets
 --------
-``--dataset`` selects both the objective and its reference optima:
+``--dataset`` selects both the objective and its reference optima.  Pass one
+name, or several comma-separated (``--dataset RF,ackley4d``) to evaluate the same
+trials on each in turn; with multiple datasets every dataset gets its own
+sub-folder (``rerun_*/RF/``, ``rerun_*/ackley4d/``) holding the usual artifacts.
 
   RF         the 3-simplex Random-Forest surrogate from the source run's
              ``run_config.json`` (search direction, csv_path and reference optima
@@ -101,6 +104,10 @@ except Exception:                                   # pragma: no cover - optiona
     mv = None
 
 DATASET_DIMS = {"RF": 3, "ackley3d": 3, "ackley4d": 4, "ackley10d": 10}
+
+
+class _TopKReached(Exception):
+    """Internal signal: ``--top-k`` needles found, stop this run early."""
 
 
 # ─── Dataset resolution ─────────────────────────────────────────────────────────
@@ -347,13 +354,17 @@ def write_point_cloud_html(path: str, ackley_fn, dh, last_payload: dict) -> None
 # ─── A single evaluation run (full run_mobo-style artifact set) ─────────────────
 
 def run_single_eval(hparams: dict, ds: dict, dataset: str, out_dir: str,
-                    time_limit_min: float) -> dict:
+                    time_limit_min: float, top_k: int | None = None) -> dict:
     """Run one time-limited ZoMBI trial on ``ds['fn']``; write all artifacts.
 
     Mirrors ``run_mobo.run_single_trial`` but is dimension-general: it writes the
     same CSVs and static plots for every dimension, and dispatches the landscape
     view by dimension (ternary frames + mp4 for 3D, an interactive point cloud
     for 4D, none for ≥5D).  Returns ``{"dist", "dup", "runtime"}``.
+
+    If ``top_k`` is given, the run terminates as soon as ``top_k`` needles have
+    been found (in addition to the wall-clock ``time_limit_min`` budget); the
+    same artifact set / metrics are written regardless of why the run stopped.
     """
     os.makedirs(out_dir, exist_ok=True)
     dim       = ds["dim"]
@@ -397,6 +408,10 @@ def run_single_eval(hparams: dict, ds: dict, dataset: str, out_dir: str,
             line_1=plot_state.get("line_1"),
             n_points_before=(dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0),
         ))
+        if top_k is not None:
+            n_needles = needles.shape[0] if needles is not None else 0
+            if n_needles >= top_k:
+                raise _TopKReached(n_needles)
         return x_req, x_act, y
 
     try:
@@ -426,6 +441,8 @@ def run_single_eval(hparams: dict, ds: dict, dataset: str, out_dir: str,
     t0 = time.time()
     try:
         optimizer.run(max_activations=float("inf"), time_limit_hours=time_limit_min / 60.0)
+    except _TopKReached as stop:
+        print(f"      [run] top-k reached: {int(stop.args[0])} needle(s) found — stopping early")
     except Exception as exc:
         print(f"      [run] ZoMBI crashed: {exc}")
     runtime = time.time() - t0
@@ -533,6 +550,86 @@ def _parse_trials(raw: str) -> list[int]:
     return nums
 
 
+def _parse_datasets(raw: str) -> list[str]:
+    """Parse the comma-separated ``--dataset`` value, preserving order, dropping
+    duplicates, and validating each name against ``DATASET_DIMS``."""
+    out: list[str] = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok not in DATASET_DIMS:
+            sys.exit(f"--dataset: '{tok}' is not a known dataset "
+                     f"(choose from {', '.join(sorted(DATASET_DIMS))}).")
+        if tok not in out:
+            out.append(tok)
+    if not out:
+        sys.exit("--dataset: no dataset names parsed.")
+    return out
+
+
+def evaluate_dataset(dataset: str, out_dir: str, runs_path: str,
+                     hparams_by_trial: dict[int, dict], trial_nums: list[int],
+                     args) -> int:
+    """Run every selected trial (``--num-runs`` times) on a single ``dataset``,
+    writing the full rerun artifact set into ``out_dir``.  Returns the number of
+    runs completed (for the closing tally)."""
+    ds = resolve_dataset(dataset, runs_path, args.ackley_variant)
+
+    # Static config for this dataset's rerun.
+    with open(os.path.join(out_dir, "rerun_config.json"), "w") as f:
+        json.dump({
+            "generated":       datetime.datetime.now().isoformat(timespec="seconds"),
+            "dataset":         dataset,
+            "dim":             ds["dim"],
+            "maximize":        ds["maximize"],
+            "ackley_variant":  (args.ackley_variant if dataset != "RF" else None),
+            "csv_path":        ds.get("csv_path"),
+            "runs_path":       runs_path,
+            "trials":          trial_nums,
+            "num_runs":        args.num_runs,
+            "time_limit_min":  args.time_limit_min,
+            "top_k":           args.top_k,
+            "true_optima":     [list(map(float, t.ravel())) for t in ds["true_optima"]],
+        }, f, indent=2)
+
+    total = len(trial_nums) * args.num_runs
+    done = 0
+    per_trial: dict = {}
+    for trial_num in trial_nums:
+        hparams = hparams_by_trial[trial_num]
+        trial_dir = os.path.join(out_dir, f"trial_{trial_num}")
+        os.makedirs(trial_dir, exist_ok=True)
+        with open(os.path.join(trial_dir, "hparams.json"), "w") as f:
+            json.dump(hparams, f, indent=2)
+
+        print(f"\n=== [{dataset}] trial {trial_num}  "
+              f"({args.num_runs} run(s) @ {args.time_limit_min} min) ===")
+        per_trial[trial_num] = []
+        for k in range(1, args.num_runs + 1):
+            done += 1
+            print(f"  [run {k}/{args.num_runs}]  (overall {done}/{total})")
+            run_dir = os.path.join(trial_dir, f"run_{k}")
+            try:
+                res = run_single_eval(hparams, ds, dataset, run_dir,
+                                      args.time_limit_min, top_k=args.top_k)
+                per_trial[trial_num].append({
+                    "run": k,
+                    "dist_to_needles": round(res["dist"], 6),
+                    "dup_fraction":    round(res["dup"], 6),
+                    "runtime_s":       round(res["runtime"], 3),
+                })
+            except KeyboardInterrupt:
+                print("\n[!] Interrupted by user — writing summary so far …")
+                write_summary(os.path.join(out_dir, "rerun_summary.json"), per_trial)
+                raise
+            except Exception as exc:
+                print(f"  [run {k}] FAILED: {exc}")
+            # Persist the summary after every run so a crash never loses progress.
+            write_summary(os.path.join(out_dir, "rerun_summary.json"), per_trial)
+    return done
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Re-evaluate selected ZoMBI-Hop hyperparameter sets on a chosen "
@@ -541,12 +638,17 @@ def main() -> None:
                         help="Source mobo_* run directory holding the trials to re-run.")
     parser.add_argument("--trials", required=True, metavar="N,N,...",
                         help="Comma-separated source trial numbers (e.g. 12,34,56).")
-    parser.add_argument("--dataset", required=True, choices=sorted(DATASET_DIMS),
-                        help="Objective to evaluate on (RF | ackley3d | ackley4d | ackley10d).")
-    parser.add_argument("--num-runs", type=int, default=3,
-                        help="Repeats per selected trial (default: 3).")
+    parser.add_argument("--dataset", required=True, metavar="DS[,DS...]",
+                        help="Objective(s) to evaluate on, comma-separated "
+                             "(RF | ackley3d | ackley4d | ackley10d). Multiple "
+                             "datasets each get their own sub-folder in the rerun.")
+    parser.add_argument("--num-runs", type=int, default=1,
+                        help="Repeats per selected trial (default: 1).")
     parser.add_argument("--time-limit-min", type=float, default=10.0,
                         help="Wall-clock budget per run, minutes (default: 10).")
+    parser.add_argument("--top-k", type=int, default=None, metavar="K",
+                        help="Stop each run as soon as K needles are found "
+                             "(in addition to --time-limit-min; default: no needle cap).")
     parser.add_argument("--ackley-variant", default="realistic",
                         choices=sorted(Ackley.VARIANTS),
                         help="Ackley variant for the ackley* datasets (default: realistic).")
@@ -560,7 +662,10 @@ def main() -> None:
         sys.exit(f"--runs-path not found: {runs_path}")
     if args.num_runs < 1:
         sys.exit("--num-runs must be >= 1.")
+    if args.top_k is not None and args.top_k < 1:
+        sys.exit("--top-k must be >= 1.")
     trial_nums = _parse_trials(args.trials)
+    datasets = _parse_datasets(args.dataset)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     out_parent = os.path.abspath(args.out) if args.out else os.path.join(script_dir, "runs")
@@ -569,65 +674,27 @@ def main() -> None:
     os.makedirs(rerun_dir, exist_ok=True)
 
     print("=" * 72)
-    print(f"ZoMBI-Hop evaluate  |  dataset={args.dataset}  trials={trial_nums}  "
-          f"num_runs={args.num_runs}  limit={args.time_limit_min} min")
+    print(f"ZoMBI-Hop evaluate  |  datasets={datasets}  trials={trial_nums}  "
+          f"num_runs={args.num_runs}  limit={args.time_limit_min} min"
+          + (f"  top_k={args.top_k}" if args.top_k is not None else ""))
     print(f"source: {runs_path}")
     print(f"output: {rerun_dir}")
     print("=" * 72)
 
-    ds = resolve_dataset(args.dataset, runs_path, args.ackley_variant)
+    # Trial hyperparameters are dataset-independent — load them once.
     hparams_by_trial = load_trial_hparams(runs_path, trial_nums)
 
-    # Static config for the whole rerun.
-    with open(os.path.join(rerun_dir, "rerun_config.json"), "w") as f:
-        json.dump({
-            "generated":       datetime.datetime.now().isoformat(timespec="seconds"),
-            "dataset":         args.dataset,
-            "dim":             ds["dim"],
-            "maximize":        ds["maximize"],
-            "ackley_variant":  (args.ackley_variant if args.dataset != "RF" else None),
-            "csv_path":        ds.get("csv_path"),
-            "runs_path":       runs_path,
-            "trials":          trial_nums,
-            "num_runs":        args.num_runs,
-            "time_limit_min":  args.time_limit_min,
-            "true_optima":     [list(map(float, t.ravel())) for t in ds["true_optima"]],
-        }, f, indent=2)
-
-    total = len(trial_nums) * args.num_runs
+    # One dataset writes its artifacts directly into rerun_dir (unchanged layout);
+    # multiple datasets each get their own sub-folder under it.
     done = 0
-    per_trial: dict = {}
-    for trial_num in trial_nums:
-        hparams = hparams_by_trial[trial_num]
-        trial_dir = os.path.join(rerun_dir, f"trial_{trial_num}")
-        os.makedirs(trial_dir, exist_ok=True)
-        with open(os.path.join(trial_dir, "hparams.json"), "w") as f:
-            json.dump(hparams, f, indent=2)
+    for dataset in datasets:
+        out_dir = rerun_dir if len(datasets) == 1 else os.path.join(rerun_dir, dataset)
+        os.makedirs(out_dir, exist_ok=True)
+        done += evaluate_dataset(dataset, out_dir, runs_path,
+                                 hparams_by_trial, trial_nums, args)
 
-        print(f"\n=== trial {trial_num}  ({args.num_runs} run(s) @ {args.time_limit_min} min) ===")
-        per_trial[trial_num] = []
-        for k in range(1, args.num_runs + 1):
-            done += 1
-            print(f"  [run {k}/{args.num_runs}]  (overall {done}/{total})")
-            run_dir = os.path.join(trial_dir, f"run_{k}")
-            try:
-                res = run_single_eval(hparams, ds, args.dataset, run_dir, args.time_limit_min)
-                per_trial[trial_num].append({
-                    "run": k,
-                    "dist_to_needles": round(res["dist"], 6),
-                    "dup_fraction":    round(res["dup"], 6),
-                    "runtime_s":       round(res["runtime"], 3),
-                })
-            except KeyboardInterrupt:
-                print("\n[!] Interrupted by user — writing summary so far …")
-                write_summary(os.path.join(rerun_dir, "rerun_summary.json"), per_trial)
-                raise
-            except Exception as exc:
-                print(f"  [run {k}] FAILED: {exc}")
-            # Persist the summary after every run so a crash never loses progress.
-            write_summary(os.path.join(rerun_dir, "rerun_summary.json"), per_trial)
-
-    print(f"\nDone. {done} run(s) across {len(trial_nums)} trial(s). Results in {rerun_dir}")
+    print(f"\nDone. {done} run(s) across {len(trial_nums)} trial(s) "
+          f"and {len(datasets)} dataset(s). Results in {rerun_dir}")
 
 
 if __name__ == "__main__":
