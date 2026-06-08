@@ -73,6 +73,11 @@ POLL_MS         = 5_000
 
 DEFAULT_CKPT_DIR = str(_HERE.parent / "runs")
 
+
+class _StopRunRequested(Exception):
+    """Raised inside the objective wrapper when the user clicks Stop Run."""
+    pass
+
 # ── ternary helpers ───────────────────────────────────────────────────────────
 
 _TERNARY_SQRT3_2 = math.sqrt(3) / 2
@@ -280,12 +285,20 @@ def _make_sim_obj(fn_callable, device, dtype, *, maximize: bool):
     return _obj
 
 
-def _make_linebo_wrapper(sim_obj, dim: int, device, dtype):
+def _make_linebo_wrapper(sim_obj, dim: int, device, dtype, plot_state: dict | None = None):
     linebo = LineBO(sim_obj, dim,
                    num_points_per_line=100, num_lines=NUM_LINES, device=str(device))
 
     def _wrap(x_tell, bounds, acq_fn):
         xl, xr  = linebo.ranked_line_endpoints(x_tell, bounds, acq_fn)
+        if plot_state is not None:
+            n_valid = xl.shape[0]
+            plot_state["line_0"] = (
+                (xl[0].cpu().numpy(), xr[0].cpu().numpy()) if n_valid > 0 else None
+            )
+            plot_state["line_1"] = (
+                (xl[1].cpu().numpy(), xr[1].cpu().numpy()) if n_valid > 1 else None
+            )
         x_act, y = sim_obj(torch.stack([xl, xr], dim=1))
         x_act = x_act.to(device=device, dtype=dtype)
         y     = y.to(device=device, dtype=dtype).ravel()
@@ -327,6 +340,194 @@ def _gen_init_data(fn_callable, d: int, maximize: bool):
     if not xa:
         raise RuntimeError("Could not generate any initial simplex lines.")
     return (torch.cat(xa), torch.cat(xe), torch.cat(yl).reshape(-1, 1))
+
+
+# ── run analytics (mirrors optimize/run_mobo.py metrics + plots) ─────────────
+
+def _metric_dup_fraction(X_all: np.ndarray, threshold: float) -> float:
+    n = len(X_all)
+    if n <= 1:
+        return 0.0
+    diff = X_all[:, None, :] - X_all[None, :, :]
+    dists = np.sqrt((diff ** 2).sum(axis=-1))
+    np.fill_diagonal(dists, np.inf)
+    return float((dists < threshold).any(axis=1).mean())
+
+
+def _metric_avg_pairwise_dist(discovered: np.ndarray) -> float:
+    disc = np.asarray(discovered, dtype=float)
+    n = len(disc)
+    if n < 2:
+        return 0.0
+    diff = disc[:, None, :] - disc[None, :, :]
+    dists = np.sqrt((diff ** 2).sum(axis=-1))
+    iu = np.triu_indices(n, k=1)
+    return float(dists[iu].mean())
+
+
+def _activation_zoom_per_point(n_points: int, snap_records: list[tuple]) -> tuple:
+    act = np.zeros(n_points, dtype=int)
+    zm = np.zeros(n_points, dtype=int)
+    prev = 0
+    for (n, a, z) in snap_records:
+        n = min(int(n), n_points)
+        if n > prev:
+            act[prev:n] = a
+            zm[prev:n] = z
+            prev = n
+    if prev < n_points and snap_records:
+        act[prev:] = snap_records[-1][1]
+        zm[prev:] = snap_records[-1][2]
+    return act, zm
+
+
+def _write_run_analytics(dh, run_dir, payloads, snap_records, maximize, log_fn):
+    import pandas as pd
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    run_dir = Path(run_dir) if not isinstance(run_dir, Path) else run_dir
+    X_all = dh.X_all_actual.detach().cpu().numpy() if dh.X_all_actual is not None else np.empty((0, 0))
+    Y_all = dh.Y_all.detach().cpu().numpy().ravel() if dh.Y_all is not None else np.empty(0)
+    d = X_all.shape[1] if X_all.ndim == 2 and X_all.size > 0 else 0
+
+    # ── points.csv ────────────────────────────────────────────────────────
+    try:
+        n = X_all.shape[0]
+        mask = dh.get_penalty_mask()
+        penalized = (~mask.detach().cpu().numpy()) if mask is not None else np.zeros(n, bool)
+        act, zm = _activation_zoom_per_point(n, snap_records)
+        data = {"sample_idx": np.arange(n)}
+        for i in range(d):
+            data[f"x{i}"] = X_all[:, i]
+        data["Y"] = Y_all
+        data["penalized"] = penalized.astype(int)
+        data["activation"] = act
+        data["zoom"] = zm
+        pd.DataFrame(data).to_csv(str(run_dir / "points.csv"), index=False)
+        log_fn("  Wrote points.csv", tag="info")
+    except Exception as exc:
+        log_fn(f"  points.csv failed: {exc}", tag="error")
+
+    # ── needles.csv ───────────────────────────────────────────────────────
+    try:
+        centroid = np.full(d, 1.0 / d) if d > 0 else np.empty(0)
+        rows = []
+        for i, r in enumerate(dh.get_all_needle_results()):
+            pt = r["point"].detach().cpu().numpy().ravel()
+            mv = r.get("median_value")
+            row = {"needle_idx": i}
+            for j in range(d):
+                row[f"x{j}"] = pt[j]
+            row.update({
+                "value": r.get("value"),
+                "median_value": (None if mv is None or (isinstance(mv, float) and math.isnan(mv)) else mv),
+                "activation": r.get("activation"),
+                "zoom": r.get("zoom"),
+                "iteration": r.get("iteration"),
+                "dist_to_centre": float(np.linalg.norm(pt - centroid)) if d > 0 else 0.0,
+            })
+            rows.append(row)
+        cols = ["needle_idx"] + [f"x{j}" for j in range(d)] + [
+            "value", "median_value", "activation", "zoom", "iteration", "dist_to_centre"]
+        pd.DataFrame(rows, columns=cols).to_csv(str(run_dir / "needles.csv"), index=False)
+        log_fn("  Wrote needles.csv", tag="info")
+    except Exception as exc:
+        log_fn(f"  needles.csv failed: {exc}", tag="error")
+
+    # ── metrics_over_time.csv ─────────────────────────────────────────────
+    try:
+        thr = NOISE_LEVEL / 2.0
+        met_rows = []
+        for p in payloads:
+            needles = p.get("needles")
+            disc = needles if needles is not None else np.empty((0, d))
+            n_before = p.get("n_points_before", len(X_all))
+            X_upto = X_all[:n_before] if n_before > 0 else np.empty((0, d))
+            nvals = p.get("needle_vals")
+            recent = float(nvals[-1]) if nvals is not None and len(nvals) > 0 else np.nan
+            met_rows.append({
+                "iteration": p["iter_num"],
+                "dup_fraction": round(_metric_dup_fraction(X_upto, thr), 6),
+                "avg_pairwise_dist": round(_metric_avg_pairwise_dist(disc), 6),
+                "recent_needle_value": (round(recent, 6) if not math.isnan(recent) else np.nan),
+                "n_needles": len(disc),
+                "n_points": n_before,
+            })
+        pd.DataFrame(met_rows, columns=[
+            "iteration", "dup_fraction", "avg_pairwise_dist",
+            "recent_needle_value", "n_needles", "n_points",
+        ]).to_csv(str(run_dir / "metrics_over_time.csv"), index=False)
+        log_fn("  Wrote metrics_over_time.csv", tag="info")
+    except Exception as exc:
+        log_fn(f"  metrics_over_time.csv failed: {exc}", tag="error")
+
+    # ── dist_from_centre.png ──────────────────────────────────────────────
+    try:
+        fig = Figure(figsize=(7, 5))
+        FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        if X_all.shape[0] > 0 and d > 0:
+            centroid = np.full(d, 1.0 / d)
+            dists = np.linalg.norm(X_all - centroid, axis=1)
+            idx = np.arange(len(Y_all))
+            sc = ax.scatter(dists, Y_all, c=idx, cmap="viridis", s=14, alpha=0.7, zorder=3, label="samples")
+            cb = fig.colorbar(sc, ax=ax)
+            cb.set_label("sample index", fontsize=8)
+            needle_t = dh.get_all_needle_locations()
+            nvals_t = dh.get_all_needle_vals()
+            if needle_t is not None and needle_t.numel() > 0:
+                nd = np.linalg.norm(needle_t.detach().cpu().numpy() - centroid, axis=1)
+                nv = nvals_t.detach().cpu().numpy().ravel()
+                ax.scatter(nd, nv, marker="*", s=220, color="crimson", edgecolors="darkred",
+                           lw=0.8, zorder=5, label="needle")
+            ax.set_xlabel("‖x − centroid‖₂")
+            ax.set_ylabel("Objective Y" + ("" if maximize else "  (ZoMBI-internal)"))
+            ax.set_title("Distance from simplex centre", fontsize=10)
+            ax.legend(fontsize=8)
+        fig.tight_layout()
+        fig.savefig(str(run_dir / "dist_from_centre.png"), dpi=120, bbox_inches="tight")
+        log_fn("  Saved dist_from_centre.png", tag="info")
+    except Exception as exc:
+        log_fn(f"  dist_from_centre.png failed: {exc}", tag="error")
+
+    # ── line_length_hist.png ──────────────────────────────────────────────
+    try:
+        lengths = []
+        for p in payloads:
+            line = p.get("line_0")
+            if line is not None:
+                left, right = np.asarray(line[0]), np.asarray(line[1])
+                lengths.append(float(np.linalg.norm(right - left)))
+        fig = Figure(figsize=(7, 5))
+        FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        if lengths:
+            ax.hist(lengths, bins=min(40, max(5, len(lengths) // 2)),
+                    color="orange", edgecolor="black", alpha=0.8)
+            ax.axvline(float(np.mean(lengths)), color="navy", ls="--", lw=1.5,
+                       label=f"mean = {np.mean(lengths):.3f}")
+            ax.legend(fontsize=8)
+        else:
+            ax.text(0.5, 0.5, "no lines recorded", ha="center")
+        ax.set_xlabel("LineBO main-line length  (composition L2)")
+        ax.set_ylabel("count")
+        ax.set_title("Line length distribution", fontsize=10)
+        fig.tight_layout()
+        fig.savefig(str(run_dir / "line_length_hist.png"), dpi=120, bbox_inches="tight")
+        log_fn("  Saved line_length_hist.png", tag="info")
+    except Exception as exc:
+        log_fn(f"  line_length_hist.png failed: {exc}", tag="error")
+
+    # ── final summary metrics ─────────────────────────────────────────────
+    needle_t = dh.get_all_needle_locations()
+    discovered = needle_t.detach().cpu().numpy() if needle_t is not None and needle_t.numel() > 0 else np.empty((0, d))
+    dup = _metric_dup_fraction(X_all, NOISE_LEVEL / 2.0)
+    avg_pw = _metric_avg_pairwise_dist(discovered)
+    nvals_t = dh.get_all_needle_vals()
+    recent_nv = float(nvals_t[-1].item()) if nvals_t is not None and nvals_t.numel() > 0 else float('nan')
+    log_fn(f"  Final: dup_frac={dup:.4f}  avg_pw_dist={avg_pw:.4f}"
+           f"  recent_needle={recent_nv:.4f}  needles={len(discovered)}"
+           f"  points={len(X_all)}", tag="info")
 
 
 # ── data loading ──────────────────────────────────────────────────────────────
@@ -520,10 +721,13 @@ class RunBrowserPanel(ttk.Frame):
 
         bf = ttk.Frame(self)
         bf.pack(fill="x", padx=4, pady=2)
-        ttk.Button(bf, text="Refresh",  command=self.refresh).pack(side="left", padx=2)
-        ttk.Button(bf, text="Load",     command=self._load_selected).pack(side="left", padx=2)
-        ttk.Button(bf, text="New Run",  command=app.open_new_run_dialog).pack(side="left", padx=2)
-        ttk.Button(bf, text="Delete",   command=self._delete_selected,
+        _bw = 8
+        ttk.Button(bf, text="Refresh",  width=_bw, command=self.refresh).pack(side="left", padx=2)
+        ttk.Button(bf, text="Load",     width=_bw, command=self._load_selected).pack(side="left", padx=2)
+        ttk.Button(bf, text="New Run",  width=_bw, command=app.open_new_run_dialog).pack(side="left", padx=2)
+        ttk.Button(bf, text="Stop Run", width=_bw, command=self._stop_selected,
+                   style="Danger.TButton").pack(side="left", padx=2)
+        ttk.Button(bf, text="Delete",   width=_bw, command=self._delete_selected,
                    style="Danger.TButton").pack(side="left", padx=2)
 
         # Active hardware-run UUID indicator
@@ -629,6 +833,22 @@ class RunBrowserPanel(ttk.Frame):
             self._app.set_status("Run deleted.")
 
         self.refresh()
+
+    def _stop_selected(self):
+        sel = self._lb.curselection()
+        if not sel:
+            messagebox.showinfo("Select", "Click a running run first.")
+            return
+        run_info = self._runs[sel[0]]
+        run_id = run_info["run_id"]
+        if run_id not in self._app._active_runs:
+            messagebox.showinfo("Not running", f"{run_id} is not currently running.")
+            return
+        if not messagebox.askyesno("Stop run",
+                                    f"Stop the active run  {run_id} ?\n\n"
+                                    "The run will be terminated after the current iteration."):
+            return
+        self._app.stop_run(run_id)
 
     def set_hw_uuid(self, uuid_or_none: str | None):
         """Update the active-hardware-run UUID indicator in the left panel."""
@@ -2487,7 +2707,8 @@ class NewRunDialog(tk.Toplevel):
         run_id   = run_dir.name
         pause_event = threading.Event()
         pause_event.set()  # start in running state
-        app._register_active_run(pause_event, run_id)
+        stop_event = threading.Event()
+        app._register_active_run(pause_event, run_id, stop_event=stop_event)
         app.track_new_run(run_dir, hw=False)  # refreshes explorer → shows RUNNING
         self.destroy()
 
@@ -2523,10 +2744,39 @@ class NewRunDialog(tk.Toplevel):
                 X_a, X_e, Y_i = _gen_init_data(fn_obj, d, maximize)
                 _log(f"  init: {X_a.shape[0]} pts", tag="info")
                 sim_obj  = _make_sim_obj(fn_obj, DEVICE, DTYPE, maximize=maximize)
-                base_obj = _make_linebo_wrapper(sim_obj, d, DEVICE, DTYPE)
+                plot_state: dict = {"line_0": None, "line_1": None}
+                base_obj = _make_linebo_wrapper(sim_obj, d, DEVICE, DTYPE,
+                                                plot_state=plot_state)
+
+                analytics_payloads: list[dict] = []
+                analytics_counter = [0]
+                analytics_dh_ref = [None]
+
+                def _analytics_obj(x_tell, bounds, acq_fn):
+                    if stop_event.is_set():
+                        raise _StopRunRequested()
+                    x_req, x_act, y = base_obj(x_tell, bounds, acq_fn)
+                    analytics_counter[0] += 1
+                    _dh = analytics_dh_ref[0]
+                    if _dh is not None:
+                        _needles = _dh.needles
+                        analytics_payloads.append({
+                            "iter_num": analytics_counter[0],
+                            "needles": (_needles.detach().cpu().numpy()
+                                        if _needles is not None and _needles.shape[0] > 0
+                                        else None),
+                            "needle_vals": (_dh.needle_vals.detach().cpu().numpy().ravel()
+                                           if _dh.needle_vals is not None
+                                           and _dh.needle_vals.shape[0] > 0 else None),
+                            "n_points_before": (_dh.X_all_actual.shape[0]
+                                                if _dh.X_all_actual is not None else 0),
+                            "line_0": plot_state.get("line_0"),
+                            "line_1": plot_state.get("line_1"),
+                        })
+                    return x_req, x_act, y
 
                 zombi = ZoMBIHop(
-                    objective=base_obj,
+                    objective=_analytics_obj,
                     X_init_actual=X_a,
                     X_init_expected=X_e,
                     Y_init=Y_i,
@@ -2540,13 +2790,34 @@ class NewRunDialog(tk.Toplevel):
                     **hp,
                 )
                 actual_run_dir = zombi.data_handler.run_dir
+                analytics_dh_ref[0] = zombi.data_handler
                 _log(f"  run_uuid: {zombi.data_handler.run_uuid}", tag="info")
 
-                zombi.run(max_activations=max_act, time_limit_hours=None,
-                          pause_event=pause_event)
+                snap_records: list[tuple] = []
+                _orig_snap = zombi.data_handler.take_snapshot
+                _snap_dh = zombi.data_handler
+                def _snap_wrap(*a, **k):
+                    _orig_snap(*a, **k)
+                    if _snap_dh.X_all_actual is not None:
+                        snap_records.append((_snap_dh.X_all_actual.shape[0],
+                                             _snap_dh.current_activation,
+                                             _snap_dh.current_zoom))
+                zombi.data_handler.take_snapshot = _snap_wrap
+
+                try:
+                    zombi.run(max_activations=max_act, time_limit_hours=None,
+                              pause_event=pause_event)
+                except _StopRunRequested:
+                    _log("Run stopped by user.", tag="done")
 
                 _log(f"Done — {actual_run_dir}", tag="done")
                 if actual_run_dir is not None:
+                    try:
+                        _write_run_analytics(
+                            zombi.data_handler, actual_run_dir,
+                            analytics_payloads, snap_records, maximize, _log)
+                    except Exception as exc:
+                        _log(f"Analytics write failed: {exc}", tag="error")
                     app.after(0, lambda rd=actual_run_dir: app.load_run(rd))
             except Exception as exc:
                 _log(f"ERROR: {exc}", tag="error")
@@ -2822,9 +3093,16 @@ class ZoMBIApp(tk.Tk):
             label = "▶ Resume" if not ev.is_set() else "⏸ Pause"
             self._pause_btn.config(state="normal", text=label)
 
-    def _register_active_run(self, pause_event: threading.Event, run_id: str):
+    def _register_active_run(self, pause_event: threading.Event, run_id: str,
+                             stop_event: threading.Event | None = None,
+                             proc: subprocess.Popen | None = None):
         """Called (on the main thread) when a new run thread starts."""
-        self._active_runs[run_id] = {"pause_event": pause_event, "log_buffer": []}
+        self._active_runs[run_id] = {
+            "pause_event": pause_event,
+            "stop_event": stop_event,
+            "proc": proc,
+            "log_buffer": [],
+        }
         self.run_browser.refresh()
         if self._viewed_run_id == run_id:
             self._refresh_pause_btn()
@@ -2835,6 +3113,30 @@ class ZoMBIApp(tk.Tk):
         self.run_browser.refresh()
         if self._viewed_run_id == run_id:
             self._refresh_pause_btn()
+
+    def stop_run(self, run_id: str):
+        """Stop a running run (synthetic or hardware)."""
+        info = self._active_runs.get(run_id)
+        if info is None:
+            return
+        # Hardware run: terminate the subprocess
+        proc = info.get("proc")
+        if proc is not None and proc.poll() is None:
+            self.log_to_main(f"Terminating hardware process for {run_id} …",
+                             tag="info", run_id=run_id)
+            proc.terminate()
+            return
+        # Synthetic run: signal the stop event
+        stop_ev = info.get("stop_event")
+        if stop_ev is not None:
+            stop_ev.set()
+            # Unblock if paused so the thread can see the stop signal
+            pause_ev = info.get("pause_event")
+            if pause_ev is not None and not pause_ev.is_set():
+                pause_ev.set()
+            self.log_to_main(f"Stop requested for {run_id} — will stop after current iteration.",
+                             tag="info", run_id=run_id)
+            self.set_status(f"{run_id} stopping …")
 
     # ── run loading ───────────────────────────────────────────────────────────
 
@@ -2906,13 +3208,15 @@ class ZoMBIApp(tk.Tk):
         # moment the run is launched — for both resume (known UUID) and new runs
         # (pre-generated UUID above).
         known_uuid = uuid or new_uuid
+        hw_run_id = f"run_{known_uuid}" if known_uuid else None
         if known_uuid:
-            run_dir = Path(ckpt_dir) / f"run_{known_uuid}"
+            run_dir = Path(ckpt_dir) / hw_run_id
             self.after(0, lambda rd=run_dir, d=dims_raw: self.track_new_run(rd, hw_dims=d))
 
         _RE_UUID = re.compile(r"Starting new trial with UUID:\s*(\S+)", re.IGNORECASE)
         app = self
         _dims = dims_raw
+        proc_ref: list[subprocess.Popen | None] = [None]
 
         def _pump():
             try:
@@ -2928,11 +3232,16 @@ class ZoMBIApp(tk.Tk):
                     cwd=proj_root,
                     env=_env,
                 )
+                proc_ref[0] = proc
+                if hw_run_id:
+                    app.after(0, lambda: app._register_active_run(
+                        threading.Event(), hw_run_id, proc=proc))
                 for line in proc.stdout:
                     stripped = line.rstrip()
                     if not stripped:
                         continue
-                    app.log_to_main(stripped)
+                    rid = hw_run_id
+                    app.log_to_main(stripped, run_id=rid)
                     if not uuid:          # only parse UUID for new runs
                         m = _RE_UUID.search(stripped)
                         if m:
@@ -2942,12 +3251,17 @@ class ZoMBIApp(tk.Tk):
                 rc = proc.returncode
                 app.log_to_main(
                     f"Hardware process exited (rc={rc})",
-                    tag="done" if rc == 0 else "error")
+                    tag="done" if rc == 0 else "error",
+                    run_id=hw_run_id)
                 app.after(0, app.run_browser.refresh)
                 app.after(0, lambda: app.run_browser.set_hw_uuid(None))
+                if hw_run_id:
+                    app.after(0, lambda r=hw_run_id: app._unregister_active_run(r))
             except Exception as exc:
                 app.log_to_main(f"ERROR launching hardware: {exc}", tag="error")
                 app.after(0, lambda: app.run_browser.set_hw_uuid(None))
+                if hw_run_id:
+                    app.after(0, lambda r=hw_run_id: app._unregister_active_run(r))
 
         threading.Thread(target=_pump, daemon=True).start()
 
