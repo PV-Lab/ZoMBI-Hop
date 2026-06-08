@@ -278,15 +278,13 @@ def write_needles_csv(path: str, dh, cols: list[str], dim: int) -> None:
 
 # ─── 4D landscape: final-state interactive point cloud ──────────────────────────
 
-def write_point_cloud_html(path: str, ackley_fn, dh, last_payload: dict,
-                           zoom_bounds: list) -> None:
+def write_point_cloud_html(path: str, ackley_fn, dh, last_payload: dict) -> None:
     """Render the final ZoMBI state over the 4-simplex Ackley cloud (one HTML).
 
     Uses ``synthetic_data/point_cloud_4d``'s overlay API.  Pared points, needle
-    markers, the last LineBO lines and the trust-region zoom zones are all exact
-    (plain simplex compositions / box bounds); needle penalisation ellipsoids are
-    intentionally omitted because the run's tangent basis differs from the
-    Helmert ILR basis the overlay assumes.
+    markers, and the last LineBO lines are all exact (plain simplex compositions);
+    needle penalisation ellipsoids are intentionally omitted because the run's
+    tangent basis differs from the Helmert ILR basis the overlay assumes.
     """
     import plotly.graph_objects as go
     import synthetic_data.point_cloud_4d as pc4
@@ -341,32 +339,9 @@ def write_point_cloud_html(path: str, ackley_fn, dh, last_payload: dict,
     pc4.add_simplex_overlays(
         fig, obj_cmin=obj_min, obj_cmax=obj_max,
         pared_points=pared_X, pared_values=pared_Y, recency=recency,
-        main_line=main_line, cache_line=cache_line,
-        zoom_zones=zoom_bounds or None, needles=needles,
+        main_line=main_line, cache_line=cache_line, needles=needles,
     )
     fig.write_html(path, include_plotlyjs="cdn", auto_open=False)
-
-
-def _collect_zoom_bounds(payloads: list[dict], max_zones: int = 4) -> list:
-    """Distinct trust-region (lo, hi) box bounds seen during the run.
-
-    Returns up to ``max_zones`` of the most recent distinct zones as
-    ``(lo, hi)`` numpy pairs for ``point_cloud_4d.zoom_zone_mesh``.
-    """
-    seen, zones = set(), []
-    for p in payloads:
-        b = p.get("bounds")
-        if b is None:
-            continue
-        arr = b.detach().cpu().numpy() if isinstance(b, torch.Tensor) else np.asarray(b)
-        if arr.shape[0] != 2:
-            continue
-        key = np.round(arr, 4).tobytes()
-        if key in seen:
-            continue
-        seen.add(key)
-        zones.append((arr[0].copy(), arr[1].copy()))
-    return zones[-max_zones:]
 
 
 # ─── A single evaluation run (full run_mobo-style artifact set) ─────────────────
@@ -500,10 +475,9 @@ def run_single_eval(hparams: dict, ds: dict, dataset: str, out_dir: str,
                     print(f"      [run] video assembly failed: {exc}")
         elif dim == 4 and ds["ackley_fn"] is not None:
             last_payload = payloads[-1] if payloads else None
-            zoom_bounds  = _collect_zoom_bounds(payloads)
             print("      [run] rendering 4D point-cloud HTML …", flush=True)
             write_point_cloud_html(os.path.join(out_dir, "point_cloud.html"),
-                                   ds["ackley_fn"], dh, last_payload, zoom_bounds)
+                                   ds["ackley_fn"], dh, last_payload)
         # dim >= 5: metrics + non-landscape plots only (no landscape view).
     except Exception as exc:
         print(f"      [run] landscape render failed: {exc}")
