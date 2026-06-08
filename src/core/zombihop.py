@@ -104,6 +104,7 @@ class ZoMBIHop:
                  device: str = 'cuda',
                  dtype: torch.dtype = torch.float64,
                  run_uuid: Optional[str] = None,
+                 resume: Optional[bool] = None,
                  checkpoint_dir: Optional[str] = 'zombihop_checkpoints',
                  num_iterations_saved: int = 50,
                  max_snapshots: Optional[int] = None,
@@ -157,6 +158,11 @@ class ZoMBIHop:
 
         effective_max_snapshots = max_snapshots if max_snapshots is not None else num_iterations_saved
 
+        # A UUID is normally taken to mean "resume that run". Callers can pass
+        # resume=False to start a *fresh* run under a caller-provided UUID (e.g.
+        # the GUI pre-creates the run dir so it appears immediately on launch).
+        do_resume = resume if resume is not None else (run_uuid is not None)
+
         # --- DataHandler owns ALL control variables ---
         self.data_handler = DataHandler(
             max_zooms=max_zooms,
@@ -176,6 +182,7 @@ class ZoMBIHop:
             nat_grad_max_steps=nat_grad_max_steps,
             directory=checkpoint_dir,
             run_uuid=run_uuid,
+            is_resume=do_resume,
             max_snapshots=effective_max_snapshots,
             device=str(self.device),
             dtype=self.dtype,
@@ -189,7 +196,7 @@ class ZoMBIHop:
         )
 
         # Resume from snapshot or start fresh
-        if run_uuid is not None:
+        if do_resume:
             if self.verbose:
                 print(f"Resuming from saved run: {run_uuid}")
             activation, zoom, iteration, _ = self.data_handler.load_state()
@@ -414,6 +421,7 @@ class ZoMBIHop:
             distance = torch.norm(needle_X - center).item()
             self._needle_plot_points_ref.append({
                 "sample_idx": global_idx + 1,
+                "point": needle_X.detach().cpu().numpy().ravel().tolist(),
                 "y": needle_Y.item(),
                 "distance": distance,
             })

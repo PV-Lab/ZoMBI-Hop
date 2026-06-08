@@ -82,6 +82,7 @@ class DataHandler:
         # --- Storage settings ---
         directory: Optional[str] = None,
         run_uuid: Optional[str] = None,
+        is_resume: bool = True,
         max_saved_recent_checkpoints: Optional[int] = 50,  # backward compat
         max_snapshots: Optional[int] = None,
         # --- Compute settings ---
@@ -183,8 +184,14 @@ class DataHandler:
             if run_uuid is not None:
                 self.run_uuid = run_uuid
                 self.run_dir = base_dir / f"run_{run_uuid}"
-                if not self.run_dir.exists():
-                    raise ValueError(f"Run directory {self.run_dir} does not exist!")
+                if is_resume:
+                    if not self.run_dir.exists():
+                        raise ValueError(f"Run directory {self.run_dir} does not exist!")
+                else:
+                    # Fresh run with a caller-provided UUID. The directory may
+                    # already exist (e.g. the GUI pre-creates a stub so the run
+                    # appears in the explorer the moment it is launched).
+                    self.run_dir.mkdir(parents=True, exist_ok=True)
             else:
                 self.run_uuid = str(uuid.uuid4())[:4]
                 self.run_dir = base_dir / f"run_{self.run_uuid}"

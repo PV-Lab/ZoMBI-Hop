@@ -25,6 +25,7 @@ import time
 import traceback
 import warnings
 from pathlib import Path
+from uuid import uuid4
 from typing import Optional
 
 import numpy as np
@@ -75,6 +76,17 @@ DEFAULT_CKPT_DIR = str(_HERE.parent / "runs")
 # ── ternary helpers ───────────────────────────────────────────────────────────
 
 _TERNARY_SQRT3_2 = math.sqrt(3) / 2
+
+# Regular-tetrahedron vertices for the 4-simplex → 3D point-cloud view (one per
+# composition component). Mirrors synthetic_data/point_cloud_4d.TETRA_VERTICES so
+# the GUI's d=4 cloud matches the offline plotter, without importing plotly.
+_TETRA_VERTICES = np.array([
+    [1.0,  1.0,  1.0],
+    [1.0, -1.0, -1.0],
+    [-1.0,  1.0, -1.0],
+    [-1.0, -1.0,  1.0],
+], dtype=float)
+_TETRA_VERTICES = _TETRA_VERTICES - _TETRA_VERTICES.mean(axis=0)
 
 
 def _ternary_xy(a: np.ndarray, b: np.ndarray, c: np.ndarray):
@@ -197,55 +209,59 @@ HPARAM_CATEGORIES: dict[str, list[tuple]] = {
     ],
 }
 
-# Allowed choices for string-typed hyperparameters (used to build OptionMenus)
-_HPARAM_STR_CHOICES: dict[str, list[str]] = {
-    "acquisition_type": ["ucb", "ei", "pi"],
+# Flat set of every tunable hyperparameter name the UI knows about.
+_KNOWN_HPARAM_NAMES: set[str] = {
+    p[0] for params in HPARAM_CATEGORIES.values() for p in params
 }
 
 
-# ── test function helpers (duplicated from run_mobo to avoid circular import) ─
+def load_hparams_json(path: str) -> dict:
+    """
+    Read a hyperparameter JSON file and return a {name: value} dict.
 
-class GaussianMixture:
-    """Sum of Gaussians at simplex peaks; maximise."""
-    maximize = True
-
-    def __init__(self, peaks: list, sigma: float = 0.12):
-        self.peaks = [np.asarray(p, float) for p in peaks]
-        self.peaks = [p / p.sum() for p in self.peaks]
-        self.sigma = sigma
-
-    def __call__(self, x: np.ndarray) -> float:
-        return float(sum(
-            np.exp(-np.sum((x - p) ** 2) / (2 * self.sigma ** 2))
-            for p in self.peaks
-        ))
-
-    @property
-    def true_optima(self) -> list:
-        return list(self.peaks)
+    Accepts either a file shaped like ``optimize/runs/.../trial.json`` (a
+    top-level ``"hparams"`` object) or a flat ``{name: value}`` object. Only
+    keys recognised by the UI (``_KNOWN_HPARAM_NAMES``) are returned; unknown
+    keys (e.g. "metrics", "trial") are ignored.
+    """
+    with open(path, "r") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError("Hyperparameter JSON must be an object.")
+    hp = data.get("hparams", data)
+    if not isinstance(hp, dict):
+        raise ValueError("'hparams' must be an object.")
+    return {k: v for k, v in hp.items() if k in _KNOWN_HPARAM_NAMES}
 
 
-class AckleyILR:
-    """Ackley in ILR space; global minimum at centroid."""
-    maximize = False
+# Default hyperparameters used when no JSON file is supplied. Copied verbatim
+# from optimize/runs/mobo_05_06_15_32/trial_112 (a strong MOBO result). Keep in
+# sync with DEFAULT_HW_HPARAMS in scripts/run_zombi_main.py.
+DEFAULT_HPARAMS: dict = {
+    "nat_grad_step": 0.00100187,
+    "nat_grad_max_steps": 54,
+    "n_restarts": 285,
+    "raw": 200,
+    "ucb_beta": 1.45791911,
+    "max_zooms": 3,
+    "max_iterations": 8,
+    "top_m_points": 8,
+    "n_consecutive_converged": 1,
+    "convergence_pi_threshold": 0.05,
+    "input_noise_threshold_mult": 3.98353261,
+    "output_noise_threshold_mult": 0.52251166,
+    "max_penalty_radius": 4.56475059,
+    "needle_shrink_factor": 0.637987,
+    "needle_stop_noise_multiplier": 2.81839283,
+    "paring_spatial_halfnoise": 1.21375814,
+    "paring_y_noise_multiplier": 4.19507699,
+}
 
-    def __init__(self, d: int = 3):
-        self.d = d
-        self.centroid = np.full(d, 1.0 / d)
 
-    def __call__(self, x: np.ndarray) -> float:
-        z = composition_to_ilr(
-            torch.tensor(x, dtype=torch.float64).unsqueeze(0)
-        ).squeeze(0).cpu().numpy()
-        a, b, c = 20.0, 0.2, 2 * math.pi
-        t1 = -a * math.exp(-b * math.sqrt((z ** 2).mean()))
-        t2 = -math.exp(float(np.cos(c * z).mean()))
-        return float(t1 + t2 + a + math.e)
-
-    @property
-    def true_optima(self) -> list:
-        return [self.centroid.copy()]
-
+# ── synthetic-run helpers ─────────────────────────────────────────────────────
+# The objective itself comes from optimize/evaluate.resolve_dataset (RF surrogate
+# + analytic Ackleys); these helpers turn a scalar objective into the LineBO/
+# ZoMBI machinery and are dimension-general.
 
 def _make_sim_obj(fn_callable, device, dtype, *, maximize: bool):
     def _obj(endpoints: torch.Tensor):
@@ -334,6 +350,10 @@ class RunData:
         self.summary: dict                       = {}
         self.d: int                              = 0
         self.log_lines: list[str]                = []
+        # Trust region + penalty-ellipsoid params (for the ternary overlays)
+        self.zoom_bounds: Optional[np.ndarray]   = None  # (2, d) composition AABB
+        self.needle_M_list: list                 = []    # per-needle (d-1,d-1) or None
+        self.needle_B: Optional[np.ndarray]      = None  # (d, d-1) or None (ILR mode)
 
     @property
     def n_points(self):
@@ -401,6 +421,25 @@ def load_run(run_dir: Path, snapshot_name: Optional[str] = None) -> RunData:
         ni = s.get("needle_indices")
         if ni is not None:
             rd.needle_indices = ni.long().numpy().ravel()
+
+        # Trust region (current zoom bounds, fall back to full bounds) +
+        # per-needle penalty-ellipsoid params, for the ternary overlays.
+        bd = s.get("current_zoom_bounds")
+        if bd is None:
+            bd = s.get("bounds")
+        if bd is not None:
+            rd.zoom_bounds = bd.float().numpy()
+        m_stack = s.get("needle_M_stack")
+        has_m   = s.get("needle_has_M")
+        if (isinstance(m_stack, torch.Tensor) and isinstance(has_m, torch.Tensor)
+                and has_m.numel() > 0):
+            rd.needle_M_list = [
+                m_stack[i].float().numpy() if bool(has_m[i].item()) else None
+                for i in range(has_m.shape[0])
+            ]
+        nb = s.get("needle_B")
+        if isinstance(nb, torch.Tensor):
+            rd.needle_B = nb.float().numpy()
     except Exception as e:
         print(f"[warn] tensors load: {e}")
 
@@ -1025,69 +1064,68 @@ class GPQueryFrame(ttk.Frame):
 
 # ── ternary plot tab ─────────────────────────────────────────────────────────
 
-_N_PENALTY_CIRCLE = 40
-_N_BOUNDS_EDGE    = 20
 
-
-def _ilr_to_ternary(ilr_pts: np.ndarray, d: int = 3):
-    """Convert ILR vectors (n, d-1) → composition (n, d) → ternary (x, y)."""
-    t = torch.tensor(ilr_pts, dtype=torch.float64)
-    comp = ilr_to_composition(t, d=d).numpy()
-    return comp, _ternary_xy(comp[:, 0], comp[:, 1], comp[:, 2])
-
-
-def _build_bounds_polygon(lo: np.ndarray, hi: np.ndarray, d: int = 3):
+def _sample_bounds_comp(lo, hi, n_sample: int = 4000):
     """
-    Sample the boundary of the ILR bounding box and convert to ternary xy.
-    Returns (xpoly, ypoly) closed polygon arrays.
+    Uniformly sample compositions inside the trust-region box ``[lo, hi]`` on the
+    3-simplex (composition space, NOT ILR). Mirrors ``_draw_bounds_region`` in
+    interactive_test_zombi.py so the GUI shows the same dashed-red trust region.
+    Returns an ``(N, 3)`` composition array, or None on failure.
     """
-    n = _N_BOUNDS_EDGE
-    t = np.linspace(0, 1, n)
-    # 4 edges of the 2D ILR rectangle (for d=3 → 2D ILR)
-    edges = []
-    if len(lo) >= 2 and len(hi) >= 2:
-        lo2, hi2 = lo[:2], hi[:2]
-        edges += [np.column_stack([np.full(n, lo2[0]),  lo2[1] + t * (hi2[1] - lo2[1])])]
-        edges += [np.column_stack([lo2[0] + t * (hi2[0] - lo2[0]),  np.full(n, hi2[1])])]
-        edges += [np.column_stack([np.full(n, hi2[0]),  hi2[1] - t * (hi2[1] - lo2[1])])]
-        edges += [np.column_stack([hi2[0] - t * (hi2[0] - lo2[0]),  np.full(n, lo2[1])])]
-    elif len(lo) == 1 and len(hi) == 1:
-        # 1-D ILR (d=2, pure binary) — draw as line
-        ilr = np.column_stack([lo[0] + t * (hi[0] - lo[0]), np.zeros(n)])
-        _, (xp, yp) = _ilr_to_ternary(ilr, d=d)
-        return xp, yp
-    else:
-        return np.array([]), np.array([])
-
-    all_ilr = np.vstack(edges)
-    _, (xp, yp) = _ilr_to_ternary(all_ilr, d=d)
-    return xp, yp
-
-
-def _build_penalty_polygon(center_comp: np.ndarray, radius_ilr: float, d: int = 3):
-    """
-    Draw a penalty-ellipsoid boundary in ternary: sample a circle of radius
-    radius_ilr in 2-D ILR space centred at the needle, convert to composition.
-    Returns (xpoly, ypoly) closed polygon arrays, or empty arrays on failure.
-    """
+    from src.utils.simplex import random_simplex
+    lo = np.asarray(lo, dtype=float).ravel()
+    hi = np.asarray(hi, dtype=float).ravel()
+    if lo.shape[0] != 3 or hi.shape[0] != 3:
+        return None
     try:
-        t = torch.tensor(center_comp, dtype=torch.float64).unsqueeze(0)
-        center_ilr = composition_to_ilr(t).squeeze(0).numpy()
-        if len(center_ilr) < 2:
-            return np.array([]), np.array([])
-        angles = np.linspace(0, 2 * math.pi, _N_PENALTY_CIRCLE, endpoint=False)
-        pts_ilr = np.column_stack([
-            center_ilr[0] + radius_ilr * np.cos(angles),
-            center_ilr[1] + radius_ilr * np.sin(angles),
-        ])
-        if len(center_ilr) > 2:
-            # Extend higher dims with center value
-            extra = np.tile(center_ilr[2:], (_N_PENALTY_CIRCLE, 1))
-            pts_ilr = np.hstack([pts_ilr, extra])
-        _, (xp, yp) = _ilr_to_ternary(pts_ilr, d=d)
-        return xp, yp
+        samp = random_simplex(
+            n_sample,
+            torch.tensor(lo, dtype=torch.float64),
+            torch.tensor(hi, dtype=torch.float64),
+            device="cpu", torch_dtype=torch.float64,
+        )
     except Exception:
-        return np.array([]), np.array([])
+        return None
+    pts = samp.detach().cpu().numpy()
+    return pts if (pts.ndim == 2 and pts.shape[0] >= 3 and pts.shape[1] == 3) else None
+
+
+def _needle_ellipsoid_comp(needle_comp, M, B, n: int = 200):
+    """
+    Penalization-ellipsoid boundary as ``(n, 3)`` compositions. Direct port of
+    ``_draw_needle_ellipsoid`` in interactive_test_zombi.py:
+
+      tangent-space mode (B given): x = x* + B @ u,  u^T M u = 1
+      ILR mode      (B is None):    x = ilr⁻¹(ilr(x*) + u),  u^T M u = 1
+
+    Returns None if ``M`` is None or on any failure.
+    """
+    if M is None:
+        return None
+    try:
+        needle_comp = np.asarray(needle_comp, dtype=float).ravel()
+        d = needle_comp.shape[0]
+        M_np = np.asarray(M, dtype=float)
+        eigvals, eigvecs = np.linalg.eigh(M_np)
+        eigvals = np.maximum(eigvals, 1e-12)
+        angles = np.linspace(0, 2 * np.pi, n)
+        circle = np.column_stack([np.cos(angles), np.sin(angles)])
+        u_ell = (eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ circle.T).T   # (n, d-1)
+        if B is not None:
+            B_np = np.asarray(B, dtype=float)               # (d, d-1)
+            ell = needle_comp.reshape(1, d) + (B_np @ u_ell.T).T
+        else:
+            needle_ilr = composition_to_ilr(
+                torch.tensor(needle_comp, dtype=torch.float64).unsqueeze(0)
+            ).squeeze(0).cpu().numpy()                       # (d-1,)
+            z_ell = needle_ilr + u_ell                       # (n, d-1)
+            ell = ilr_to_composition(
+                torch.tensor(z_ell, dtype=torch.float64), d).cpu().numpy()
+        ell = np.clip(ell, 0, 1)
+        s = ell.sum(axis=1, keepdims=True)
+        return ell / np.where(s < 1e-9, 1.0, s)
+    except Exception:
+        return None
 
 
 class TernaryPlotFrame(ttk.Frame):
@@ -1274,7 +1312,124 @@ class TernaryPlotFrame(ttk.Frame):
 
     # ── rendering ─────────────────────────────────────────────────────────
 
+    def _replot_tetra(self, X: np.ndarray, labels: list[str]):
+        """
+        d == 4 view: project the 4-simplex onto a regular tetrahedron and show a
+        3D point cloud of the *sampled* points only (coloured by objective),
+        plus discovered needles and the latest LineBO lines.
+
+        This simulates a real run, so the ground-truth objective lattice/peaks
+        are intentionally NOT drawn — only what the optimizer has actually
+        visited appears.
+        """
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d proj)
+
+        self.fig.clf()
+        ax = self.fig.add_subplot(111, projection="3d")
+        rd   = self._last_rd
+        live = self._live_state
+        V    = _TETRA_VERTICES
+        vlabels = (labels[:4] if len(labels) >= 4
+                   else [f"x{i + 1}" for i in range(4)])
+
+        # Tetrahedron wireframe + corner labels for orientation.
+        for i in range(4):
+            for j in range(i + 1, 4):
+                ax.plot([V[i, 0], V[j, 0]], [V[i, 1], V[j, 1]], [V[i, 2], V[j, 2]],
+                        color="0.6", lw=1.0, zorder=1)
+        lp = V * 1.12
+        for k in range(4):
+            ax.text(lp[k, 0], lp[k, 1], lp[k, 2], vlabels[k],
+                    fontsize=9, fontweight="bold", ha="center", va="center")
+
+        legend_handles: list = []
+
+        # ── sampled points (no ground-truth background cloud) ─────────────
+        if X.shape[0] > 0 and X.shape[1] >= 4:
+            P = X[:, :4] @ V
+            Y = None
+            if live is not None:
+                yraw = live.get("y_values", [])
+                if len(yraw) == P.shape[0]:
+                    Y = np.array(yraw, dtype=float)
+            elif rd is not None and rd.Y_all is not None and len(rd.Y_all) == P.shape[0]:
+                Y = rd.Y_all
+            if Y is not None:
+                sc = ax.scatter(P[:, 0], P[:, 1], P[:, 2], c=Y, cmap="viridis",
+                                s=18, depthshade=True, zorder=3)
+                cb = self.fig.colorbar(sc, ax=ax, shrink=0.55, pad=0.02)
+                cb.set_label("Objective Y", fontsize=8)
+            else:
+                ax.scatter(P[:, 0], P[:, 1], P[:, 2], s=18,
+                           color="steelblue", zorder=3)
+            legend_handles.append(matplotlib.lines.Line2D(
+                [], [], linestyle="none", marker="o", markersize=6,
+                color="steelblue", label=f"Samples ({P.shape[0]})"))
+
+        # ── LineBO lines (live runs only; snapshots don't carry them) ─────
+        def _draw_lines(key, style, color, label):
+            drawn = False
+            for ep in (live.get(key, []) if live else [])[:2]:
+                try:
+                    L = np.asarray(ep[0], float); R = np.asarray(ep[1], float)
+                    if L.shape[0] >= 4 and R.shape[0] >= 4:
+                        seg = np.vstack([L[:4], R[:4]]) @ V
+                        ax.plot(seg[:, 0], seg[:, 1], seg[:, 2], style,
+                                color=color, lw=2.0, alpha=0.85, zorder=4)
+                        drawn = True
+                except Exception:
+                    pass
+            if drawn:
+                legend_handles.append(matplotlib.lines.Line2D(
+                    [], [], linestyle=style, color=color, lw=2.0, label=label))
+
+        _draw_lines("prior_line_endpoints", "--", "#7799ee", "Prior LineBO lines")
+        _draw_lines("line_endpoints",       "-",  "#0044dd", "Current LineBO lines")
+
+        # ── needles ───────────────────────────────────────────────────────
+        needles_data: list = live.get("needles", []) if live else []
+        if not needles_data and rd is not None and rd.needles is not None \
+                and rd.needles.shape[0] > 0:
+            needles_data = [{"point": npt.tolist()} for npt in rd.needles]
+        nd_pts = []
+        for nd in needles_data:
+            try:
+                pt = np.asarray(nd["point"], float)
+                if pt.shape[0] >= 4:
+                    nd_pts.append(pt[:4])
+            except Exception:
+                pass
+        if nd_pts:
+            NP = np.asarray(nd_pts) @ V
+            ax.scatter(NP[:, 0], NP[:, 1], NP[:, 2], marker="X", s=160,
+                       color="#ff3300", edgecolors="darkred", lw=0.8, zorder=6)
+            legend_handles.append(matplotlib.lines.Line2D(
+                [], [], linestyle="none", marker="X", markersize=10,
+                color="#ff3300", markeredgecolor="darkred",
+                label=f"Needles ({len(nd_pts)})"))
+
+        try:
+            ax.set_box_aspect((1, 1, 1))
+        except Exception:
+            pass
+        ax.set_axis_off()
+        run_lbl = rd.run_id if rd else ""
+        n_pts   = X.shape[0] if X.ndim == 2 else 0
+        src_tag = (" [live]" if live else
+                   (f" [snap: {rd.snapshot_name}]" if rd and rd.snapshot_name else ""))
+        ax.set_title(f"{run_lbl}  —  4-simplex point cloud  ·  {n_pts} pts{src_tag}",
+                     fontsize=9)
+        if legend_handles:
+            ax.legend(handles=legend_handles, loc="upper left",
+                      fontsize=7, framealpha=0.88)
+        self.draw()
+
     def _replot(self, X: np.ndarray, n_cols: int, labels: list[str]):
+        # d == 4 → tetrahedron point-cloud view instead of a 3-of-d ternary.
+        if n_cols == 4:
+            self._replot_tetra(X, labels)
+            return
+
         self.fig.clf()
         ax = self.fig.add_subplot(111)
         rd   = self._last_rd
@@ -1311,49 +1466,76 @@ class TernaryPlotFrame(ttk.Frame):
         _draw_ternary_frame_ax(ax, la, lb, lc)
         legend_handles: list = []
 
-        # ── zoom bounds polygon (live only, d=3 composition) ─────────────
-        if live is not None:
-            lo_raw = live.get("zoom_bounds_lo")
-            hi_raw = live.get("zoom_bounds_hi")
-            if lo_raw is not None and hi_raw is not None:
+        # Project a composition array (N, 3) to ternary xy using the current
+        # vertex-dim selection, so overlays line up with the scatter points.
+        def _proj(comp: np.ndarray):
+            x, y = _ternary_xy(comp[:, da], comp[:, db], comp[:, dc])
+            return np.column_stack([x, y])
+
+        # ── trust / zoom region: sample composition bounds → convex hull ──
+        # Matches _draw_bounds_region in interactive_test_zombi.py. Source the
+        # bounds from the snapshot (works for synthetic runs) or live state.
+        lo = hi = None
+        if live is not None and live.get("zoom_bounds_lo") is not None \
+                and live.get("zoom_bounds_hi") is not None:
+            lo, hi = live["zoom_bounds_lo"], live["zoom_bounds_hi"]
+        elif rd is not None and rd.zoom_bounds is not None \
+                and rd.zoom_bounds.shape == (2, 3):
+            lo, hi = rd.zoom_bounds[0], rd.zoom_bounds[1]
+        if lo is not None and n_cols == 3:
+            comp = _sample_bounds_comp(lo, hi)
+            if comp is not None:
+                bxy = _proj(comp)
                 try:
-                    lo, hi  = np.asarray(lo_raw, float), np.asarray(hi_raw, float)
-                    d_comp  = len(lo) + 1
-                    if d_comp == 3 and n_cols == 3:
-                        xb, yb = _build_bounds_polygon(lo, hi, d=d_comp)
-                        if len(xb) > 2:
-                            ax.add_patch(matplotlib.patches.Polygon(
-                                np.column_stack([xb, yb]), closed=True,
-                                facecolor="#ffd70030", edgecolor="#cc9900",
-                                lw=1.4, linestyle="--", zorder=2))
-                            legend_handles.append(matplotlib.patches.Patch(
-                                facecolor="#ffd70050", edgecolor="#cc9900",
-                                linestyle="--", label="Zoom bounds"))
+                    from scipy.spatial import ConvexHull
+                    verts = bxy[ConvexHull(bxy).vertices]
+                    ax.add_patch(matplotlib.patches.Polygon(
+                        verts, closed=True, facecolor="#ff000010",
+                        edgecolor="red", lw=2.0, linestyle="--",
+                        zorder=2))
+                    legend_handles.append(matplotlib.patches.Patch(
+                        facecolor="#ff000018", edgecolor="red",
+                        linestyle="--", label="Zoom bounds"))
                 except Exception:
                     pass
 
-        # ── penalty regions (live only, d=3 composition) ─────────────────
-        if live is not None:
-            penalty_drawn = False
+        # ── penalty / needle penalization ellipsoids ─────────────────────
+        # Matches _draw_needle_ellipsoid in interactive_test_zombi.py. Prefer the
+        # snapshot's true ellipsoid (needle M + B); fall back to live isotropic
+        # spheres (radius_ilr) when no snapshot ellipsoid is available.
+        penalty_drawn = False
+        if n_cols == 3 and rd is not None and rd.needles is not None \
+                and rd.needles.shape[0] > 0 and rd.needle_M_list:
+            for i, ncomp in enumerate(rd.needles):
+                M = rd.needle_M_list[i] if i < len(rd.needle_M_list) else None
+                ell = _needle_ellipsoid_comp(ncomp, M, rd.needle_B)
+                if ell is None:
+                    continue
+                ax.add_patch(matplotlib.patches.Polygon(
+                    _proj(ell), closed=True, facecolor="#80008022",
+                    edgecolor="purple", lw=0.9, zorder=2))
+                penalty_drawn = True
+        if not penalty_drawn and live is not None and n_cols == 3:
             for pr in live.get("penalty_regions", []):
                 try:
-                    cpt    = np.asarray(pr["center"], float)
-                    rad    = float(pr["radius_ilr"])
-                    d_comp = len(cpt)
-                    if d_comp == 3 and n_cols == 3:
-                        xpc, ypc = _build_penalty_polygon(cpt, rad, d=d_comp)
-                        if len(xpc) > 2:
-                            ax.add_patch(matplotlib.patches.Polygon(
-                                np.column_stack([xpc, ypc]), closed=True,
-                                facecolor="#ff000018", edgecolor="#cc0000",
-                                lw=1.0, linestyle="-.", zorder=2))
-                            if not penalty_drawn:
-                                legend_handles.append(matplotlib.patches.Patch(
-                                    facecolor="#ff000030", edgecolor="#cc0000",
-                                    linestyle="-.", label="Penalty region"))
-                                penalty_drawn = True
+                    cpt = np.asarray(pr["center"], float)
+                    rad = float(pr["radius_ilr"])
+                    if cpt.shape[0] != 3 or rad <= 0:
+                        continue
+                    # isotropic ILR sphere of radius rad ⇒ M = I / rad²
+                    ell = _needle_ellipsoid_comp(cpt, np.eye(2) / (rad ** 2), None)
+                    if ell is None:
+                        continue
+                    ax.add_patch(matplotlib.patches.Polygon(
+                        _proj(ell), closed=True, facecolor="#80008022",
+                        edgecolor="purple", lw=0.9, zorder=2))
+                    penalty_drawn = True
                 except Exception:
                     pass
+        if penalty_drawn:
+            legend_handles.append(matplotlib.patches.Patch(
+                facecolor="#80008033", edgecolor="purple",
+                label="Penalty region"))
 
         # ── scatter points ────────────────────────────────────────────────
         if X.shape[0] > 0 and X.shape[1] > max_col:
@@ -2101,45 +2283,34 @@ class NewRunDialog(tk.Toplevel):
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=6, pady=6)
 
-        # ── test function tab ──────────────────────────────────────────────
+        # ── synthetic tab ──────────────────────────────────────────────────
         tf = ttk.Frame(nb)
         nb.add(tf, text="Synthetic")
 
         row = 0
-        ttk.Label(tf, text="Test function:", anchor="w").grid(
+        ttk.Label(tf, text="Dataset:", anchor="w").grid(
             row=row, column=0, sticky="w", padx=8, pady=4)
-        self._tf_var = tk.StringVar(value="GaussianMixture")
-        for j, nm in enumerate(["GaussianMixture", "AckleyILR"]):
-            ttk.Radiobutton(tf, text=nm, variable=self._tf_var, value=nm).grid(
-                row=row, column=1+j, sticky="w", padx=4)
+        # Datasets mirror optimize/evaluate.py (RF surrogate + analytic Ackleys).
+        self._ds_var = tk.StringVar(value="ackley3d")
+        ttk.OptionMenu(tf, self._ds_var, "ackley3d",
+                       "RF", "ackley3d", "ackley4d", "ackley10d",
+                       command=lambda _v: self._sync_ds_fields()).grid(
+            row=row, column=1, sticky="w", padx=4)
+        ttk.Label(tf, text="(dimension is set by the dataset)",
+                  foreground="gray").grid(row=row, column=2, sticky="w")
 
         row += 1
-        ttk.Label(tf, text="Dimensionality (d):").grid(
+        ttk.Label(tf, text="Ackley variant:").grid(
             row=row, column=0, sticky="w", padx=8)
-        self._d_var = tk.IntVar(value=3)
-        ttk.Entry(tf, textvariable=self._d_var, width=6).grid(
-            row=row, column=1, sticky="w")
+        from synthetic_data.ackley import Ackley as _Ackley
+        self._variant_var = tk.StringVar(value="realistic")
+        self._variant_menu = ttk.OptionMenu(
+            tf, self._variant_var, "realistic", *sorted(_Ackley.VARIANTS))
+        self._variant_menu.grid(row=row, column=1, sticky="w", padx=4)
 
-        row += 1
-        ttk.Label(tf, text="Max activations:").grid(
-            row=row, column=0, sticky="w", padx=8)
-        self._act_var = tk.IntVar(value=6)
-        ttk.Entry(tf, textvariable=self._act_var, width=6).grid(
-            row=row, column=1, sticky="w")
-
-        row += 1
-        ttk.Label(tf, text="Gaussian σ (GM only):").grid(
-            row=row, column=0, sticky="w", padx=8)
-        self._sigma_var = tk.DoubleVar(value=0.12)
-        ttk.Entry(tf, textvariable=self._sigma_var, width=8).grid(
-            row=row, column=1, sticky="w")
-
-        row += 1
-        ttk.Label(tf, text="Peaks (GM only)\none per line, comma-sep:").grid(
-            row=row, column=0, sticky="nw", padx=8)
-        self._peaks_txt = scrolledtext.ScrolledText(tf, width=30, height=5)
-        self._peaks_txt.grid(row=row, column=1, columnspan=2, padx=4, pady=4, sticky="w")
-        self._peaks_txt.insert("end", "0.8, 0.1, 0.1\n0.1, 0.8, 0.1\n0.1, 0.1, 0.8")
+        # RF source (mobo_* dir) is hardcoded to the default surrogate run; the
+        # max number of activations is hardcoded to infinite (run until stopped).
+        self._rf_src_default = str(_HERE.parent / "optimize" / "runs" / "mobo_05_06_15_32")
 
         row += 1
         ttk.Label(tf, text="Output directory:").grid(
@@ -2149,6 +2320,25 @@ class NewRunDialog(tk.Toplevel):
         odf.grid(row=row, column=1, columnspan=2, sticky="w", pady=4)
         ttk.Entry(odf, textvariable=self._outdir_var, width=26).pack(side="left")
         ttk.Button(odf, text="…", width=3, command=self._browse_out).pack(side="left")
+
+        row += 1
+        ttk.Label(tf, text="Hyperparameters JSON:").grid(
+            row=row, column=0, sticky="w", padx=8)
+        self._syn_hparams_var = tk.StringVar(value="")
+        shp = ttk.Frame(tf)
+        shp.grid(row=row, column=1, columnspan=2, sticky="w", pady=2)
+        ttk.Entry(shp, textvariable=self._syn_hparams_var, width=26).pack(side="left")
+        ttk.Button(shp, text="…", width=3,
+                   command=lambda: self._browse_hparams_into(self._syn_hparams_var)).pack(side="left")
+
+        row += 1
+        ttk.Label(tf, text="(trial.json-style file. If blank, arbitrary defaults "
+                           "are used instead — from mobo trial_112.)",
+                  foreground="gray").grid(row=row, column=0, columnspan=3,
+                                          sticky="w", padx=8)
+
+        # Enable/disable the variant / RF-source rows to match the dataset.
+        self._sync_ds_fields()
 
         # ── hardware tab ───────────────────────────────────────────────────
         hw = ttk.Frame(nb)
@@ -2187,6 +2377,22 @@ class NewRunDialog(tk.Toplevel):
             row=hrow, column=1, sticky="w", padx=4)
 
         hrow += 1
+        ttk.Label(hw, text="Hyperparameters JSON:").grid(
+            row=hrow, column=0, sticky="w", padx=8)
+        self._hw_hparams_var = tk.StringVar(value="")
+        hpf = ttk.Frame(hw)
+        hpf.grid(row=hrow, column=1, sticky="w", pady=2)
+        ttk.Entry(hpf, textvariable=self._hw_hparams_var, width=30).pack(side="left")
+        ttk.Button(hpf, text="…", width=3,
+                   command=lambda: self._browse_hparams_into(self._hw_hparams_var)).pack(side="left")
+
+        hrow += 1
+        ttk.Label(hw, text="(trial.json-style file. If blank, arbitrary defaults "
+                           "are used instead — from mobo trial_112.)",
+                  foreground="gray").grid(
+            row=hrow, column=0, columnspan=2, sticky="w", padx=8)
+
+        hrow += 1
         hw_btn_f = ttk.Frame(hw)
         hw_btn_f.grid(row=hrow, column=0, columnspan=2, sticky="w", padx=8, pady=6)
         ttk.Button(
@@ -2197,59 +2403,6 @@ class NewRunDialog(tk.Toplevel):
         ttk.Label(hw, text="(Requires COM5 connected and databases initialised.)",
                   foreground="gray").grid(
             row=hrow, column=0, columnspan=2, sticky="w", padx=8)
-
-        # ── hyperparams tab ────────────────────────────────────────────────
-        hp_tab = ttk.Frame(nb)
-        nb.add(hp_tab, text="Hyperparameters")
-        hp_nb = ttk.Notebook(hp_tab)
-        hp_nb.pack(fill="both", expand=True, padx=4, pady=4)
-        self._hp_vars: dict[str, tuple] = {}
-        for cat, params in HPARAM_CATEGORIES.items():
-            outer = ttk.Frame(hp_nb)
-            hp_nb.add(outer, text=cat[:14])
-            # Scrollable canvas so long lists don't get clipped
-            canvas = tk.Canvas(outer, borderwidth=0, highlightthickness=0)
-            vsb    = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-            canvas.configure(yscrollcommand=vsb.set)
-            vsb.pack(side="right", fill="y")
-            canvas.pack(side="left", fill="both", expand=True)
-            frame = ttk.Frame(canvas)
-            frame_id = canvas.create_window((0, 0), window=frame, anchor="nw")
-
-            def _on_resize(event, c=canvas, fid=frame_id):
-                c.itemconfig(fid, width=event.width)
-            canvas.bind("<Configure>", _on_resize)
-
-            def _on_frame_resize(event, c=canvas):
-                c.configure(scrollregion=c.bbox("all"))
-            frame.bind("<Configure>", _on_frame_resize)
-
-            for ri, param_tuple in enumerate(params):
-                name, typ, default, label = param_tuple[:4]
-                tooltip = param_tuple[4] if len(param_tuple) > 4 else ""
-
-                ttk.Label(frame, text=label + ":", anchor="w", width=22).grid(
-                    row=ri, column=0, sticky="w", padx=6, pady=3)
-
-                if typ == "str":
-                    v = tk.StringVar(value=str(default))
-                    choices = _HPARAM_STR_CHOICES.get(name, [str(default)])
-                    om = ttk.OptionMenu(frame, v, str(default), *choices)
-                    om.config(width=8)
-                    om.grid(row=ri, column=1, sticky="w", padx=2)
-                else:
-                    v = tk.DoubleVar(value=default) if typ == "float" else tk.IntVar(value=default)
-                    ttk.Entry(frame, textvariable=v, width=12).grid(
-                        row=ri, column=1, sticky="w", padx=2)
-
-                self._hp_vars[name] = (v, typ)
-
-                if tooltip:
-                    q = ttk.Label(frame, text=" ? ", foreground="#0055cc",
-                                  cursor="question_arrow",
-                                  font=("TkDefaultFont", 8, "bold"), relief="flat")
-                    q.grid(row=ri, column=2, padx=(2, 8), sticky="w")
-                    ToolTip(q, tooltip)
 
         # ── bottom: start / close ──────────────────────────────────────────
         bot = ttk.Frame(self)
@@ -2262,6 +2415,13 @@ class NewRunDialog(tk.Toplevel):
         if d:
             self._outdir_var.set(d)
 
+    def _sync_ds_fields(self):
+        """Enable only the inputs relevant to the chosen dataset."""
+        ds = self._ds_var.get()
+        is_rf = (ds == "RF")
+        # Ackley variant applies to the analytic datasets only.
+        self._variant_menu.config(state="disabled" if is_rf else "normal")
+
     def _browse_hw_script(self):
         p = filedialog.askopenfilename(
             initialdir=str(Path(self._hw_script_var.get()).parent),
@@ -2269,63 +2429,69 @@ class NewRunDialog(tk.Toplevel):
         if p:
             self._hw_script_var.set(p)
 
+    def _browse_hparams_into(self, var: tk.StringVar):
+        """Pick a trial.json-style hyperparameter file into the given path var."""
+        p = filedialog.askopenfilename(
+            title="Select hyperparameter JSON",
+            filetypes=[("JSON", "*.json"), ("All", "*")])
+        if not p:
+            return
+        # Validate early so the user gets immediate feedback on a bad file.
+        try:
+            hp = load_hparams_json(p)
+        except Exception as exc:
+            messagebox.showerror("Load failed",
+                                 f"Could not read hyperparameters:\n{exc}")
+            return
+        if not hp:
+            messagebox.showwarning(
+                "No hyperparameters",
+                "No recognised hyperparameter keys found in that file.")
+            return
+        var.set(p)
+
     def _log_msg(self, msg: str, tag: Optional[str] = None):
         if tag is None:
             tag = _log_tag_for(msg)
         self._app.log_to_main(msg, tag)
 
-    def _parse_peaks(self) -> list:
-        peaks = []
-        for line in self._peaks_txt.get("1.0", "end").strip().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                peaks.append([float(v) for v in line.replace(";", ",").split(",")])
-            except ValueError:
-                raise ValueError(f"Cannot parse peak: {line!r}")
-        return peaks
-
-    def _build_hparams(self) -> dict:
-        result = {}
-        for name, (v, typ) in self._hp_vars.items():
-            if typ == "int":
-                result[name] = int(v.get())
-            elif typ == "float":
-                result[name] = float(v.get())
-            else:
-                result[name] = v.get()
-        return result
-
     def _start(self):
         try:
-            hp      = self._build_hparams()
-            d       = int(self._d_var.get())
-            max_act = int(self._act_var.get())
-            outdir  = self._outdir_var.get()
-            tf_name = self._tf_var.get()
-            if tf_name == "GaussianMixture":
-                peaks  = self._parse_peaks()
-                if not peaks:
-                    raise ValueError("Provide at least one peak.")
-                fn_obj = GaussianMixture(peaks, sigma=float(self._sigma_var.get()))
-            else:
-                fn_obj = AckleyILR(d=d)
+            # Hyperparameters: defaults (trial_112) unless a JSON file is given.
+            hp = dict(DEFAULT_HPARAMS)
+            syn_path = self._syn_hparams_var.get().strip()
+            if syn_path:
+                loaded = load_hparams_json(syn_path)
+                if not loaded:
+                    raise ValueError(f"No recognised hyperparameters in {syn_path}.")
+                hp.update(loaded)
+            max_act  = float("inf")   # hardcoded: run until stopped
+            outdir   = self._outdir_var.get()
+            dataset  = self._ds_var.get()
+            variant  = self._variant_var.get()
+            rf_src   = self._rf_src_default   # hardcoded default surrogate run
         except Exception as exc:
             messagebox.showerror("Config error", str(exc))
             return
 
         app = self._app
-        maximize = fn_obj.maximize
-        app.log_to_main(f"Starting: tf={tf_name}, d={d}, max_act={max_act}", tag="info")
+        app.log_to_main(f"Starting synthetic: dataset={dataset}"
+                        + (f" variant={variant}" if dataset != "RF" else "")
+                        + f", max_act={max_act}", tag="info")
         app.log_to_main(f"  outdir: {outdir}", tag="info")
-        self.destroy()
 
+        # Pre-generate the UUID and register the run NOW so it appears in the
+        # explorer the moment Start is clicked — before any data is collected.
+        new_uuid = str(uuid4())[:4]
+        run_dir  = Path(outdir) / f"run_{new_uuid}"
+        run_id   = run_dir.name
         pause_event = threading.Event()
         pause_event.set()  # start in running state
+        app._register_active_run(pause_event, run_id)
+        app.track_new_run(run_dir, hw=False)  # refreshes explorer → shows RUNNING
+        self.destroy()
 
-        # Mutable ref: filled in once the run directory is known inside the thread
-        run_id_ref: list[Optional[str]] = [None]
+        run_id_ref: list[Optional[str]] = [run_id]
 
         def _log(msg: str, tag: Optional[str] = None):
             """Log helper that routes to the correct per-run buffer."""
@@ -2335,6 +2501,25 @@ class NewRunDialog(tk.Toplevel):
             old_stdout = sys.stdout
             sys.stdout = _LogStream(_log, real_stdout=old_stdout)
             try:
+                # Resolve the objective from optimize/evaluate.py so the GUI shares
+                # the exact RF surrogate + analytic Ackley datasets the benchmark
+                # harness uses. Imported lazily (pulls run_mobo) only on Start.
+                try:
+                    import optimize.evaluate as _ev
+                except Exception as exc:
+                    _log(f"ERROR: could not import optimize/evaluate.py: {exc}", tag="error")
+                    return
+                # resolve_dataset may sys.exit() on bad RF config — catch that too.
+                try:
+                    ds = _ev.resolve_dataset(dataset, rf_src, variant)
+                except SystemExit as exc:
+                    _log(f"ERROR resolving dataset {dataset!r}: {exc}", tag="error")
+                    return
+                fn_obj   = ds["fn"]
+                maximize = ds["maximize"]
+                d        = ds["dim"]
+                _log(f"  dataset={dataset} d={d} maximize={maximize}", tag="info")
+
                 X_a, X_e, Y_i = _gen_init_data(fn_obj, d, maximize)
                 _log(f"  init: {X_a.shape[0]} pts", tag="info")
                 sim_obj  = _make_sim_obj(fn_obj, DEVICE, DTYPE, maximize=maximize)
@@ -2348,27 +2533,21 @@ class NewRunDialog(tk.Toplevel):
                     verbose=True,
                     device=str(DEVICE),
                     dtype=DTYPE,
-                    run_uuid=None,
+                    run_uuid=new_uuid,
+                    resume=False,
                     checkpoint_dir=outdir,
                     num_iterations_saved=50,
                     **hp,
                 )
-                run_dir = zombi.data_handler.run_dir
-                # run_id is the directory name, e.g. "run_b470"
-                run_id  = run_dir.name if run_dir else zombi.data_handler.run_uuid
-                run_id_ref[0] = run_id
-
+                actual_run_dir = zombi.data_handler.run_dir
                 _log(f"  run_uuid: {zombi.data_handler.run_uuid}", tag="info")
-                if run_dir is not None:
-                    app.after(0, lambda rd=run_dir: app.track_new_run(rd))
-                app.after(0, lambda rid=run_id: app._register_active_run(pause_event, rid))
 
                 zombi.run(max_activations=max_act, time_limit_hours=None,
                           pause_event=pause_event)
 
-                _log(f"Done — {run_dir}", tag="done")
-                if run_dir is not None:
-                    app.after(0, lambda rd=run_dir: app.load_run(rd))
+                _log(f"Done — {actual_run_dir}", tag="done")
+                if actual_run_dir is not None:
+                    app.after(0, lambda rd=actual_run_dir: app.load_run(rd))
             except Exception as exc:
                 _log(f"ERROR: {exc}", tag="error")
                 _log(traceback.format_exc(), tag="error")
@@ -2382,11 +2561,12 @@ class NewRunDialog(tk.Toplevel):
 
     def _start_hardware(self):
         self._app.launch_hardware_process(
-            uuid     = self._uuid_var.get().strip() or None,
-            dims_raw = self._hw_dims_var.get().strip(),
-            script   = self._hw_script_var.get(),
-            python   = self._hw_python_var.get(),
-            ckpt_dir = self._app.ckpt_dir,
+            uuid         = self._uuid_var.get().strip() or None,
+            dims_raw     = self._hw_dims_var.get().strip(),
+            script       = self._hw_script_var.get(),
+            python       = self._hw_python_var.get(),
+            ckpt_dir     = self._app.ckpt_dir,
+            hparams_path = self._hw_hparams_var.get().strip() or None,
         )
         self.destroy()
 
@@ -2460,6 +2640,15 @@ class HardwareResumeDialog(tk.Toplevel):
             row=row, column=1, sticky="w", **pad)
 
         row += 1
+        ttk.Label(f, text="Hyperparameters JSON (optional):").grid(
+            row=row, column=0, sticky="w", **pad)
+        self._hparams_var = tk.StringVar(value="")
+        hpf = ttk.Frame(f)
+        hpf.grid(row=row, column=1, sticky="w", pady=4)
+        ttk.Entry(hpf, textvariable=self._hparams_var, width=26).pack(side="left")
+        ttk.Button(hpf, text="…", width=3, command=self._browse_hparams).pack(side="left")
+
+        row += 1
         ttk.Separator(f, orient="horizontal").grid(
             row=row, column=0, columnspan=2, sticky="ew", pady=8)
 
@@ -2480,17 +2669,25 @@ class HardwareResumeDialog(tk.Toplevel):
         if p:
             self._script_var.set(p)
 
+    def _browse_hparams(self):
+        p = filedialog.askopenfilename(
+            title="Select hyperparameter JSON",
+            filetypes=[("JSON", "*.json"), ("All", "*")])
+        if p:
+            self._hparams_var.set(p)
+
     def _view_only(self):
         self.destroy()
         self._app.load_run(self._run_info["run_dir"])
 
     def _resume(self):
         self._app.launch_hardware_process(
-            uuid     = self._run_info["run_id"].removeprefix("run_"),
-            dims_raw = self._dims_var.get().strip(),
-            script   = self._script_var.get(),
-            python   = self._python_var.get(),
-            ckpt_dir = self._app.ckpt_dir,
+            uuid         = self._run_info["run_id"].removeprefix("run_"),
+            dims_raw     = self._dims_var.get().strip(),
+            script       = self._script_var.get(),
+            python       = self._python_var.get(),
+            ckpt_dir     = self._app.ckpt_dir,
+            hparams_path = self._hparams_var.get().strip() or None,
         )
         self.destroy()
 
@@ -2667,35 +2864,50 @@ class ZoMBIApp(tk.Tk):
 
     def launch_hardware_process(
         self,
-        uuid:     str | None = None,
-        dims_raw: str        = "",
-        script:   str | None = None,
-        python:   str | None = None,
-        ckpt_dir: str | None = None,
+        uuid:         str | None = None,
+        dims_raw:     str        = "",
+        script:       str | None = None,
+        python:       str | None = None,
+        ckpt_dir:     str | None = None,
+        hparams_path: str | None = None,
     ):
         """Spawn scripts/main.py as a subprocess and stream its output to the log panel.
 
-        uuid     – resume UUID (None = new run)
-        dims_raw – comma-separated dim indices, e.g. "0,8,9"
-        script   – path to main.py
-        python   – python executable
-        ckpt_dir – checkpoint directory (defaults to self.ckpt_dir)
+        uuid         – resume UUID (None = new run)
+        dims_raw     – comma-separated dim indices, e.g. "0,8,9"
+        script       – path to main.py
+        python       – python executable
+        ckpt_dir     – checkpoint directory (defaults to self.ckpt_dir)
+        hparams_path – optional path to a trial.json-style hyperparameter file
         """
         if script   is None: script   = str(Path(__file__).resolve().parent.parent / "scripts" / "main.py")
         if python   is None: python   = sys.executable
         if ckpt_dir is None: ckpt_dir = self.ckpt_dir
 
         proj_root = str(Path(script).resolve().parent.parent)
+
+        # For a new run, pre-generate the UUID so the run dir can be created and
+        # shown in the explorer the moment the run is launched (the subprocess
+        # adopts it via --run-uuid). Resume runs already know their UUID.
+        new_uuid = None if uuid else str(uuid4())[:4]
+
         cmd = [python, script] + ([uuid] if uuid else [])
         if dims_raw:
             cmd += ["--dims", dims_raw]
         cmd += ["--checkpoint-dir", ckpt_dir]
+        if hparams_path:
+            cmd += ["--hparams", hparams_path]
+        if new_uuid:
+            cmd += ["--run-uuid", new_uuid]
 
         self.log_to_main(f"Launching: {' '.join(cmd)}", tag="info")
 
-        # For a resume, we already know the run_dir — register it immediately.
-        if uuid:
-            run_dir = Path(ckpt_dir) / f"run_{uuid}"
+        # Register the run_dir immediately so it appears in the explorer the
+        # moment the run is launched — for both resume (known UUID) and new runs
+        # (pre-generated UUID above).
+        known_uuid = uuid or new_uuid
+        if known_uuid:
+            run_dir = Path(ckpt_dir) / f"run_{known_uuid}"
             self.after(0, lambda rd=run_dir, d=dims_raw: self.track_new_run(rd, hw_dims=d))
 
         _RE_UUID = re.compile(r"Starting new trial with UUID:\s*(\S+)", re.IGNORECASE)
@@ -2739,18 +2951,24 @@ class ZoMBIApp(tk.Tk):
 
         threading.Thread(target=_pump, daemon=True).start()
 
-    def track_new_run(self, run_dir, hw_dims: str = ""):
-        """Register a just-started run so the poll loop watches it from the first snapshot."""
+    def track_new_run(self, run_dir, hw_dims: str = "", hw: bool = True):
+        """Register a just-started run so the poll loop watches it from the first snapshot.
+
+        hw : True for hardware runs (writes hw_config.json + shows the green HW-run
+             indicator). False for in-process synthetic runs.
+        """
         run_dir_path = Path(run_dir)
         # Ensure the directory and a stub config.json exist so scan_runs() lists
         # the run immediately, before ZoMBI writes its own config.
         run_dir_path.mkdir(parents=True, exist_ok=True)
         cfg_path = run_dir_path / "config.json"
         if not cfg_path.exists():
-            cfg_path.write_text(json.dumps({"status": "running", "source": "hardware"}))
-        # Write hw_config.json with dims so Resume dialog can pre-fill them.
-        hw_cfg = run_dir_path / "hw_config.json"
-        hw_cfg.write_text(json.dumps({"dims": hw_dims, "source": "hardware"}))
+            cfg_path.write_text(json.dumps(
+                {"status": "running", "source": "hardware" if hw else "synthetic"}))
+        if hw:
+            # Write hw_config.json with dims so Resume dialog can pre-fill them.
+            hw_cfg = run_dir_path / "hw_config.json"
+            hw_cfg.write_text(json.dumps({"dims": hw_dims, "source": "hardware"}))
 
         try:
             rd = load_run(run_dir_path)
@@ -2762,7 +2980,8 @@ class ZoMBIApp(tk.Tk):
         self._viewed_run_id = rd.run_id
         self._refresh_all(rd)
         self.run_browser.refresh()
-        self.run_browser.set_hw_uuid(rd.run_id)
+        if hw:
+            self.run_browser.set_hw_uuid(rd.run_id)
         self.set_status(f"Running: {rd.run_id} — waiting for first snapshot …")
 
     def load_snapshot(self, snapshot_name: str):

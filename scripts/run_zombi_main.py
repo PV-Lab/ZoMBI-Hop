@@ -47,6 +47,66 @@ OPTIMIZING_DIMS = [0, 8, 9]
 # to minimize (we negate for the GP; plots/logs show measured y).
 MINIMIZE_OBJECTIVE = False
 
+# Built-in (arbitrary) ZoMBI-Hop hyperparameters used when no --hparams JSON file
+# is supplied. Copied verbatim from optimize/runs/mobo_05_06_15_32/trial_112.
+# Keep in sync with DEFAULT_HPARAMS in interface/app.py.
+DEFAULT_HW_HPARAMS: Dict[str, Any] = {
+    "nat_grad_step": 0.00100187,
+    "nat_grad_max_steps": 54,
+    "n_restarts": 285,
+    "raw": 200,
+    "ucb_beta": 1.45791911,
+    "max_zooms": 3,
+    "max_iterations": 8,
+    "top_m_points": 8,
+    "n_consecutive_converged": 1,
+    "convergence_pi_threshold": 0.05,
+    "input_noise_threshold_mult": 3.98353261,
+    "output_noise_threshold_mult": 0.52251166,
+    "max_penalty_radius": 4.56475059,
+    "needle_shrink_factor": 0.637987,
+    "needle_stop_noise_multiplier": 2.81839283,
+    "paring_spatial_halfnoise": 1.21375814,
+    "paring_y_noise_multiplier": 4.19507699,
+}
+
+# ZoMBIHop tunable kwargs that may be set from a hyperparameter JSON file.
+_VALID_HPARAM_KEYS = {
+    "max_zooms", "max_iterations", "top_m_points", "n_restarts", "raw",
+    "convergence_pi_threshold", "input_noise_threshold_mult",
+    "output_noise_threshold_mult", "n_consecutive_converged", "max_gp_points",
+    "repulsion_lambda", "acquisition_type", "ucb_beta", "nat_grad_step",
+    "nat_grad_max_steps", "ellipsoid_drop_fraction", "ellipsoid_eigenvalue_floor",
+    "max_penalty_radius", "paring_spatial_halfnoise", "paring_y_noise_multiplier",
+    "input_noise_ilr", "needle_shrink_factor", "needle_stop_noise_multiplier",
+    "zoom_jaccard_threshold", "bounds_shrink_factor", "min_axis_noise_mult",
+    "jaccard_window", "jaccard_threshold",
+}
+
+
+def _load_hparams_file(path: str) -> Dict[str, Any]:
+    """
+    Load hyperparameters from a trial.json-style file.
+
+    Accepts a top-level ``"hparams"`` object (as in optimize/runs/.../trial.json)
+    or a flat ``{name: value}`` object. Returns only keys ZoMBIHop accepts;
+    unknown keys (metrics, trial, phase, …) are ignored. Returns {} on failure.
+    """
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        print(f"[ZoMBI] WARNING: could not read hyperparameters from {path!r}: {exc}")
+        return {}
+    if not isinstance(data, dict):
+        print(f"[ZoMBI] WARNING: {path!r} is not a JSON object; ignoring.")
+        return {}
+    hp = data.get("hparams", data)
+    if not isinstance(hp, dict):
+        print(f"[ZoMBI] WARNING: 'hparams' in {path!r} is not an object; ignoring.")
+        return {}
+    return {k: v for k, v in hp.items() if k in _VALID_HPARAM_KEYS}
+
 
 def y_measured_to_optimizer(y: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
     """Map apparatus / DB y to the value the GP + acquisition maximize."""
@@ -160,10 +220,20 @@ def _write_live_plot_state(
         }
         for n in needle_plot_points:
             try:
-                si = int(n["sample_idx"]) - 1
-                if 0 <= si < len(all_x_actual):
+                # Prefer the needle's true composition recorded at declaration.
+                # Fall back to the sample-index lookup only for legacy records
+                # that predate the "point" field.  Note: sample_idx indexes the
+                # DataHandler arrays (which include the initial data) while
+                # all_x_actual does not, so the lookup is offset and only kept
+                # for backward compatibility.
+                pt = n.get("point")
+                if pt is None:
+                    si = int(n["sample_idx"]) - 1
+                    if 0 <= si < len(all_x_actual):
+                        pt = all_x_actual[si].tolist()
+                if pt is not None:
                     state["needles"].append({
-                        "point": all_x_actual[si].tolist(),
+                        "point": list(pt),
                         "y": float(n["y"]),
                     })
             except Exception:
@@ -866,21 +936,44 @@ def _load_needles_for_plot(
             y_val = float(rec["value"])
         except (KeyError, TypeError, ValueError):
             continue
-        # Closest point index in all_x_actual (1-based sample number)
+        # Closest point index in all_x_actual (1-based sample number); used only
+        # for the matplotlib sample-number axis.  The live_plot_state "point" is
+        # taken from the needle's true composition below.
         dists = np.linalg.norm(X - pt, axis=1)
         idx = int(np.argmin(dists))
         sample_idx = idx + 1
         distance = float(np.linalg.norm(pt - center))
-        out.append({"sample_idx": sample_idx, "y": y_val, "distance": distance})
+        out.append({"sample_idx": sample_idx, "point": pt.ravel().tolist(),
+                    "y": y_val, "distance": distance})
     return out
 
 
 def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None = None,
-                   checkpoint_dir: str | None = None):
-    """Run DB-driven ZoMBI-Hop loop (new or resume)."""
+                   checkpoint_dir: str | None = None, hparams_path: str | None = None,
+                   new_run_uuid: str | None = None):
+    """Run DB-driven ZoMBI-Hop loop (new or resume).
+
+    hparams_path : optional path to a trial.json-style JSON file whose 'hparams'
+        override DEFAULT_HW_HPARAMS for this run.
+    new_run_uuid : optional caller-provided UUID for a *new* run. Lets the GUI
+        pre-create and display the run directory the moment the run is launched,
+        before any data has been collected. Ignored when resuming.
+    """
     global OPTIMIZING_DIMS
     if optimizing_dims is not None:
         OPTIMIZING_DIMS = list(optimizing_dims)
+
+    # Merge built-in defaults with any user-supplied hyperparameter file.
+    hw_hparams: Dict[str, Any] = dict(DEFAULT_HW_HPARAMS)
+    if hparams_path:
+        overrides = _load_hparams_file(hparams_path)
+        if overrides:
+            hw_hparams.update(overrides)
+            print(f"[ZoMBI] Applied {len(overrides)} hyperparameter override(s) "
+                  f"from {hparams_path}: {overrides}")
+        else:
+            print(f"[ZoMBI] No usable hyperparameters found in {hparams_path}; "
+                  f"using built-in defaults.")
 
     # Clear objective DB and handshake so the first read waits for fresh data (new run or resume).
     communication.reset_objective()
@@ -971,34 +1064,23 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
         X_init_expected = torch.cat(x_expected_list, dim=0)
         Y_init = torch.cat(y_list, dim=0).reshape(-1, 1)
 
-        # ZoMBI hyperparameters: hyperparam_results_v2.json → best_so_far.config (MOBO eval 52)
+        # ZoMBI hyperparameters: DEFAULT_HW_HPARAMS, optionally overridden by --hparams.
+        new_hparams = dict(hw_hparams)
+        new_hparams.setdefault("top_m_points", max(dimensions + 1, 4))
         optimizer = ZoMBIHop(
             objective=objective_wrapper,
             X_init_actual=X_init_actual,
             X_init_expected=X_init_expected,
             Y_init=Y_init,
-            max_zooms=6,
-            max_iterations=12,
-            top_m_points=max(dimensions + 1, 4),
-            n_restarts=100,
-            raw=1323,
-            convergence_pi_threshold=0.001,
-            input_noise_threshold_mult=2.0,
-            output_noise_threshold_mult=0.5,
-            n_consecutive_converged=5,
-            max_gp_points=3000,
-            acquisition_type="ucb",
-            ucb_beta=0.6677950695897094,
-            nat_grad_step=0.024757059158665974,
-            nat_grad_max_steps=67,
-            max_penalty_radius=0.16398949475603125,
             device=str(device),
             dtype=dtype,
-            run_uuid=None,
+            run_uuid=new_run_uuid,
+            resume=False,
             checkpoint_dir=str(ckpt_path),
             num_iterations_saved=50,
             verbose=True,
             needle_plot_points_ref=needle_plot_points,
+            **new_hparams,
         )
 
         run_dir_ref[0] = ckpt_path / f"run_{optimizer.run_uuid}"
@@ -1016,10 +1098,6 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
             X_init_actual=_dummy,
             X_init_expected=_dummy,
             Y_init=torch.zeros(0, 1, device=device, dtype=dtype),
-            acquisition_type="ucb",
-            ucb_beta=0.6677950695897094,
-            nat_grad_step=0.024757059158665974,
-            nat_grad_max_steps=67,
             device=str(device),
             dtype=dtype,
             run_uuid=resume_uuid,
@@ -1027,6 +1105,7 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
             num_iterations_saved=50,
             verbose=True,
             needle_plot_points_ref=needle_plot_points,
+            **hw_hparams,
         )
         run_dir_ref[0] = run_dir
         optimizer_ref[0] = optimizer
