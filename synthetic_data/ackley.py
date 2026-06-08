@@ -19,7 +19,7 @@ The ``Ackley`` class exposes a ``predict(X)`` method matching scikit-learn's
 
 For the "realistic" variant, ``Ackley("realistic")`` reads its parameters
 (``n_optima``, ``basin_width``, ``noise_freq``, ``noise_amp``) from
-``synthetic_data/configs/defaults.json``.  You can override any of them via
+``synthetic_data/ackley/defaults.json``.  You can override any of them via
 keyword arguments::
 
     fn = Ackley("realistic", dim=3, n_optima=5, noise_amp=10.0)
@@ -44,9 +44,10 @@ import json
 from pathlib import Path
 
 import numpy as np
+from sklearn.ensemble import RandomForestRegressor
 
 # ── Config file for tunable defaults ─────────────────────────────────────────
-_CONFIGS_DIR = Path(__file__).resolve().parent / "configs"
+_CONFIGS_DIR = Path(__file__).resolve().parent / "ackley"
 _DEFAULTS_PATH = _CONFIGS_DIR / "defaults.json"
 
 _HARDCODED_DEFAULTS = {
@@ -58,7 +59,7 @@ _HARDCODED_DEFAULTS = {
 
 
 def load_config() -> dict:
-    """Load tunable defaults from ``synthetic_data/configs/defaults.json``."""
+    """Load tunable defaults from ``synthetic_data/ackley/defaults.json``."""
     if _DEFAULTS_PATH.exists():
         with open(_DEFAULTS_PATH) as f:
             return json.load(f)
@@ -66,7 +67,7 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    """Write tunable defaults to ``synthetic_data/configs/defaults.json``."""
+    """Write tunable defaults to ``synthetic_data/ackley/defaults.json``."""
     _CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
     with open(_DEFAULTS_PATH, "w") as f:
         json.dump(cfg, f, indent=4)
@@ -79,6 +80,8 @@ ACKLEY_B_SKINNY = 1.2
 ACKLEY_C = 2.0 * np.pi
 ACKLEY_SCALE = 30.0
 _RANGE_SAMPLES = 100_000  # simplex samples used to estimate raw min/max for [0.5, 1] scaling
+RF_N_SAMPLES = 650
+RF_N_ESTIMATORS = 500
 
 
 # ── Dimension-general variant helpers ────────────────────────────────────────
@@ -185,7 +188,7 @@ class Ackley:
     """A negated Ackley objective on the ``dim``-element probability simplex.
 
     For the ``"realistic"`` variant, parameters are read from
-    ``synthetic_data/configs/defaults.json`` and can be overridden via kwargs.
+    ``synthetic_data/ackley/defaults.json`` and can be overridden via kwargs.
     All other variants ignore the extra kwargs.
 
     Parameters
@@ -261,6 +264,17 @@ class Ackley:
         self._raw_min = float(_raw.min())
         self._raw_max = float(_raw.max())
 
+        # Train an RF surrogate on the analytic function so that all external
+        # predictions go through the same RF-reconstruction process used on
+        # real experimental data.
+        rf_rng = np.random.default_rng(99)
+        X_rf = rf_rng.dirichlet(np.ones(dim), size=RF_N_SAMPLES)
+        y_rf = self._predict_analytic(X_rf)
+        self._rf = RandomForestRegressor(
+            n_estimators=RF_N_ESTIMATORS, n_jobs=-1, random_state=42,
+        )
+        self._rf.fit(X_rf, y_rf)
+
     def _predict_raw(self, X: np.ndarray) -> np.ndarray:
         X = np.atleast_2d(np.asarray(X, dtype=float))
         terms = np.stack(
@@ -279,15 +293,20 @@ class Ackley:
             )
         return result
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
+    def _predict_analytic(self, X: np.ndarray) -> np.ndarray:
+        """Scaled analytic prediction (no RF). Used to generate RF training data."""
         raw = self._predict_raw(X)
         span = self._raw_max - self._raw_min
         if span < 1e-12:
             return np.full(raw.shape, 0.75)
         return 0.5 + 0.5 * (raw - self._raw_min) / span
 
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+        return self._rf.predict(X)
+
     def __call__(self, x: np.ndarray) -> float:
-        return float(self.predict(np.asarray(x, dtype=float).reshape(1, -1))[0])
+        return float(self._rf.predict(np.asarray(x, dtype=float).reshape(1, -1))[0])
 
     @property
     def known_maxima(self) -> list[tuple[np.ndarray, float]]:

@@ -6,7 +6,7 @@ objective value is encoded as colour.
 
 Runs a Dash app with sliders for noise frequency, noise amplitude, number of
 Ackley optima, basin width, and grid resolution.  Click "Save as Default" to
-persist slider values to ``synthetic_data/configs/defaults.json``.
+persist slider values to ``synthetic_data/ackley/defaults.json``.
 
 Usage:
     python point_cloud_4d.py

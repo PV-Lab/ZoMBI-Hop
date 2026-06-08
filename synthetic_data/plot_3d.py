@@ -3,7 +3,7 @@
 Runs a Dash app with sliders for noise frequency, noise amplitude, number of
 Ackley optima, and basin width.  The ternary heatmap updates in real time as
 you drag any slider.  Click "Save as Default" to persist the current slider
-values to ``synthetic_data/configs/defaults.json``.
+values to ``synthetic_data/ackley/defaults.json``.
 
 Usage:
     python plot_3d.py
