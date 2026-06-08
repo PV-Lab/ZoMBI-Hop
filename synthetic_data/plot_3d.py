@@ -1,80 +1,136 @@
-"""Interactive ternary plot of a 3D negated-Ackley objective.
+"""Interactive ternary plot of a tunable realistic Ackley + noise objective.
 
-Evaluates one of the analytic negated-Ackley variants from
-``synthetic_data/ackley.py`` on the 3-element probability simplex
-(x1 + x2 + x3 = 1) and renders it as a single ternary heatmap. Because the
-3-simplex *is* the ternary, the whole objective fits in one plot -- there is no
-hidden dimension to slice, so (unlike plot_4d.py) there is no slider. The
-objective is analytic, so the grid is evaluated directly (no scattered-data
-interpolation). Output is a self-contained interactive HTML file that opens in
-your default browser -- no notebook, no kernel, no ipywidgets, no blocking GUI
-backend.
+Runs a Dash app with sliders for noise frequency, noise amplitude, number of
+Ackley optima, and basin width.  The ternary heatmap updates in real time as
+you drag any slider.  Click "Save as Default" to persist the current slider
+values to ``synthetic_data/configs/defaults.json``.
 
 Usage:
-    python plot_3d.py --ackley {centroid|edge|vertex|multimodal|realistic}
-
-The variant catalogue is defined once in ``synthetic_data/ackley.py``; adding a
-new mode there makes it available here automatically.
+    python plot_3d.py
 """
 
-import argparse
 import sys
-import webbrowser
 from pathlib import Path
 
 import numpy as np
 import plotly.graph_objects as go
+from dash import Dash, Input, Output, State, callback, ctx, dcc, html
 
 HERE = Path(__file__).resolve().parent
-# Make the repo root importable so this runs from any working directory.
 sys.path.insert(0, str(HERE.parent))
-from synthetic_data.ackley import Ackley  # noqa: E402
+from synthetic_data.ackley import Ackley, load_config, save_config  # noqa: E402
 
-DIM = 3          # plot the 3-element simplex (x1 + x2 + x3 = 1)
-GRID_N = 200     # resolution of the x1/x2/x3 ternary grid
-MARKER_SIZE = 4.0  # heatmap cell size in px; tune alongside GRID_N + FIG_W so cells just touch
-FIG_W, FIG_H = 900, 820
+DIM = 3
+GRID_N = 150
+MARKER_SIZE = 4.0
+FIG_W, FIG_H = 920, 860
 
 
-def build_grid(grid_n):
-    """Barycentric (a, b, c) nodes on the unit simplex, each summing to 1."""
+def build_grid(grid_n: int) -> np.ndarray:
     pts = [
         (i / grid_n, j / grid_n, (grid_n - i - j) / grid_n)
         for i in range(grid_n + 1)
         for j in range(grid_n + 1 - i)
     ]
-    bary = np.array(pts)
-    return bary[:, 0], bary[:, 1], bary[:, 2]
+    return np.array(pts)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Plot a 3D negated-Ackley objective as a ternary heatmap."
+GRID = build_grid(GRID_N)
+GA, GB, GC = GRID[:, 0], GRID[:, 1], GRID[:, 2]
+
+cfg = load_config()
+
+app = Dash(__name__)
+
+app.layout = html.Div([
+    html.H2("Tunable Realistic Ackley on the 3-Simplex",
+            style={"textAlign": "center"}),
+    html.Div([
+        html.Div([
+            html.Label("Number of Optima"),
+            dcc.Slider(id="n-optima", min=1, max=30, step=1,
+                       value=cfg["n_optima"],
+                       marks={i: str(i) for i in range(1, 31, 5)},
+                       tooltip={"placement": "bottom", "always_visible": True}),
+        ], style={"padding": "10px"}),
+        html.Div([
+            html.Label("Basin Width (b)"),
+            dcc.Slider(id="basin-width", min=1, max=200, step=1,
+                       value=cfg["basin_width"],
+                       marks={i: str(i) for i in range(0, 201, 25)},
+                       tooltip={"placement": "bottom", "always_visible": True}),
+        ], style={"padding": "10px"}),
+        html.Div([
+            html.Label("Noise Frequency"),
+            dcc.Slider(id="noise-freq", min=0, max=40, step=0.5,
+                       value=cfg["noise_freq"],
+                       marks={i: str(i) for i in range(0, 41, 5)},
+                       tooltip={"placement": "bottom", "always_visible": True}),
+        ], style={"padding": "10px"}),
+        html.Div([
+            html.Label("Noise Amplitude (relative to peaks)"),
+            dcc.Slider(id="noise-amp", min=0, max=2000, step=20,
+                       value=cfg["noise_amp"],
+                       marks={i: str(i) for i in range(0, 2000, 200)},
+                       tooltip={"placement": "bottom", "always_visible": True}),
+        ], style={"padding": "10px"}),
+        html.Div([
+            html.Button("Save as Default", id="save-btn", n_clicks=0,
+                        style={"marginTop": "10px", "padding": "8px 24px"}),
+            html.Span(id="save-status", style={"marginLeft": "12px"}),
+        ], style={"padding": "10px", "textAlign": "center"}),
+    ], style={"width": "60%", "margin": "0 auto"}),
+    dcc.Graph(id="ternary-plot", style={"height": f"{FIG_H}px"}),
+])
+
+
+@callback(
+    Output("save-status", "children"),
+    Input("save-btn", "n_clicks"),
+    State("n-optima", "value"),
+    State("basin-width", "value"),
+    State("noise-freq", "value"),
+    State("noise-amp", "value"),
+    prevent_initial_call=True,
+)
+def save_defaults(n_clicks, n_optima, basin_width, noise_freq, noise_amp):
+    save_config({
+        "n_optima": int(n_optima),
+        "basin_width": float(basin_width),
+        "noise_freq": float(noise_freq),
+        "noise_amp": float(noise_amp),
+    })
+    return "Saved!"
+
+
+@callback(
+    Output("ternary-plot", "figure"),
+    Input("n-optima", "value"),
+    Input("basin-width", "value"),
+    Input("noise-freq", "value"),
+    Input("noise-amp", "value"),
+)
+def update_plot(n_optima, basin_width, noise_freq, noise_amp):
+    fn = Ackley(
+        "realistic", dim=DIM,
+        n_optima=int(n_optima),
+        basin_width=float(basin_width),
+        noise_freq=float(noise_freq),
+        noise_amp=float(noise_amp),
     )
-    parser.add_argument(
-        "--ackley", required=True, choices=sorted(Ackley.VARIANTS),
-        help="Which analytic Ackley variant to plot (on the 3-element simplex).",
-    )
-    args = parser.parse_args()
-
-    variant = args.ackley
-    fn = Ackley(variant, dim=DIM)
-
-    ga, gb, gc = build_grid(GRID_N)
-    X = np.column_stack([ga, gb, gc])
-    obj = fn.predict(X)
-    obj_min = float(np.nanmin(obj))
-    obj_max = float(np.nanmax(obj))
+    obj = fn.predict(GRID)
+    obj_min, obj_max = float(np.nanmin(obj)), float(np.nanmax(obj))
 
     heat = go.Scatterternary(
-        a=ga, b=gb, c=gc, mode="markers", name="objective", hoverinfo="skip",
-        marker=dict(color=obj, colorscale="Viridis",
-                    cmin=obj_min, cmax=obj_max, size=MARKER_SIZE,
-                    showscale=True, colorbar=dict(title="Objective", x=1.02)),
+        a=GA, b=GB, c=GC, mode="markers", name="objective", hoverinfo="skip",
+        marker=dict(
+            color=obj, colorscale="Viridis",
+            cmin=obj_min, cmax=obj_max, size=MARKER_SIZE,
+            showscale=True, colorbar=dict(title="Objective", x=1.02),
+        ),
     )
     traces = [heat]
 
-    # Overlay the known analytic peak(s) as red stars.
     peaks = np.array(fn.centers)
     if len(peaks):
         traces.append(go.Scatterternary(
@@ -86,19 +142,20 @@ def main():
 
     fig = go.Figure(data=traces)
     fig.update_layout(
-        title=f"Negated Ackley ('{variant}') on the 3-simplex",
-        ternary=dict(sum=1, aaxis=dict(title="x1"), baxis=dict(title="x2"),
-                     caxis=dict(title="x3")),
-        # push the legend to the right of the colorbar (x=1.02) so they don't overlap
+        title=f"Tunable Realistic Ackley ({n_optima} peaks, b={basin_width})",
+        ternary=dict(
+            sum=1,
+            aaxis=dict(title="x1"),
+            baxis=dict(title="x2"),
+            caxis=dict(title="x3"),
+        ),
         legend=dict(x=1.18, y=1.0),
         width=FIG_W, height=FIG_H,
+        margin=dict(t=60),
     )
-
-    out_html = HERE / "simplex_plot_3d.html"
-    fig.write_html(out_html, include_plotlyjs="cdn", auto_open=False)
-    print(f"Wrote {out_html}")
-    webbrowser.open(out_html.as_uri())
+    return fig
 
 
 if __name__ == "__main__":
-    main()
+    print("Starting Dash app at http://127.0.0.1:8050")
+    app.run(debug=True)

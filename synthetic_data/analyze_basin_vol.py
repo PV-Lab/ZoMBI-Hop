@@ -36,7 +36,6 @@ from synthetic_data.ackley import Ackley  # noqa: E402
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 DIMENSIONS = [3, 4, 10]   # simplex dimensionalities to examine (one panel each)
-VARIANT = "realistic"     # which Ackley variant from Ackley.VARIANTS to analyze
 N_SAMPLES = 200_000       # uniform simplex samples used to estimate the distribution
 N_BINS = 80               # histogram bins per panel
 SEED = 0                  # RNG seed for reproducible sampling
@@ -76,9 +75,9 @@ def main():
     # Build the list of (title, objective-values, colour) panels.
     panels = []
     for dim in DIMENSIONS:
-        fn = Ackley(VARIANT, dim=dim)
+        fn = Ackley("realistic", dim=dim)
         y = fn.predict(sample_simplex(dim, N_SAMPLES, rng))
-        panels.append((f"Ackley '{VARIANT}'\ndim = {dim}", y, "steelblue"))
+        panels.append((f"Ackley 'realistic'\ndim = {dim}", y, "steelblue"))
 
     if INCLUDE_RF:
         rf = load_rf_surrogate()
@@ -109,7 +108,7 @@ def main():
     axes[0].set_ylabel("count")
     fig.suptitle(
         f"Objective distribution over the simplex "
-        f"(Ackley '{VARIANT}' vs. campaign1a RF, {N_SAMPLES:,} uniform samples each)",
+        f"(Ackley 'realistic' vs. campaign1a RF, {N_SAMPLES:,} uniform samples each)",
         fontsize=13,
     )
     fig.tight_layout()
