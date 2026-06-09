@@ -14,6 +14,7 @@ from botorch.models import SingleTaskGP
 from botorch.fit import fit_gpytorch_mll
 from botorch.acquisition import LogExpectedImprovement, UpperConfidenceBound
 from gpytorch.mlls import ExactMarginalLogLikelihood
+from gpytorch.utils.errors import NotPSDError
 from torch.autograd import grad
 from typing import Literal, Optional, Tuple, Callable, List
 
@@ -248,6 +249,8 @@ class GPSimplex:
         self._tangent_basis: Optional[torch.Tensor] = None  # cached (d, d-1)
         self.ilr_std: Optional[torch.Tensor] = None  # per-dimension ILR std from last fit
 
+    _JITTER_SCHEDULE = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2]
+
     def fit(self, X: torch.Tensor, Y: torch.Tensor):
         """
         Fit GP to data.
@@ -265,10 +268,30 @@ class GPSimplex:
         X_ilr = composition_to_ilr(X)
         ilr_std = X_ilr.std(dim=0).clamp(min=1e-3)
         self.ilr_std = ilr_std
-        self.gp = SingleTaskGP(X_ilr / ilr_std, Y)
-        self.mll = ExactMarginalLogLikelihood(self.gp.likelihood, self.gp)
+        X_norm = X_ilr / ilr_std
+
         _t0 = time.time()
-        fit_gpytorch_mll(self.mll)
+        last_exc: Exception | None = None
+        for jitter in [0.0, *self._JITTER_SCHEDULE]:
+            try:
+                if jitter > 0.0:
+                    noise = torch.randn_like(X_norm) * jitter
+                    X_fit = X_norm + noise
+                else:
+                    X_fit = X_norm
+                self.gp = SingleTaskGP(X_fit, Y)
+                self.mll = ExactMarginalLogLikelihood(self.gp.likelihood, self.gp)
+                fit_gpytorch_mll(self.mll)
+                if jitter > 0.0:
+                    print(f"  [GP.fit] recovered with jitter={jitter:.0e}")
+                break
+            except (NotPSDError, RuntimeError) as exc:
+                last_exc = exc
+                continue
+        else:
+            raise RuntimeError(
+                f"GP fit failed after all jitter levels: {last_exc}"
+            ) from last_exc
         if self.verbose:
             print(f"  [GP.fit] MLL: {time.time()-_t0:.2f}s  ({X.shape[0]} pts)")
         self.data_handler.update_gp_noise(self.get_output_noise())
@@ -299,7 +322,12 @@ class GPSimplex:
         x_ilr = composition_to_ilr(X)
         if self.ilr_std is not None:
             x_ilr = x_ilr / self.ilr_std
-        posterior = self.gp.posterior(x_ilr)
+        try:
+            posterior = self.gp.posterior(x_ilr)
+        except (NotPSDError, RuntimeError):
+            mean = torch.zeros(X.shape[0], 1, device=self.device, dtype=self.dtype)
+            var = torch.ones(X.shape[0], 1, device=self.device, dtype=self.dtype)
+            return mean, var
         return posterior.mean, posterior.variance
 
     def get_output_noise(self) -> float:
@@ -331,7 +359,10 @@ class GPSimplex:
             x_ilr = composition_to_ilr(x_2d)
             if self.ilr_std is not None:
                 x_ilr = x_ilr / self.ilr_std
-            posterior = self.gp.posterior(x_ilr)
+            try:
+                posterior = self.gp.posterior(x_ilr)
+            except (NotPSDError, RuntimeError):
+                return 0.0
             mu = posterior.mean.squeeze().item()
             var = posterior.variance.squeeze().item()
         sigma = max(var ** 0.5, 1e-9)
@@ -361,17 +392,19 @@ class GPSimplex:
         if self.ilr_std is not None:
             x_ilr = x_ilr / self.ilr_std
         x_ilr_3d = x_ilr.unsqueeze(0)  # (1, 1, d-1)
-        if self.acquisition_type == "ei":
-            base_acq = LogExpectedImprovement(self.gp, best_f=best_f)
-            with torch.no_grad():
-                val = base_acq(x_ilr_3d).squeeze().item()
-            return val
-        else:
-            # UCB: return acquisition value at point for logging (not log EI)
-            base_acq = UpperConfidenceBound(self.gp, beta=self.ucb_beta)
-            with torch.no_grad():
-                val = base_acq(x_ilr_3d).squeeze().item()
-            return val
+        try:
+            if self.acquisition_type == "ei":
+                base_acq = LogExpectedImprovement(self.gp, best_f=best_f)
+                with torch.no_grad():
+                    val = base_acq(x_ilr_3d).squeeze().item()
+                return val
+            else:
+                base_acq = UpperConfidenceBound(self.gp, beta=self.ucb_beta)
+                with torch.no_grad():
+                    val = base_acq(x_ilr_3d).squeeze().item()
+                return val
+        except (NotPSDError, RuntimeError):
+            return float('-inf')
 
     def create_acquisition(
         self,
@@ -526,6 +559,18 @@ class GPSimplex:
 
         _t_total = time.time()
 
+        try:
+            return self._get_candidate_inner(bounds, best_f, max_attempts,
+                                             exclude_near, exclude_near_tol,
+                                             _t_total)
+        except (NotPSDError, RuntimeError) as exc:
+            if "singular" in str(exc).lower() or "cholesky" in str(exc).lower() or isinstance(exc, NotPSDError):
+                print(f"  [GP] get_candidate: numerical failure ({type(exc).__name__}), skipping iteration")
+                return None
+            raise
+
+    def _get_candidate_inner(self, bounds, best_f, max_attempts,
+                             exclude_near, exclude_near_tol, _t_total):
         # Create acquisition function
         acq = self.create_acquisition(best_f=best_f)
 
