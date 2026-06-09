@@ -36,7 +36,7 @@ def build_grid(grid_n: int) -> np.ndarray:
 
 
 GRID = build_grid(GRID_N)
-GA, GB, GC = GRID[:, 0], GRID[:, 1], GRID[:, 2]
+GA, GB, GC = GRID[:, 2], GRID[:, 0], GRID[:, 1]
 
 cfg = load_config()
 
@@ -134,7 +134,7 @@ def update_plot(n_optima, basin_width, noise_freq, noise_amp):
     peaks = np.array(fn.centers)
     if len(peaks):
         traces.append(go.Scatterternary(
-            a=peaks[:, 0], b=peaks[:, 1], c=peaks[:, 2], mode="markers",
+            a=peaks[:, 2], b=peaks[:, 0], c=peaks[:, 1], mode="markers",
             name="known peak",
             marker=dict(symbol="star", color="red", size=14,
                         line=dict(color="white", width=1)),
@@ -145,9 +145,9 @@ def update_plot(n_optima, basin_width, noise_freq, noise_amp):
         title=f"Tunable Realistic Ackley ({n_optima} peaks, b={basin_width})",
         ternary=dict(
             sum=1,
-            aaxis=dict(title="x1"),
-            baxis=dict(title="x2"),
-            caxis=dict(title="x3"),
+            aaxis=dict(title="x3"),
+            baxis=dict(title="x1"),
+            caxis=dict(title="x2"),
         ),
         legend=dict(x=1.18, y=1.0),
         width=FIG_W, height=FIG_H,
