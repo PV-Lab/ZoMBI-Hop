@@ -5,6 +5,7 @@
 #   bash scripts/probe_cluster.sh info              # partition/account limits
 #   bash scripts/probe_cluster.sh cpu               # 1-trial CPU, 3D campaign
 #   bash scripts/probe_cluster.sh gpu-campaign      # 1-trial GPU, 3D campaign RF
+#   bash scripts/probe_cluster.sh gpu-synthetic       # 1-trial GPU, 3D messy synthetic RF
 #   bash scripts/probe_cluster.sh gpu-ackley        # 1-trial GPU, Ackley 10D
 #   bash scripts/probe_cluster.sh both-campaign     # CPU + GPU campaign probes
 #   bash scripts/probe_cluster.sh summarize         # timing from optimize/runs
@@ -55,8 +56,13 @@ print_cluster_info() {
   echo "  slurm/probe_mobo.sbatch     short probe, MOBO_MAX_TRIALS=${MOBO_MAX_TRIALS:-1}"
   echo ""
   echo "Probe configs:"
-  echo "  probe_campaign_gpu.json  — 1 trial, 0.4 h/trial, 3D RF campaign"
-  echo "  ackley_10d_layout1.json — Ackley 10D synthetic benchmark"
+  echo "  probe_campaign_gpu.json   — 1 trial, 0.4 h/trial, 3D RF campaign"
+  echo "  probe_synthetic_messy_gpu.json — 1 trial, 3D messy synthetic RF"
+  echo "  ackley_10d_layout1.json   — Ackley 10D synthetic benchmark"
+  echo ""
+  echo "Synthetic data:"
+  echo "  bash scripts/generate_synthetic_mobo_data.sh"
+  echo "  MOBO_MANIFEST=optimize/mobo_batch_manifest_synthetic_3d.json bash scripts/submit_mobo_batch.sh"
 }
 
 submit_probe() {
@@ -97,6 +103,12 @@ case "${MODE}" in
     echo ""
     submit_probe gpu ackley
     ;;
+  gpu-synthetic)
+    print_cluster_info
+    echo ""
+    MOBO_CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/probe_synthetic_messy_gpu.json}" \
+      submit_probe gpu synthetic
+    ;;
   both|both-campaign)
     print_cluster_info
     echo ""
@@ -109,7 +121,7 @@ case "${MODE}" in
     python "${REPO}/scripts/summarize_mobo_runs.py"
     ;;
   *)
-    echo "Usage: bash scripts/probe_cluster.sh [info|cpu|gpu-campaign|gpu-ackley|both-campaign|summarize]" >&2
+    echo "Usage: bash scripts/probe_cluster.sh [info|cpu|gpu-campaign|gpu-synthetic|gpu-ackley|both-campaign|summarize]" >&2
     echo "       (gpu is an alias for gpu-campaign)" >&2
     exit 1
     ;;

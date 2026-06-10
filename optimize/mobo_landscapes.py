@@ -22,11 +22,35 @@ if _REPO not in sys.path:
 
 # ─── Composition column naming ───────────────────────────────────────────────────
 
+CAMPAIGN_COMPOSITION_COLS = ["FAPbI3", "MAPbI3", "MAPbBr3"]
+
+
 def composition_column_names(dim: int) -> list[str]:
     """CSV column names for simplex compositions (FA/MA/Br when d=3)."""
     if dim == 3:
         return ["FA", "MA", "Br"]
     return [f"x{i}" for i in range(dim)]
+
+
+def infer_composition_columns(df, *, explicit: list[str] | None = None) -> list[str]:
+    """Pick composition columns from config, metadata-style names, or campaign CSV."""
+    if explicit:
+        missing = [c for c in explicit if c not in df.columns]
+        if missing:
+            raise ValueError(f"composition_columns missing from CSV: {missing}")
+        return list(explicit)
+    for candidate in (CAMPAIGN_COMPOSITION_COLS, [f"Comp{i + 1}" for i in range(20)]):
+        cols = [c for c in candidate if c in df.columns]
+        if len(cols) >= 2 and all(c in df.columns for c in cols):
+            # Comp* columns must be contiguous from Comp1.
+            if cols[0].startswith("Comp"):
+                while len(cols) < 20 and f"Comp{len(cols) + 1}" in df.columns:
+                    cols.append(f"Comp{len(cols) + 1}")
+            return cols
+    raise ValueError(
+        "Could not infer composition columns; set 'composition_columns' in the batch JSON "
+        f"or use {CAMPAIGN_COMPOSITION_COLS} / Comp1..CompN."
+    )
 
 
 # ─── Multi-Ackley (composition space) ─────────────────────────────────────────
@@ -164,6 +188,9 @@ class LandscapeSpec:
     ackley_b: float | None = None
     csv_path: str | None = None
     objective_column: str = "Objective"
+    composition_columns: list[str] | None = None
+    oracle: str | None = None
+    metadata_path: str | None = None
 
     @property
     def render_ternary(self) -> bool:
@@ -178,7 +205,9 @@ class LandscapeSpec:
     def label(self) -> str:
         if self.landscape == "ackley":
             return f"MultiAckley-{self.dim}D-L{self.ackley_layout}"
-        return "RF surrogate"
+        if self.oracle:
+            return f"RF surrogate ({self.oracle}, {self.dim}D)"
+        return f"RF surrogate ({self.dim}D)"
 
 
 def build_ackley_landscape(
@@ -206,17 +235,28 @@ def build_ackley_landscape(
 def build_rf_landscape(
     rf_fn: ObjectiveFn,
     true_optima: list[np.ndarray],
-    grid_pts: np.ndarray,
-    grid_vals: np.ndarray,
+    grid_pts: np.ndarray | None,
+    grid_vals: np.ndarray | None,
     *,
     maximize: bool,
     csv_path: str,
     objective_column: str = "Objective",
+    composition_columns: list[str] | None = None,
+    dim: int | None = None,
+    oracle: str | None = None,
+    metadata_path: str | None = None,
     time_limit_hours: float | None = 0.4,
 ) -> LandscapeSpec:
+    resolved_dim = dim
+    if resolved_dim is None and composition_columns:
+        resolved_dim = len(composition_columns)
+    if resolved_dim is None and true_optima:
+        resolved_dim = int(np.asarray(true_optima[0]).size)
+    if resolved_dim is None:
+        resolved_dim = 3
     return LandscapeSpec(
         landscape="rf",
-        dim=3,
+        dim=resolved_dim,
         maximize=maximize,
         true_optima=true_optima,
         fn_callable=rf_fn,
@@ -226,6 +266,9 @@ def build_rf_landscape(
         max_activations=float("inf"),
         csv_path=os.path.abspath(csv_path),
         objective_column=objective_column,
+        composition_columns=composition_columns,
+        oracle=oracle,
+        metadata_path=metadata_path,
     )
 
 
@@ -247,14 +290,23 @@ def landscape_from_run_config(cfg: dict, *, build_rf_and_grid) -> LandscapeSpec:
 
     csv_path = cfg["csv_path"]
     obj_col = cfg.get("objective_column", "Objective")
+    comp_cols = cfg.get("composition_columns")
     maximize = bool(cfg.get("maximize", False))
     true_optima = [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
-    _, rf_fn, grid_pts, grid_vals = build_rf_and_grid(csv_path, objective_column=obj_col)
+    _, rf_fn, grid_pts, grid_vals, resolved_cols, resolved_dim = build_rf_and_grid(
+        csv_path,
+        objective_column=obj_col,
+        composition_columns=comp_cols,
+    )
     return build_rf_landscape(
         rf_fn, true_optima, grid_pts, grid_vals,
         maximize=maximize,
         csv_path=csv_path,
         objective_column=obj_col,
+        composition_columns=resolved_cols,
+        dim=resolved_dim,
+        oracle=cfg.get("oracle"),
+        metadata_path=cfg.get("metadata_path"),
         time_limit_hours=time_limit,
     )
 

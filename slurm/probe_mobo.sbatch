@@ -37,6 +37,8 @@ if [[ "${PROBE_TARGET}" == "gpu" ]]; then
   CPUS="${SLURM_CPUS_PER_TASK:-8}"
   if [[ "${PROBE_LANDSCAPE}" == "ackley" ]]; then
     CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/ackley_10d_layout1.json}"
+  elif [[ "${PROBE_LANDSCAPE}" == "synthetic" ]]; then
+    CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/probe_synthetic_messy_gpu.json}"
   else
     CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/probe_campaign_gpu.json}"
   fi

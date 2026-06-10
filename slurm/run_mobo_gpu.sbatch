@@ -9,7 +9,7 @@
 #SBATCH --error=logs/mobo-gpu-%j.err
 
 set -euo pipefail
-# 3D campaign RF MOBO on GPU (optimize/run_mobo.py).
+# 3D RF MOBO on GPU — campaign1a or synthetic surrogates (optimize/run_mobo.py).
 #
 # Submit from repo root:
 #   cd ~/ZoMBI-Hop && sbatch slurm/run_mobo_gpu.sbatch
@@ -17,6 +17,11 @@ set -euo pipefail
 # Quick probe (1 trial):
 #   MOBO_MAX_TRIALS=1 sbatch slurm/run_mobo_gpu.sbatch
 #   bash scripts/probe_cluster.sh gpu-campaign
+#   bash scripts/probe_cluster.sh gpu-synthetic
+#
+# Synthetic 3D RF (generate data first):
+#   bash scripts/generate_synthetic_mobo_data.sh
+#   MOBO_CONFIG=optimize/mobo_batch_configs/synthetic_3d_messy_rf_max.json sbatch slurm/run_mobo_gpu.sbatch
 #
 # Override config / trials:
 #   MOBO_CONFIG=optimize/mobo_batch_configs/campaign1a_objective_min.json \

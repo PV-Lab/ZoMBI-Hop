@@ -4,7 +4,8 @@ optimize/run_mobo.py
 Multi-objective Bayesian optimisation (MOBO) of ZoMBI-Hop hyperparameters.
 
 Landscapes (``--landscape`` or batch JSON ``"landscape"`` field):
-  • ``rf`` (default) — Random-Forest surrogate on the 3-component ternary simplex
+  • ``rf`` (default) — Random-Forest surrogate on a composition simplex CSV
+                       (campaign1a or synthetic_data/data/campaign*d_synthetic_*.csv)
   • ``ackley``       — Multi-Ackley sum on the d-dimensional probability simplex
 
 Three objectives (all minimised):
@@ -83,6 +84,10 @@ Non-interactive / MIT ORCD HPC
 ------------------------------
   # Campaign RF (headless JSON config):
   MPLBACKEND=Agg python optimize/run_mobo.py --batch --config optimize/mobo_batch_configs/campaign1a_objective_min.json
+
+  # Synthetic 3D RF (generate CSVs first):
+  python synthetic_data/generate_synthetic_campaign.py --all-3d
+  MPLBACKEND=Agg python optimize/run_mobo.py --batch --config optimize/mobo_batch_configs/synthetic_3d_messy_rf_max.json
 
   # 10D Multi-Ackley synthetic benchmark:
   MPLBACKEND=Agg python optimize/run_mobo.py --batch --config optimize/mobo_batch_configs/ackley_10d_layout1.json
@@ -172,10 +177,12 @@ from optimize.mobo_landscapes import (
     build_ackley_landscape,
     build_rf_landscape,
     composition_column_names,
+    infer_composition_columns,
     interactive_ackley_startup,
     landscape_from_run_config,
     parse_ackley_batch_fields,
 )
+from synthetic_data.campaign_datasets import load_metadata, resolve_metadata_path
 
 # ─── Global config ────────────────────────────────────────────────────────────
 
@@ -317,24 +324,65 @@ def _log_error(run_dir: str, trial_num: int, exc: Exception) -> None:
 
 # ─── Deterministic RF surrogate (rebuilt identically on resume) ─────────────────
 
-def build_rf_and_grid(csv_path: str, objective_column: str = "Objective"):
-    """Train the RF surrogate from a campaign CSV and build the ternary grid.
+def build_rf_and_grid(
+    csv_path: str,
+    objective_column: str = "Objective",
+    composition_columns: list[str] | None = None,
+):
+    """Train the RF surrogate from a campaign or synthetic CSV.
 
     Deterministic (fixed random_state / tree count), so a resumed run rebuilds an
     identical surrogate without re-prompting the interactive extrema picker.
-    Returns (rf, rf_fn, grid_pts, grid_vals).
+    Returns (rf, rf_fn, grid_pts, grid_vals, composition_columns, dim).
     """
-    cols = ["FAPbI3", "MAPbI3", "MAPbBr3", objective_column]
-    df = pd.read_csv(csv_path).dropna(subset=cols)
-    X_data = df[["FAPbI3", "MAPbI3", "MAPbBr3"]].values.astype(float)
+    df = pd.read_csv(csv_path)
+    comp_cols = infer_composition_columns(df, explicit=composition_columns)
+    dim = len(comp_cols)
+    df = df.dropna(subset=comp_cols + [objective_column])
+    X_data = df[comp_cols].values.astype(float)
     X_data /= X_data.sum(axis=1, keepdims=True)
     y_data = df[objective_column].values.astype(float)
     rf = RandomForestRegressor(n_estimators=RF_N_ESTIMATORS, n_jobs=-1, random_state=42)
     rf.fit(X_data, y_data)
-    grid_pts  = ternary_grid(TERNARY_GRID_N)
-    grid_vals = rf.predict(grid_pts)
+    if dim == 3:
+        grid_pts = ternary_grid(TERNARY_GRID_N)
+        grid_vals = rf.predict(grid_pts)
+    else:
+        grid_pts = grid_vals = None
     rf_fn = lambda x, _rf=rf: float(_rf.predict(x.reshape(1, -1))[0])
-    return rf, rf_fn, grid_pts, grid_vals
+    return rf, rf_fn, grid_pts, grid_vals, comp_cols, dim
+
+
+def _load_rf_batch_extras(cfg: dict, csv_path: str, repo_root: str) -> dict:
+    """Merge optional synthetic metadata sidecar into a batch RF config."""
+    meta_path = cfg.get("metadata_path")
+    if meta_path and not os.path.isabs(meta_path):
+        meta_path = os.path.normpath(os.path.join(repo_root, meta_path))
+    resolved = resolve_metadata_path(csv_path, meta_path)
+    extras = {
+        "composition_columns": cfg.get("composition_columns"),
+        "oracle": cfg.get("oracle"),
+        "metadata_path": resolved,
+        "maximize": bool(cfg.get("maximize", False)),
+        "true_optima": [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
+        if cfg.get("true_optima") else [],
+    }
+    if not resolved:
+        return extras
+    try:
+        meta = load_metadata(resolved)
+    except Exception as exc:
+        print(f"  [batch] WARNING: metadata unreadable ({resolved}): {exc}")
+        return extras
+    if not extras["composition_columns"] and meta.get("composition_columns"):
+        extras["composition_columns"] = list(meta["composition_columns"])
+    if not extras["oracle"] and meta.get("oracle"):
+        extras["oracle"] = str(meta["oracle"])
+    if not extras["true_optima"] and meta.get("true_optima"):
+        extras["true_optima"] = [np.asarray(t, dtype=float) for t in meta["true_optima"]]
+    if "maximize" not in cfg and "maximize" in meta:
+        extras["maximize"] = bool(meta["maximize"])
+    return extras
 
 
 # ─── Run-config persistence + resume ────────────────────────────────────────────
@@ -370,6 +418,12 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
     if landscape.landscape == "rf":
         cfg["csv_path"] = landscape.csv_path
         cfg["objective_column"] = landscape.objective_column
+        if landscape.composition_columns:
+            cfg["composition_columns"] = landscape.composition_columns
+        if landscape.oracle:
+            cfg["oracle"] = landscape.oracle
+        if landscape.metadata_path:
+            cfg["metadata_path"] = landscape.metadata_path
     if landscape.landscape == "ackley":
         cfg["ackley_layout"] = landscape.ackley_layout
         cfg["ackley_b"] = landscape.ackley_b
@@ -517,10 +571,16 @@ def load_batch_config(path: str, script_dir: str) -> dict:
     if not os.path.exists(csv_path):
         sys.exit(f"--config: csv_path does not exist: {csv_path}")
 
-    true_optima: list[np.ndarray] = []
+    rf_extras = _load_rf_batch_extras(cfg, csv_path, repo_root)
+    composition_columns = rf_extras.get("composition_columns")
+    oracle = rf_extras.get("oracle")
+    metadata_path = rf_extras.get("metadata_path")
+    maximize = rf_extras["maximize"]
+
+    true_optima: list[np.ndarray] = list(rf_extras.get("true_optima") or [])
     if cfg.get("true_optima"):
         true_optima = [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
-    elif cfg.get("regions_objective"):
+    elif not true_optima and cfg.get("regions_objective"):
         regions_path = cfg.get("regions_path", "scripts/max_min_regions.json")
         if not os.path.isabs(regions_path):
             regions_path = os.path.normpath(os.path.join(repo_root, regions_path))
@@ -545,6 +605,9 @@ def load_batch_config(path: str, script_dir: str) -> dict:
         "landscape":         None,
         "csv_path":          csv_path,
         "objective_column":  cfg.get("objective_column", "Objective"),
+        "composition_columns": composition_columns,
+        "oracle":            oracle,
+        "metadata_path":     metadata_path,
         "maximize":          maximize,
         "true_optima":       true_optima,
         "max_trials":        cfg.get("max_trials"),
@@ -1886,7 +1949,7 @@ def _interactive_run_config(script_dir: str):
         sys.exit("campaign1a.csv not found. Tried:\n" +
                  "\n".join(f"  {os.path.normpath(p)}" for p in csv_candidates))
     print(f"\n[RF] Loading {csv_path} …  Training RF ({RF_N_ESTIMATORS} trees) …")
-    rf, rf_fn, grid_pts, grid_vals = build_rf_and_grid(csv_path)
+    rf, rf_fn, grid_pts, grid_vals, _, _ = build_rf_and_grid(csv_path)
     print("  RF trained.")
 
     raw_mm = input("  Maximize or minimize RF?  [max/min, default min]: ").strip().lower()
@@ -2050,11 +2113,20 @@ def main() -> None:
         else:
             csv_path = batch["csv_path"]
             obj_col = batch["objective_column"]
+            comp_cols = batch.get("composition_columns")
             rf_maximize = batch["maximize"]
-            print(f"\n[RF] Loading {csv_path} ({obj_col}) …  "
+            oracle = batch.get("oracle")
+            label_bits = [obj_col]
+            if oracle:
+                label_bits.append(f"oracle={oracle}")
+            if comp_cols:
+                label_bits.append(f"cols={','.join(comp_cols)}")
+            print(f"\n[RF] Loading {csv_path} ({', '.join(label_bits)}) …  "
                   f"Training RF ({RF_N_ESTIMATORS} trees) …")
-            rf, rf_fn, grid_pts, grid_vals = build_rf_and_grid(csv_path, objective_column=obj_col)
-            print("  RF trained.")
+            rf, rf_fn, grid_pts, grid_vals, comp_cols, dim = build_rf_and_grid(
+                csv_path, objective_column=obj_col, composition_columns=comp_cols,
+            )
+            print(f"  RF trained ({dim}D, {len(comp_cols)} composition columns).")
 
             true_optima = batch["true_optima"]
             if not true_optima:
@@ -2076,6 +2148,10 @@ def main() -> None:
                 rf_fn, true_optima, grid_pts, grid_vals,
                 maximize=rf_maximize, csv_path=csv_path,
                 objective_column=obj_col,
+                composition_columns=comp_cols,
+                dim=dim,
+                oracle=oracle,
+                metadata_path=batch.get("metadata_path"),
                 time_limit_hours=TIME_LIMIT_HOURS,
             )
 

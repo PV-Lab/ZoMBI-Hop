@@ -1,0 +1,10 @@
+{
+  "description": "Parallel 3D synthetic RF MOBO runs (generate CSVs with generate_synthetic_campaign.py --all-3d first).",
+  "configs": [
+    "optimize/mobo_batch_configs/synthetic_3d_messy_rf_max.json",
+    "optimize/mobo_batch_configs/synthetic_3d_ackley_rf_max.json",
+    "optimize/mobo_batch_configs/synthetic_3d_gaussian_rf_max.json",
+    "optimize/mobo_batch_configs/synthetic_3d_planted_bumps_rf_max.json",
+    "optimize/mobo_batch_configs/synthetic_3d_rastrigin_ilr_rf_max.json"
+  ]
+}
