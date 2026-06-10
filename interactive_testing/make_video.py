@@ -24,12 +24,17 @@ Dependencies
 from __future__ import annotations
 
 import os
+import re
 import sys
 import glob
 
 TARGET_DURATION_S = 30.0
 MIN_FPS = 1.0
 MAX_FPS = 60.0
+
+POINTS_PER_ITERATION = 24   # NUM_EXPERIMENTS in interactive_test_zombi.py
+N_INIT_LINES = 2            # random lines sampled before ZoMBI starts
+INIT_POINTS = N_INIT_LINES * POINTS_PER_ITERATION
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 plots_dir  = os.path.join(script_dir, "plots")
@@ -43,6 +48,40 @@ def _collect_frames(directory: str) -> list[str]:
         # Also accept any PNG if the naming scheme changed.
         frames = sorted(glob.glob(os.path.join(directory, "*.png")))
     return frames
+
+
+def _iter_number(path: str) -> int | None:
+    m = re.search(r"iter_(\d+)", os.path.basename(path))
+    return int(m.group(1)) if m else None
+
+
+def _total_points(iter_num: int | None) -> int:
+    if iter_num is None:
+        return 0
+    return INIT_POINTS + iter_num * POINTS_PER_ITERATION
+
+
+def _stamp_counter(img: "np.ndarray", text: str) -> "np.ndarray":
+    from PIL import Image as PILImage, ImageDraw, ImageFont
+    pil = PILImage.fromarray(img)
+    draw = ImageDraw.Draw(pil)
+    try:
+        font = ImageFont.truetype("arial.ttf", size=28)
+    except OSError:
+        font = ImageFont.load_default()
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    margin = 12
+    x = pil.width - tw - margin
+    y = pil.height - th - margin
+    pad = 6
+    draw.rounded_rectangle(
+        [x - pad, y - pad, x + tw + pad, y + th + pad],
+        radius=6, fill=(0, 0, 0, 180),
+    )
+    draw.text((x, y), text, fill="white", font=font)
+    import numpy as np
+    return np.array(pil)
 
 
 def _compute_fps(n: int) -> float:
@@ -59,12 +98,16 @@ def _write_imageio(frames: list[str], out: str, fps: float) -> None:
     # Ensure all frames are the same size (use first frame as reference).
     h, w = imgs[0].shape[:2]
     resized = []
-    for img in imgs:
+    for i, img in enumerate(imgs):
         if img.shape[:2] != (h, w):
             from PIL import Image as PILImage
             pil = PILImage.fromarray(img).resize((w, h), PILImage.LANCZOS)
             img = np.array(pil)
-        resized.append(img[:, :, :3])   # drop alpha if present
+        img = img[:, :, :3]   # drop alpha if present
+        n_pts = _total_points(_iter_number(frames[i]))
+        if n_pts > 0:
+            img = _stamp_counter(img, f"Points sampled: {n_pts}")
+        resized.append(img)
 
     print(f"  writing MP4 at {fps:.2f} fps …")
     iio.imwrite(
@@ -92,6 +135,12 @@ def _write_opencv(frames: list[str], out: str, fps: float) -> None:
             continue
         if img.shape[:2] != (h, w):
             img = cv2.resize(img, (w, h))
+        n_pts = _total_points(_iter_number(path))
+        if n_pts > 0:
+            import numpy as np
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            rgb = _stamp_counter(rgb, f"Points sampled: {n_pts}")
+            img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         writer.write(img)
     writer.release()
 

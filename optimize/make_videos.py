@@ -15,18 +15,24 @@ Usage
 from __future__ import annotations
 
 import argparse
+import csv
 import glob
 import os
+import re
 import sys
 
 import numpy as np
 
 import imageio.v2 as iio
-from PIL import Image as PILImage
+from PIL import Image as PILImage, ImageDraw, ImageFont
 
 VIDEO_TARGET_DURATION_S = 60.0
 VIDEO_MIN_FPS           = 1.0
 VIDEO_MAX_FPS           = 60.0
+
+POINTS_PER_ITERATION = 24
+N_INIT_LINES         = 2
+INIT_POINTS          = N_INIT_LINES * POINTS_PER_ITERATION
 
 
 def resolve_run_dir(arg: str, runs_dir: str) -> str:
@@ -46,8 +52,39 @@ def resolve_run_dir(arg: str, runs_dir: str) -> str:
     sys.exit(f"Run directory not found: {arg}")
 
 
+def _iter_number(path: str) -> int | None:
+    m = re.search(r"iter_(\d+)", os.path.basename(path))
+    return int(m.group(1)) if m else None
+
+
+def _total_points_for_frame(iter_num: int | None) -> int:
+    if iter_num is None:
+        return 0
+    return INIT_POINTS + (iter_num + 1) * POINTS_PER_ITERATION
+
+
+def _stamp_counter(img: np.ndarray, text: str) -> np.ndarray:
+    pil = PILImage.fromarray(img)
+    draw = ImageDraw.Draw(pil)
+    try:
+        font = ImageFont.truetype("arial.ttf", size=28)
+    except OSError:
+        font = ImageFont.load_default()
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    margin, pad = 12, 6
+    x = pil.width - tw - margin
+    y = pil.height - th - margin
+    draw.rounded_rectangle(
+        [x - pad, y - pad, x + tw + pad, y + th + pad],
+        radius=6, fill=(0, 0, 0, 180),
+    )
+    draw.text((x, y), text, fill="white", font=font)
+    return np.array(pil)
+
+
 def make_video_from_dir(plots_dir: str, out_path: str) -> bool:
-    """Compile iter_*.png frames in plots_dir into a ~30s MP4 at out_path.
+    """Compile iter_*.png frames in plots_dir into a ~60s MP4 at out_path.
 
     Returns True on success. Tries imageio+ffmpeg (h264) then OpenCV; both paths
     verify the output is non-empty, since ffmpeg/cv2 can fail without raising.
@@ -69,9 +106,12 @@ def make_video_from_dir(plots_dir: str, out_path: str) -> bool:
     imgs = [iio.imread(f)[:, :, :3] for f in frames]
     h, w = imgs[0].shape[:2]
     fixed = []
-    for img in imgs:
+    for i, img in enumerate(imgs):
         if img.shape[:2] != (h, w):
             img = np.array(PILImage.fromarray(img).resize((w, h), PILImage.LANCZOS))
+        n_pts = _total_points_for_frame(_iter_number(frames[i]))
+        if n_pts > 0:
+            img = _stamp_counter(img, f"Points sampled: {n_pts}")
         fixed.append(_even(img))
     iio.mimwrite(out_path, fixed, fps=fps, codec="libx264", macro_block_size=None)
     if not _ok():
