@@ -266,7 +266,11 @@ class GPSimplex:
         Y = Y.to(device=self.device, dtype=self.dtype)
 
         X_ilr = composition_to_ilr(X)
-        ilr_std = X_ilr.std(dim=0).clamp(min=1e-3)
+        # std(dim=0) is NaN for a single training point (unbiased std divides by
+        # n-1 = 0), and clamp() does NOT rescue NaN — normalising by it would
+        # poison the GP with NaNs. Fall back to unit scale when there is no spread
+        # (single pared point), so the GP still fits instead of erroring.
+        ilr_std = torch.nan_to_num(X_ilr.std(dim=0), nan=1.0).clamp(min=1e-3)
         self.ilr_std = ilr_std
         X_norm = X_ilr / ilr_std
 
