@@ -1,0 +1,316 @@
+"""Show a ternary coverage plot: ground-truth landscape + all sampled points,
+and produce a coverage.mp4 video of points appearing over time.
+
+Usage
+-----
+    python -m optimize.coverage_plot <trial_dir>
+
+``trial_dir`` is any folder that contains ``points.csv`` and whose parent (or
+itself) contains ``run_config.json`` or ``rerun_config.json``.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+
+import imageio.v2 as iio
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+from PIL import Image as PILImage, ImageDraw, ImageFont
+from sklearn.ensemble import RandomForestRegressor
+
+VIDEO_TARGET_DURATION_S = 60.0
+VIDEO_MIN_FPS = 1.0
+VIDEO_MAX_FPS = 60.0
+
+# ─── Ternary geometry (mirrors run_mobo.py) ──────────────────────────────────
+
+_SQRT3_2 = math.sqrt(3) / 2
+CORNER_LABELS = ("FAPbI₃", "MAPbI₃", "MAPbBr₃")
+GRID_N = 80
+RF_N_ESTIMATORS = 500
+
+
+def comp_to_xy(comp: np.ndarray) -> np.ndarray:
+    p = np.asarray(comp, dtype=float)
+    if p.ndim == 1:
+        p = p.reshape(1, -1)
+    s = p.sum(axis=-1, keepdims=True)
+    p = p / np.where(s == 0, 1.0, s)
+    return np.column_stack([p[:, 1] + 0.5 * p[:, 2], _SQRT3_2 * p[:, 2]])
+
+
+def ternary_grid(n: int = GRID_N) -> np.ndarray:
+    pts = []
+    for i in range(n + 1):
+        for j in range(n + 1 - i):
+            pts.append([i / n, j / n, (n - i - j) / n])
+    return np.array(pts, dtype=float)
+
+
+def draw_ternary_frame(ax, pad: float = 0.04) -> None:
+    ax.plot([0, 1, 0.5, 0], [0, 0, _SQRT3_2, 0], "k-", lw=1.2)
+    ax.set_aspect("equal")
+    ax.set_xlim(-0.12, 1.12)
+    ax.set_ylim(-0.12, _SQRT3_2 + 0.16)
+    ax.axis("off")
+    ax.text(-pad, -pad, CORNER_LABELS[0], ha="right", va="top", fontsize=10)
+    ax.text(1 + pad, -pad, CORNER_LABELS[1], ha="left", va="top", fontsize=10)
+    ax.text(0.5, _SQRT3_2 + pad, CORNER_LABELS[2], ha="center", va="bottom", fontsize=10)
+
+
+# ─── Ground-truth builders ───────────────────────────────────────────────────
+
+def _build_rf_ground_truth(csv_path: str):
+    df = pd.read_csv(csv_path).dropna(subset=["FAPbI3", "MAPbI3", "MAPbBr3", "Objective"])
+    X = df[["FAPbI3", "MAPbI3", "MAPbBr3"]].values.astype(float)
+    X /= X.sum(axis=1, keepdims=True)
+    y = df["Objective"].values.astype(float)
+    rf = RandomForestRegressor(n_estimators=RF_N_ESTIMATORS, n_jobs=-1, random_state=42)
+    rf.fit(X, y)
+    grid_pts = ternary_grid()
+    grid_vals = rf.predict(grid_pts)
+    return grid_pts, grid_vals
+
+
+def _build_ackley_ground_truth(variant: str, dim: int):
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from synthetic_data.ackley import Ackley
+    fn = Ackley(variant, dim=dim)
+    grid_pts = ternary_grid()
+    grid_vals = fn.predict(grid_pts)
+    return grid_pts, grid_vals
+
+
+# ─── Config discovery ────────────────────────────────────────────────────────
+
+def _find_config(trial_dir: str) -> dict:
+    """Search trial_dir and ancestors for run_config.json or rerun_config.json."""
+    for name in ("run_config.json", "rerun_config.json"):
+        path = os.path.join(trial_dir, name)
+        if os.path.isfile(path):
+            with open(path) as f:
+                return json.load(f)
+
+    parent = os.path.dirname(os.path.normpath(trial_dir))
+    for name in ("run_config.json", "rerun_config.json"):
+        path = os.path.join(parent, name)
+        if os.path.isfile(path):
+            with open(path) as f:
+                return json.load(f)
+
+    grandparent = os.path.dirname(parent)
+    for name in ("run_config.json", "rerun_config.json"):
+        path = os.path.join(grandparent, name)
+        if os.path.isfile(path):
+            with open(path) as f:
+                return json.load(f)
+
+    sys.exit(f"Could not find run_config.json or rerun_config.json in or above {trial_dir}")
+
+
+def _detect_comp_cols(df: pd.DataFrame) -> list[str]:
+    if {"FA", "MA", "Br"}.issubset(df.columns):
+        return ["FA", "MA", "Br"]
+    x_cols = sorted([c for c in df.columns if c.startswith("x") and c[1:].isdigit()],
+                    key=lambda c: int(c[1:]))
+    if len(x_cols) >= 3:
+        return x_cols[:3]
+    sys.exit("Cannot detect composition columns in points.csv")
+
+
+# ─── Video rendering ─────────────────────────────────────────────────────────
+
+def _stamp_counter(img: np.ndarray, text: str) -> np.ndarray:
+    pil = PILImage.fromarray(img)
+    draw = ImageDraw.Draw(pil)
+    try:
+        font = ImageFont.truetype("arial.ttf", size=28)
+    except OSError:
+        font = ImageFont.load_default()
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    margin, pad = 12, 6
+    x = pil.width - tw - margin
+    y = pil.height - th - margin
+    draw.rounded_rectangle(
+        [x - pad, y - pad, x + tw + pad, y + th + pad],
+        radius=6, fill=(0, 0, 0, 180),
+    )
+    draw.text((x, y), text, fill="white", font=font)
+    return np.array(pil)
+
+
+def _render_coverage_frame(
+    n_visible: int,
+    pxy: np.ndarray,
+    y_vals: np.ndarray,
+    gxy: np.ndarray,
+    grid_vals: np.ndarray,
+    true_optima: list,
+    maximize: bool,
+    title_base: str,
+) -> np.ndarray:
+    fig = Figure(figsize=(8, 7))
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    draw_ternary_frame(ax)
+
+    ax.scatter(gxy[:, 0], gxy[:, 1], c=grid_vals, cmap="viridis",
+               s=6, alpha=0.72, zorder=2, rasterized=True)
+
+    if n_visible > 0:
+        ax.scatter(pxy[:n_visible, 0], pxy[:n_visible, 1],
+                   c=y_vals[:n_visible], cmap="viridis",
+                   vmin=grid_vals.min(), vmax=grid_vals.max(),
+                   s=40, alpha=1.0, zorder=5,
+                   edgecolors="black", linewidths=0.6)
+
+    if true_optima:
+        mxy = comp_to_xy(np.array(true_optima))
+        label = "True maxima" if maximize else "True minima"
+        ax.scatter(mxy[:, 0], mxy[:, 1], marker="*", s=360, c="blue",
+                   zorder=11, edgecolors="navy", linewidths=1.3, label=label)
+        ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
+
+    ax.set_title(f"Coverage: {title_base}  ({n_visible} points)", fontsize=12)
+    fig.tight_layout()
+
+    fig.canvas.draw()
+    buf = fig.canvas.buffer_rgba()
+    img = np.asarray(buf)[:, :, :3].copy()
+    fig.clear()
+    return img
+
+
+POINTS_PER_LINE = 24
+
+
+def _line_boundaries(n_total: int) -> list[int]:
+    """Cumulative point counts at each line boundary (one frame per line)."""
+    boundaries = list(range(POINTS_PER_LINE, n_total, POINTS_PER_LINE))
+    if not boundaries or boundaries[-1] != n_total:
+        boundaries.append(n_total)
+    return boundaries
+
+
+def make_coverage_video(
+    out_path: str,
+    pxy: np.ndarray,
+    y_vals: np.ndarray,
+    gxy: np.ndarray,
+    grid_vals: np.ndarray,
+    true_optima: list,
+    maximize: bool,
+    title_base: str,
+) -> None:
+    n_total = len(pxy)
+    boundaries = _line_boundaries(n_total)
+    n_frames = len(boundaries)
+    fps = max(VIDEO_MIN_FPS, min(VIDEO_MAX_FPS, n_frames / VIDEO_TARGET_DURATION_S))
+
+    def _even(img: np.ndarray) -> np.ndarray:
+        h, w = img.shape[:2]
+        return img[: h - (h % 2), : w - (w % 2)]
+
+    bar_width = 40
+    frames = []
+    for frame_idx, n_visible in enumerate(boundaries, 1):
+        img = _render_coverage_frame(
+            n_visible, pxy, y_vals, gxy, grid_vals, true_optima, maximize, title_base)
+        img = _stamp_counter(img, f"Points sampled: {n_visible}")
+        frames.append(_even(img))
+        filled = int(bar_width * frame_idx / n_frames)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        pct = 100 * frame_idx / n_frames
+        print(f"\r  Rendering: |{bar}| {pct:5.1f}%  ({frame_idx}/{n_frames})", end="", flush=True)
+    print()
+
+    print("  Encoding video ...", end="", flush=True)
+    iio.mimwrite(out_path, frames, fps=fps, codec="libx264", macro_block_size=None)
+    if not (os.path.exists(out_path) and os.path.getsize(out_path) > 0):
+        raise RuntimeError(f"Failed to write video: {out_path}")
+    print(f"\r  [video] {out_path}  ({n_frames} frames @ {fps:.2f} fps)")
+
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Ternary coverage plot + video")
+    parser.add_argument("trial_dir", help="Path to a trial_* folder (or any folder with points.csv)")
+    args = parser.parse_args()
+
+    trial_dir = os.path.abspath(args.trial_dir)
+    points_path = os.path.join(trial_dir, "points.csv")
+    if not os.path.isfile(points_path):
+        sys.exit(f"No points.csv found in {trial_dir}")
+
+    cfg = _find_config(trial_dir)
+    df = pd.read_csv(points_path)
+    comp_cols = _detect_comp_cols(df)
+
+    dataset = cfg.get("dataset", "RF")
+    dim = cfg.get("dim", 3)
+    if dim != 3:
+        sys.exit(f"Ternary coverage plot only supports 3D datasets (got dim={dim})")
+
+    if dataset == "RF":
+        csv_path = cfg["csv_path"]
+        if not os.path.isfile(csv_path):
+            sys.exit(f"Surrogate CSV not found: {csv_path}")
+        grid_pts, grid_vals = _build_rf_ground_truth(csv_path)
+    else:
+        variant = cfg.get("ackley_variant", "realistic")
+        grid_pts, grid_vals = _build_ackley_ground_truth(variant, dim)
+
+    true_optima = cfg.get("true_optima", [])
+    maximize = cfg.get("maximize", True)
+
+    comps = df[comp_cols].values.astype(float)
+    y_vals = df["Y"].values.astype(float)
+
+    gxy = comp_to_xy(grid_pts)
+    pxy = comp_to_xy(comps)
+    title_base = os.path.basename(os.path.normpath(trial_dir))
+
+    # ── Static plot (shown interactively) ──
+    fig, ax = plt.subplots(figsize=(8, 7))
+    draw_ternary_frame(ax)
+
+    sc_bg = ax.scatter(gxy[:, 0], gxy[:, 1], c=grid_vals, cmap="viridis",
+                       s=6, alpha=0.72, zorder=2, rasterized=True)
+    fig.colorbar(sc_bg, ax=ax, label="Objective", fraction=0.046, pad=0.04)
+
+    ax.scatter(pxy[:, 0], pxy[:, 1], c=y_vals, cmap="viridis",
+               vmin=grid_vals.min(), vmax=grid_vals.max(),
+               s=40, alpha=1.0, zorder=5,
+               edgecolors="black", linewidths=0.6)
+
+    if true_optima:
+        mxy = comp_to_xy(np.array(true_optima))
+        label = "True maxima" if maximize else "True minima"
+        ax.scatter(mxy[:, 0], mxy[:, 1], marker="*", s=360, c="blue",
+                   zorder=11, edgecolors="navy", linewidths=1.3, label=label)
+        ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
+
+    n_pts = len(df)
+    ax.set_title(f"Coverage: {title_base}  ({n_pts} points)", fontsize=12)
+
+    fig.tight_layout()
+    plt.show()
+
+    # ── Video (saved to trial folder) ──
+    video_path = os.path.join(trial_dir, "coverage.mp4")
+    print(f"Rendering coverage video ({n_pts} frames) ...")
+    make_coverage_video(
+        video_path, pxy, y_vals, gxy, grid_vals, true_optima, maximize, title_base)
+
+
+if __name__ == "__main__":
+    main()
