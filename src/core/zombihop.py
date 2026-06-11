@@ -414,6 +414,7 @@ class ZoMBIHop:
             M=M_ellipsoid,
             B=B_ellipsoid,
             needle_median_value=needle_median,
+            reason=reason,
         )
 
         if self._needle_plot_points_ref is not None:

@@ -1121,10 +1121,11 @@ def write_needles_csv(path: str, dh) -> None:
             "activation": r.get("activation"),
             "zoom": r.get("zoom"),
             "iteration": r.get("iteration"),
+            "reason": r.get("reason"),
             "dist_to_centre": float(np.linalg.norm(pt - centroid)),
         })
     cols = ["needle_idx", "FA", "MA", "Br", "value", "median_value",
-            "activation", "zoom", "iteration", "dist_to_centre"]
+            "activation", "zoom", "iteration", "reason", "dist_to_centre"]
     pd.DataFrame(rows, columns=cols).to_csv(path, index=False)
 
 

@@ -964,6 +964,7 @@ class DataHandler:
         M: Optional[torch.Tensor] = None,
         B: Optional[torch.Tensor] = None,
         needle_median_value: Optional[float] = None,
+        reason: Optional[str] = None,
     ):
         """Record a discovered needle (local optimum) and update penalty mask.
 
@@ -1000,6 +1001,7 @@ class DataHandler:
             'activation': activation,
             'zoom': zoom,
             'iteration': iteration,
+            'reason': reason,
         })
 
         self._update_penalty_mask()
