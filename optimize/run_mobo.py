@@ -75,6 +75,21 @@ Usage
   python optimize/make_videos.py                       # newest run
   python optimize/make_videos.py <run_dir>             # specific run
   python optimize/make_videos.py <run_dir> --force     # rebuild all
+
+Non-interactive / MIT ORCD HPC
+------------------------------
+  # Single headless run from a JSON config (no GUI picker):
+  MPLBACKEND=Agg python optimize/run_mobo.py --batch --config optimize/mobo_batch_configs/campaign1a_objective_min.json
+
+  # Submit one Slurm job:
+  cd ~/ZoMBI-Hop && sbatch slurm/run_mobo.sbatch
+
+  # Submit a batch (one array task per manifest entry):
+  cd ~/ZoMBI-Hop && bash scripts/submit_mobo_batch.sh
+
+Each trial appends to ``trials_log.csv`` (hyperparameters + metrics) and
+``all_samples.csv`` (every ZoMBI sample point with trial/phase context).
+``mobo_progress.json`` is still rewritten atomically after every trial.
 """
 
 from __future__ import annotations
@@ -100,7 +115,18 @@ from scipy.optimize import minimize as sp_minimize
 from scipy.spatial import ConvexHull
 
 import matplotlib
-matplotlib.use("TkAgg")              # interactive backend for the extrema picker
+
+
+def _configure_mpl_backend(*, headless: bool) -> None:
+    """Pick a matplotlib backend: respect MPLBACKEND, else Agg when headless."""
+    if os.environ.get("MPLBACKEND"):
+        matplotlib.use(os.environ["MPLBACKEND"])
+    elif headless:
+        matplotlib.use("Agg")
+    else:
+        matplotlib.use("TkAgg")
+
+
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -272,17 +298,18 @@ def _log_error(run_dir: str, trial_num: int, exc: Exception) -> None:
 
 # ─── Deterministic RF surrogate (rebuilt identically on resume) ─────────────────
 
-def build_rf_and_grid(csv_path: str):
-    """Train the RF surrogate from campaign1a.csv and build the ternary grid.
+def build_rf_and_grid(csv_path: str, objective_column: str = "Objective"):
+    """Train the RF surrogate from a campaign CSV and build the ternary grid.
 
     Deterministic (fixed random_state / tree count), so a resumed run rebuilds an
     identical surrogate without re-prompting the interactive extrema picker.
     Returns (rf, rf_fn, grid_pts, grid_vals).
     """
-    df = pd.read_csv(csv_path).dropna(subset=["FAPbI3", "MAPbI3", "MAPbBr3", "Objective"])
+    cols = ["FAPbI3", "MAPbI3", "MAPbBr3", objective_column]
+    df = pd.read_csv(csv_path).dropna(subset=cols)
     X_data = df[["FAPbI3", "MAPbI3", "MAPbBr3"]].values.astype(float)
     X_data /= X_data.sum(axis=1, keepdims=True)
-    y_data = df["Objective"].values.astype(float)
+    y_data = df[objective_column].values.astype(float)
     rf = RandomForestRegressor(n_estimators=RF_N_ESTIMATORS, n_jobs=-1, random_state=42)
     rf.fit(X_data, y_data)
     grid_pts  = ternary_grid(TERNARY_GRID_N)
@@ -293,16 +320,38 @@ def build_rf_and_grid(csv_path: str):
 
 # ─── Run-config persistence + resume ────────────────────────────────────────────
 
-def write_run_config(run_dir, maximize, csv_path, true_optima) -> None:
+def _slurm_metadata() -> dict:
+    """Capture Slurm / host context for reproducibility (best-effort)."""
+    keys = (
+        "SLURM_JOB_ID", "SLURM_ARRAY_TASK_ID", "SLURM_ARRAY_JOB_ID",
+        "SLURM_JOB_NAME", "SLURM_CLUSTER_NAME", "SLURM_CPUS_PER_TASK",
+        "SLURM_MEM_PER_NODE", "SLURM_JOB_PARTITION", "HOSTNAME",
+    )
+    meta = {k.lower(): os.environ[k] for k in keys if os.environ.get(k)}
+    meta["submitted_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+    return meta
+
+
+def write_run_config(run_dir, maximize, csv_path, true_optima, *,
+                     objective_column: str = "Objective",
+                     batch_name: str | None = None,
+                     batch_config_path: str | None = None) -> None:
     """Persist the static run state needed for a fully non-interactive resume."""
     cfg = {
         "maximize":      bool(maximize),
         "csv_path":      os.path.abspath(csv_path),
+        "objective_column": objective_column,
         "true_optima":   [list(map(float, np.asarray(t).ravel())) for t in true_optima],
         "n_init_trials": N_INIT_TRIALS,
         "hparam_names":  HPARAM_NAMES,
+        "time_limit_hours": TIME_LIMIT_HOURS,
         "created":       datetime.datetime.now().isoformat(timespec="seconds"),
     }
+    if batch_name:
+        cfg["batch_name"] = batch_name
+    if batch_config_path:
+        cfg["batch_config_path"] = os.path.abspath(batch_config_path)
+    cfg["slurm"] = _slurm_metadata()
     _atomic_write_text(os.path.join(run_dir, "run_config.json"), json.dumps(cfg, indent=2))
 
 
@@ -360,6 +409,162 @@ def load_run_config_from_path(path: str) -> dict:
     print(f"  [copy-config] reusing config from {cfg_path} "
           f"(created {cfg.get('created', '?')})")
     return cfg
+
+
+def auto_detect_rf_optima(
+    rf: RandomForestRegressor,
+    grid_pts: np.ndarray,
+    grid_vals: np.ndarray,
+    *,
+    maximize: bool,
+    n_peaks: int = 3,
+    min_sep: float = 0.08,
+) -> list[np.ndarray]:
+    """Greedy top-grid peak picking + L-BFGS-B refinement (headless picker)."""
+    order = np.argsort(grid_vals)
+    if not maximize:
+        order = order[::-1]
+    chosen: list[np.ndarray] = []
+    for idx in order:
+        if len(chosen) >= n_peaks:
+            break
+        pt = grid_pts[idx]
+        if any(float(np.linalg.norm(pt - c)) < min_sep for c in chosen):
+            continue
+        x_ref, _ = _refine_extremum(rf, pt, maximize=maximize)
+        if any(float(np.linalg.norm(x_ref - c)) < min_sep for c in chosen):
+            continue
+        chosen.append(x_ref)
+    if not chosen:
+        chosen = [np.array([1 / 3, 1 / 3, 1 / 3], dtype=float)]
+    return chosen
+
+
+def load_batch_config(path: str, script_dir: str) -> dict:
+    """Load a headless run config JSON (paths resolved relative to repo root)."""
+    cfg_path = os.path.abspath(path)
+    if not os.path.exists(cfg_path):
+        sys.exit(f"--config: file not found: {cfg_path}")
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except Exception as exc:
+        sys.exit(f"--config: {cfg_path} unreadable ({exc}).")
+
+    repo_root = os.path.normpath(os.path.join(script_dir, ".."))
+    csv_path = cfg.get("csv_path")
+    if not csv_path:
+        sys.exit(f"--config: {cfg_path} must include 'csv_path'.")
+    if not os.path.isabs(csv_path):
+        csv_path = os.path.normpath(os.path.join(repo_root, csv_path))
+    if not os.path.exists(csv_path):
+        sys.exit(f"--config: csv_path does not exist: {csv_path}")
+
+    maximize = bool(cfg.get("maximize", False))
+    true_optima: list[np.ndarray] = []
+    if cfg.get("true_optima"):
+        true_optima = [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
+    elif cfg.get("regions_objective"):
+        regions_path = cfg.get("regions_path", "scripts/max_min_regions.json")
+        if not os.path.isabs(regions_path):
+            regions_path = os.path.normpath(os.path.join(repo_root, regions_path))
+        if not os.path.exists(regions_path):
+            sys.exit(f"--config: regions_path not found: {regions_path}")
+        with open(regions_path) as f:
+            regions = json.load(f)
+        obj_key = cfg["regions_objective"]
+        obj = regions.get("objectives", {}).get(obj_key)
+        if obj is None:
+            sys.exit(f"--config: regions_objective '{obj_key}' not in {regions_path}")
+        seed_key = "max_seeds" if maximize else "min_seeds"
+        seeds = obj.get(seed_key) or []
+        if not seeds:
+            sys.exit(f"--config: no {seed_key} for '{obj_key}' in {regions_path}")
+        true_optima = [np.asarray(s, dtype=float) for s in seeds]
+        print(f"  [batch] loaded {len(true_optima)} reference optima from "
+              f"{obj_key}/{seed_key}")
+
+    return {
+        "name":              cfg.get("name") or os.path.splitext(os.path.basename(cfg_path))[0],
+        "csv_path":          csv_path,
+        "objective_column":  cfg.get("objective_column", "Objective"),
+        "maximize":          maximize,
+        "true_optima":       true_optima,
+        "max_trials":      cfg.get("max_trials"),
+        "time_limit_hours": cfg.get("time_limit_hours"),
+        "auto_optima":     cfg.get("auto_optima"),
+        "config_path":     cfg_path,
+    }
+
+
+def _append_csv_rows(path: str, fieldnames: list[str], rows: list[dict]) -> None:
+    """Append rows to a CSV, writing the header when the file is new."""
+    if not rows:
+        return
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if write_header:
+            w.writeheader()
+        for row in rows:
+            w.writerow(row)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def append_trial_logs(
+    run_dir: str,
+    trial_num: int,
+    phase: str,
+    hparams: dict,
+    metrics: dict,
+    trial_dir: str,
+) -> None:
+    """Append one trial row + all sample points for live analysis on HPC."""
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    trial_row = {
+        "timestamp": ts,
+        "trial": trial_num,
+        "phase": phase,
+        "dist_to_needles": round(metrics["dist"], 6),
+        "dup_fraction": round(metrics["dup"], 6),
+        "runtime_s": round(metrics["runtime"], 3),
+    }
+    for k, v in hparams.items():
+        trial_row[f"hp_{k}"] = v
+    hp_cols = [f"hp_{k}" for k in HPARAM_NAMES]
+    _append_csv_rows(
+        os.path.join(run_dir, "trials_log.csv"),
+        ["timestamp", "trial", "phase", "dist_to_needles", "dup_fraction", "runtime_s"]
+        + hp_cols,
+        [trial_row],
+    )
+
+    points_path = os.path.join(trial_dir, "points.csv")
+    if not os.path.exists(points_path):
+        return
+    sample_rows: list[dict] = []
+    with open(points_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            sample_rows.append({
+                "timestamp": ts,
+                "trial": trial_num,
+                "phase": phase,
+                "sample_idx": row.get("sample_idx"),
+                "FA": row.get("FA"),
+                "MA": row.get("MA"),
+                "Br": row.get("Br"),
+                "Y": row.get("Y"),
+                "penalized": row.get("penalized"),
+                "activation": row.get("activation"),
+                "zoom": row.get("zoom"),
+            })
+    _append_csv_rows(
+        os.path.join(run_dir, "all_samples.csv"),
+        ["timestamp", "trial", "phase", "sample_idx", "FA", "MA", "Br",
+         "Y", "penalized", "activation", "zoom"],
+        sample_rows,
+    )
 
 
 def collect_all_observations(runs_dir: str):
@@ -1551,6 +1756,11 @@ def run_mobo(rf_fn, true_optima, grid_pts, grid_vals, maximize, run_dir,
                     {"dist": res["dist"], "dup": res["dup"], "runtime": res["runtime"]},
                     hparams,
                 )
+                append_trial_logs(
+                    run_dir, trial_num, phase, hparams,
+                    {"dist": res["dist"], "dup": res["dup"], "runtime": res["runtime"]},
+                    trial_dir,
+                )
                 consec_fail = 0
 
             except KeyboardInterrupt:
@@ -1615,18 +1825,54 @@ def _interactive_run_config(script_dir: str):
 
 
 def _launch_run(runs_dir, rf_fn, true_optima, grid_pts, grid_vals, rf_maximize,
-                csv_path, max_trials, X_prior=None, Y_prior=None) -> None:
+                csv_path, max_trials, X_prior=None, Y_prior=None, *,
+                objective_column: str = "Objective",
+                batch_name: str | None = None,
+                batch_config_path: str | None = None,
+                run_dir: str | None = None) -> None:
     """Create a fresh runs/mobo_* folder, persist its config, and run MOBO."""
-    run_dir = os.path.join(runs_dir, datetime.datetime.now().strftime("mobo_%d_%m_%H_%M"))
+    if run_dir is None:
+        stamp = datetime.datetime.now().strftime("mobo_%d_%m_%H_%M")
+        suffix = f"_{batch_name}" if batch_name else ""
+        run_dir = os.path.join(runs_dir, f"{stamp}{suffix}")
     os.makedirs(run_dir, exist_ok=True)
-    write_run_config(run_dir, rf_maximize, csv_path, true_optima)
+    write_run_config(
+        run_dir, rf_maximize, csv_path, true_optima,
+        objective_column=objective_column,
+        batch_name=batch_name, batch_config_path=batch_config_path,
+    )
     print(f"\n[run] Output folder: {run_dir}")
     run_mobo(rf_fn, true_optima, grid_pts, grid_vals, rf_maximize, run_dir,
              max_trials=max_trials, X_prior=X_prior, Y_prior=Y_prior)
 
 
+def _apply_runtime_overrides(*, device: str | None, time_limit_hours: float | None) -> None:
+    """Apply CLI overrides to module-level DEVICE and TIME_LIMIT_HOURS."""
+    global DEVICE, TIME_LIMIT_HOURS
+    if device is not None:
+        DEVICE = torch.device(device)
+    if time_limit_hours is not None:
+        TIME_LIMIT_HOURS = float(time_limit_hours)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="ZoMBI-Hop MOBO hyperparameter optimisation (RF surrogate).")
+    parser.add_argument("--batch", action="store_true",
+                        help="Headless mode: read --config JSON, skip interactive picker "
+                             "(for Slurm / ORCD HPC).")
+    parser.add_argument("--config", metavar="PATH", default=None,
+                        help="Batch run config JSON (csv_path, maximize, true_optima or "
+                             "regions_objective, max_trials, time_limit_hours).")
+    parser.add_argument("--no-show", action="store_true",
+                        help="Use Agg matplotlib backend (no GUI windows). Implied by --batch.")
+    parser.add_argument("--device", choices=("cpu", "cuda"), default=None,
+                        help="Torch device (default: cuda if available else cpu).")
+    parser.add_argument("--time-limit-hours", type=float, default=None,
+                        help=f"Per-trial ZoMBI wall-clock budget in hours (default: {TIME_LIMIT_HOURS}).")
+    parser.add_argument("--runs-dir", metavar="DIR", default=None,
+                        help="Override output runs directory (default: optimize/runs).")
+    parser.add_argument("--run-dir", metavar="DIR", default=None,
+                        help="Explicit run output folder (array jobs: one dir per task).")
     parser.add_argument("--max-trials", type=int, default=None,
                         help="Optional cap on total number of trials (default: unbounded, Ctrl+C to stop).")
     parser.add_argument("--resume", action="store_true",
@@ -1654,12 +1900,78 @@ def main() -> None:
                              "--resume / --resume-scratch.")
     args = parser.parse_args()
 
+    if args.batch and not args.config:
+        sys.exit("--batch requires --config PATH.")
+    if args.config and not args.batch and not args.no_show:
+        print("  [hint] --config is usually paired with --batch on HPC.")
+
     if sum(bool(x) for x in (args.resume, args.resume_scratch, args.copy_config)) > 1:
         sys.exit("Use only one of --resume / --resume-scratch / --copy-config.")
+    if args.batch and any((args.resume, args.resume_scratch, args.copy_config)):
+        sys.exit("--batch cannot combine with --resume / --resume-scratch / --copy-config.")
+
+    headless = bool(args.batch or args.no_show or args.config
+                    or args.resume or args.copy_config)
+    _configure_mpl_backend(headless=headless)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    runs_dir   = os.path.join(script_dir, "runs")
+    runs_dir   = os.path.abspath(args.runs_dir or os.path.join(script_dir, "runs"))
     os.makedirs(runs_dir, exist_ok=True)
+
+    max_trials = args.max_trials
+    batch_name = None
+    batch_config_path = None
+    run_dir_override = os.path.abspath(args.run_dir) if args.run_dir else None
+
+    if args.batch:
+        batch = load_batch_config(args.config, script_dir)
+        batch_name = batch["name"]
+        batch_config_path = batch["config_path"]
+        _apply_runtime_overrides(
+            device=args.device,
+            time_limit_hours=batch.get("time_limit_hours") or args.time_limit_hours,
+        )
+        max_trials = batch.get("max_trials") if batch.get("max_trials") is not None else args.max_trials
+
+        print("=" * 70)
+        print(f"ZoMBI-Hop MOBO — BATCH  |  {batch_name}")
+        print(f"Device: {DEVICE}   |   time limit/trial: {TIME_LIMIT_HOURS} h")
+        print("=" * 70)
+
+        csv_path = batch["csv_path"]
+        obj_col = batch["objective_column"]
+        rf_maximize = batch["maximize"]
+        print(f"\n[RF] Loading {csv_path} ({obj_col}) …  "
+              f"Training RF ({RF_N_ESTIMATORS} trees) …")
+        rf, rf_fn, grid_pts, grid_vals = build_rf_and_grid(csv_path, objective_column=obj_col)
+        print("  RF trained.")
+
+        true_optima = batch["true_optima"]
+        if not true_optima:
+            auto = batch.get("auto_optima") or {}
+            n_peaks = int(auto.get("n_peaks", 3))
+            min_sep = float(auto.get("min_sep", 0.08))
+            print(f"  [batch] auto-detecting {n_peaks} reference "
+                  f"{'maxima' if rf_maximize else 'minima'} …")
+            true_optima = auto_detect_rf_optima(
+                rf, grid_pts, grid_vals,
+                maximize=rf_maximize, n_peaks=n_peaks, min_sep=min_sep,
+            )
+        goal = "maxima" if rf_maximize else "minima"
+        print(f"  RF ready: {len(true_optima)} reference {goal}")
+        for i, t in enumerate(true_optima):
+            print(f"    #{i + 1}  {np.round(t, 4).tolist()}")
+
+        _launch_run(
+            runs_dir, rf_fn, true_optima, grid_pts, grid_vals, rf_maximize,
+            csv_path, max_trials,
+            objective_column=obj_col,
+            batch_name=batch_name, batch_config_path=batch_config_path,
+            run_dir=run_dir_override,
+        )
+        return
+
+    _apply_runtime_overrides(device=args.device, time_limit_hours=args.time_limit_hours)
 
     # "Start from best" seeds: (X, Y) pairs copied straight into the GP prior
     # history (never re-evaluated), shared by all run modes.
@@ -1691,12 +2003,14 @@ def main() -> None:
 
         if not os.path.exists(csv_path):
             sys.exit(f"Saved CSV path no longer exists: {csv_path}")
-        print(f"\n[RF] Rebuilding surrogate from {csv_path} …")
-        _, rf_fn, grid_pts, grid_vals = build_rf_and_grid(csv_path)
+        obj_col = cfg.get("objective_column", "Objective")
+        print(f"\n[RF] Rebuilding surrogate from {csv_path} ({obj_col}) …")
+        _, rf_fn, grid_pts, grid_vals = build_rf_and_grid(csv_path, objective_column=obj_col)
         print(f"  RF ready: reusing {len(true_optima)} saved reference optima")
 
         _launch_run(runs_dir, rf_fn, true_optima, grid_pts, grid_vals, rf_maximize,
-                    csv_path, args.max_trials, X_prior=X_prior, Y_prior=Y_prior)
+                    csv_path, max_trials, X_prior=X_prior, Y_prior=Y_prior,
+                    objective_column=obj_col, run_dir=run_dir_override)
         return
 
     # ── Resume-from-scratch: seed with all prior (X,Y), but re-pick config ──
@@ -1719,7 +2033,8 @@ def main() -> None:
         X_prior += X_seed; Y_prior += Y_seed
 
         _launch_run(runs_dir, rf_fn, true_optima, grid_pts, grid_vals, rf_maximize,
-                    csv_path, args.max_trials, X_prior=X_prior, Y_prior=Y_prior)
+                    csv_path, max_trials, X_prior=X_prior, Y_prior=Y_prior,
+                    run_dir=run_dir_override)
         return
 
     # ── Copy-config: reuse another run's config, but start with NO prior data ──
@@ -1740,12 +2055,14 @@ def main() -> None:
 
         if not os.path.exists(csv_path):
             sys.exit(f"Copied CSV path no longer exists: {csv_path}")
-        print(f"\n[RF] Rebuilding surrogate from {csv_path} …")
-        _, rf_fn, grid_pts, grid_vals = build_rf_and_grid(csv_path)
+        obj_col = cfg.get("objective_column", "Objective")
+        print(f"\n[RF] Rebuilding surrogate from {csv_path} ({obj_col}) …")
+        _, rf_fn, grid_pts, grid_vals = build_rf_and_grid(csv_path, objective_column=obj_col)
         print(f"  RF ready: reusing {len(true_optima)} saved reference optima")
 
         _launch_run(runs_dir, rf_fn, true_optima, grid_pts, grid_vals, rf_maximize,
-                    csv_path, args.max_trials, X_prior=X_seed, Y_prior=Y_seed)
+                    csv_path, max_trials, X_prior=X_seed, Y_prior=Y_seed,
+                    objective_column=obj_col, run_dir=run_dir_override)
         return
 
     # ── Fresh run ──
@@ -1758,7 +2075,8 @@ def main() -> None:
         _interactive_run_config(script_dir)
 
     _launch_run(runs_dir, rf_fn, true_optima, grid_pts, grid_vals, rf_maximize,
-                csv_path, args.max_trials, X_prior=X_seed, Y_prior=Y_seed)
+                csv_path, max_trials, X_prior=X_seed, Y_prior=Y_seed,
+                run_dir=run_dir_override)
 
 
 if __name__ == "__main__":
