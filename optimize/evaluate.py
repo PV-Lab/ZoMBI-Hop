@@ -65,6 +65,15 @@ Usage
          --trials 12,34 --dataset ackley4d --num-runs 5 --time-limit-min 10
   python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
          --trials 12 --dataset ackley10d --num-runs 3
+
+Instead of ``--trials``, you can pass ``--hparams-json`` with a path to a JSON
+file containing the hyperparameters directly (either a trial.json-style dict
+with an ``"hparams"`` key, or a flat dict of hyperparameter values).  The run
+is labelled ``trial_0``.  ``--runs-path`` is still required for the RF dataset
+config::
+
+  python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
+         --hparams-json optimize/hparams.json --dataset RF --num-runs 3
 """
 
 from __future__ import annotations
@@ -159,6 +168,34 @@ def resolve_dataset(dataset: str, runs_path: str, ackley_variant: str) -> dict:
 
 
 # ─── Trial-hparam selection from the source mobo run ────────────────────────────
+
+def load_hparams_from_json(json_path: str) -> dict[int, dict]:
+    """Load hyperparameters from a standalone JSON file.
+
+    Accepts two formats: (1) a trial.json-style dict with an ``"hparams"`` key,
+    or (2) a flat dict whose keys are all hyperparameter names.  Returns a
+    single-entry ``{0: hparams}`` dict (trial number 0) so it slots into the
+    same ``hparams_by_trial`` flow as ``load_trial_hparams``.
+    """
+    if not os.path.exists(json_path):
+        sys.exit(f"--hparams-json: file not found: {json_path}")
+    try:
+        with open(json_path) as f:
+            raw = json.load(f)
+    except Exception as exc:
+        sys.exit(f"--hparams-json: {json_path} is not valid JSON ({exc}).")
+    hp = raw.get("hparams", raw) if isinstance(raw, dict) else None
+    if not isinstance(hp, dict):
+        sys.exit(f"--hparams-json: expected a dict with hparam keys (or an "
+                 f"'hparams' key containing them).")
+    missing = [k for k in rm.HPARAM_NAMES if k not in hp]
+    if missing:
+        sys.exit(f"--hparams-json: missing hparams {missing} "
+                 f"(stale hyperparameter set?).")
+    hp = {k: hp[k] for k in rm.HPARAM_NAMES}
+    print(f"  [hparams-json] loaded {len(hp)} hyperparameters from {json_path}")
+    return {0: hp}
+
 
 def load_trial_hparams(runs_path: str, trial_nums: list[int]) -> dict[int, dict]:
     """Read the hyperparameters of the requested trials from ``--runs-path``.
@@ -275,11 +312,13 @@ def write_needles_csv(path: str, dh, cols: list[str], dim: int) -> None:
             "activation": r.get("activation"),
             "zoom": r.get("zoom"),
             "iteration": r.get("iteration"),
+            "reason": r.get("reason"),
             "dist_to_centre": float(np.linalg.norm(pt - centroid)),
         })
         rows.append(row)
     columns = ["needle_idx"] + cols + ["value", "median_value", "activation",
-                                       "zoom", "iteration", "dist_to_centre"]
+                                       "zoom", "iteration", "reason",
+                                       "dist_to_centre"]
     pd.DataFrame(rows, columns=columns).to_csv(path, index=False)
 
 
@@ -438,11 +477,15 @@ def run_single_eval(hparams: dict, ds: dict, dataset: str, out_dir: str,
                                  dh.current_activation, dh.current_zoom))
     dh.take_snapshot = snap_wrap
 
+    interrupted = False
     t0 = time.time()
     try:
         optimizer.run(max_activations=float("inf"), time_limit_hours=time_limit_min / 60.0)
     except _TopKReached as stop:
         print(f"      [run] top-k reached: {int(stop.args[0])} needle(s) found — stopping early")
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n      [run] interrupted — writing artifacts before exit …")
     except Exception as exc:
         print(f"      [run] ZoMBI crashed: {exc}")
     runtime = time.time() - t0
@@ -504,6 +547,8 @@ def run_single_eval(hparams: dict, ds: dict, dataset: str, out_dir: str,
                "runtime_s":       round(runtime, 3)}
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
+    if interrupted:
+        raise KeyboardInterrupt
     return {"dist": dist, "dup": dup, "runtime": runtime}
 
 
@@ -635,9 +680,15 @@ def main() -> None:
         description="Re-evaluate selected ZoMBI-Hop hyperparameter sets on a chosen "
                     "objective, writing run_mobo-style artifacts.")
     parser.add_argument("--runs-path", required=True, metavar="MOBO_DIR",
-                        help="Source mobo_* run directory holding the trials to re-run.")
-    parser.add_argument("--trials", required=True, metavar="N,N,...",
-                        help="Comma-separated source trial numbers (e.g. 12,34,56).")
+                        help="Source mobo_* run directory (needed for --dataset RF config, "
+                             "and for --trials to look up hyperparameters).")
+    parser.add_argument("--trials", default=None, metavar="N,N,...",
+                        help="Comma-separated source trial numbers (e.g. 12,34,56). "
+                             "Mutually exclusive with --hparams-json.")
+    parser.add_argument("--hparams-json", default=None, metavar="PATH",
+                        help="Path to a JSON file containing hyperparameters (either a "
+                             "flat hparam dict or a trial.json-style dict with an "
+                             "'hparams' key). Mutually exclusive with --trials.")
     parser.add_argument("--dataset", required=True, metavar="DS[,DS...]",
                         help="Objective(s) to evaluate on, comma-separated "
                              "(RF | ackley3d | ackley4d | ackley10d). Multiple "
@@ -664,7 +715,10 @@ def main() -> None:
         sys.exit("--num-runs must be >= 1.")
     if args.top_k is not None and args.top_k < 1:
         sys.exit("--top-k must be >= 1.")
-    trial_nums = _parse_trials(args.trials)
+    if args.trials and args.hparams_json:
+        sys.exit("--trials and --hparams-json are mutually exclusive.")
+    if not args.trials and not args.hparams_json:
+        sys.exit("One of --trials or --hparams-json is required.")
     datasets = _parse_datasets(args.dataset)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -673,16 +727,22 @@ def main() -> None:
     rerun_dir = os.path.join(out_parent, datetime.datetime.now().strftime("rerun_%d_%m_%H_%M"))
     os.makedirs(rerun_dir, exist_ok=True)
 
+    if args.hparams_json:
+        hparams_by_trial = load_hparams_from_json(args.hparams_json)
+        trial_nums = list(hparams_by_trial.keys())
+    else:
+        trial_nums = _parse_trials(args.trials)
+        hparams_by_trial = load_trial_hparams(runs_path, trial_nums)
+
     print("=" * 72)
     print(f"ZoMBI-Hop evaluate  |  datasets={datasets}  trials={trial_nums}  "
           f"num_runs={args.num_runs}  limit={args.time_limit_min} min"
           + (f"  top_k={args.top_k}" if args.top_k is not None else ""))
+    if args.hparams_json:
+        print(f"hparams: {os.path.abspath(args.hparams_json)}")
     print(f"source: {runs_path}")
     print(f"output: {rerun_dir}")
     print("=" * 72)
-
-    # Trial hyperparameters are dataset-independent — load them once.
-    hparams_by_trial = load_trial_hparams(runs_path, trial_nums)
 
     # One dataset writes its artifacts directly into rerun_dir (unchanged layout);
     # multiple datasets each get their own sub-folder under it.
