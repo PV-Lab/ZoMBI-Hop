@@ -3,7 +3,7 @@
 #SBATCH --partition=mit_normal
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=32G
-#SBATCH --time=24:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=logs/mobo-%j.out
 #SBATCH --error=logs/mobo-%j.err
 
