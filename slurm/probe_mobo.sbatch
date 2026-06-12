@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=zombi-probe
 #SBATCH --partition=mit_normal
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=2:00:00
 #SBATCH --output=logs/probe-%j.out
@@ -11,18 +11,21 @@ set -euo pipefail
 # Short MOBO probe to measure per-trial runtime and log cluster allocation.
 #
 # Submit from repo root:
-#   sbatch slurm/probe_mobo.sbatch                          # CPU, 1 trial
-#   bash scripts/probe_cluster.sh gpu                       # GPU (sets partition + gres)
-#   MOBO_MAX_TRIALS=2 bash scripts/probe_cluster.sh gpu
+#   sbatch slurm/probe_mobo.sbatch                              # CPU, campaign, 1 trial
+#   bash scripts/probe_cluster.sh gpu-campaign                  # GPU, 3D campaign (recommended)
+#   bash scripts/probe_cluster.sh gpu-ackley                    # GPU, Ackley 10D
+#   MOBO_MAX_TRIALS=2 bash scripts/probe_cluster.sh gpu-campaign
 #
 # Or use the helper:
 #   bash scripts/probe_cluster.sh info
 #   bash scripts/probe_cluster.sh cpu
-#   bash scripts/probe_cluster.sh gpu
-#   bash scripts/probe_cluster.sh both
+#   bash scripts/probe_cluster.sh gpu-campaign
+#   bash scripts/probe_cluster.sh gpu-ackley
+#   bash scripts/probe_cluster.sh both-campaign               # CPU + GPU campaign probes
 
 REPO="${SLURM_SUBMIT_DIR:-$(pwd)}"
 PROBE_TARGET="${PROBE_TARGET:-cpu}"
+PROBE_LANDSCAPE="${PROBE_LANDSCAPE:-campaign}"
 MAX_TRIALS="${MOBO_MAX_TRIALS:-1}"
 REPORT="${REPO}/logs/probe-${SLURM_JOB_ID:-local}.txt"
 
@@ -30,22 +33,26 @@ cd "${REPO}"
 mkdir -p logs optimize/runs
 
 if [[ "${PROBE_TARGET}" == "gpu" ]]; then
-  CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/ackley_10d_layout1.json}"
   DEVICE="cuda"
   CPUS="${SLURM_CPUS_PER_TASK:-8}"
+  if [[ "${PROBE_LANDSCAPE}" == "ackley" ]]; then
+    CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/ackley_10d_layout1.json}"
+  else
+    CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/probe_campaign_gpu.json}"
+  fi
 else
-  CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/campaign1a_objective_min.json}"
+  CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/probe_campaign_gpu.json}"
   DEVICE="cpu"
-  CPUS="${SLURM_CPUS_PER_TASK:-16}"
+  CPUS="${SLURM_CPUS_PER_TASK:-8}"
 fi
 
-RUN_DIR="${MOBO_RUN_DIR:-optimize/runs/probe_${SLURM_JOB_ID:-local}_${PROBE_TARGET}}"
+RUN_DIR="${MOBO_RUN_DIR:-optimize/runs/probe_${SLURM_JOB_ID:-local}_${PROBE_TARGET}_${PROBE_LANDSCAPE}}"
 
 {
   echo "=== ZoMBI-Hop MOBO cluster probe ==="
   echo "started:    $(date -Is)"
   echo "job_id:     ${SLURM_JOB_ID:-local}"
-  echo "target:     ${PROBE_TARGET}"
+  echo "target:     ${PROBE_TARGET} (${PROBE_LANDSCAPE})"
   echo "partition:  ${SLURM_JOB_PARTITION:-unknown}"
   echo "config:     ${CONFIG}"
   echo "max_trials: ${MAX_TRIALS}"

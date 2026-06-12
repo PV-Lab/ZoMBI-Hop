@@ -1,30 +1,29 @@
 #!/bin/bash
-#SBATCH --job-name=zombi-mobo-10d
+#SBATCH --job-name=zombi-mobo-gpu
 #SBATCH --partition=mit_normal_gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=6:00:00
-#SBATCH --output=logs/mobo-10d-%j.out
-#SBATCH --error=logs/mobo-10d-%j.err
+#SBATCH --output=logs/mobo-gpu-%j.out
+#SBATCH --error=logs/mobo-gpu-%j.err
 
 set -euo pipefail
-# Unified 10D Multi-Ackley MOBO via optimize/run_mobo.py (same run layout as campaign MOBO).
+# 3D campaign RF MOBO on GPU (optimize/run_mobo.py).
 #
 # Submit from repo root:
-#   cd ~/ZoMBI-Hop && sbatch slurm/mobo_10d.sbatch
+#   cd ~/ZoMBI-Hop && sbatch slurm/run_mobo_gpu.sbatch
 #
-# Quick probe (2 trials):
-#   MOBO_MAX_TRIALS=2 sbatch slurm/mobo_10d.sbatch
-#   bash scripts/probe_cluster.sh gpu
+# Quick probe (1 trial):
+#   MOBO_MAX_TRIALS=1 sbatch slurm/run_mobo_gpu.sbatch
+#   bash scripts/probe_cluster.sh gpu-campaign
 #
-# Override config / trials / output dir:
-#   MOBO_CONFIG=optimize/mobo_batch_configs/ackley_10d_layout1.json \
-#   MOBO_MAX_TRIALS=2 \
-#   MOBO_RUN_DIR=optimize/runs/mobo_ackley_10d_test sbatch slurm/mobo_10d.sbatch
+# Override config / trials:
+#   MOBO_CONFIG=optimize/mobo_batch_configs/campaign1a_objective_min.json \
+#   MOBO_MAX_TRIALS=20 sbatch slurm/run_mobo_gpu.sbatch
 
 REPO="${SLURM_SUBMIT_DIR}"
-CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/ackley_10d_layout1.json}"
+CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/campaign1a_objective_min.json}"
 MAX_TRIALS="${MOBO_MAX_TRIALS:-}"
 RUN_DIR="${MOBO_RUN_DIR:-}"
 

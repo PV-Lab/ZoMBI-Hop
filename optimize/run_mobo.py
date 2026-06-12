@@ -1857,6 +1857,9 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user — finalising results …")
 
+    if max_trials is not None and len(Y_obs) >= max_trials:
+        print(f"\n[stop] max_trials={max_trials} reached ({len(Y_obs)} completed).")
+
     if Y_obs:
         save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior,
                              n_init_trials=n_init_trials)
@@ -2026,11 +2029,16 @@ def main() -> None:
             device=args.device,
             time_limit_hours=batch.get("time_limit_hours") or args.time_limit_hours,
         )
-        max_trials = batch.get("max_trials") if batch.get("max_trials") is not None else args.max_trials
+        max_trials = (
+            args.max_trials
+            if args.max_trials is not None
+            else batch.get("max_trials")
+        )
 
         print("=" * 70)
         print(f"ZoMBI-Hop MOBO — BATCH  |  {batch_name}")
-        print(f"Device: {DEVICE}   |   Sobol init: {n_init} trials")
+        print(f"Device: {DEVICE}   |   Sobol init: {n_init} trials   |   "
+              f"max_trials: {max_trials if max_trials is not None else 'unbounded (Ctrl+C)'}")
         print("=" * 70)
 
         if batch.get("landscape") is not None:

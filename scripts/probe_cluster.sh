@@ -2,15 +2,17 @@
 # Probe MOBO runtime and print ORCD cluster limits.
 #
 # Usage (from repo root on MIT ORCD):
-#   bash scripts/probe_cluster.sh info          # print partition/account limits only
-#   bash scripts/probe_cluster.sh cpu           # submit 1-trial CPU probe
-#   bash scripts/probe_cluster.sh gpu           # submit 1-trial GPU probe
-#   bash scripts/probe_cluster.sh both          # submit CPU + GPU probes
-#   bash scripts/probe_cluster.sh summarize     # summarize all runs under optimize/runs
+#   bash scripts/probe_cluster.sh info              # partition/account limits
+#   bash scripts/probe_cluster.sh cpu               # 1-trial CPU, 3D campaign
+#   bash scripts/probe_cluster.sh gpu-campaign      # 1-trial GPU, 3D campaign RF
+#   bash scripts/probe_cluster.sh gpu-ackley        # 1-trial GPU, Ackley 10D
+#   bash scripts/probe_cluster.sh both-campaign     # CPU + GPU campaign probes
+#   bash scripts/probe_cluster.sh summarize         # timing from optimize/runs
 #
 # Environment overrides (passed to sbatch):
-#   MOBO_MAX_TRIALS=2   — trials per probe job (default 1)
-#   MOBO_CONFIG=...     — batch JSON config path
+#   MOBO_MAX_TRIALS=2        — trials per probe (default 1; overrides config)
+#   MOBO_CONFIG=...          — batch JSON (default depends on probe type)
+#   MOBO_RUN_DIR=...         — explicit output run directory
 
 set -euo pipefail
 
@@ -46,30 +48,34 @@ print_cluster_info() {
   fi
 
   echo ""
-  echo "=== Current sbatch defaults in this repo ==="
-  echo "  slurm/run_mobo.sbatch     mit_normal,     16 CPU, 32G,  12h wall, device=cpu"
-  echo "  slurm/mobo_10d.sbatch     mit_normal_gpu,  8 CPU, 64G,   6h wall, 1 GPU"
-  echo "  slurm/probe_mobo.sbatch   2h wall, MOBO_MAX_TRIALS=${MOBO_MAX_TRIALS:-1}"
+  echo "=== MOBO sbatch scripts ==="
+  echo "  slurm/run_mobo.sbatch       CPU campaign (mit_normal, 16 CPU, 12h)"
+  echo "  slurm/run_mobo_gpu.sbatch   GPU campaign (mit_normal_gpu, 1 GPU, 12h)"
+  echo "  slurm/mobo_10d.sbatch       GPU Ackley 10D (mit_normal_gpu, 1 GPU, 6h)"
+  echo "  slurm/probe_mobo.sbatch     short probe, MOBO_MAX_TRIALS=${MOBO_MAX_TRIALS:-1}"
   echo ""
-  echo "Campaign config: 20 trials × 0.4 h/trial ≈ 8 h ZoMBI (12 h sbatch limit)"
-  echo "Ackley config:   28 trials, max_activations/trial — measure with gpu probe first"
+  echo "Probe configs:"
+  echo "  probe_campaign_gpu.json  — 1 trial, 0.4 h/trial, 3D RF campaign"
+  echo "  ackley_10d_layout1.json — Ackley 10D synthetic benchmark"
 }
 
 submit_probe() {
   local target="$1"
+  local landscape="${2:-campaign}"
   local extra=()
 
   if [[ "${target}" == "gpu" ]]; then
     extra+=(--partition=mit_normal_gpu --gres=gpu:1 --cpus-per-task=8 --mem=64G)
   else
-    extra+=(--partition=mit_normal --cpus-per-task=16 --mem=32G)
+    extra+=(--partition=mit_normal --cpus-per-task=8 --mem=32G)
   fi
 
-  echo "Submitting ${target} probe (MOBO_MAX_TRIALS=${MOBO_MAX_TRIALS:-1}) …"
+  echo "Submitting ${target}/${landscape} probe (MOBO_MAX_TRIALS=${MOBO_MAX_TRIALS:-1}) …"
   PROBE_TARGET="${target}" \
+  PROBE_LANDSCAPE="${landscape}" \
   MOBO_MAX_TRIALS="${MOBO_MAX_TRIALS:-1}" \
   MOBO_CONFIG="${MOBO_CONFIG:-}" \
-  sbatch "${extra[@]}" --export=ALL,PROBE_TARGET="${target}" "${SBATCH}"
+  sbatch "${extra[@]}" --export=ALL,PROBE_TARGET="${target}",PROBE_LANDSCAPE="${landscape}" "${SBATCH}"
 }
 
 case "${MODE}" in
@@ -79,18 +85,23 @@ case "${MODE}" in
   cpu)
     print_cluster_info
     echo ""
-    submit_probe cpu
+    submit_probe cpu campaign
     ;;
-  gpu)
+  gpu|gpu-campaign)
     print_cluster_info
     echo ""
-    submit_probe gpu
+    submit_probe gpu campaign
     ;;
-  both)
+  gpu-ackley)
     print_cluster_info
     echo ""
-    submit_probe cpu
-    submit_probe gpu
+    submit_probe gpu ackley
+    ;;
+  both|both-campaign)
+    print_cluster_info
+    echo ""
+    submit_probe cpu campaign
+    submit_probe gpu campaign
     ;;
   summarize)
     python "${REPO}/scripts/summarize_mobo_runs.py" --latest
@@ -98,7 +109,8 @@ case "${MODE}" in
     python "${REPO}/scripts/summarize_mobo_runs.py"
     ;;
   *)
-    echo "Usage: bash scripts/probe_cluster.sh [info|cpu|gpu|both|summarize]" >&2
+    echo "Usage: bash scripts/probe_cluster.sh [info|cpu|gpu-campaign|gpu-ackley|both-campaign|summarize]" >&2
+    echo "       (gpu is an alias for gpu-campaign)" >&2
     exit 1
     ;;
 esac
