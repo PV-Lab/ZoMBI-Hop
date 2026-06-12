@@ -14,8 +14,13 @@ set -euo pipefail
 # Submit from repo root:
 #   cd ~/ZoMBI-Hop && sbatch slurm/mobo_10d.sbatch
 #
-# Override config / output dir:
+# Quick probe (2 trials):
+#   MOBO_MAX_TRIALS=2 sbatch slurm/mobo_10d.sbatch
+#   bash scripts/probe_cluster.sh gpu
+#
+# Override config / trials / output dir:
 #   MOBO_CONFIG=optimize/mobo_batch_configs/ackley_10d_layout1.json \
+#   MOBO_MAX_TRIALS=2 \
 #   MOBO_RUN_DIR=optimize/runs/mobo_ackley_10d_test sbatch slurm/mobo_10d.sbatch
 
 REPO="${SLURM_SUBMIT_DIR}"
@@ -35,6 +40,9 @@ export MPLBACKEND=Agg
 export PYTHONUNBUFFERED=1
 
 EXTRA=()
+if [[ -n "${MAX_TRIALS}" ]]; then
+  EXTRA+=(--max-trials "${MAX_TRIALS}")
+fi
 if [[ -n "${RUN_DIR}" ]]; then
   EXTRA+=(--run-dir "${REPO}/${RUN_DIR}")
 fi

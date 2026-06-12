@@ -16,6 +16,10 @@ set -euo pipefail
 # Override config / trials:
 #   MOBO_CONFIG=optimize/mobo_batch_configs/campaign1a_objective_min.json \
 #   MOBO_MAX_TRIALS=30 sbatch slurm/run_mobo.sbatch
+#
+# Quick runtime probe (1 trial, ~25 min):
+#   MOBO_MAX_TRIALS=1 sbatch slurm/run_mobo.sbatch
+#   bash scripts/probe_cluster.sh cpu
 
 REPO="${SLURM_SUBMIT_DIR}"
 CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/campaign1a_objective_min.json}"
