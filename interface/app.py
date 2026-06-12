@@ -57,7 +57,7 @@ except ImportError:
     _BOTORCH_OK = False
 
 from src import ZoMBIHop, LineBO
-from src.core.linebo import line_simplex_segment, zero_sum_dirs
+from src.core.linebo import dimension_line_scale, line_simplex_segment, zero_sum_dirs
 from src.utils.simplex import composition_to_ilr, ilr_to_composition, proj_simplex
 from src.utils.datahandler import reconstruct_snapshot_tensors
 
@@ -320,7 +320,9 @@ def _make_linebo_wrapper(sim_obj, dim: int, device, dtype, plot_state: dict | No
 
 def _gen_init_data(fn_callable, d: int, maximize: bool):
     xa, xe, yl = [], [], []
-    for _ in range(N_INIT_LINES):
+    # Initial-seeding budget scales with dimension (no-op at d=3).
+    n_init_lines = max(1, int(round(N_INIT_LINES * dimension_line_scale(d))))
+    for _ in range(n_init_lines):
         x0  = torch.full((d,), 1.0 / d, device=DEVICE, dtype=DTYPE)
         dir_ = zero_sum_dirs(1, d, device=DEVICE, dtype=DTYPE).squeeze(0)
         seg  = line_simplex_segment(x0, dir_)

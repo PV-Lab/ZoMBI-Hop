@@ -24,6 +24,11 @@ keyword arguments::
 
     fn = Ackley("realistic", dim=3, n_optima=5, noise_amp=10.0)
 
+The configured ``n_optima`` describes the **3-simplex (d=3)**; when it is *not*
+overridden, the number of optima is scaled with dimension by ``(d-1)/2`` (see
+``scaled_n_optima``) so higher-d benchmarks have proportionally more optima.
+Passing ``n_optima`` explicitly disables this scaling and uses that exact count.
+
 All other variants ignore these keyword arguments and behave exactly as
 before.
 
@@ -71,6 +76,30 @@ def save_config(cfg: dict) -> None:
     with open(_DEFAULTS_PATH, "w") as f:
         json.dump(cfg, f, indent=4)
         f.write("\n")
+
+
+def scaled_n_optima(n_base: int, dim: int) -> int:
+    """Number of "realistic" optima for ``dim``, scaling a 3-simplex baseline.
+
+    The configured ``n_optima`` describes the **3-simplex (d=3)**.  The count of
+    distinct optima then grows **linearly** with the tangent dimension by the
+    factor ``(d-1)/2`` — exactly the baseline at d=3, ~1.5× at d=4, 4.5× at d=10.
+
+    Why linear: the room for distinct basins lives in the ``(d-1)``-dimensional
+    simplex, so it expands with dimension; true geometric growth is exponential,
+    but (as with the sampling-budget scaling in ``DIMENSION_SCALING.md``) that is
+    both unrealistic for materials composition spaces — which are mostly
+    phase-separated, not densely packed with stable phases — and undiscoverable as
+    a benchmark.  Tying the optima count to the *same* ``(d-1)/2`` factor used for
+    sampling budgets keeps the benchmark equally hard *per unit budget* across
+    dimensions, so a budget-scaling A/B isn't confounded by a higher-d run getting
+    more budget to chase the same number of targets.
+
+    This is intentionally a *plain* function of ``dim`` — independent of the
+    runtime ``src.utils.scaling`` toggle — so both arms of such an A/B face the
+    identical objective.
+    """
+    return max(1, int(round(n_base * (dim - 1) / 2.0)))
 
 # ── Ackley constants ─────────────────────────────────────────────────────────
 ACKLEY_A = 20.0
@@ -196,7 +225,9 @@ class Ackley:
         Simplex dimensionality.
     n_optima, basin_width, noise_freq, noise_amp : optional
         Overrides for the "realistic" variant (ignored by others).
-        Unspecified values are read from the config file.
+        Unspecified values are read from the config file.  When ``n_optima`` is
+        left unspecified it is scaled with ``dim`` by ``(d-1)/2`` relative to the
+        configured (d=3) value; passing it explicitly uses that exact count.
     noise_octaves, noise_seed, peak_seed : optional
         Additional "realistic" controls with sensible defaults.
     """
@@ -228,7 +259,14 @@ class Ackley:
 
         if variant == "realistic":
             cfg = load_config()
-            _n = int(n_optima if n_optima is not None else cfg["n_optima"])
+            # An explicit n_optima is honoured exactly (e.g. the plot_3d/plot_4d
+            # sliders); otherwise the configured value is the d=3 baseline and is
+            # scaled with dimension so higher-d benchmarks have proportionally
+            # more optima (see ``scaled_n_optima``).
+            if n_optima is not None:
+                _n = int(n_optima)
+            else:
+                _n = scaled_n_optima(int(cfg["n_optima"]), dim)
             _b = float(basin_width if basin_width is not None else cfg["basin_width"])
             _nf = float(noise_freq if noise_freq is not None else cfg["noise_freq"])
             _na = float(noise_amp if noise_amp is not None else cfg["noise_amp"])

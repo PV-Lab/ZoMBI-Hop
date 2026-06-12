@@ -103,6 +103,10 @@ for _stream in (sys.stdout, sys.stderr):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_mobo as rm
 
+# Dimension scaling helper for the LineBO seeding budget (run_mobo wires the
+# repo root onto sys.path, so src is importable after importing it).
+from src.core.linebo import dimension_line_scale
+
 # Analytic benchmark objectives (negated Ackley on the d-simplex).
 from synthetic_data.ackley import Ackley
 
@@ -239,10 +243,16 @@ def load_trial_hparams(runs_path: str, trial_nums: list[int]) -> dict[int, dict]
 
 # ─── Generalised init data (dimension-aware copy of run_mobo._gen_init_data) ────
 
-def gen_init_data(fn_callable, maximize: bool, dim: int):
-    """Generate ``N_INIT_LINES`` random simplex lines on the ``dim``-simplex."""
+def gen_init_data(fn_callable, maximize: bool, dim: int, n_init_lines: int | None = None):
+    """Generate ``n_init_lines`` random simplex lines on the ``dim``-simplex.
+
+    ``n_init_lines`` defaults to ``run_mobo.N_INIT_LINES``; callers transferring a
+    3-D-tuned configuration to a higher dimension pass a dimension-scaled count.
+    """
+    if n_init_lines is None:
+        n_init_lines = rm.N_INIT_LINES
     x_a_list, x_e_list, y_list = [], [], []
-    for _ in range(rm.N_INIT_LINES):
+    for _ in range(n_init_lines):
         x0   = torch.full((dim,), 1.0 / dim, device=rm.DEVICE, dtype=rm.DTYPE)
         dir_ = rm.zero_sum_dirs(1, dim, device=rm.DEVICE, dtype=rm.DTYPE).squeeze(0)
         seg  = rm.line_simplex_segment(x0, dir_)
@@ -418,6 +428,11 @@ def run_single_eval(hparams: dict, ds: dict, dataset: str, out_dir: str,
     call_counter = [0]
     dh_ref = [None]
 
+    # Initial-seeding line budget scales with dimension (1.0 at d=3).  The
+    # per-iteration NUM_LINES budget is scaled inside LineBO.__init__, so it is
+    # passed through unchanged here.
+    n_init_lines = max(1, int(round(rm.N_INIT_LINES * dimension_line_scale(dim))))
+
     sim_obj = rm.make_sim_obj(fn, rm.DEVICE, rm.DTYPE, maximize=maximize)
     inner   = rm.make_linebo_wrapper(sim_obj, dim, rm.NUM_LINES, rm.DEVICE, rm.DTYPE, plot_state)
 
@@ -454,7 +469,7 @@ def run_single_eval(hparams: dict, ds: dict, dataset: str, out_dir: str,
         return x_req, x_act, y
 
     try:
-        X_a, X_e, Y = gen_init_data(fn, maximize, dim)
+        X_a, X_e, Y = gen_init_data(fn, maximize, dim, n_init_lines)
     except RuntimeError as exc:
         print(f"      [run] init failed: {exc}")
         return {"dist": rm.UNMATCHED_PENALTY, "dup": 1.0, "runtime": 0.0}
