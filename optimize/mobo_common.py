@@ -1,5 +1,5 @@
 """
-Shared MOBO utilities for optimize/run_mobo.py and optimize/run_mobo_10d.py.
+Shared MOBO utilities for optimize/run_mobo.py (and the deprecated run_mobo_10d shim).
 
 No matplotlib import — safe on headless HPC nodes.
 """

@@ -9,24 +9,37 @@
 #SBATCH --error=logs/mobo-10d-%j.err
 
 set -euo pipefail
-# Submit from repo root:  cd ~/ZoMBI-Hop && sbatch slurm/mobo_10d.sbatch
+# Unified 10D Multi-Ackley MOBO via optimize/run_mobo.py (same run layout as campaign MOBO).
+#
+# Submit from repo root:
+#   cd ~/ZoMBI-Hop && sbatch slurm/mobo_10d.sbatch
+#
+# Override config / output dir:
+#   MOBO_CONFIG=optimize/mobo_batch_configs/ackley_10d_layout1.json \
+#   MOBO_RUN_DIR=optimize/runs/mobo_ackley_10d_test sbatch slurm/mobo_10d.sbatch
+
 REPO="${SLURM_SUBMIT_DIR}"
+CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/ackley_10d_layout1.json}"
+RUN_DIR="${MOBO_RUN_DIR:-}"
+
 cd "${REPO}"
-mkdir -p logs runs
+mkdir -p logs optimize/runs
 
 source "${HOME}/miniforge3/etc/profile.d/conda.sh"
 conda activate zombi-hop-linebo
 
-export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
+export OPENBLAS_NUM_THREADS="${OMP_NUM_THREADS}"
 export MPLBACKEND=Agg
 export PYTHONUNBUFFERED=1
 
-python optimize/run_mobo_10d.py \
-  --batch \
-  --dim 10 \
-  --layout 1 \
-  --n-init-trials 8 \
-  --n-mobo-trials 20 \
+EXTRA=()
+if [[ -n "${RUN_DIR}" ]]; then
+  EXTRA+=(--run-dir "${REPO}/${RUN_DIR}")
+fi
+
+python optimize/run_mobo.py --batch --no-show \
+  --config "${REPO}/${CONFIG}" \
   --device cuda \
-  --no-show \
-  --save-dir "${REPO}/runs/mobo_10d"
+  "${EXTRA[@]}"
