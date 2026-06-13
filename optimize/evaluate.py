@@ -454,6 +454,8 @@ def run_single_eval(hparams: dict, ds: dict, dataset: str, out_dir: str,
             pared_X=pared_X, pared_Y=pared_Y,
             needles=(needles.detach().cpu().numpy()
                      if needles is not None and needles.shape[0] > 0 else None),
+            needle_vals=(dh.needle_vals.detach().cpu().numpy().ravel()
+                         if dh.needle_vals is not None and dh.needle_vals.shape[0] > 0 else None),
             needle_M_list=[m.detach().cpu().clone() if m is not None else None
                            for m in dh.needle_M_list],
             needle_B=(dh.needle_B.detach().cpu().clone() if dh.needle_B is not None else None),
