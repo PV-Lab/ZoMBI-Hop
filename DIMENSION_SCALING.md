@@ -19,7 +19,7 @@ We divide the hyperparameters into 2 groups that scale differently with dimensio
 **Parameters:** `paring_spatial_halfnoise`, `max_penalty_radius`,
 `min_axis_noise_mult`.
 
-These are all **lengths in tangent space**: a paring/deduplication radius, a
+These are all **lengths in tangent (ILR) space**: a paring/deduplication radius, a
 penalty-ellipsoid radius cap, and the semi-axis floor that decides when a needle
 has shrunk "into the noise". Each is, directly or after multiplying by
 `input_noise_ilr`, a radius measured in the `(d − 1)`-dimensional ILR space.

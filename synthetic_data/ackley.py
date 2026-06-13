@@ -57,6 +57,8 @@ _DEFAULTS_PATH = _CONFIGS_DIR / "defaults.json"
 _HARDCODED_DEFAULTS = {
     "n_optima": 10,
     "basin_width": 50,
+    "intensity_mean": 0.0,
+    "intensity_var": 0.0,
     "noise_freq": 8.0,
     "noise_amp": 5.0,
 }
@@ -228,6 +230,10 @@ class Ackley:
         Unspecified values are read from the config file.  When ``n_optima`` is
         left unspecified it is scaled with ``dim`` by ``(d-1)/2`` relative to the
         configured (d=3) value; passing it explicitly uses that exact count.
+    intensity_mean, intensity_var : optional
+        Mean and variance of a nonneg offset added to each optimum's basin
+        width, producing varying peak intensities.  Sampled from a Gamma
+        distribution (constant when ``intensity_var`` is 0).
     noise_octaves, noise_seed, peak_seed : optional
         Additional "realistic" controls with sensible defaults.
     """
@@ -241,6 +247,8 @@ class Ackley:
         *,
         n_optima: int | None = None,
         basin_width: float | None = None,
+        intensity_mean: float | None = None,
+        intensity_var: float | None = None,
         noise_freq: float | None = None,
         noise_amp: float | None = None,
         noise_octaves: int = 4,
@@ -268,12 +276,20 @@ class Ackley:
             else:
                 _n = scaled_n_optima(int(cfg["n_optima"]), dim)
             _b = float(basin_width if basin_width is not None else cfg["basin_width"])
+            _im = float(intensity_mean if intensity_mean is not None else cfg.get("intensity_mean", 0.0))
+            _iv = float(intensity_var if intensity_var is not None else cfg.get("intensity_var", 0.0))
             _nf = float(noise_freq if noise_freq is not None else cfg["noise_freq"])
             _na = float(noise_amp if noise_amp is not None else cfg["noise_amp"])
 
             rng = np.random.default_rng(peak_seed)
             self.centers = [c.copy() for c in rng.dirichlet(np.ones(dim), size=_n)]
-            self.basin_widths = [_b] * _n
+            if _iv > 0 and _im > 0:
+                shape = _im ** 2 / _iv
+                scale = _iv / _im
+                offsets = rng.gamma(shape, scale, size=_n)
+            else:
+                offsets = np.full(_n, _im)
+            self.basin_widths = [max(1.0, _b - float(o)) for o in offsets]
             self.combine = "max"
 
             self._noise_freq = _nf
