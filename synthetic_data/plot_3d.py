@@ -1,9 +1,10 @@
 """Interactive ternary plot of a tunable realistic Ackley + noise objective.
 
 Runs a Dash app with sliders for noise frequency, noise amplitude, number of
-Ackley optima, and basin width.  The ternary heatmap updates in real time as
-you drag any slider.  Click "Save as Default" to persist the current slider
-values to ``synthetic_data/ackley/defaults.json``.
+Ackley optima, and intensity offsets.  The ternary heatmap updates in real time
+as you drag any slider.  Basin width (b) is not tunable here: it is the hardcoded
+``BASIN_WIDTH_BY_DIM[3]`` in ``ackley.py``.  Click "Save as Default" to persist
+the current slider values to ``synthetic_data/ackley/defaults.json``.
 
 Usage:
     python plot_3d.py
@@ -18,7 +19,7 @@ from dash import Dash, Input, Output, State, callback, ctx, dcc, html
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-from synthetic_data.ackley import Ackley, load_config, save_config  # noqa: E402
+from synthetic_data.ackley import Ackley, load_config, save_config, BASIN_WIDTH_BY_DIM  # noqa: E402
 
 DIM = 3
 GRID_N = 150
@@ -51,13 +52,6 @@ app.layout = html.Div([
             dcc.Slider(id="n-optima", min=1, max=30, step=1,
                        value=cfg["n_optima"],
                        marks={i: str(i) for i in range(1, 31, 5)},
-                       tooltip={"placement": "bottom", "always_visible": True}),
-        ], style={"padding": "10px"}),
-        html.Div([
-            html.Label("Basin Width"),
-            dcc.Slider(id="basin-width", min=1, max=200, step=1,
-                       value=201 - cfg["basin_width"],
-                       marks={i: str(i) for i in range(0, 201, 25)},
                        tooltip={"placement": "bottom", "always_visible": True}),
         ], style={"padding": "10px"}),
         html.Div([
@@ -102,17 +96,18 @@ app.layout = html.Div([
     Output("save-status", "children"),
     Input("save-btn", "n_clicks"),
     State("n-optima", "value"),
-    State("basin-width", "value"),
     State("intensity-mean", "value"),
     State("intensity-var", "value"),
     State("noise-freq", "value"),
     State("noise-amp", "value"),
     prevent_initial_call=True,
 )
-def save_defaults(n_clicks, n_optima, basin_width, intensity_mean, intensity_var, noise_freq, noise_amp):
+def save_defaults(n_clicks, n_optima, intensity_mean, intensity_var, noise_freq, noise_amp):
+    # basin_width is no longer tunable here (it's hardcoded per-dim in ackley.py);
+    # preserve whatever is already in the config so saving doesn't drop it.
     save_config({
         "n_optima": int(n_optima),
-        "basin_width": float(201 - basin_width),
+        "basin_width": float(load_config().get("basin_width", 50.0)),
         "intensity_mean": float(intensity_mean),
         "intensity_var": float(intensity_var),
         "noise_freq": float(noise_freq),
@@ -124,17 +119,17 @@ def save_defaults(n_clicks, n_optima, basin_width, intensity_mean, intensity_var
 @callback(
     Output("ternary-plot", "figure"),
     Input("n-optima", "value"),
-    Input("basin-width", "value"),
     Input("noise-freq", "value"),
     Input("noise-amp", "value"),
     Input("intensity-mean", "value"),
     Input("intensity-var", "value"),
 )
-def update_plot(n_optima, basin_width, noise_freq, noise_amp, intensity_mean, intensity_var):
+def update_plot(n_optima, noise_freq, noise_amp, intensity_mean, intensity_var):
+    # basin_width (b) is not passed: Ackley uses the hardcoded BASIN_WIDTH_BY_DIM
+    # value for this dim.
     fn = Ackley(
         "realistic", dim=DIM,
         n_optima=int(n_optima),
-        basin_width=float(201 - basin_width),
         intensity_mean=float(intensity_mean),
         intensity_var=float(intensity_var),
         noise_freq=float(noise_freq),
@@ -164,7 +159,7 @@ def update_plot(n_optima, basin_width, noise_freq, noise_amp, intensity_mean, in
 
     fig = go.Figure(data=traces)
     fig.update_layout(
-        title=f"Tunable Realistic Ackley ({n_optima} peaks, b={basin_width})",
+        title=f"Tunable Realistic Ackley ({n_optima} peaks, b={BASIN_WIDTH_BY_DIM[DIM]} at dim {DIM})",
         ternary=dict(
             sum=1,
             aaxis=dict(title="x3"),

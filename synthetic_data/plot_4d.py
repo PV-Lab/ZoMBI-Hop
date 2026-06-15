@@ -5,8 +5,9 @@ The 4-element probability simplex is a tetrahedron: each composition
 objective value is encoded as colour.
 
 Runs a Dash app with sliders for noise frequency, noise amplitude, number of
-Ackley optima, basin width, and grid resolution.  Click "Save as Default" to
-persist slider values to ``synthetic_data/ackley/defaults.json``.
+Ackley optima, and grid resolution.  Basin width (b) is not tunable here: it is
+the hardcoded ``BASIN_WIDTH_BY_DIM[4]`` in ``ackley.py``.  Click "Save as Default"
+to persist slider values to ``synthetic_data/ackley/defaults.json``.
 
 Usage:
     python point_cloud_4d.py
@@ -31,7 +32,7 @@ from dash import Dash, Input, Output, State, callback, dcc, html
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-from synthetic_data.ackley import Ackley, load_config, save_config  # noqa: E402
+from synthetic_data.ackley import Ackley, load_config, save_config, BASIN_WIDTH_BY_DIM  # noqa: E402
 
 DIM = 4
 DEFAULT_GRID_N = 44
@@ -247,13 +248,6 @@ app.layout = html.Div([
                        tooltip={"placement": "bottom", "always_visible": True}),
         ], style={"padding": "10px"}),
         html.Div([
-            html.Label("Basin Width"),
-            dcc.Slider(id="basin-width", min=1, max=200, step=1,
-                       value=201 - cfg["basin_width"],
-                       marks={i: str(i) for i in range(0, 201, 25)},
-                       tooltip={"placement": "bottom", "always_visible": True}),
-        ], style={"padding": "10px"}),
-        html.Div([
             html.Label("Noise Frequency"),
             dcc.Slider(id="noise-freq", min=0, max=40, step=0.5,
                        value=cfg["noise_freq"],
@@ -301,17 +295,18 @@ app.layout = html.Div([
     Output("save-status", "children"),
     Input("save-btn", "n_clicks"),
     State("n-optima", "value"),
-    State("basin-width", "value"),
     State("intensity-mean", "value"),
     State("intensity-var", "value"),
     State("noise-freq", "value"),
     State("noise-amp", "value"),
     prevent_initial_call=True,
 )
-def save_defaults(n_clicks, n_optima, basin_width, intensity_mean, intensity_var, noise_freq, noise_amp):
+def save_defaults(n_clicks, n_optima, intensity_mean, intensity_var, noise_freq, noise_amp):
+    # basin_width is no longer tunable here; preserve whatever is already in the
+    # config (the 3d default) so saving the other params doesn't drop it.
     save_config({
         "n_optima": int(n_optima),
-        "basin_width": float(201 - basin_width),
+        "basin_width": float(load_config().get("basin_width", 50.0)),
         "intensity_mean": float(intensity_mean),
         "intensity_var": float(intensity_var),
         "noise_freq": float(noise_freq),
@@ -323,18 +318,18 @@ def save_defaults(n_clicks, n_optima, basin_width, intensity_mean, intensity_var
 @callback(
     Output("cloud-plot", "figure"),
     Input("n-optima", "value"),
-    Input("basin-width", "value"),
     Input("noise-freq", "value"),
     Input("noise-amp", "value"),
     Input("intensity-mean", "value"),
     Input("intensity-var", "value"),
     Input("grid-res", "value"),
 )
-def update_plot(n_optima, basin_width, noise_freq, noise_amp, intensity_mean, intensity_var, grid_res):
+def update_plot(n_optima, noise_freq, noise_amp, intensity_mean, intensity_var, grid_res):
+    # basin_width (b) is not passed: Ackley uses the hardcoded BASIN_WIDTH_BY_DIM
+    # value for this dim.
     fn = Ackley(
         "realistic", dim=DIM,
         n_optima=int(n_optima),
-        basin_width=float(201 - basin_width),
         intensity_mean=float(intensity_mean),
         intensity_var=float(intensity_var),
         noise_freq=float(noise_freq),
@@ -374,7 +369,8 @@ def update_plot(n_optima, basin_width, noise_freq, noise_amp, intensity_mean, in
 
     fig = go.Figure(data=[cloud, tetra_edges_trace(), vertex_labels_trace(), peaks_trace])
     fig.update_layout(
-        title=f"Tunable Realistic Ackley ({n_optima} peaks, b={basin_width})",
+        title=f"Tunable Realistic Ackley ({n_optima} peaks, "
+              f"b={BASIN_WIDTH_BY_DIM[DIM]} at dim {DIM})",
         scene=dict(
             xaxis=dict(visible=False),
             yaxis=dict(visible=False),

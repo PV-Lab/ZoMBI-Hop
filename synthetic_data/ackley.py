@@ -54,6 +54,25 @@ import numpy as np
 _CONFIGS_DIR = Path(__file__).resolve().parent / "ackley"
 _DEFAULTS_PATH = _CONFIGS_DIR / "defaults.json"
 
+SCALE_OPTIMA_WITH_DIM = True
+
+# The classic Ackley function has two parts: a smooth Gaussian-like envelope
+# (``t1``) that forms the basin, and an oscillatory cosine term (``t2``) that
+# studs that basin with fine local ripples / minima.  When this is False the
+# cosine term is dropped entirely, so each peak is a single smooth, monotonic
+# basin with no ripples — the envelope alone.
+USE_OSCILLATION = False
+
+# Hardcoded Ackley sharpness ``b`` (basin width) per simplex dimensionality.
+# When the "realistic" variant is built without an explicit ``basin_width``
+# override, the value for its ``dim`` is taken from here; dims not listed fall
+# back to the config ``basin_width``.
+BASIN_WIDTH_BY_DIM = {
+    3: 86.0,
+    4: 65.0,
+    10: 20,
+}
+
 _HARDCODED_DEFAULTS = {
     "n_optima": 10,
     "basin_width": 50,
@@ -173,11 +192,17 @@ def _negated_ackley(
     scale: float = ACKLEY_SCALE,
 ) -> np.ndarray:
     X = np.atleast_2d(np.asarray(X, dtype=float))
-    d = X.shape[1]
-    delta = X - np.asarray(center, dtype=float)
-    t1 = -a * np.exp(-b * np.sqrt(np.sum(delta ** 2, axis=1) / d))
-    t2 = -np.exp(np.sum(np.cos(c * delta), axis=1) / d)
-    ackley = t1 + t2 + a + np.e
+    center = np.asarray(center, dtype=float).reshape(1, -1)
+    delta = X - center
+    d_eff = delta.shape[1]
+    t1 = -a * np.exp(-b * np.sqrt(np.sum(delta ** 2, axis=1) / d_eff))
+    if USE_OSCILLATION:
+        t2 = -np.exp(np.sum(np.cos(c * delta), axis=1) / d_eff)
+        ackley = t1 + t2 + a + np.e
+    else:
+        # Drop the cosine ripple: pure smooth envelope, 0 at the center rising
+        # to ``a`` far away (same peak value as the full form, no local minima).
+        ackley = t1 + a
     return -scale * ackley
 
 
@@ -273,9 +298,16 @@ class Ackley:
             # more optima (see ``scaled_n_optima``).
             if n_optima is not None:
                 _n = int(n_optima)
-            else:
+            elif SCALE_OPTIMA_WITH_DIM:
                 _n = scaled_n_optima(int(cfg["n_optima"]), dim)
-            _b = float(basin_width if basin_width is not None else cfg["basin_width"])
+            else:
+                _n = int(cfg["n_optima"])
+            # An explicit basin_width override wins; otherwise use the hardcoded
+            # per-dim value, falling back to the config for dims not listed.
+            if basin_width is not None:
+                _b = float(basin_width)
+            else:
+                _b = float(BASIN_WIDTH_BY_DIM.get(dim, cfg["basin_width"]))
             _im = float(intensity_mean if intensity_mean is not None else cfg.get("intensity_mean", 0.0))
             _iv = float(intensity_var if intensity_var is not None else cfg.get("intensity_var", 0.0))
             _nf = float(noise_freq if noise_freq is not None else cfg["noise_freq"])
@@ -308,36 +340,86 @@ class Ackley:
             self._noise_octaves = 0
             self._noise_seed = 0
 
-        # Estimate raw range by sampling the simplex, then scale to [0.5, 1].
-        _est_rng = np.random.default_rng(12345)
-        _samples = _est_rng.dirichlet(np.ones(dim), size=_RANGE_SAMPLES)
-        _raw = self._predict_raw(_samples)
-        self._raw_min = float(_raw.min())
-        self._raw_max = float(_raw.max())
+        # For dims above 3 the objective is built so it always spans [0.5, 1]:
+        # the [0.5, 1] map is fixed from the *noise-free* Ackley signal (peak -> 1,
+        # far-field floor -> 0.5), then noise is added on top but measured against
+        # the *highest sampled* value -- the best a uniform draw reaches (cf.
+        # analyze_basin_vol.py) rather than the never-sampled peak.  Since that
+        # value sits well below the peak in high dim, this deliberately makes the
+        # noise much quieter; the sum is clipped to [0.5, 1].  At dim <= 3 the
+        # Ackley+noise signal is normalized together and left unclamped, as before.
+        self._clip_to_unit = self.dim > 3
 
-    def _predict_raw(self, X: np.ndarray) -> np.ndarray:
+        _est_rng = np.random.default_rng(12345)
+        _uniform = _est_rng.dirichlet(np.ones(dim), size=_RANGE_SAMPLES)
+        _centers = (np.asarray(self.centers, dtype=float)
+                    if self.centers else np.empty((0, dim)))
+
+        if self._clip_to_unit:
+            # Noise-free [0.5, 1] normalization: include the peak centers (the
+            # analytic maxima) so raw_max is the true peak, not a sample miss.
+            _est = np.vstack([_uniform, _centers]) if len(_centers) else _uniform
+            _ack = self._ackley_raw(_est)
+            self._raw_min = float(_ack.min())
+            self._raw_max = float(_ack.max())
+            # Highest *sampled* objective: max over the uniform draw only (no
+            # centers), matching the "best sampled" notion in analyze_basin_vol.
+            _span = self._raw_max - self._raw_min
+            if _span < 1e-12:
+                self._y_best_sampled = 0.75
+            else:
+                _base_u = 0.5 + 0.5 * (self._ackley_raw(_uniform) - self._raw_min) / _span
+                self._y_best_sampled = float(_base_u.max())
+        else:
+            # Per-dim min-max over the combined Ackley+noise signal.  Include the
+            # peak centers so a sample-only max doesn't underestimate the peak.
+            _samples = np.vstack([_uniform, _centers]) if len(_centers) else _uniform
+            _raw = self._predict_raw(_samples)
+            self._raw_min = float(_raw.min())
+            self._raw_max = float(_raw.max())
+            self._y_best_sampled = 1.0  # unused for dim <= 3
+
+    def _ackley_raw(self, X: np.ndarray) -> np.ndarray:
+        """Noise-free negated-Ackley signal, combined over the peaks."""
         X = np.atleast_2d(np.asarray(X, dtype=float))
         terms = np.stack(
             [_negated_ackley(X, center, b=b)
              for center, b in zip(self.centers, self.basin_widths)],
             axis=0,
         )
-        result = terms.max(axis=0) if self.combine == "max" else terms.sum(axis=0)
-        if self._noise_amp > 0:
-            result = result + simplex_noise(
-                X,
-                frequency=self._noise_freq,
-                amplitude=self._noise_amp,
-                octaves=self._noise_octaves,
-                seed=self._noise_seed,
-            )
-        return result
+        return terms.max(axis=0) if self.combine == "max" else terms.sum(axis=0)
+
+    def _noise_raw(self, X: np.ndarray) -> np.ndarray:
+        """Background simplex-noise field in raw units (0 when noise is off)."""
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+        if self._noise_amp <= 0:
+            return np.zeros(X.shape[0])
+        return simplex_noise(
+            X,
+            frequency=self._noise_freq,
+            amplitude=self._noise_amp,
+            octaves=self._noise_octaves,
+            seed=self._noise_seed,
+        )
+
+    def _predict_raw(self, X: np.ndarray) -> np.ndarray:
+        return self._ackley_raw(X) + self._noise_raw(X)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        raw = self._predict_raw(X)
         span = self._raw_max - self._raw_min
         if span < 1e-12:
-            return np.full(raw.shape, 0.75)
+            n = np.atleast_2d(np.asarray(X, dtype=float)).shape[0]
+            return np.full(n, 0.75)
+        if self._clip_to_unit:
+            # dim > 3: fixed [0.5, 1] map from the noise-free Ackley signal, with
+            # noise measured against the highest sampled value's elevation above
+            # the floor (y_best - 0.5) -- expressed as a fraction of the basin
+            # depth (``span``).  This is much quieter than measuring against the
+            # (never-sampled) peak.  Clip to keep the objective within [0.5, 1].
+            base = 0.5 + 0.5 * (self._ackley_raw(X) - self._raw_min) / span
+            noise_obj = (self._noise_raw(X) / span) * (self._y_best_sampled - 0.5)
+            return np.clip(base + noise_obj, 0.5, 1.0)
+        raw = self._predict_raw(X)
         return 0.5 + 0.5 * (raw - self._raw_min) / span
 
     def __call__(self, x: np.ndarray) -> float:
