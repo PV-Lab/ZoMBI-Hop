@@ -73,6 +73,17 @@ BASIN_WIDTH_BY_DIM = {
     10: 20,
 }
 
+# Hardcoded background-noise amplitude per simplex dimensionality, tuned by hand.
+# When the "realistic" variant is built without an explicit ``noise_amp``
+# override, the value for its ``dim`` is taken from here; dims not listed fall
+# back to the config ``noise_amp``.  (Interactive sliders pass noise_amp
+# explicitly, so they still override this.)
+NOISE_AMP_BY_DIM = {
+    3: 400.0,
+    4: 300.0,
+    10: 20.0,
+}
+
 _HARDCODED_DEFAULTS = {
     "n_optima": 10,
     "basin_width": 50,
@@ -311,7 +322,12 @@ class Ackley:
             _im = float(intensity_mean if intensity_mean is not None else cfg.get("intensity_mean", 0.0))
             _iv = float(intensity_var if intensity_var is not None else cfg.get("intensity_var", 0.0))
             _nf = float(noise_freq if noise_freq is not None else cfg["noise_freq"])
-            _na = float(noise_amp if noise_amp is not None else cfg["noise_amp"])
+            # An explicit noise_amp override wins; otherwise use the hardcoded
+            # per-dim value, falling back to the config for dims not listed.
+            if noise_amp is not None:
+                _na = float(noise_amp)
+            else:
+                _na = float(NOISE_AMP_BY_DIM.get(dim, cfg["noise_amp"]))
 
             rng = np.random.default_rng(peak_seed)
             self.centers = [c.copy() for c in rng.dirichlet(np.ones(dim), size=_n)]
@@ -340,44 +356,23 @@ class Ackley:
             self._noise_octaves = 0
             self._noise_seed = 0
 
-        # For dims above 3 the objective is built so it always spans [0.5, 1]:
-        # the [0.5, 1] map is fixed from the *noise-free* Ackley signal (peak -> 1,
-        # far-field floor -> 0.5), then noise is added on top but measured against
-        # the *highest sampled* value -- the best a uniform draw reaches (cf.
-        # analyze_basin_vol.py) rather than the never-sampled peak.  Since that
-        # value sits well below the peak in high dim, this deliberately makes the
-        # noise much quieter; the sum is clipped to [0.5, 1].  At dim <= 3 the
-        # Ackley+noise signal is normalized together and left unclamped, as before.
+        # For dims above 3 the [0.5, 1] map is fixed from the *noise-free* Ackley
+        # signal (peak -> 1, far-field floor -> 0.5); noise (level set per-dim via
+        # NOISE_AMP_BY_DIM) is then added through that same map and the result is
+        # clipped to [0.5, 1].  At dim <= 3 the Ackley+noise signal is normalized
+        # together and left unclamped, as before.
         self._clip_to_unit = self.dim > 3
 
         _est_rng = np.random.default_rng(12345)
-        _uniform = _est_rng.dirichlet(np.ones(dim), size=_RANGE_SAMPLES)
-        _centers = (np.asarray(self.centers, dtype=float)
-                    if self.centers else np.empty((0, dim)))
-
-        if self._clip_to_unit:
-            # Noise-free [0.5, 1] normalization: include the peak centers (the
-            # analytic maxima) so raw_max is the true peak, not a sample miss.
-            _est = np.vstack([_uniform, _centers]) if len(_centers) else _uniform
-            _ack = self._ackley_raw(_est)
-            self._raw_min = float(_ack.min())
-            self._raw_max = float(_ack.max())
-            # Highest *sampled* objective: max over the uniform draw only (no
-            # centers), matching the "best sampled" notion in analyze_basin_vol.
-            _span = self._raw_max - self._raw_min
-            if _span < 1e-12:
-                self._y_best_sampled = 0.75
-            else:
-                _base_u = 0.5 + 0.5 * (self._ackley_raw(_uniform) - self._raw_min) / _span
-                self._y_best_sampled = float(_base_u.max())
-        else:
-            # Per-dim min-max over the combined Ackley+noise signal.  Include the
-            # peak centers so a sample-only max doesn't underestimate the peak.
-            _samples = np.vstack([_uniform, _centers]) if len(_centers) else _uniform
-            _raw = self._predict_raw(_samples)
-            self._raw_min = float(_raw.min())
-            self._raw_max = float(_raw.max())
-            self._y_best_sampled = 1.0  # unused for dim <= 3
+        _samples = _est_rng.dirichlet(np.ones(dim), size=_RANGE_SAMPLES)
+        # Include the peak centers (the analytic maxima) so a sample-only max
+        # doesn't underestimate the peak in high dim.
+        if self.centers:
+            _samples = np.vstack([_samples, np.asarray(self.centers, dtype=float)])
+        # dim > 3 normalizes on the noise-free Ackley span; dim <= 3 on Ackley+noise.
+        _raw = self._ackley_raw(_samples) if self._clip_to_unit else self._predict_raw(_samples)
+        self._raw_min = float(_raw.min())
+        self._raw_max = float(_raw.max())
 
     def _ackley_raw(self, X: np.ndarray) -> np.ndarray:
         """Noise-free negated-Ackley signal, combined over the peaks."""
@@ -406,21 +401,16 @@ class Ackley:
         return self._ackley_raw(X) + self._noise_raw(X)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
+        raw = self._predict_raw(X)
         span = self._raw_max - self._raw_min
         if span < 1e-12:
-            n = np.atleast_2d(np.asarray(X, dtype=float)).shape[0]
-            return np.full(n, 0.75)
+            return np.full(raw.shape, 0.75)
+        y = 0.5 + 0.5 * (raw - self._raw_min) / span
         if self._clip_to_unit:
-            # dim > 3: fixed [0.5, 1] map from the noise-free Ackley signal, with
-            # noise measured against the highest sampled value's elevation above
-            # the floor (y_best - 0.5) -- expressed as a fraction of the basin
-            # depth (``span``).  This is much quieter than measuring against the
-            # (never-sampled) peak.  Clip to keep the objective within [0.5, 1].
-            base = 0.5 + 0.5 * (self._ackley_raw(X) - self._raw_min) / span
-            noise_obj = (self._noise_raw(X) / span) * (self._y_best_sampled - 0.5)
-            return np.clip(base + noise_obj, 0.5, 1.0)
-        raw = self._predict_raw(X)
-        return 0.5 + 0.5 * (raw - self._raw_min) / span
+            # dim > 3: keep the (noisy) objective within [0.5, 1] -- the span is
+            # the noise-free Ackley range, so noise can push a value past it.
+            y = np.clip(y, 0.5, 1.0)
+        return y
 
     def __call__(self, x: np.ndarray) -> float:
         return float(self.predict(np.asarray(x, dtype=float).reshape(1, -1))[0])
