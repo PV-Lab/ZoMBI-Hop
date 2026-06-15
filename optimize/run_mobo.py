@@ -28,11 +28,12 @@ clock) containing:
         ├─ points.csv                 (sample_idx, FA, MA, Br, Y, penalized,
         │                              activation, zoom)
         ├─ needles.csv                (needle_idx, FA, MA, Br, value,
-        │                              median_value, activation, zoom,
-        │                              iteration, dist_to_centre)
+        │                              median_value, zoom, iteration,
+        │                              dist_to_centre)
         ├─ metrics_over_time.csv      (iteration, dist_to_needles, dup_fraction,
         │                              pct_matched, avg_pairwise_dist,
         │                              recent_needle_value)
+        ├─ convergence.png
         ├─ dist_from_centre.png
         ├─ line_length_hist.png
         ├─ hparam_edge_proximity.png
@@ -1065,6 +1066,55 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
     fig.clear()
 
 
+def plot_convergence(path: str, dh, maximize: bool) -> None:
+    """Save a convergence plot: all Y values, running best, needle vlines."""
+    Y_all = dh.Y_all.detach().cpu().numpy().ravel()
+    if Y_all.size == 0:
+        return
+    mask = dh.get_penalty_mask()
+    pm = mask.detach().cpu().numpy().ravel() if mask is not None else None
+    needle_indices = (dh.needle_indices.detach().cpu().numpy().ravel()
+                      if dh.needle_indices is not None and dh.needle_indices.numel() > 0
+                      else None)
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    idx = np.arange(len(Y_all))
+
+    if pm is not None and pm.any():
+        ax.scatter(idx[~pm], Y_all[~pm], s=10, alpha=0.35, color="#aaaaaa",
+                   label="penalized", zorder=2)
+        ax.scatter(idx[pm], Y_all[pm], s=10, alpha=0.65, color="steelblue",
+                   label="valid", zorder=3)
+        running_best = np.maximum.accumulate(np.where(pm, Y_all, -np.inf))
+    else:
+        ax.scatter(idx, Y_all, s=10, alpha=0.65, color="steelblue",
+                   label="obs", zorder=2)
+        running_best = np.maximum.accumulate(Y_all)
+
+    ax.plot(idx, running_best, color="darkorange", lw=1.8,
+            label="running best", zorder=4)
+
+    if needle_indices is not None:
+        labeled = False
+        for ni in needle_indices:
+            if 0 <= ni < len(Y_all):
+                kw = dict(color="crimson", alpha=0.55, lw=0.9, ls="--")
+                if not labeled:
+                    kw["label"] = "needle found"
+                    labeled = True
+                ax.axvline(float(ni), **kw)
+
+    ax.set_xlabel("Sample index")
+    ax.set_ylabel("Objective Y")
+    ax.set_title(f"Convergence  ({len(Y_all)} pts, "
+                 f"{len(needle_indices) if needle_indices is not None else 0} needles)",
+                 fontsize=9)
+    ax.legend(fontsize=7, loc="lower right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 # ─── Per-trial artifact writers ────────────────────────────────────────────────
 
 def _activation_zoom_per_point(n_points: int, snap_records: list[tuple]) -> tuple:
@@ -1118,14 +1168,13 @@ def write_needles_csv(path: str, dh) -> None:
             "FA": pt[0], "MA": pt[1], "Br": pt[2],
             "value": r.get("value"),
             "median_value": (None if mv is None or (isinstance(mv, float) and math.isnan(mv)) else mv),
-            "activation": r.get("activation"),
             "zoom": r.get("zoom"),
             "iteration": r.get("iteration"),
             "reason": r.get("reason"),
             "dist_to_centre": float(np.linalg.norm(pt - centroid)),
         })
     cols = ["needle_idx", "FA", "MA", "Br", "value", "median_value",
-            "activation", "zoom", "iteration", "reason", "dist_to_centre"]
+            "zoom", "iteration", "reason", "dist_to_centre"]
     pd.DataFrame(rows, columns=cols).to_csv(path, index=False)
 
 
@@ -1372,6 +1421,7 @@ def run_single_trial(
     try:
         plot_dist_from_centre(os.path.join(trial_dir, "dist_from_centre.png"), dh, maximize)
         plot_line_length_hist(os.path.join(trial_dir, "line_length_hist.png"), payloads)
+        plot_convergence(os.path.join(trial_dir, "convergence.png"), dh, maximize)
     except Exception as exc:
         print(f"    [trial] static plot failed: {exc}")
 

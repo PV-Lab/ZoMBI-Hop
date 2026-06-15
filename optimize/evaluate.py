@@ -44,8 +44,9 @@ A single ``rerun_DD_MM_HH_MM/`` folder (military clock, mirroring ``mobo_*``):
             metrics.json
             points.csv         (sample_idx, <coords>, Y, penalized, activation, zoom)
             needles.csv        (needle_idx, <coords>, value, median_value,
-                                activation, zoom, iteration, dist_to_centre)
+                                zoom, iteration, dist_to_centre)
             metrics_over_time.csv
+            convergence.png
             dist_from_centre.png
             line_length_hist.png
             hparam_edge_proximity.png
@@ -319,14 +320,13 @@ def write_needles_csv(path: str, dh, cols: list[str], dim: int) -> None:
         row.update({
             "value": r.get("value"),
             "median_value": (None if mv_ is None or (isinstance(mv_, float) and math.isnan(mv_)) else mv_),
-            "activation": r.get("activation"),
             "zoom": r.get("zoom"),
             "iteration": r.get("iteration"),
             "reason": r.get("reason"),
             "dist_to_centre": float(np.linalg.norm(pt - centroid)),
         })
         rows.append(row)
-    columns = ["needle_idx"] + cols + ["value", "median_value", "activation",
+    columns = ["needle_idx"] + cols + ["value", "median_value",
                                        "zoom", "iteration", "reason",
                                        "dist_to_centre"]
     pd.DataFrame(rows, columns=columns).to_csv(path, index=False)
@@ -533,6 +533,7 @@ def run_single_eval(hparams: dict, ds: dict, dataset: str, out_dir: str,
         rm.plot_hparam_edge_proximity(
             os.path.join(out_dir, "hparam_edge_proximity.png"),
             rm.hparams_to_norm(hparams))
+        rm.plot_convergence(os.path.join(out_dir, "convergence.png"), dh, maximize)
     except Exception as exc:
         print(f"      [run] static plot failed: {exc}")
 

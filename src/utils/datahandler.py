@@ -458,7 +458,6 @@ class DataHandler:
                     None if r.get('median_value') is None or _math.isnan(r['median_value'])
                     else r['median_value']
                 ),
-                'activation': r['activation'],
                 'zoom': r['zoom'],
                 'iteration': r['iteration'],
             }
@@ -856,7 +855,6 @@ class DataHandler:
                 'point': torch.tensor(r['point'], device=self.device, dtype=self.dtype),
                 'value': r['value'],
                 'median_value': r.get('median_value', None),
-                'activation': r['activation'],
                 'zoom': r['zoom'],
                 'iteration': r['iteration'],
             }
@@ -958,7 +956,6 @@ class DataHandler:
         needle: torch.Tensor,
         needle_value: float,
         needle_penalty_radius: float,
-        activation: int,
         zoom: int,
         iteration: int,
         M: Optional[torch.Tensor] = None,
@@ -998,7 +995,6 @@ class DataHandler:
             'point': needle.clone(),
             'value': needle_value,
             'median_value': needle_median_value,
-            'activation': activation,
             'zoom': zoom,
             'iteration': iteration,
             'reason': reason,

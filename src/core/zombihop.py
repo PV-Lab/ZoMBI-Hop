@@ -385,7 +385,6 @@ class ZoMBIHop:
     def _declare_needle_at_best(
         self,
         dh,
-        activation: int,
         zoom: int,
         iteration: int,
         reason: str = "converged",
@@ -435,7 +434,6 @@ class ZoMBIHop:
             needle=needle_X,
             needle_value=needle_Y.item(),
             needle_penalty_radius=0.0,
-            activation=activation,
             zoom=zoom,
             iteration=iteration,
             M=M_ellipsoid,
@@ -586,6 +584,7 @@ class ZoMBIHop:
         finished = False
         activation, zoom, iteration, _ = dh.get_iteration_state()
         start_activation = activation
+        global_iteration = 0
 
         while activation < max_activations and not finished:
             self._log(f"\n{'='*50}")
@@ -696,6 +695,7 @@ class ZoMBIHop:
                     unpenalized_X, unpenalized_Y = self._objective_wrapper(
                         candidate, bounds, self.gp_handler.acq_fn
                     )
+                    global_iteration += 1
                     data_added_since_last_failure = True
                     if self.verbose:
                         if unpenalized_Y.numel() > 0:
@@ -751,7 +751,7 @@ class ZoMBIHop:
                     # --- Declare needle after N consecutive converged iterations ---
                     if consecutive_converged >= dh.n_consecutive_converged:
                         needle = self._declare_needle_at_best(
-                            dh, activation, zoom, iteration, reason="PI convergence"
+                            dh, zoom, global_iteration, reason="PI convergence"
                         )
                         if needle is not None:
                             dh.take_snapshot(
@@ -838,7 +838,7 @@ class ZoMBIHop:
                                 f"  → repeated zoom (Jaccard={repeated_jac:.3f}) — forcing needle."
                             )
                             needle = self._declare_needle_at_best(
-                                dh, activation, zoom, iteration, reason="Jaccard convergence"
+                                dh, zoom, global_iteration, reason="Jaccard convergence"
                             )
                             if needle is None:
                                 activation_failed = True
