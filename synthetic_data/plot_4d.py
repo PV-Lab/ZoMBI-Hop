@@ -28,7 +28,6 @@ from pathlib import Path
 
 import numpy as np
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, State, callback, dcc, html
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -230,113 +229,50 @@ def add_simplex_overlays(
     return fig
 
 
-# ── Dash app ─────────────────────────────────────────────────────────────────
+# ── Static per-iteration export ───────────────────────────────────────────────
 
-cfg = load_config()
-
-app = Dash(__name__)
-
-app.layout = html.Div([
-    html.H2("Tunable Realistic Ackley on the 4-Simplex (Point Cloud)",
-            style={"textAlign": "center"}),
-    html.Div([
-        html.Div([
-            html.Label("Number of Optima"),
-            dcc.Slider(id="n-optima", min=1, max=30, step=1,
-                       value=cfg["n_optima"],
-                       marks={i: str(i) for i in range(1, 31, 5)},
-                       tooltip={"placement": "bottom", "always_visible": True}),
-        ], style={"padding": "10px"}),
-        html.Div([
-            html.Label("Noise Frequency"),
-            dcc.Slider(id="noise-freq", min=0, max=40, step=0.5,
-                       value=cfg["noise_freq"],
-                       marks={i: str(i) for i in range(0, 41, 5)},
-                       tooltip={"placement": "bottom", "always_visible": True}),
-        ], style={"padding": "10px"}),
-        html.Div([
-            html.Label("Noise Amplitude (relative to peaks)"),
-            dcc.Slider(id="noise-amp", min=0, max=2000, step=20,
-                       value=cfg["noise_amp"],
-                       marks={i: str(i) for i in range(0, 2000, 200)},
-                       tooltip={"placement": "bottom", "always_visible": True}),
-        ], style={"padding": "10px"}),
-        html.Div([
-            html.Label("Intensity Offset Mean"),
-            dcc.Slider(id="intensity-mean", min=0, max=100, step=1,
-                       value=cfg.get("intensity_mean", 0),
-                       marks={i: str(i) for i in range(0, 101, 20)},
-                       tooltip={"placement": "bottom", "always_visible": True}),
-        ], style={"padding": "10px"}),
-        html.Div([
-            html.Label("Intensity Offset Variance"),
-            dcc.Slider(id="intensity-var", min=0, max=2000, step=10,
-                       value=cfg.get("intensity_var", 0),
-                       marks={i: str(i) for i in range(0, 2001, 400)},
-                       tooltip={"placement": "bottom", "always_visible": True}),
-        ], style={"padding": "10px"}),
-        html.Div([
-            html.Label("Grid Resolution"),
-            dcc.Slider(id="grid-res", min=15, max=50, step=5, value=DEFAULT_GRID_N,
-                       marks={i: str(i) for i in range(15, 55, 5)},
-                       tooltip={"placement": "bottom", "always_visible": True}),
-        ], style={"padding": "10px"}),
-        html.Div([
-            html.Button("Save as Default", id="save-btn", n_clicks=0,
-                        style={"marginTop": "10px", "padding": "8px 24px"}),
-            html.Span(id="save-status", style={"marginLeft": "12px"}),
-        ], style={"padding": "10px", "textAlign": "center"}),
-    ], style={"width": "60%", "margin": "0 auto"}),
-    dcc.Graph(id="cloud-plot", style={"height": f"{FIG_H}px"}),
-])
+COORD_COLS_4D = ["x1", "x2", "x3", "x4"]
 
 
-@callback(
-    Output("save-status", "children"),
-    Input("save-btn", "n_clicks"),
-    State("n-optima", "value"),
-    State("intensity-mean", "value"),
-    State("intensity-var", "value"),
-    State("noise-freq", "value"),
-    State("noise-amp", "value"),
-    prevent_initial_call=True,
-)
-def save_defaults(n_clicks, n_optima, intensity_mean, intensity_var, noise_freq, noise_amp):
-    # basin_width is no longer tunable here; preserve whatever is already in the
-    # config (the 3d default) so saving the other params doesn't drop it.
-    save_config({
-        "n_optima": int(n_optima),
-        "basin_width": float(load_config().get("basin_width", 50.0)),
-        "intensity_mean": float(intensity_mean),
-        "intensity_var": float(intensity_var),
-        "noise_freq": float(noise_freq),
-        "noise_amp": float(noise_amp),
-    })
-    return "Saved!"
+def _read_needles_at_iter(needles_csv: Path, n: int) -> np.ndarray:
+    """Load the (M, 4) needle compositions discovered up to and including iteration ``n``.
+
+    The needles.csv (written by ``optimize/evaluate.py``) stamps each needle with
+    the ``iteration`` it was found, so the run's state *during* iteration ``n`` is
+    every needle with ``iteration <= n``.  Returns an empty (0, 4) array if none
+    qualify.
+    """
+    import pandas as pd
+
+    df = pd.read_csv(needles_csv)
+    missing = [c for c in COORD_COLS_4D + ["iteration"] if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"{needles_csv} is missing expected column(s) {missing}; "
+            f"this exporter only handles 4D (x1..x4) needles.csv files."
+        )
+    df = df[df["iteration"] <= n]
+    if df.empty:
+        return np.empty((0, 4), dtype=float)
+    return df[COORD_COLS_4D].to_numpy(dtype=float)
 
 
-@callback(
-    Output("cloud-plot", "figure"),
-    Input("n-optima", "value"),
-    Input("noise-freq", "value"),
-    Input("noise-amp", "value"),
-    Input("intensity-mean", "value"),
-    Input("intensity-var", "value"),
-    Input("grid-res", "value"),
-)
-def update_plot(n_optima, noise_freq, noise_amp, intensity_mean, intensity_var, grid_res):
-    # basin_width (b) is not passed: Ackley uses the hardcoded BASIN_WIDTH_BY_DIM
-    # value for this dim.
-    fn = Ackley(
-        "realistic", dim=DIM,
-        n_optima=int(n_optima),
-        intensity_mean=float(intensity_mean),
-        intensity_var=float(intensity_var),
-        noise_freq=float(noise_freq),
-        noise_amp=float(noise_amp),
-    )
+def render_iteration_point_cloud(run_dir, n: int, *, grid_n: int = GRID_N):
+    """Write ``point_cloud_<n>.html`` for the run in ``run_dir`` at iteration ``n``.
 
-    comp = build_simplex_lattice(int(grid_res))
+    Shows only the background objective point cloud (the current default 4D
+    "realistic" Ackley), the known peaks, and the needles discovered up to
+    iteration ``n``.  Returns the path to the written HTML file.
+    """
+    run_dir = Path(run_dir)
+    needles_csv = run_dir / "needles.csv"
+    if not needles_csv.exists():
+        raise FileNotFoundError(f"No needles.csv in {run_dir}")
+
+    needles = _read_needles_at_iter(needles_csv, n)
+    fn = Ackley("realistic", dim=DIM)
+
+    comp = build_simplex_lattice(int(grid_n))
     obj = fn.predict(comp)
     xyz = to_3d(comp)
     obj_min, obj_max = float(obj.min()), float(obj.max())
@@ -345,20 +281,17 @@ def update_plot(n_optima, noise_freq, noise_amp, intensity_mean, intensity_var, 
         f"x=[{a:.2f}, {b:.2f}, {c:.2f}, {d:.2f}]<br>obj={v:.2f}"
         for (a, b, c, d), v in zip(comp, obj)
     ]
-
     cloud = go.Scatter3d(
         x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2], mode="markers",
         name="objective", text=hover, hoverinfo="text",
         marker=dict(
-            color=obj, colorscale="Viridis",
-            cmin=obj_min, cmax=obj_max,
+            color=obj, colorscale="Viridis", cmin=obj_min, cmax=obj_max,
             size=MARKER_SIZE, opacity=MARKER_OPACITY,
             showscale=True, colorbar=dict(title="Objective"),
         ),
     )
 
-    peaks = np.array(fn.centers)
-    peaks_xyz = to_3d(peaks)
+    peaks_xyz = to_3d(np.array(fn.centers))
     peaks_trace = go.Scatter3d(
         x=peaks_xyz[:, 0], y=peaks_xyz[:, 1], z=peaks_xyz[:, 2], mode="markers",
         name="known peak",
@@ -367,22 +300,211 @@ def update_plot(n_optima, noise_freq, noise_amp, intensity_mean, intensity_var, 
         hoverinfo="name",
     )
 
-    fig = go.Figure(data=[cloud, tetra_edges_trace(), vertex_labels_trace(), peaks_trace])
+    data = [cloud, tetra_edges_trace(), vertex_labels_trace(), peaks_trace]
+    if needles.shape[0] > 0:
+        data.append(needle_marker_trace(needles))
+
+    fig = go.Figure(data=data)
     fig.update_layout(
-        title=f"Tunable Realistic Ackley ({n_optima} peaks, "
-              f"b={BASIN_WIDTH_BY_DIM[DIM]} at dim {DIM})",
+        title=f"ZoMBI-Hop state at iteration {n} on the 4-simplex "
+              f"(negated Ackley) — {needles.shape[0]} needle(s)",
         scene=dict(
-            xaxis=dict(visible=False),
-            yaxis=dict(visible=False),
-            zaxis=dict(visible=False),
-            aspectmode="data",
+            xaxis=dict(visible=False), yaxis=dict(visible=False),
+            zaxis=dict(visible=False), aspectmode="data",
         ),
         legend=dict(x=0.0, y=1.0),
         width=FIG_W, height=FIG_H,
     )
-    return fig
+
+    out_path = run_dir / f"point_cloud_{n}.html"
+    fig.write_html(str(out_path), include_plotlyjs="cdn", auto_open=False)
+    return out_path
+
+
+# ── Dash app ─────────────────────────────────────────────────────────────────
+
+def build_app():
+    """Construct the interactive Dash app (imported lazily so the static
+    exporter and overlay API don't require Dash)."""
+    from dash import Dash, Input, Output, State, callback, dcc, html
+
+    cfg = load_config()
+
+    app = Dash(__name__)
+
+    app.layout = html.Div([
+        html.H2("Tunable Realistic Ackley on the 4-Simplex (Point Cloud)",
+                style={"textAlign": "center"}),
+        html.Div([
+            html.Div([
+                html.Label("Number of Optima"),
+                dcc.Slider(id="n-optima", min=1, max=30, step=1,
+                           value=cfg["n_optima"],
+                           marks={i: str(i) for i in range(1, 31, 5)},
+                           tooltip={"placement": "bottom", "always_visible": True}),
+            ], style={"padding": "10px"}),
+            html.Div([
+                html.Label("Noise Frequency"),
+                dcc.Slider(id="noise-freq", min=0, max=40, step=0.5,
+                           value=cfg["noise_freq"],
+                           marks={i: str(i) for i in range(0, 41, 5)},
+                           tooltip={"placement": "bottom", "always_visible": True}),
+            ], style={"padding": "10px"}),
+            html.Div([
+                html.Label("Noise Amplitude (relative to peaks)"),
+                dcc.Slider(id="noise-amp", min=0, max=2000, step=20,
+                           value=cfg["noise_amp"],
+                           marks={i: str(i) for i in range(0, 2000, 200)},
+                           tooltip={"placement": "bottom", "always_visible": True}),
+            ], style={"padding": "10px"}),
+            html.Div([
+                html.Label("Intensity Offset Mean"),
+                dcc.Slider(id="intensity-mean", min=0, max=100, step=1,
+                           value=cfg.get("intensity_mean", 0),
+                           marks={i: str(i) for i in range(0, 101, 20)},
+                           tooltip={"placement": "bottom", "always_visible": True}),
+            ], style={"padding": "10px"}),
+            html.Div([
+                html.Label("Intensity Offset Variance"),
+                dcc.Slider(id="intensity-var", min=0, max=2000, step=10,
+                           value=cfg.get("intensity_var", 0),
+                           marks={i: str(i) for i in range(0, 2001, 400)},
+                           tooltip={"placement": "bottom", "always_visible": True}),
+            ], style={"padding": "10px"}),
+            html.Div([
+                html.Label("Grid Resolution"),
+                dcc.Slider(id="grid-res", min=15, max=50, step=5, value=DEFAULT_GRID_N,
+                           marks={i: str(i) for i in range(15, 55, 5)},
+                           tooltip={"placement": "bottom", "always_visible": True}),
+            ], style={"padding": "10px"}),
+            html.Div([
+                html.Button("Save as Default", id="save-btn", n_clicks=0,
+                            style={"marginTop": "10px", "padding": "8px 24px"}),
+                html.Span(id="save-status", style={"marginLeft": "12px"}),
+            ], style={"padding": "10px", "textAlign": "center"}),
+        ], style={"width": "60%", "margin": "0 auto"}),
+        dcc.Graph(id="cloud-plot", style={"height": f"{FIG_H}px"}),
+    ])
+
+    @callback(
+        Output("save-status", "children"),
+        Input("save-btn", "n_clicks"),
+        State("n-optima", "value"),
+        State("intensity-mean", "value"),
+        State("intensity-var", "value"),
+        State("noise-freq", "value"),
+        State("noise-amp", "value"),
+        prevent_initial_call=True,
+    )
+    def save_defaults(n_clicks, n_optima, intensity_mean, intensity_var, noise_freq, noise_amp):
+        # basin_width is no longer tunable here; preserve whatever is already in the
+        # config (the 3d default) so saving the other params doesn't drop it.
+        save_config({
+            "n_optima": int(n_optima),
+            "basin_width": float(load_config().get("basin_width", 50.0)),
+            "intensity_mean": float(intensity_mean),
+            "intensity_var": float(intensity_var),
+            "noise_freq": float(noise_freq),
+            "noise_amp": float(noise_amp),
+        })
+        return "Saved!"
+
+    @callback(
+        Output("cloud-plot", "figure"),
+        Input("n-optima", "value"),
+        Input("noise-freq", "value"),
+        Input("noise-amp", "value"),
+        Input("intensity-mean", "value"),
+        Input("intensity-var", "value"),
+        Input("grid-res", "value"),
+    )
+    def update_plot(n_optima, noise_freq, noise_amp, intensity_mean, intensity_var, grid_res):
+        # basin_width (b) is not passed: Ackley uses the hardcoded BASIN_WIDTH_BY_DIM
+        # value for this dim.
+        fn = Ackley(
+            "realistic", dim=DIM,
+            n_optima=int(n_optima),
+            intensity_mean=float(intensity_mean),
+            intensity_var=float(intensity_var),
+            noise_freq=float(noise_freq),
+            noise_amp=float(noise_amp),
+        )
+
+        comp = build_simplex_lattice(int(grid_res))
+        obj = fn.predict(comp)
+        xyz = to_3d(comp)
+        obj_min, obj_max = float(obj.min()), float(obj.max())
+
+        hover = [
+            f"x=[{a:.2f}, {b:.2f}, {c:.2f}, {d:.2f}]<br>obj={v:.2f}"
+            for (a, b, c, d), v in zip(comp, obj)
+        ]
+
+        cloud = go.Scatter3d(
+            x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2], mode="markers",
+            name="objective", text=hover, hoverinfo="text",
+            marker=dict(
+                color=obj, colorscale="Viridis",
+                cmin=obj_min, cmax=obj_max,
+                size=MARKER_SIZE, opacity=MARKER_OPACITY,
+                showscale=True, colorbar=dict(title="Objective"),
+            ),
+        )
+
+        peaks = np.array(fn.centers)
+        peaks_xyz = to_3d(peaks)
+        peaks_trace = go.Scatter3d(
+            x=peaks_xyz[:, 0], y=peaks_xyz[:, 1], z=peaks_xyz[:, 2], mode="markers",
+            name="known peak",
+            marker=dict(symbol="diamond", color="red", size=6,
+                        line=dict(color="white", width=1)),
+            hoverinfo="name",
+        )
+
+        fig = go.Figure(data=[cloud, tetra_edges_trace(), vertex_labels_trace(), peaks_trace])
+        fig.update_layout(
+            title=f"Tunable Realistic Ackley ({n_optima} peaks, "
+                  f"b={BASIN_WIDTH_BY_DIM[DIM]} at dim {DIM})",
+            scene=dict(
+                xaxis=dict(visible=False),
+                yaxis=dict(visible=False),
+                zaxis=dict(visible=False),
+                aspectmode="data",
+            ),
+            legend=dict(x=0.0, y=1.0),
+            width=FIG_W, height=FIG_H,
+        )
+        return fig
+
+    return app
+
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Render a 4-simplex Ackley point cloud. With RUN_DIR and "
+                    "ITERATION, export a static point_cloud_<n>.html showing the "
+                    "needles discovered up to that iteration; with no positional "
+                    "args, launch the interactive Dash app.")
+    parser.add_argument("run_dir", nargs="?", default=None,
+                        help="Run directory containing a needles.csv.")
+    parser.add_argument("iteration", nargs="?", type=int, default=None,
+                        help="Iteration n to render the state of.")
+    parser.add_argument("--grid-n", type=int, default=GRID_N,
+                        help=f"Simplex lattice resolution (default: {GRID_N}).")
+    args = parser.parse_args()
+
+    if args.run_dir is not None and args.iteration is not None:
+        out = render_iteration_point_cloud(args.run_dir, args.iteration, grid_n=args.grid_n)
+        print(f"Wrote {out}")
+    elif args.run_dir is not None or args.iteration is not None:
+        parser.error("provide BOTH run_dir and iteration to export, or neither "
+                     "to launch the interactive app.")
+    else:
+        print("Starting Dash app at http://127.0.0.1:8051")
+        build_app().run(debug=True, port=8051)
 
 
 if __name__ == "__main__":
-    print("Starting Dash app at http://127.0.0.1:8051")
-    app.run(debug=True, port=8051)
+    main()
