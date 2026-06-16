@@ -21,6 +21,7 @@ Usage:
     python analyze_basin_vol.py
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -70,9 +71,12 @@ def load_rf_surrogate() -> RandomForestRegressor:
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--log", action="store_true", help="Use a log scale for the y axis")
+    args = parser.parse_args()
+
     rng = np.random.default_rng(SEED)
 
-    # Build the list of (title, objective-values, colour) panels.
     panels = []
     for dim in DIMENSIONS:
         fn = Ackley("realistic", dim=dim)
@@ -88,16 +92,22 @@ def main():
     fig, axes = plt.subplots(
         1, len(panels), figsize=(5 * len(panels), 4.5), sharey=True
     )
-    # Keep axes iterable even when there is a single panel.
     axes = np.atleast_1d(axes)
 
     for ax, (title, y, color) in zip(axes, panels):
         ax.hist(y, bins=N_BINS, color=color, edgecolor="white", linewidth=0.3)
         ax.set_title(title, fontsize=12, fontweight="bold")
         ax.set_xlabel("objective value")
+        # Pin every panel to the full objective range and disable matplotlib's
+        # offset notation.  Otherwise a high-dim panel whose values all collapse
+        # to the floor (~0.5) gets auto-zoomed to a ~1e-5 sliver and relabelled
+        # "0..6  1e-5+5e-1", which reads like values of 0-6 instead of a spike
+        # at 0.5.
+        ax.set_xlim(0.5, 1.0)
+        ax.ticklabel_format(axis="x", useOffset=False)
+        if args.log:
+            ax.set_yscale("log")
         ax.grid(axis="y", alpha=0.25)
-
-        # Annotate with the best (highest) sampled value as a basin-reach cue.
         ax.axvline(y.max(), color="crimson", linestyle="--", linewidth=1.2)
         ax.text(
             0.97, 0.95, f"best sampled\n{y.max():.2f}",

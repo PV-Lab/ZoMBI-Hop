@@ -300,7 +300,6 @@ def plot_needles_summary(
         return
 
     values = [n['value'] for n in needles_results]
-    activations = [n['activation'] for n in needles_results]
     zooms = [n['zoom'] for n in needles_results]
     iterations = [n['iteration'] for n in needles_results]
 
@@ -317,12 +316,12 @@ def plot_needles_summary(
 
     # Discovery timeline
     discovery_order = list(range(len(needles_results)))
-    axes[1].scatter(discovery_order, values, c=activations, cmap='tab10',
+    axes[1].scatter(discovery_order, values, c=iterations, cmap='viridis',
                    s=100, edgecolors='black', linewidths=1)
     axes[1].plot(discovery_order, values, 'k--', alpha=0.3)
     axes[1].set_xlabel('Discovery Order')
     axes[1].set_ylabel('Objective Value')
-    axes[1].set_title('Discovery Timeline (colored by activation)')
+    axes[1].set_title('Discovery Timeline (colored by iteration)')
     axes[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -336,10 +335,10 @@ def plot_needles_summary(
     print("\n" + "="*60)
     print("NEEDLES SUMMARY")
     print("="*60)
-    print(f"{'#':<4} {'Value':<12} {'Activation':<12} {'Zoom':<8} {'Iteration':<10}")
+    print(f"{'#':<4} {'Value':<12} {'Zoom':<8} {'Iteration':<10}")
     print("-"*60)
     for i, n in enumerate(needles_results):
-        print(f"{i+1:<4} {n['value']:<12.4f} {n['activation']:<12} {n['zoom']:<8} {n['iteration']:<10}")
+        print(f"{i+1:<4} {n['value']:<12.4f} {n['zoom']:<8} {n['iteration']:<10}")
     print("="*60)
     print(f"Total needles: {len(needles_results)}")
     print(f"Best value: {max(values):.4f}")

@@ -18,6 +18,7 @@ from ..utils.simplex import (
     Ellipsoid,
     composition_to_ilr,
 )
+from ..utils.scaling import dimension_line_scale, dimension_radius_scale
 from ..utils.datahandler import DataHandler
 from ..utils.gp_simplex import GPSimplex
 
@@ -127,6 +128,33 @@ class ZoMBIHop:
         self.device = torch.device(device)
         self.dtype = dtype
         self.verbose = verbose
+
+        # --- Dimension scaling of dimension-sensitive hyperparameters ---
+        # These hyperparameters were tuned on the 3-simplex (d=3).  To help them
+        # generalise to higher dimensions we scale two groups by the problem
+        # dimension d (= number of simplex components):
+        #   Group 1 — tangent/ILR-space distances & radii — by sqrt((d-1)/2)
+        #   Group 2 — acquisition sampling budgets        — linearly by (d-1)/2
+        # Both factors are exactly 1.0 at d=3, so a 3-D-tuned configuration is
+        # reproduced unchanged there.  (NUM_LINES / N_INIT_LINES live in the
+        # LineBO layer outside ZoMBIHop and are scaled at that call site.)
+        # The factors collapse to 1.0 everywhere when scaling is disabled via
+        # src.utils.scaling.dimension_scaling_disabled() (see test_dim_scale.py).
+        d = X_init_actual.shape[1]
+        dim_scale_g1 = dimension_radius_scale(d)
+        dim_scale_g2 = dimension_line_scale(d)
+        paring_spatial_halfnoise *= dim_scale_g1
+        max_penalty_radius *= dim_scale_g1
+        min_axis_noise_mult *= dim_scale_g1
+        n_restarts = int(round(n_restarts * dim_scale_g2))
+        raw = int(round(raw * dim_scale_g2))
+        if verbose and d != 3:
+            print(f"Dimension scaling (d={d}): group1 ×{dim_scale_g1:.3f}, "
+                  f"group2 ×{dim_scale_g2:.3f} → n_restarts={n_restarts}, raw={raw}, "
+                  f"max_penalty_radius={max_penalty_radius:.4f}, "
+                  f"paring_spatial_halfnoise={paring_spatial_halfnoise:.4f}, "
+                  f"min_axis_noise_mult={min_axis_noise_mult:.4f}")
+
         self._needle_plot_points_ref = needle_plot_points_ref
         self.ellipsoid_drop_fraction = ellipsoid_drop_fraction
         self.ellipsoid_eigenvalue_floor = ellipsoid_eigenvalue_floor
@@ -150,7 +178,6 @@ class ZoMBIHop:
                                          else random_zero_sum_directions)
         self.objective = objective
 
-        d = X_init_actual.shape[1]
         if top_m_points is None:
             top_m_points = max(d + 1, 4)
             if self.verbose:
@@ -358,7 +385,6 @@ class ZoMBIHop:
     def _declare_needle_at_best(
         self,
         dh,
-        activation: int,
         zoom: int,
         iteration: int,
         reason: str = "converged",
@@ -408,12 +434,12 @@ class ZoMBIHop:
             needle=needle_X,
             needle_value=needle_Y.item(),
             needle_penalty_radius=0.0,
-            activation=activation,
             zoom=zoom,
             iteration=iteration,
             M=M_ellipsoid,
             B=B_ellipsoid,
             needle_median_value=needle_median,
+            reason=reason,
         )
 
         if self._needle_plot_points_ref is not None:
@@ -558,6 +584,7 @@ class ZoMBIHop:
         finished = False
         activation, zoom, iteration, _ = dh.get_iteration_state()
         start_activation = activation
+        global_iteration = 0
 
         while activation < max_activations and not finished:
             self._log(f"\n{'='*50}")
@@ -668,6 +695,7 @@ class ZoMBIHop:
                     unpenalized_X, unpenalized_Y = self._objective_wrapper(
                         candidate, bounds, self.gp_handler.acq_fn
                     )
+                    global_iteration += 1
                     data_added_since_last_failure = True
                     if self.verbose:
                         if unpenalized_Y.numel() > 0:
@@ -723,7 +751,7 @@ class ZoMBIHop:
                     # --- Declare needle after N consecutive converged iterations ---
                     if consecutive_converged >= dh.n_consecutive_converged:
                         needle = self._declare_needle_at_best(
-                            dh, activation, zoom, iteration, reason="PI convergence"
+                            dh, zoom, global_iteration, reason="PI convergence"
                         )
                         if needle is not None:
                             dh.take_snapshot(
@@ -810,7 +838,7 @@ class ZoMBIHop:
                                 f"  → repeated zoom (Jaccard={repeated_jac:.3f}) — forcing needle."
                             )
                             needle = self._declare_needle_at_best(
-                                dh, activation, zoom, iteration, reason="Jaccard convergence"
+                                dh, zoom, global_iteration, reason="Jaccard convergence"
                             )
                             if needle is None:
                                 activation_failed = True

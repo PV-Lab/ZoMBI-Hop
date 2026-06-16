@@ -156,6 +156,7 @@ def _render_coverage_frame(
     true_optima: list,
     maximize: bool,
     title_base: str,
+    needle_xy: np.ndarray | None = None,
 ) -> np.ndarray:
     fig = Figure(figsize=(8, 7))
     FigureCanvasAgg(fig)
@@ -175,8 +176,15 @@ def _render_coverage_frame(
     if true_optima:
         mxy = comp_to_xy(np.array(true_optima))
         label = "True maxima" if maximize else "True minima"
-        ax.scatter(mxy[:, 0], mxy[:, 1], marker="*", s=360, c="blue",
+        ax.scatter(mxy[:, 0], mxy[:, 1], marker="*", s=360, c="blue", alpha=0.45,
                    zorder=11, edgecolors="navy", linewidths=1.3, label=label)
+
+    if needle_xy is not None and len(needle_xy):
+        ax.scatter(needle_xy[:, 0], needle_xy[:, 1], marker="*", s=360,
+                   c="red", alpha=0.55, zorder=12, edgecolors="darkred",
+                   linewidths=1.3, label="Found needles")
+
+    if true_optima or (needle_xy is not None and len(needle_xy)):
         ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
 
     ax.set_title(f"Coverage: {title_base}  ({n_visible} points)", fontsize=12)
@@ -209,6 +217,7 @@ def make_coverage_video(
     true_optima: list,
     maximize: bool,
     title_base: str,
+    needle_xy: np.ndarray | None = None,
 ) -> None:
     n_total = len(pxy)
     boundaries = _line_boundaries(n_total)
@@ -223,7 +232,8 @@ def make_coverage_video(
     frames = []
     for frame_idx, n_visible in enumerate(boundaries, 1):
         img = _render_coverage_frame(
-            n_visible, pxy, y_vals, gxy, grid_vals, true_optima, maximize, title_base)
+            n_visible, pxy, y_vals, gxy, grid_vals, true_optima, maximize, title_base,
+            needle_xy=needle_xy)
         img = _stamp_counter(img, f"Points sampled: {n_visible}")
         frames.append(_even(img))
         filled = int(bar_width * frame_idx / n_frames)
@@ -279,6 +289,14 @@ def main() -> None:
     pxy = comp_to_xy(comps)
     title_base = os.path.basename(os.path.normpath(trial_dir))
 
+    # ── Load found needles ──
+    needles_path = os.path.join(trial_dir, "needles.csv")
+    needle_xy = None
+    if os.path.isfile(needles_path):
+        ndf = pd.read_csv(needles_path)
+        ncols = _detect_comp_cols(ndf)
+        needle_xy = comp_to_xy(ndf[ncols].values.astype(float))
+
     # ── Static plot (shown interactively) ──
     fig, ax = plt.subplots(figsize=(8, 7))
     draw_ternary_frame(ax)
@@ -295,8 +313,15 @@ def main() -> None:
     if true_optima:
         mxy = comp_to_xy(np.array(true_optima))
         label = "True maxima" if maximize else "True minima"
-        ax.scatter(mxy[:, 0], mxy[:, 1], marker="*", s=360, c="blue",
+        ax.scatter(mxy[:, 0], mxy[:, 1], marker="*", s=360, c="blue", alpha=0.45,
                    zorder=11, edgecolors="navy", linewidths=1.3, label=label)
+
+    if needle_xy is not None and len(needle_xy):
+        ax.scatter(needle_xy[:, 0], needle_xy[:, 1], marker="*", s=360,
+                   c="red", alpha=0.55, zorder=12, edgecolors="darkred",
+                   linewidths=1.3, label="Found needles")
+
+    if true_optima or (needle_xy is not None and len(needle_xy)):
         ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
 
     n_pts = len(df)
@@ -309,7 +334,8 @@ def main() -> None:
     video_path = os.path.join(trial_dir, "coverage.mp4")
     print(f"Rendering coverage video ({n_pts} frames) ...")
     make_coverage_video(
-        video_path, pxy, y_vals, gxy, grid_vals, true_optima, maximize, title_base)
+        video_path, pxy, y_vals, gxy, grid_vals, true_optima, maximize, title_base,
+        needle_xy=needle_xy)
 
 
 if __name__ == "__main__":
