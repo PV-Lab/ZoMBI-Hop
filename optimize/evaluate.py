@@ -99,6 +99,10 @@ from mobo_landscapes import build_synthetic_landscape, parse_synthetic_batch_fie
 from src.core.linebo import dimension_line_scale
 from synthetic_data.ackley import Ackley
 from synthetic_data.gaussian_landscape import RealisticGaussian
+from synthetic_data.landscape_config_log import (
+    build_landscape_config_log,
+    format_landscape_config_summary,
+)
 from synthetic_data.oracles import ORACLE_CHOICES
 
 try:
@@ -142,7 +146,7 @@ def _load_synthetic_batch_config(config_path: str) -> dict:
 
 
 def _landscape_to_ds(spec, dataset: str, *, ackley_fn=None, variant: str | None = None) -> dict:
-    return {
+    ds = {
         "dim": spec.dim,
         "maximize": spec.maximize,
         "fn": spec.fn_callable,
@@ -158,7 +162,12 @@ def _landscape_to_ds(spec, dataset: str, *, ackley_fn=None, variant: str | None 
         "seed": spec.synthetic_seed,
         "variant": variant,
         "time_limit_hours": spec.time_limit_hours,
+        "metadata_path": spec.metadata_path,
     }
+    log = build_landscape_config_log(dataset=dataset, ds=ds)
+    ds["landscape_config"] = log
+    print(format_landscape_config_summary(log))
+    return ds
 
 
 def _gaussian_kwargs(config: dict | None) -> dict:
@@ -730,9 +739,12 @@ def run_single_eval(
     except Exception as exc:
         print(f"      [run] landscape render failed: {exc}")
 
-    metrics = {"dist_to_needles": round(dist, 6),
-               "dup_fraction": round(dup, 6),
-               "runtime_s": round(runtime, 3)}
+    metrics = {
+        "dist_to_needles": round(dist, 6),
+        "dup_fraction": round(dup, 6),
+        "runtime_s": round(runtime, 3),
+        "landscape_config": ds.get("landscape_config"),
+    }
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
     if interrupted:
@@ -789,6 +801,7 @@ def _build_rerun_config(
         "time_limit_min": time_limit_min,
         "top_k": args.top_k,
         "true_optima": [list(map(float, t.ravel())) for t in ds["true_optima"]],
+        "landscape_config": ds.get("landscape_config"),
     }
     if config_meta:
         cfg["batch_config"] = config_meta.get("name")

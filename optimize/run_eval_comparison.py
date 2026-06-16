@@ -336,6 +336,17 @@ def main() -> None:
     if result.returncode != 0:
         sys.exit(result.returncode)
 
+    try:
+        manifest["landscape_configs"] = {
+            name: json.loads((path / "rerun_config.json").read_text(encoding="utf-8")).get("landscape_config")
+            for name, path in _dataset_dirs(eval_root)
+            if (path / "rerun_config.json").is_file()
+        }
+        with open(eval_root / "comparison_config.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+    except FileNotFoundError:
+        pass
+
     rows = collect_rows(eval_root)
     summary_path = eval_root / "comparison_summary.json"
     csv_path = eval_root / "comparison_summary.csv"

@@ -439,6 +439,22 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
         cfg["batch_name"] = batch_name
     if batch_config_path:
         cfg["batch_config_path"] = os.path.abspath(batch_config_path)
+    from synthetic_data.landscape_config_log import build_landscape_config_log, dataset_label_for_landscape
+    cfg["landscape_config"] = build_landscape_config_log(
+        dataset=dataset_label_for_landscape(
+            landscape.landscape, dim=landscape.dim, oracle=landscape.oracle,
+        ),
+        ds={
+            "dim": landscape.dim,
+            "oracle": landscape.oracle,
+            "landscape": landscape.landscape,
+            "fn": landscape.fn_callable,
+            "csv_path": landscape.csv_path,
+            "metadata_path": landscape.metadata_path,
+            "seed": landscape.synthetic_seed,
+            "layout": landscape.ackley_layout,
+        },
+    )
     cfg["slurm"] = _slurm_metadata()
     _atomic_write_text(os.path.join(run_dir, "run_config.json"), json.dumps(cfg, indent=2))
 
