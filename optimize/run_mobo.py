@@ -4,8 +4,10 @@ optimize/run_mobo.py
 Multi-objective Bayesian optimisation (MOBO) of ZoMBI-Hop hyperparameters.
 
 Landscapes (``--landscape`` or batch JSON ``"landscape"`` field):
-  • ``rf`` (default) — Random-Forest surrogate on a composition simplex CSV
-                       (campaign1a or synthetic_data/data/campaign*d_synthetic_*.csv)
+  • ``rf`` (default) — Random-Forest surrogate on a composition CSV (campaign1a)
+  • ``synthetic``    — Direct analytic oracle (messy, gaussian, …) — MOBO default
+                       for synthetic benchmarks; RF is comparison-only (see
+                       synthetic_data/compare_campaign_datasets.py)
   • ``ackley``       — Multi-Ackley sum on the d-dimensional probability simplex
 
 Three objectives (all minimised):
@@ -85,21 +87,19 @@ Non-interactive / MIT ORCD HPC
   # Campaign RF (headless JSON config):
   MPLBACKEND=Agg python optimize/run_mobo.py --batch --config optimize/mobo_batch_configs/campaign1a_objective_min.json
 
-  # Synthetic 3D RF (generate CSVs first):
-  python synthetic_data/generate_synthetic_campaign.py --all-3d
-  MPLBACKEND=Agg python optimize/run_mobo.py --batch --config optimize/mobo_batch_configs/synthetic_3d_messy_rf_max.json
+  # Synthetic 3D oracle (direct — no RF CSV):
+  MPLBACKEND=Agg python optimize/run_mobo.py --batch --config optimize/mobo_batch_configs/synthetic_3d_messy.json
 
   # 10D Multi-Ackley synthetic benchmark:
   MPLBACKEND=Agg python optimize/run_mobo.py --batch --config optimize/mobo_batch_configs/ackley_10d_layout1.json
 
-  # Submit one Slurm job:
-  cd ~/ZoMBI-Hop && sbatch slurm/run_mobo.sbatch
-
-  # 10D Ackley (GPU):
-  cd ~/ZoMBI-Hop && sbatch slurm/mobo_10d.sbatch
+  # Submit one Slurm job (CPU or GPU):
+  cd ~/ZoMBI-Hop && bash scripts/submit_mobo.sh
+  MOBO_DEVICE=cuda MOBO_CONFIG=optimize/mobo_batch_configs/ackley_10d_layout1.json bash scripts/submit_mobo.sh
 
   # Submit a batch (one array task per manifest entry):
   cd ~/ZoMBI-Hop && bash scripts/submit_mobo_batch.sh
+  MOBO_DEVICE=cuda MOBO_MANIFEST=optimize/mobo_batch_manifest_synthetic_3d.json bash scripts/submit_mobo_batch.sh
 
 Each trial appends to ``trials_log.csv`` (hyperparameters + metrics) and
 ``all_samples.csv`` (every ZoMBI sample point with trial/phase context).
@@ -176,11 +176,13 @@ from optimize.mobo_landscapes import (
     LandscapeSpec,
     build_ackley_landscape,
     build_rf_landscape,
+    build_synthetic_landscape,
     composition_column_names,
     infer_composition_columns,
     interactive_ackley_startup,
     landscape_from_run_config,
     parse_ackley_batch_fields,
+    parse_synthetic_batch_fields,
 )
 from synthetic_data.campaign_datasets import load_metadata, resolve_metadata_path
 
@@ -427,6 +429,11 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
     if landscape.landscape == "ackley":
         cfg["ackley_layout"] = landscape.ackley_layout
         cfg["ackley_b"] = landscape.ackley_b
+    if landscape.landscape == "synthetic":
+        cfg["oracle"] = landscape.oracle
+        cfg["ackley_layout"] = landscape.ackley_layout
+        if landscape.synthetic_seed is not None:
+            cfg["seed"] = landscape.synthetic_seed
     if batch_name:
         cfg["batch_name"] = batch_name
     if batch_config_path:
@@ -553,6 +560,34 @@ def load_batch_config(path: str, script_dir: str) -> dict:
             "name":              cfg.get("name") or os.path.splitext(os.path.basename(cfg_path))[0],
             "landscape":         landscape,
             "maximize":          True,
+            "true_optima":       landscape.true_optima,
+            "max_trials":        cfg.get("max_trials"),
+            "time_limit_hours":  time_limit,
+            "n_init_trials":     cfg.get("n_init_trials", N_INIT_TRIALS),
+            "auto_optima":       None,
+            "config_path":       cfg_path,
+            "csv_path":          None,
+            "objective_column":  None,
+        }
+
+    if landscape_type == "synthetic":
+        try:
+            syn = parse_synthetic_batch_fields(cfg)
+        except ValueError as exc:
+            sys.exit(f"--config: {exc}")
+        landscape = build_synthetic_landscape(
+            syn["oracle"], syn["dim"], syn["layout"],
+            seed=syn["seed"],
+            time_limit_hours=time_limit,
+        )
+        maximize = bool(cfg.get("maximize", True))
+        print(f"  [batch] Synthetic oracle={syn['oracle']} d={syn['dim']} "
+              f"layout={syn['layout']} seed={syn['seed']}")
+        print(f"  [batch] {len(landscape.true_optima)} planted peaks (direct oracle, no RF)")
+        return {
+            "name":              cfg.get("name") or os.path.splitext(os.path.basename(cfg_path))[0],
+            "landscape":         landscape,
+            "maximize":          maximize,
             "true_optima":       landscape.true_optima,
             "max_trials":        cfg.get("max_trials"),
             "time_limit_hours":  time_limit,
@@ -1317,7 +1352,7 @@ def _draw_needle_ellipsoid(ax, needle_x, M, B) -> None:
 
 
 def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool,
-                 out_path: str) -> None:
+                 out_path: str, *, ref_title: str = "Reference: RF landscape") -> None:
     """Render one two-panel ternary iteration figure to out_path (no GUI)."""
     fig = Figure(figsize=(16, 6.8))
     FigureCanvasAgg(fig)
@@ -1326,7 +1361,7 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
 
     # ── Left: RF reference ──
     draw_ternary_frame(ax_ref)
-    ax_ref.set_title("Reference: RF landscape", fontsize=11)
+    ax_ref.set_title(ref_title, fontsize=11)
     gxy = comp_to_xy(grid_pts)
     sc_ref = ax_ref.scatter(gxy[:, 0], gxy[:, 1], c=grid_vals, cmap="viridis",
                             s=6, alpha=0.72, zorder=2, rasterized=True)
@@ -1731,8 +1766,16 @@ def run_single_trial(
         print(f"    [trial] rendering {len(payloads)} frames …", flush=True)
         for p in payloads:
             try:
-                render_frame(p, grid_pts, grid_vals, true_optima, maximize,
-                             os.path.join(plots_dir, f"iter_{p['iter_num'] - 1:04d}.png"))
+                ref_title = (
+                    "Reference: oracle landscape"
+                    if landscape.landscape == "synthetic"
+                    else "Reference: RF landscape"
+                )
+                render_frame(
+                    p, grid_pts, grid_vals, true_optima, maximize,
+                    os.path.join(plots_dir, f"iter_{p['iter_num'] - 1:04d}.png"),
+                    ref_title=ref_title,
+                )
             except Exception as exc:
                 print(f"    [trial] frame {p['iter_num']} failed: {exc}")
 
@@ -2155,7 +2198,7 @@ def main() -> None:
                 time_limit_hours=TIME_LIMIT_HOURS,
             )
 
-        if landscape.landscape == "ackley":
+        if landscape.landscape in ("ackley", "synthetic"):
             for i, p in enumerate(landscape.true_optima):
                 print(f"  peak {i + 1}: {np.round(p, 4).tolist()}")
         stop = (

@@ -10,18 +10,15 @@
 set -euo pipefail
 # Short MOBO probe to measure per-trial runtime and log cluster allocation.
 #
-# Submit from repo root:
-#   sbatch slurm/probe_mobo.sbatch                              # CPU, campaign, 1 trial
-#   bash scripts/probe_cluster.sh gpu-campaign                  # GPU, 3D campaign (recommended)
-#   bash scripts/probe_cluster.sh gpu-ackley                    # GPU, Ackley 10D
-#   MOBO_MAX_TRIALS=2 bash scripts/probe_cluster.sh gpu-campaign
-#
-# Or use the helper:
+# Submit via helper (recommended):
 #   bash scripts/probe_cluster.sh info
 #   bash scripts/probe_cluster.sh cpu
 #   bash scripts/probe_cluster.sh gpu-campaign
+#   bash scripts/probe_cluster.sh gpu-synthetic
 #   bash scripts/probe_cluster.sh gpu-ackley
-#   bash scripts/probe_cluster.sh both-campaign               # CPU + GPU campaign probes
+#   bash scripts/probe_cluster.sh both-campaign
+#
+# Probes use production batch configs with MOBO_MAX_TRIALS=1 (CLI override).
 
 REPO="${SLURM_SUBMIT_DIR:-$(pwd)}"
 PROBE_TARGET="${PROBE_TARGET:-cpu}"
@@ -38,12 +35,12 @@ if [[ "${PROBE_TARGET}" == "gpu" ]]; then
   if [[ "${PROBE_LANDSCAPE}" == "ackley" ]]; then
     CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/ackley_10d_layout1.json}"
   elif [[ "${PROBE_LANDSCAPE}" == "synthetic" ]]; then
-    CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/probe_synthetic_messy_gpu.json}"
+    CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/synthetic_3d_messy.json}"
   else
-    CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/probe_campaign_gpu.json}"
+    CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/campaign1a_objective_min.json}"
   fi
 else
-  CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/probe_campaign_gpu.json}"
+  CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/campaign1a_objective_min.json}"
   DEVICE="cpu"
   CPUS="${SLURM_CPUS_PER_TASK:-8}"
 fi
@@ -79,14 +76,9 @@ RUN_DIR="${MOBO_RUN_DIR:-optimize/runs/probe_${SLURM_JOB_ID:-local}_${PROBE_TARG
   fi
 } | tee "${REPORT}"
 
-source "${HOME}/miniforge3/etc/profile.d/conda.sh"
-conda activate zombi-hop-linebo
-
-export OMP_NUM_THREADS="${CPUS}"
-export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
-export OPENBLAS_NUM_THREADS="${OMP_NUM_THREADS}"
-export MPLBACKEND=Agg
-export PYTHONUNBUFFERED=1
+# shellcheck source=/dev/null
+source "${REPO}/slurm/mobo_job_common.sh"
+_mobo_setup_env
 
 WALL_START=$(date +%s)
 

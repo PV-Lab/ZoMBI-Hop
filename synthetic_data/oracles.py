@@ -204,12 +204,13 @@ class MessyCampaignOracle:
         *,
         n_micro: int = 150,
         n_ripples: int = 30,
+        major_sigma: float = 0.055,
         seed: int = 42,
     ):
         self._bumps = PlantedBumpField(
             major_centers,
             n_micro=n_micro,
-            major_sigma=0.055,
+            major_sigma=major_sigma,
             signed_micro=True,
             seed=seed,
         )

@@ -9,16 +9,21 @@
 #SBATCH --error=logs/mobo-array-%A_%a.err
 
 set -euo pipefail
-# Slurm array: one MOBO run per manifest entry (optimize/mobo_batch_manifest.json).
+# Slurm array: one MOBO run per manifest entry.
 #
-# Submit from repo root (array bounds set by scripts/submit_mobo_batch.sh):
-#   cd ~/ZoMBI-Hop && bash scripts/submit_mobo_batch.sh
+# Submit from repo root (array bounds + partition set by scripts/submit_mobo_batch.sh):
+#   bash scripts/submit_mobo_batch.sh
+#   MOBO_DEVICE=cuda MOBO_MANIFEST=optimize/mobo_batch_manifest_synthetic_3d.json bash scripts/submit_mobo_batch.sh
 #
-# Or manually after editing --array above:
-#   sbatch slurm/run_mobo_array.sbatch
+# Environment:
+#   MOBO_MANIFEST=...      (default optimize/mobo_batch_manifest.json)
+#   MOBO_DEVICE=cpu|cuda   (default cpu; submit script sets partition/gres)
+#   MOBO_MAX_TRIALS=N      (optional CLI override per task)
 
 REPO="${SLURM_SUBMIT_DIR}"
 MANIFEST="${MOBO_MANIFEST:-optimize/mobo_batch_manifest.json}"
+DEVICE="${MOBO_DEVICE:-cpu}"
+MAX_TRIALS="${MOBO_MAX_TRIALS:-}"
 TASK_ID="${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID not set}"
 
 cd "${REPO}"
@@ -47,18 +52,18 @@ PY
 )
 RUN_DIR="${REPO}/optimize/runs/mobo_batch_${BATCH_NAME}_job${SLURM_ARRAY_JOB_ID}_task${TASK_ID}"
 
-source "${HOME}/miniforge3/etc/profile.d/conda.sh"
-conda activate zombi-hop-linebo
+# shellcheck source=/dev/null
+source "${REPO}/slurm/mobo_job_common.sh"
+_mobo_setup_env
 
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
-export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
-export OPENBLAS_NUM_THREADS="${OMP_NUM_THREADS}"
-export MPLBACKEND=Agg
-export PYTHONUNBUFFERED=1
+EXTRA=(--run-dir "${RUN_DIR}")
+if [[ -n "${MAX_TRIALS}" ]]; then
+  EXTRA+=(--max-trials "${MAX_TRIALS}")
+fi
 
-echo "[array] task=${TASK_ID}  config=${CONFIG}  run_dir=${RUN_DIR}"
+echo "[array] task=${TASK_ID}  device=${DEVICE}  config=${CONFIG}  run_dir=${RUN_DIR}"
 
 python optimize/run_mobo.py --batch --no-show \
   --config "${CONFIG_PATH}" \
-  --device cpu \
-  --run-dir "${RUN_DIR}"
+  --device "${DEVICE}" \
+  "${EXTRA[@]}"

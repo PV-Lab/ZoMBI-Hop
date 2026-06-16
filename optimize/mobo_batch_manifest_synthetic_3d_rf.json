@@ -1,0 +1,10 @@
+{
+  "description": "Optional RF-surrogate comparison runs (generate CSVs with generate_synthetic_campaign.py --all-3d first). MOBO defaults use direct oracles in mobo_batch_manifest_synthetic_3d.json.",
+  "configs": [
+    "optimize/mobo_batch_configs/synthetic_3d_messy_rf_max.json",
+    "optimize/mobo_batch_configs/synthetic_3d_ackley_rf_max.json",
+    "optimize/mobo_batch_configs/synthetic_3d_gaussian_rf_max.json",
+    "optimize/mobo_batch_configs/synthetic_3d_planted_bumps_rf_max.json",
+    "optimize/mobo_batch_configs/synthetic_3d_rastrigin_ilr_rf_max.json"
+  ]
+}

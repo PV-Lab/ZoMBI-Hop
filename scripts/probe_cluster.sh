@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Probe MOBO runtime and print ORCD cluster limits.
 #
-# Usage (from repo root on MIT ORCD):
+# Usage (from repo root on MIT Engaging):
 #   bash scripts/probe_cluster.sh info              # partition/account limits
 #   bash scripts/probe_cluster.sh cpu               # 1-trial CPU, 3D campaign
 #   bash scripts/probe_cluster.sh gpu-campaign      # 1-trial GPU, 3D campaign RF
-#   bash scripts/probe_cluster.sh gpu-synthetic       # 1-trial GPU, 3D messy synthetic RF
+#   bash scripts/probe_cluster.sh gpu-synthetic     # 1-trial GPU, 3D messy synthetic oracle
 #   bash scripts/probe_cluster.sh gpu-ackley        # 1-trial GPU, Ackley 10D
 #   bash scripts/probe_cluster.sh both-campaign     # CPU + GPU campaign probes
 #   bash scripts/probe_cluster.sh summarize         # timing from optimize/runs
@@ -30,7 +30,7 @@ print_cluster_info() {
     sinfo -o "%P %a %l %D %c %m %G %F" 2>/dev/null | head -1
     sinfo -o "%P %a %l %D %c %m %G %F" 2>/dev/null | grep -E "mit_normal" || true
   else
-    echo "(sinfo not available — run on ORCD login node)"
+    echo "(sinfo not available — run on Engaging login node)"
   fi
 
   echo ""
@@ -49,20 +49,23 @@ print_cluster_info() {
   fi
 
   echo ""
-  echo "=== MOBO sbatch scripts ==="
-  echo "  slurm/run_mobo.sbatch       CPU campaign (mit_normal, 16 CPU, 12h)"
-  echo "  slurm/run_mobo_gpu.sbatch   GPU campaign (mit_normal_gpu, 1 GPU, 12h)"
-  echo "  slurm/mobo_10d.sbatch       GPU Ackley 10D (mit_normal_gpu, 1 GPU, 6h)"
-  echo "  slurm/probe_mobo.sbatch     short probe, MOBO_MAX_TRIALS=${MOBO_MAX_TRIALS:-1}"
+  echo "=== MOBO Slurm scripts ==="
+  echo "  slurm/run_mobo.sbatch        single job (use scripts/submit_mobo.sh for GPU)"
+  echo "  slurm/run_mobo_array.sbatch  array job (use scripts/submit_mobo_batch.sh)"
+  echo "  slurm/probe_mobo.sbatch      short probe, MOBO_MAX_TRIALS=${MOBO_MAX_TRIALS:-1}"
   echo ""
-  echo "Probe configs:"
-  echo "  probe_campaign_gpu.json   — 1 trial, 0.4 h/trial, 3D RF campaign"
-  echo "  probe_synthetic_messy_gpu.json — 1 trial, 3D messy synthetic RF"
-  echo "  ackley_10d_layout1.json   — Ackley 10D synthetic benchmark"
+  echo "Submit helpers:"
+  echo "  scripts/submit_mobo.sh        single job (MOBO_DEVICE=cpu|cuda)"
+  echo "  scripts/submit_mobo_batch.sh  parallel manifest (MOBO_DEVICE=cpu|cuda)"
+  echo ""
+  echo "Example configs:"
+  echo "  campaign1a_objective_min.json — 3D RF campaign"
+  echo "  synthetic_3d_messy.json       — 3D messy synthetic oracle"
+  echo "  ackley_10d_layout1.json       — Ackley 10D synthetic benchmark"
   echo ""
   echo "Synthetic data:"
   echo "  bash scripts/generate_synthetic_mobo_data.sh"
-  echo "  MOBO_MANIFEST=optimize/mobo_batch_manifest_synthetic_3d.json bash scripts/submit_mobo_batch.sh"
+  echo "  MOBO_DEVICE=cuda MOBO_MANIFEST=optimize/mobo_batch_manifest_synthetic_3d.json bash scripts/submit_mobo_batch.sh"
 }
 
 submit_probe() {
@@ -106,7 +109,7 @@ case "${MODE}" in
   gpu-synthetic)
     print_cluster_info
     echo ""
-    MOBO_CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/probe_synthetic_messy_gpu.json}" \
+    MOBO_CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/synthetic_3d_messy.json}" \
       submit_probe gpu synthetic
     ;;
   both|both-campaign)

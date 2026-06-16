@@ -2,8 +2,9 @@
 Landscape definitions for optimize/run_mobo.py.
 
 Supports:
-  • ``rf``     — Random-Forest surrogate on the 3-component ternary simplex
-  • ``ackley`` — Multi-Ackley sum on the d-dimensional probability simplex
+  • ``rf``        — Random-Forest surrogate (campaign1a or optional RF-on-CSV comparison)
+  • ``synthetic`` — Direct analytic oracle from synthetic_data/oracles.py (MOBO default)
+  • ``ackley``    — Multi-Ackley sum on the d-dimensional probability simplex
 """
 
 from __future__ import annotations
@@ -186,6 +187,7 @@ class LandscapeSpec:
     max_activations: float | None = None
     ackley_layout: str | None = None
     ackley_b: float | None = None
+    synthetic_seed: int | None = None
     csv_path: str | None = None
     objective_column: str = "Objective"
     composition_columns: list[str] | None = None
@@ -195,7 +197,7 @@ class LandscapeSpec:
     @property
     def render_ternary(self) -> bool:
         return (
-            self.landscape == "rf"
+            self.landscape in ("rf", "synthetic")
             and self.dim == 3
             and self.grid_pts is not None
             and self.grid_vals is not None
@@ -205,9 +207,77 @@ class LandscapeSpec:
     def label(self) -> str:
         if self.landscape == "ackley":
             return f"MultiAckley-{self.dim}D-L{self.ackley_layout}"
-        if self.oracle:
+        if self.landscape == "synthetic" and self.oracle:
+            return f"Synthetic-{self.oracle}-{self.dim}D-L{self.ackley_layout or '?'}"
+        if self.landscape == "rf" and self.oracle:
             return f"RF surrogate ({self.oracle}, {self.dim}D)"
-        return f"RF surrogate ({self.dim}D)"
+        if self.landscape == "rf":
+            return f"RF surrogate ({self.dim}D)"
+        return self.landscape
+
+
+def ternary_grid(n: int = 80) -> np.ndarray:
+    pts = []
+    for i in range(n + 1):
+        for j in range(n + 1 - i):
+            pts.append([i / n, j / n, (n - i - j) / n])
+    return np.array(pts, dtype=float)
+
+
+def build_synthetic_landscape(
+    oracle: str,
+    dim: int,
+    layout: str,
+    *,
+    seed: int = 42,
+    time_limit_hours: float | None = 0.4,
+    grid_n: int = 80,
+) -> LandscapeSpec:
+    """Direct analytic oracle — no RF CSV required (RF is comparison-only)."""
+    from synthetic_data.oracles import ORACLE_CHOICES, build_oracle
+
+    if oracle not in ORACLE_CHOICES:
+        raise ValueError(f"Unknown synthetic oracle {oracle!r}; choose from {ORACLE_CHOICES}")
+
+    fn, optima, _label = build_oracle(oracle, dim, layout, seed=seed)
+    grid_pts = grid_vals = None
+    if dim == 3:
+        grid_pts = ternary_grid(grid_n)
+        grid_vals = np.array([float(fn(x)) for x in grid_pts], dtype=float)
+
+    return LandscapeSpec(
+        landscape="synthetic",
+        dim=dim,
+        maximize=True,
+        true_optima=optima,
+        fn_callable=fn,
+        grid_pts=grid_pts,
+        grid_vals=grid_vals,
+        time_limit_hours=time_limit_hours,
+        max_activations=float("inf"),
+        oracle=oracle,
+        ackley_layout=layout,
+        synthetic_seed=seed,
+    )
+
+
+def parse_synthetic_batch_fields(cfg: dict) -> dict:
+    """Extract synthetic-oracle fields from a batch JSON config."""
+    from synthetic_data.oracles import ORACLE_CHOICES
+
+    oracle = str(cfg.get("oracle", "messy"))
+    if oracle not in ORACLE_CHOICES:
+        raise ValueError(f"oracle must be one of {ORACLE_CHOICES}, got {oracle!r}")
+    dim = int(cfg.get("dim", 3))
+    layout = str(cfg.get("layout", "2"))
+    seed = int(cfg.get("seed", 42))
+    if dim < 2 or dim > 20:
+        raise ValueError(f"synthetic dim must be in [2, 20], got {dim}")
+    if layout == "3" and dim < 5:
+        raise ValueError("synthetic layout 3 requires dim >= 5")
+    if layout == "2" and dim < 3:
+        raise ValueError("synthetic layout 2 requires dim >= 3")
+    return {"oracle": oracle, "dim": dim, "layout": layout, "seed": seed}
 
 
 def build_ackley_landscape(
@@ -286,6 +356,14 @@ def landscape_from_run_config(cfg: dict, *, build_rf_and_grid) -> LandscapeSpec:
             dim, layout, b=b,
             time_limit_hours=time_limit,
             max_activations=float(max_act) if max_act is not None else None,
+        )
+
+    if landscape == "synthetic":
+        syn = parse_synthetic_batch_fields(cfg)
+        return build_synthetic_landscape(
+            syn["oracle"], syn["dim"], syn["layout"],
+            seed=syn["seed"],
+            time_limit_hours=time_limit,
         )
 
     csv_path = cfg["csv_path"]
