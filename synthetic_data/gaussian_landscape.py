@@ -87,15 +87,19 @@ class RealisticGaussian:
 
         if sigma is not None:
             _sigma = float(sigma)
+        elif "sigma" in cfg:
+            _sigma = float(cfg["sigma"])
         else:
-            _sigma = float(SIGMA_BY_DIM.get(dim, cfg["sigma"]))
+            _sigma = float(SIGMA_BY_DIM.get(dim, 0.07))
 
         _sv = float(sigma_var if sigma_var is not None else cfg.get("sigma_var", 0.0))
         _nf = float(noise_freq if noise_freq is not None else cfg["noise_freq"])
         if noise_amp is not None:
             _na = float(noise_amp)
+        elif "noise_amp" in cfg:
+            _na = float(cfg["noise_amp"])
         else:
-            _na = float(NOISE_AMP_BY_DIM.get(dim, cfg["noise_amp"]))
+            _na = float(NOISE_AMP_BY_DIM.get(dim, 0.15))
 
         rng = np.random.default_rng(peak_seed)
         self.centers = [c.copy() for c in rng.dirichlet(np.ones(dim), size=_n)]

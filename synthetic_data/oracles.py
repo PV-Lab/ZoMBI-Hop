@@ -7,7 +7,10 @@ to 10D+ for MOBO hyperparameter transfer experiments.
 
 from __future__ import annotations
 
+import itertools
+import json
 import math
+from pathlib import Path
 
 import numpy as np
 
@@ -23,6 +26,20 @@ ORACLE_CHOICES = (
     "rastrigin_ilr",
     "planted_bumps",
 )
+
+_RASTRIGIN_CONFIGS_DIR = Path(__file__).resolve().parent / "rastrigin_ilr"
+_RASTRIGIN_DEFAULTS_PATH = _RASTRIGIN_CONFIGS_DIR / "defaults.json"
+_RASTRIGIN_HARDCODED_DEFAULTS = {
+    "n_optima": 20,
+    "amplitude": 30.0,
+}
+
+
+def load_rastrigin_config() -> dict:
+    if _RASTRIGIN_DEFAULTS_PATH.is_file():
+        with open(_RASTRIGIN_DEFAULTS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    return dict(_RASTRIGIN_HARDCODED_DEFAULTS)
 
 
 def simplex_vertex(d: int, i: int) -> np.ndarray:
@@ -115,6 +132,62 @@ def composition_to_ilr_np(x: np.ndarray) -> np.ndarray:
     return ilr
 
 
+def ilr_to_composition_np(ilr: np.ndarray, d: int) -> np.ndarray:
+    """Inverse Helmert ILR (numpy), matching ``src.utils.simplex.ilr_to_composition``."""
+    ilr = np.asarray(ilr, dtype=float)
+    log_x = np.zeros(d, dtype=float)
+    for i in range(d - 1):
+        coef = math.sqrt((i + 1) / (i + 2))
+        contribution = ilr[i] * coef
+        log_x[: i + 1] += contribution / (i + 1)
+        log_x[i + 1] -= contribution
+    x = np.exp(log_x)
+    return x / x.sum()
+
+
+def rastrigin_ilr_optima(
+    d: int,
+    *,
+    n_optima: int = 20,
+    amplitude: float = 30.0,
+    max_search_radius: int = 12,
+) -> list[np.ndarray]:
+    """Top ``n_optima`` simplex compositions at integer ILR lattice points."""
+    if n_optima < 1:
+        raise ValueError("n_optima must be >= 1")
+
+    def _eval(x: np.ndarray) -> float:
+        z = composition_to_ilr_np(x)
+        n = z.shape[0]
+        rastrigin = amplitude * n + float(np.sum(z ** 2 - amplitude * np.cos(2.0 * math.pi * z)))
+        return -rastrigin
+
+    optima: list[np.ndarray] = []
+    for radius in range(1, max_search_radius + 1):
+        ranges = [range(-radius, radius + 1) for _ in range(d - 1)]
+        candidates: list[tuple[float, np.ndarray]] = []
+        for z_tuple in itertools.product(*ranges):
+            x = ilr_to_composition_np(np.asarray(z_tuple, dtype=float), d)
+            if np.all(x >= -1e-12) and abs(float(x.sum()) - 1.0) < 1e-9:
+                candidates.append((_eval(x), x.copy()))
+        candidates.sort(key=lambda item: -item[0])
+        optima = []
+        seen: set[tuple[float, ...]] = set()
+        for _, x in candidates:
+            key = tuple(np.round(x, 8))
+            if key in seen:
+                continue
+            seen.add(key)
+            optima.append(x)
+            if len(optima) >= n_optima:
+                return optima
+
+    raise ValueError(
+        f"Found only {len(optima)} rastrigin_ilr optima for d={d} "
+        f"within search radius {max_search_radius}; need {n_optima}."
+    )
+
+
 def normalize_rows(X: np.ndarray) -> np.ndarray:
     s = X.sum(axis=1, keepdims=True)
     return X / np.where(s == 0, 1.0, s)
@@ -142,10 +215,18 @@ class GaussianMixtureOracle:
 class RastriginILROracle:
     maximize = True
 
-    def __init__(self, d: int = 3, *, amplitude: float = 10.0):
+    def __init__(
+        self,
+        d: int = 3,
+        *,
+        amplitude: float | None = None,
+        n_optima: int | None = None,
+    ):
+        cfg = load_rastrigin_config()
         self.d = d
-        self.amplitude = amplitude
-        self._centroid = centroid_composition(d)
+        self.amplitude = float(amplitude if amplitude is not None else cfg["amplitude"])
+        _n = int(n_optima if n_optima is not None else cfg["n_optima"])
+        self._optima = rastrigin_ilr_optima(d, n_optima=_n, amplitude=self.amplitude)
 
     def __call__(self, x: np.ndarray) -> float:
         z = composition_to_ilr_np(np.asarray(x, dtype=float))
@@ -155,7 +236,7 @@ class RastriginILROracle:
 
     @property
     def true_optima(self) -> list[np.ndarray]:
-        return [self._centroid.copy()]
+        return [p.copy() for p in self._optima]
 
 
 class PlantedBumpField:
@@ -282,8 +363,9 @@ def build_oracle(
         label = f"Gaussian mixture ({len(centers)} peaks, σ=0.07)"
         return obj, obj.true_optima, label
     if name == "rastrigin_ilr":
-        obj = RastriginILROracle(d)
-        label = "Rastrigin in ILR (cosine ripples)"
+        cfg = load_rastrigin_config()
+        obj = RastriginILROracle(d, amplitude=float(cfg["amplitude"]))
+        label = f"Rastrigin in ILR ({len(obj.true_optima)} lattice optima)"
         return obj, obj.true_optima, label
     if name == "planted_bumps":
         obj = PlantedBumpField(centers, n_micro=40, seed=seed)

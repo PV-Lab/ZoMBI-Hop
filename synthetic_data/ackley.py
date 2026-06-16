@@ -133,6 +133,32 @@ def scaled_n_optima(n_base: int, dim: int) -> int:
     """
     return max(1, int(round(n_base * (dim - 1) / 2.0)))
 
+
+def scaled_n_optima_multiplicative(n_base: int, dim: int, *, ref_dim: int = 3) -> int:
+    """Peak count scaling proportional to ``dim / ref_dim`` (multiplicative in d).
+
+    Alternative to ``scaled_n_optima`` (linear in ``(d-1)/2``).  At the default
+    ``ref_dim=3`` baseline this gives 20 → 27 → 67 peaks for d = 3, 4, 10 when
+    ``n_base=20``, vs 20 → 30 → 90 under linear scaling.
+    """
+    if ref_dim < 1:
+        raise ValueError("ref_dim must be >= 1")
+    return max(1, int(round(n_base * dim / ref_dim)))
+
+
+def resolve_scaled_n_optima(
+    n_base: int,
+    dim: int,
+    *,
+    mode: str = "linear",
+    ref_dim: int = 3,
+) -> int:
+    if mode == "linear":
+        return scaled_n_optima(n_base, dim)
+    if mode == "multiplicative":
+        return scaled_n_optima_multiplicative(n_base, dim, ref_dim=ref_dim)
+    raise ValueError(f"Unknown peak scaling mode {mode!r}; use 'linear' or 'multiplicative'.")
+
 # ── Ackley constants ─────────────────────────────────────────────────────────
 ACKLEY_A = 20.0
 ACKLEY_B = 0.2
