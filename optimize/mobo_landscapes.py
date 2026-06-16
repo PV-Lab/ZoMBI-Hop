@@ -21,6 +21,31 @@ _REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
+
+def resolve_surrogate_csv_path(csv_path: str, repo_root: str | None = None) -> str:
+    """Resolve a surrogate CSV path, tolerating stale absolute paths from other machines.
+
+    If ``csv_path`` is missing, looks for the same basename under ``data/``,
+    ``interactive_testing/``, and the repo root (relative to ``repo_root``).
+    """
+    if os.path.isfile(csv_path):
+        return os.path.abspath(csv_path)
+
+    root = os.path.abspath(repo_root or _REPO)
+    basename = os.path.basename(csv_path.replace("\\", "/"))
+    for rel in (os.path.join("data", basename),
+                os.path.join("interactive_testing", basename),
+                basename):
+        candidate = os.path.join(root, rel)
+        if os.path.isfile(candidate):
+            print(f"  [csv] resolved stale path -> {candidate}")
+            return candidate
+
+    raise FileNotFoundError(
+        f"Surrogate CSV not found: {csv_path!r} "
+        f"(also checked data/, interactive_testing/, repo root for {basename!r})"
+    )
+
 # ─── Composition column naming ───────────────────────────────────────────────────
 
 CAMPAIGN_COMPOSITION_COLS = ["FAPbI3", "MAPbI3", "MAPbBr3"]
@@ -232,6 +257,12 @@ def build_synthetic_landscape(
     seed: int = 42,
     time_limit_hours: float | None = 0.4,
     grid_n: int = 80,
+    variant: str = "layout",
+    n_peaks: int | None = None,
+    sigma: float | None = None,
+    sigma_var: float | None = None,
+    noise_freq: float | None = None,
+    noise_amp: float | None = None,
 ) -> LandscapeSpec:
     """Direct analytic oracle — no RF CSV required (RF is comparison-only)."""
     from synthetic_data.oracles import ORACLE_CHOICES, build_oracle
@@ -239,7 +270,11 @@ def build_synthetic_landscape(
     if oracle not in ORACLE_CHOICES:
         raise ValueError(f"Unknown synthetic oracle {oracle!r}; choose from {ORACLE_CHOICES}")
 
-    fn, optima, _label = build_oracle(oracle, dim, layout, seed=seed)
+    fn, optima, _label = build_oracle(
+        oracle, dim, layout, seed=seed, variant=variant,
+        n_peaks=n_peaks, sigma=sigma, sigma_var=sigma_var,
+        noise_freq=noise_freq, noise_amp=noise_amp,
+    )
     grid_pts = grid_vals = None
     if dim == 3:
         grid_pts = ternary_grid(grid_n)
@@ -271,13 +306,20 @@ def parse_synthetic_batch_fields(cfg: dict) -> dict:
     dim = int(cfg.get("dim", 3))
     layout = str(cfg.get("layout", "2"))
     seed = int(cfg.get("seed", 42))
+    variant = str(cfg.get("variant", "layout"))
     if dim < 2 or dim > 20:
         raise ValueError(f"synthetic dim must be in [2, 20], got {dim}")
     if layout == "3" and dim < 5:
         raise ValueError("synthetic layout 3 requires dim >= 5")
     if layout == "2" and dim < 3:
         raise ValueError("synthetic layout 2 requires dim >= 3")
-    return {"oracle": oracle, "dim": dim, "layout": layout, "seed": seed}
+    out = {
+        "oracle": oracle, "dim": dim, "layout": layout, "seed": seed, "variant": variant,
+    }
+    for key in ("n_peaks", "sigma", "sigma_var", "noise_freq", "noise_amp"):
+        if key in cfg:
+            out[key] = cfg[key]
+    return out
 
 
 def build_ackley_landscape(
@@ -366,7 +408,7 @@ def landscape_from_run_config(cfg: dict, *, build_rf_and_grid) -> LandscapeSpec:
             time_limit_hours=time_limit,
         )
 
-    csv_path = cfg["csv_path"]
+    csv_path = resolve_surrogate_csv_path(cfg["csv_path"])
     obj_col = cfg.get("objective_column", "Objective")
     comp_cols = cfg.get("composition_columns")
     maximize = bool(cfg.get("maximize", False))

@@ -245,8 +245,29 @@ def build_oracle(
     *,
     seed: int,
     ackley_b: float = ACKLEY_B_SKINNY,
+    variant: str = "layout",
+    n_peaks: int | None = None,
+    sigma: float | None = None,
+    sigma_var: float | None = None,
+    noise_freq: float | None = None,
+    noise_amp: float | None = None,
 ) -> tuple[object, list[np.ndarray], str]:
     """Return (callable oracle, reference optima, display label)."""
+    if name == "gaussian" and variant == "realistic":
+        from synthetic_data.gaussian_landscape import RealisticGaussian
+        obj = RealisticGaussian(
+            d,
+            n_peaks=n_peaks,
+            sigma=sigma,
+            sigma_var=sigma_var,
+            noise_freq=noise_freq,
+            noise_amp=noise_amp,
+            peak_seed=seed,
+        )
+        label = (f"Realistic Gaussian ({len(obj.centers)} random peaks, "
+                 f"σ≈{obj.sigmas[0]:.3g}, noise_amp={obj._noise_amp})")
+        return obj, [c.copy() for c in obj.centers], label
+
     centers = ackley_centers_for_layout(d, layout)
     if name == "messy":
         obj = MessyCampaignOracle(centers, n_micro=150, n_ripples=30, seed=seed)

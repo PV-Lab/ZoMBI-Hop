@@ -7,7 +7,7 @@ per-iteration landscape frames / video where the dimension allows).
 
 Where ``run_mobo.py`` *searches* for good hyperparameters, this script takes
 configurations a MOBO run already found and RUNS them ``--num-runs`` times each
-(default 3) so you can quantify run-to-run variance or transfer a configuration
+(default 1) so you can quantify run-to-run variance or transfer a configuration
 onto a different benchmark.
 
 Datasets
@@ -23,10 +23,17 @@ Built-in names:
   ackley3d     negated analytic Ackley on the 3-simplex (``--ackley-variant``).
   ackley4d     negated analytic Ackley on the 4-simplex.
   ackley10d    negated analytic Ackley on the 10-simplex.
+  gaussian3d   realistic Gaussian mixture on the 3-simplex (random peaks + noise).
+  gaussian4d   realistic Gaussian mixture on the 4-simplex.
+  gaussian10d  realistic Gaussian mixture on the 10-simplex.
 
 Synthetic oracle names (direct analytic landscapes from ``synthetic_data/oracles.py``):
 
   messy, gaussian, ackley, planted_bumps, rastrigin_ilr
+
+  For ``gaussian``, use ``"variant": "realistic"`` in a batch JSON (or ``--oracle-variant
+  realistic``) for random Dirichlet peaks like ``gaussian3d``; default ``layout`` uses
+  fixed symmetric peak geometry (3/5/7 peaks via ``--layout``).
 
 For synthetic oracles, dimension / layout / seed come from ``--dim``, ``--layout``,
 ``--seed``, or a batch JSON via ``--config`` (e.g.
@@ -53,17 +60,17 @@ Default parent: ``optimize/runs/rerun_DD_MM_HH_MM/`` (override with ``--out`` or
 
 Usage
 -----
-  python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \\
-      --trials 112 --dataset gaussian --num-runs 3 --time-limit-hours 0.05
+  python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
+      --trials 112 --dataset gaussian --num-runs 3 --time-limit-min 3
 
-  python optimize/evaluate.py \\
-      --hparams optimize/runs/mobo_05_06_15_32/trial_112 \\
+  python optimize/evaluate.py \
+      --hparams optimize/runs/mobo_05_06_15_32/trial_112 \
       --config optimize/mobo_batch_configs/synthetic_3d_gaussian.json
 
-  python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \\
-      --trials 12 --dataset ackley4d --num-runs 5 --time-limit-min 10
+  python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
+      --trials 112 --dataset ackley4d --num-runs 5 --time-limit-min 10
 
-  python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \\
+  python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
       --trials 112 --dataset RF,gaussian --num-runs 1
 """
 
@@ -88,9 +95,10 @@ for _stream in (sys.stdout, sys.stderr):
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_mobo as rm
-from mobo_landscapes import build_synthetic_landscape, parse_synthetic_batch_fields
+from mobo_landscapes import build_synthetic_landscape, parse_synthetic_batch_fields, resolve_surrogate_csv_path
 from src.core.linebo import dimension_line_scale
 from synthetic_data.ackley import Ackley
+from synthetic_data.gaussian_landscape import RealisticGaussian
 from synthetic_data.oracles import ORACLE_CHOICES
 
 try:
@@ -99,7 +107,8 @@ except Exception:  # pragma: no cover
     mv = None
 
 ACKLEY_BENCHMARKS = {"ackley3d": 3, "ackley4d": 4, "ackley10d": 10}
-BUILTIN_DATASETS = {"RF", *ACKLEY_BENCHMARKS.keys(), *ORACLE_CHOICES}
+GAUSSIAN_BENCHMARKS = {"gaussian3d": 3, "gaussian4d": 4, "gaussian10d": 10}
+BUILTIN_DATASETS = {"RF", *ACKLEY_BENCHMARKS.keys(), *GAUSSIAN_BENCHMARKS.keys(), *ORACLE_CHOICES}
 
 
 class _TopKReached(Exception):
@@ -117,17 +126,22 @@ def _load_synthetic_batch_config(config_path: str) -> dict:
     if cfg.get("landscape") != "synthetic":
         sys.exit(f"--config must have landscape=synthetic (got {cfg.get('landscape')!r}).")
     syn = parse_synthetic_batch_fields(cfg)
-    return {
+    out = {
         "name": cfg.get("name") or os.path.splitext(os.path.basename(cfg_path))[0],
         "oracle": syn["oracle"],
         "dim": syn["dim"],
         "layout": syn["layout"],
         "seed": syn["seed"],
+        "variant": syn.get("variant", "layout"),
         "time_limit_hours": cfg.get("time_limit_hours"),
     }
+    for key in ("n_peaks", "sigma", "sigma_var", "noise_freq", "noise_amp"):
+        if key in syn:
+            out[key] = syn[key]
+    return out
 
 
-def _landscape_to_ds(spec, dataset: str, *, ackley_fn=None) -> dict:
+def _landscape_to_ds(spec, dataset: str, *, ackley_fn=None, variant: str | None = None) -> dict:
     return {
         "dim": spec.dim,
         "maximize": spec.maximize,
@@ -142,8 +156,18 @@ def _landscape_to_ds(spec, dataset: str, *, ackley_fn=None) -> dict:
         "oracle": spec.oracle,
         "layout": spec.ackley_layout,
         "seed": spec.synthetic_seed,
+        "variant": variant,
         "time_limit_hours": spec.time_limit_hours,
     }
+
+
+def _gaussian_kwargs(config: dict | None) -> dict:
+    cfg = config or {}
+    out = {}
+    for key in ("n_peaks", "sigma", "sigma_var", "noise_freq", "noise_amp"):
+        if key in cfg and cfg[key] is not None:
+            out[key] = cfg[key]
+    return out
 
 
 def resolve_dataset(
@@ -154,6 +178,7 @@ def resolve_dataset(
     dim: int = 3,
     layout: str = "2",
     seed: int = 42,
+    oracle_variant: str = "layout",
     config: dict | None = None,
     time_limit_hours: float | None = None,
 ) -> dict:
@@ -167,19 +192,26 @@ def resolve_dataset(
                      f"does not exist.")
         with open(cfg_path) as f:
             cfg = json.load(f)
-        csv_path = cfg["csv_path"]
-        if not os.path.exists(csv_path):
-            sys.exit(f"Surrogate CSV from run_config.json no longer exists: {csv_path}")
+        try:
+            csv_path = resolve_surrogate_csv_path(cfg["csv_path"])
+        except FileNotFoundError as exc:
+            sys.exit(str(exc))
         maximize = bool(cfg["maximize"])
         true_optima = [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
+        obj_col = cfg.get("objective_column", "Objective")
+        comp_cols = cfg.get("composition_columns")
         print(f"  [dataset] RF surrogate from {csv_path} "
               f"({'maximize' if maximize else 'minimize'}, "
               f"{len(true_optima)} reference optima from {os.path.basename(runs_path)})")
-        _, rf_fn, grid_pts, grid_vals = rm.build_rf_and_grid(csv_path)
+        _, rf_fn, grid_pts, grid_vals, resolved_cols, dim = rm.build_rf_and_grid(
+            csv_path, objective_column=obj_col, composition_columns=comp_cols,
+        )
         spec = rm.LandscapeSpec(
-            landscape="rf", dim=3, maximize=maximize, true_optima=true_optima,
+            landscape="rf", dim=dim, maximize=maximize, true_optima=true_optima,
             fn_callable=rf_fn, grid_pts=grid_pts, grid_vals=grid_vals,
             csv_path=os.path.abspath(csv_path),
+            objective_column=obj_col,
+            composition_columns=resolved_cols,
         )
         return _landscape_to_ds(spec, "RF")
 
@@ -200,6 +232,25 @@ def resolve_dataset(
         )
         return _landscape_to_ds(spec, dataset, ackley_fn=(fn if d == 4 else None))
 
+    if dataset in GAUSSIAN_BENCHMARKS:
+        d = GAUSSIAN_BENCHMARKS[dataset]
+        gkw = _gaussian_kwargs(config)
+        fn = RealisticGaussian(d, peak_seed=seed, **gkw)
+        true_optima = [np.asarray(c, dtype=float) for c in fn.centers]
+        print(f"  [dataset] {dataset}: RealisticGaussian(dim={d}, "
+              f"{len(true_optima)} random peak(s), seed={seed})")
+        grid_pts = grid_vals = None
+        if d == 3:
+            grid_pts = rm.ternary_grid(rm.TERNARY_GRID_N)
+            grid_vals = fn.predict(grid_pts)
+        spec = rm.LandscapeSpec(
+            landscape="synthetic", dim=d, maximize=True, true_optima=true_optima,
+            fn_callable=fn, grid_pts=grid_pts, grid_vals=grid_vals,
+            time_limit_hours=time_limit_hours, oracle="gaussian",
+            ackley_layout=layout, synthetic_seed=seed,
+        )
+        return _landscape_to_ds(spec, dataset, variant="realistic")
+
     if dataset in ORACLE_CHOICES:
         syn_cfg = config or {}
         oracle = syn_cfg.get("oracle", dataset)
@@ -208,13 +259,17 @@ def resolve_dataset(
         d = int(syn_cfg.get("dim", dim))
         ly = str(syn_cfg.get("layout", layout))
         sd = int(syn_cfg.get("seed", seed))
+        var = str(syn_cfg.get("variant", oracle_variant))
         tl = time_limit_hours
         if tl is None and syn_cfg.get("time_limit_hours") is not None:
             tl = float(syn_cfg["time_limit_hours"])
-        spec = build_synthetic_landscape(oracle, d, ly, seed=sd, time_limit_hours=tl)
-        print(f"  [dataset] synthetic '{oracle}' dim={d} layout={ly} seed={sd} — "
+        gkw = _gaussian_kwargs(syn_cfg)
+        spec = build_synthetic_landscape(
+            oracle, d, ly, seed=sd, time_limit_hours=tl, variant=var, **gkw,
+        )
+        print(f"  [dataset] synthetic '{oracle}' variant={var} dim={d} layout={ly} seed={sd} — "
               f"maximize, {len(spec.true_optima)} reference optima")
-        return _landscape_to_ds(spec, dataset)
+        return _landscape_to_ds(spec, dataset, variant=var)
 
     sys.exit(f"--dataset: '{dataset}' is not known "
              f"(choose from {', '.join(sorted(BUILTIN_DATASETS))}).")
@@ -723,12 +778,15 @@ def _build_rerun_config(
         "layout": ds.get("layout"),
         "seed": ds.get("seed"),
         "ackley_variant": (args.ackley_variant if dataset in ACKLEY_BENCHMARKS else None),
+        "oracle_variant": ds.get("variant"),
+        "gaussian_n_peaks": (len(ds["true_optima"]) if dataset in GAUSSIAN_BENCHMARKS
+                             or (dataset == "gaussian" and ds.get("variant") == "realistic")
+                             else None),
         "csv_path": ds.get("csv_path"),
         "runs_path": runs_path,
         "trials": trial_nums,
         "num_runs": args.num_runs,
         "time_limit_min": time_limit_min,
-        "time_limit_hours": round(time_limit_min / 60.0, 6),
         "top_k": args.top_k,
         "true_optima": [list(map(float, t.ravel())) for t in ds["true_optima"]],
     }
@@ -775,12 +833,6 @@ def _parse_datasets(raw: str) -> list[str]:
     return out
 
 
-def _resolve_time_limit_min(args) -> float:
-    if args.time_limit_hours is not None:
-        return args.time_limit_hours * 60.0
-    return args.time_limit_min
-
-
 def evaluate_dataset(
     dataset: str,
     out_dir: str,
@@ -792,8 +844,7 @@ def evaluate_dataset(
     config_meta: dict | None = None,
     synthetic_defaults: dict | None = None,
 ) -> int:
-    time_limit_min = _resolve_time_limit_min(args)
-    time_limit_hours = time_limit_min / 60.0
+    time_limit_min = args.time_limit_min
     syn_defaults = synthetic_defaults or {}
 
     ds = resolve_dataset(
@@ -801,8 +852,9 @@ def evaluate_dataset(
         dim=syn_defaults.get("dim", args.dim),
         layout=syn_defaults.get("layout", args.layout),
         seed=syn_defaults.get("seed", args.seed),
-        config=syn_defaults if dataset in ORACLE_CHOICES else None,
-        time_limit_hours=time_limit_hours,
+        oracle_variant=syn_defaults.get("variant", args.oracle_variant),
+        config=synthetic_defaults,
+        time_limit_hours=time_limit_min / 60.0,
     )
 
     with open(os.path.join(out_dir, "rerun_config.json"), "w") as f:
@@ -873,17 +925,18 @@ def main() -> None:
 
     parser.add_argument("--runs-path", default=None, metavar="MOBO_DIR",
                         help="Source mobo_* dir (required for --trials and --dataset RF).")
-    parser.add_argument("--num-runs", type=int, default=3,
-                        help="Repeats per selected trial (default: 3).")
+    parser.add_argument("--num-runs", type=int, default=1,
+                        help="Repeats per selected trial (default: 1).")
     parser.add_argument("--time-limit-min", type=float, default=10.0,
                         help="Wall-clock budget per run, minutes (default: 10).")
-    parser.add_argument("--time-limit-hours", type=float, default=None,
-                        help="Wall-clock budget per run, hours (overrides --time-limit-min).")
     parser.add_argument("--top-k", type=int, default=None, metavar="K",
                         help="Stop each run once K needles are found.")
     parser.add_argument("--ackley-variant", default="realistic",
                         choices=sorted(Ackley.VARIANTS),
                         help="Ackley variant for ackley3d/4d/10d (default: realistic).")
+    parser.add_argument("--oracle-variant", default="layout",
+                        choices=["layout", "realistic"],
+                        help="Synthetic oracle variant; realistic = random peaks for gaussian.")
     parser.add_argument("--dim", type=int, default=3,
                         help="Simplex dimension for synthetic oracles (default: 3).")
     parser.add_argument("--layout", default="2", choices=["1", "2", "3"],
@@ -916,8 +969,8 @@ def main() -> None:
         synthetic_defaults = batch
         if args.dataset is None:
             args.dataset = batch["oracle"]
-        if args.time_limit_hours is None and batch.get("time_limit_hours") is not None:
-            args.time_limit_hours = float(batch["time_limit_hours"])
+        if batch.get("time_limit_hours") is not None:
+            args.time_limit_min = float(batch["time_limit_hours"]) * 60.0
 
     if not args.dataset:
         sys.exit("Provide --dataset or --config.")
@@ -963,7 +1016,7 @@ def main() -> None:
         eval_dir = os.path.join(out_parent, datetime.datetime.now().strftime("rerun_%d_%m_%H_%M"))
         os.makedirs(eval_dir, exist_ok=True)
 
-    time_limit_min = _resolve_time_limit_min(args)
+    time_limit_min = args.time_limit_min
     print("=" * 72)
     print(f"ZoMBI-Hop evaluate  |  datasets={datasets}  trials={trial_nums}  "
           f"num_runs={args.num_runs}  limit={time_limit_min:.2g} min"

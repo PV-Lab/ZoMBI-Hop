@@ -1,9 +1,10 @@
 {
-  "name": "synthetic_3d_gaussian",
+  "name": "synthetic_3d_gaussian_realistic",
   "landscape": "synthetic",
   "oracle": "gaussian",
+  "variant": "realistic",
   "dim": 3,
-  "layout": "3",
+  "layout": "2",
   "seed": 42,
   "maximize": true,
   "max_trials": 20,

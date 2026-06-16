@@ -25,6 +25,8 @@ from matplotlib.figure import Figure
 from PIL import Image as PILImage, ImageDraw, ImageFont
 from sklearn.ensemble import RandomForestRegressor
 
+from optimize.mobo_landscapes import resolve_surrogate_csv_path
+
 VIDEO_TARGET_DURATION_S = 60.0
 VIDEO_MIN_FPS = 1.0
 VIDEO_MAX_FPS = 60.0
@@ -271,9 +273,10 @@ def main() -> None:
         sys.exit(f"Ternary coverage plot only supports 3D datasets (got dim={dim})")
 
     if dataset == "RF":
-        csv_path = cfg["csv_path"]
-        if not os.path.isfile(csv_path):
-            sys.exit(f"Surrogate CSV not found: {csv_path}")
+        try:
+            csv_path = resolve_surrogate_csv_path(cfg["csv_path"])
+        except FileNotFoundError as exc:
+            sys.exit(str(exc))
         grid_pts, grid_vals = _build_rf_ground_truth(csv_path)
     else:
         variant = cfg.get("ackley_variant", "realistic")
