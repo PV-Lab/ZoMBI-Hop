@@ -108,6 +108,10 @@ import run_mobo as rm
 # repo root onto sys.path, so src is importable after importing it).
 from src.core.linebo import dimension_line_scale
 
+# Process-wide dimension-scaling toggle (see src/utils/scaling.py).  Used to run
+# with scaling on (--scaling-on) or off (default) through the same code paths.
+from src.utils.scaling import dimension_scaling_disabled
+
 # Analytic benchmark objectives (negated Ackley on the d-simplex).
 from synthetic_data.ackley import Ackley
 
@@ -653,6 +657,7 @@ def evaluate_dataset(dataset: str, out_dir: str, runs_path: str,
             "num_runs":        args.num_runs,
             "time_limit_min":  args.time_limit_min,
             "top_k":           args.top_k,
+            "scaling_on":      args.scaling_on,
             "true_optima":     [list(map(float, t.ravel())) for t in ds["true_optima"]],
         }, f, indent=2)
 
@@ -674,8 +679,16 @@ def evaluate_dataset(dataset: str, out_dir: str, runs_path: str,
             print(f"  [run {k}/{args.num_runs}]  (overall {done}/{total})")
             run_dir = os.path.join(trial_dir, f"run_{k}")
             try:
-                res = run_single_eval(hparams, ds, dataset, run_dir,
-                                      args.time_limit_min, top_k=args.top_k)
+                # Dimension scaling is on globally by default; --scaling-on keeps
+                # it on, otherwise the whole run is wrapped so both scaling
+                # factors collapse to 1.0 (identical code path, no separate branch).
+                if args.scaling_on:
+                    res = run_single_eval(hparams, ds, dataset, run_dir,
+                                          args.time_limit_min, top_k=args.top_k)
+                else:
+                    with dimension_scaling_disabled():
+                        res = run_single_eval(hparams, ds, dataset, run_dir,
+                                              args.time_limit_min, top_k=args.top_k)
                 per_trial[trial_num].append({
                     "run": k,
                     "dist_to_needles": round(res["dist"], 6),
@@ -721,6 +734,11 @@ def main() -> None:
     parser.add_argument("--ackley-variant", default="realistic",
                         choices=sorted(Ackley.VARIANTS),
                         help="Ackley variant for the ackley* datasets (default: realistic).")
+    parser.add_argument("--scaling-on", action="store_true",
+                        help="Scale the hyperparameters with the objective dimension "
+                             "(Group-1 radii by sqrt((d-1)/2), Group-2 budgets by "
+                             "(d-1)/2; both 1.0 at d=3). Off by default, so a 3-D-tuned "
+                             "config transfers verbatim to higher-dimensional datasets.")
     parser.add_argument("--out", default=None,
                         help="Parent directory for the rerun_* folder "
                              "(default: optimize/runs).")
@@ -755,7 +773,8 @@ def main() -> None:
     print("=" * 72)
     print(f"ZoMBI-Hop evaluate  |  datasets={datasets}  trials={trial_nums}  "
           f"num_runs={args.num_runs}  limit={args.time_limit_min} min"
-          + (f"  top_k={args.top_k}" if args.top_k is not None else ""))
+          + (f"  top_k={args.top_k}" if args.top_k is not None else "")
+          + f"  scaling={'ON' if args.scaling_on else 'OFF'}")
     if args.hparams_json:
         print(f"hparams: {os.path.abspath(args.hparams_json)}")
     print(f"source: {runs_path}")
