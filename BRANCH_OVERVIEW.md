@@ -72,14 +72,15 @@ This directory provides synthetic test functions and interactive visualization t
 
 | Script | What It Does |
 |---|---|
-| `ackley.py` | Defines the `Ackley` class — a negated Ackley function on probability simplices in arbitrary dimensions. Supports variants: `centroid`, `edge`, `vertex`, `multimodal`, `realistic`. The `realistic` variant uses Dirichlet-sampled peaks + Perlin-style noise, configurable via `ackley/defaults.json`. |
-| `plot_3d.py` | Interactive Dash app for tuning the 3-simplex `realistic` Ackley. Adjust n\_optima, basin\_width, noise\_freq, noise\_amp with sliders; click "Save as Default" to persist to `defaults.json`. Run with `python synthetic_data/plot_3d.py` → [http://127.0.0.1:8050](http://127.0.0.1:8050) |
-| `plot_4d.py` | Interactive 3D point-cloud viewer for the 4-simplex Ackley (tetrahedron embedding). Also provides `add_simplex_overlays()` used by `evaluate.py` to render ZoMBI-Hop artifacts (lines, needles, penalization ellipsoids) on top of the landscape. |
+| `ackley.py` | Defines the `Ackley` class — a negated Ackley function on probability simplices in arbitrary dimensions. Supports variants: `centroid`, `edge`, `vertex`, `multimodal`, `realistic`. The `realistic` variant uses Dirichlet-sampled peaks + Perlin-style noise, configurable via `defaults/ackley.json`. |
+| `bumps.py` | Defines the `Bumps` class — a planted bump field on the simplex (randomly placed major bumps = true optima, plus many random micro bumps), rescaled to `[0.5, 1]` like the `realistic` Ackley. Configurable via `defaults/bumps.json`. |
+| `plot.py` | Interactive Dash app for tuning either objective (`ackley`/`bumps`) on the 3-simplex (ternary heatmap) or 4-simplex (tetrahedron point cloud), selected via dropdowns; the sliders swap to match the objective. Click "Save as Default" to persist to the matching `defaults/*.json`. Run with `python synthetic_data/plot.py` → [http://127.0.0.1:8050](http://127.0.0.1:8050). Also provides `add_simplex_overlays()` used by `evaluate.py` to render ZoMBI-Hop artifacts (lines, needles, penalization ellipsoids) on the 4D landscape. |
 | `analyze_basin_vol.py` | Diagnostic script: samples 200K points uniformly on each simplex and histograms objective values for 3D, 4D, and 10D — illustrates how near-optimal basins shrink with dimensionality. |
 
 #### Config
 
-- `ackley/defaults.json` — global defaults for the `realistic` Ackley variant (n\_optima, basin\_width, noise\_freq, noise\_amp). Updated via the Dash "Save as Default" button.
+- `defaults/ackley.json` — global defaults for the `realistic` Ackley variant (n\_optima, basin\_width, noise\_freq, noise\_amp). Updated via the Dash "Save as Default" button.
+- `defaults/bumps.json` — global defaults for the planted `Bumps` field (n\_major, n\_micro, major\_sigma, micro σ/weight ranges, seed). Updated via the Dash "Save as Default" button.
 
 ---
 

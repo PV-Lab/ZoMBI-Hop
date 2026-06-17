@@ -2,7 +2,7 @@
 produce a coverage.mp4 video of points appearing over time.
 
 3D (ternary) datasets render as a triangle; 4D datasets render as a tetrahedron
-(the 4-simplex), reusing the geometry from ``synthetic_data/plot_4d.py``. The 4D
+(the 4-simplex), reusing the geometry from ``synthetic_data/plot.py``. The 4D
 video slowly rotates so the structure reads in 3D.
 
 Usage
@@ -20,14 +20,12 @@ import math
 import os
 import sys
 
-import imageio.v2 as iio
 import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the "3d" projection)
 import pandas as pd
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
-from PIL import Image as PILImage, ImageDraw, ImageFont
 from sklearn.ensemble import RandomForestRegressor
 
 VIDEO_TARGET_DURATION_S = 60.0
@@ -70,7 +68,7 @@ def draw_ternary_frame(ax, pad: float = 0.04) -> None:
     ax.text(0.5, _SQRT3_2 + pad, CORNER_LABELS[2], ha="center", va="bottom", fontsize=10)
 
 
-# ─── Quaternary geometry (4-simplex → tetrahedron, mirrors plot_4d.py) ────────
+# ─── Quaternary geometry (4-simplex → tetrahedron, mirrors plot.py) ────────
 
 GRID_N_4D = 24
 VERTEX_LABELS_4D = ("x1", "x2", "x3", "x4")
@@ -180,6 +178,7 @@ def _detect_comp_cols(df: pd.DataFrame, dim: int = 3) -> list[str]:
 # ─── Video rendering ─────────────────────────────────────────────────────────
 
 def _stamp_counter(img: np.ndarray, text: str) -> np.ndarray:
+    from PIL import Image as PILImage, ImageDraw, ImageFont  # lazy (video path only)
     pil = PILImage.fromarray(img)
     draw = ImageDraw.Draw(pil)
     try:
@@ -352,23 +351,26 @@ def make_coverage_video(
     print()
 
     print("  Encoding video ...", end="", flush=True)
+    import imageio.v2 as iio  # lazy: only the video path needs imageio/ffmpeg
     iio.mimwrite(out_path, frames, fps=fps, codec="libx264", macro_block_size=None)
     if not (os.path.exists(out_path) and os.path.getsize(out_path) > 0):
         raise RuntimeError(f"Failed to write video: {out_path}")
     print(f"\r  [video] {out_path}  ({n_frames} frames @ {fps:.2f} fps)")
 
 
-# ─── Main ────────────────────────────────────────────────────────────────────
+# ─── Data preparation + static figure (shared by the CLI and run_mobo) ─────────
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Ternary/tetrahedron coverage plot + video")
-    parser.add_argument("trial_dir", help="Path to a trial_* folder (or any folder with points.csv)")
-    args = parser.parse_args()
+def _prepare_coverage(trial_dir: str) -> dict:
+    """Load points.csv + config + ground-truth grid for ``trial_dir``.
 
-    trial_dir = os.path.abspath(args.trial_dir)
+    Raises ``FileNotFoundError`` / ``ValueError`` on bad input rather than calling
+    ``sys.exit`` so it is safe to call from inside a running optimisation (which
+    catches exceptions but not ``SystemExit``). Returns everything the static
+    figure and the video need.
+    """
     points_path = os.path.join(trial_dir, "points.csv")
     if not os.path.isfile(points_path):
-        sys.exit(f"No points.csv found in {trial_dir}")
+        raise FileNotFoundError(f"No points.csv found in {trial_dir}")
 
     cfg = _find_config(trial_dir)
     df = pd.read_csv(points_path)
@@ -376,18 +378,19 @@ def main() -> None:
     dataset = cfg.get("dataset", "RF")
     dim = cfg.get("dim", 3)
     if dim not in (3, 4):
-        sys.exit(f"Coverage plot only supports 3D (ternary) or 4D (tetrahedron) "
-                 f"datasets (got dim={dim})")
+        raise ValueError(f"Coverage plot only supports 3D (ternary) or 4D "
+                         f"(tetrahedron) datasets (got dim={dim})")
 
     comp_cols = _detect_comp_cols(df, dim)
     map_comp = comp_to_xy if dim == 3 else comp_to_xyz
 
     if dataset == "RF":
         if dim != 3:
-            sys.exit(f"RF surrogate ground truth is only available for dim=3 (got dim={dim})")
+            raise ValueError(f"RF surrogate ground truth is only available for dim=3 "
+                             f"(got dim={dim})")
         csv_path = cfg["csv_path"]
         if not os.path.isfile(csv_path):
-            sys.exit(f"Surrogate CSV not found: {csv_path}")
+            raise FileNotFoundError(f"Surrogate CSV not found: {csv_path}")
         grid_pts, grid_vals = _build_rf_ground_truth(csv_path)
     else:
         variant = cfg.get("ackley_variant", "realistic")
@@ -399,11 +402,6 @@ def main() -> None:
     comps = df[comp_cols].values.astype(float)
     y_vals = df["Y"].values.astype(float)
 
-    gxy = map_comp(grid_pts)
-    pxy = map_comp(comps)
-    title_base = os.path.basename(os.path.normpath(trial_dir))
-
-    # ── Load found needles ──
     needles_path = os.path.join(trial_dir, "needles.csv")
     needle_xy = None
     if os.path.isfile(needles_path):
@@ -411,9 +409,30 @@ def main() -> None:
         ncols = _detect_comp_cols(ndf, dim)
         needle_xy = map_comp(ndf[ncols].values.astype(float))
 
-    n_pts = len(df)
+    return dict(
+        dim=dim, map_comp=map_comp,
+        gxy=map_comp(grid_pts), grid_vals=grid_vals,
+        pxy=map_comp(comps), y_vals=y_vals,
+        true_optima=true_optima, maximize=maximize,
+        needle_xy=needle_xy, n_pts=len(df),
+        title_base=os.path.basename(os.path.normpath(trial_dir)),
+    )
 
-    # ── Static plot (shown interactively) ──
+
+def _build_static_figure(prep: dict):
+    """Build (but do not show/save) the static coverage Figure from ``_prepare``."""
+    dim        = prep["dim"]
+    map_comp   = prep["map_comp"]
+    gxy        = prep["gxy"]
+    grid_vals  = prep["grid_vals"]
+    pxy        = prep["pxy"]
+    y_vals     = prep["y_vals"]
+    true_optima = prep["true_optima"]
+    maximize   = prep["maximize"]
+    needle_xy  = prep["needle_xy"]
+    n_pts      = prep["n_pts"]
+    title_base = prep["title_base"]
+
     fig = plt.figure(figsize=(8, 7))
     if dim == 3:
         ax = fig.add_subplot(111)
@@ -457,17 +476,55 @@ def main() -> None:
     if true_optima or (needle_xy is not None and len(needle_xy)):
         ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
     ax.set_title(f"Coverage: {title_base}  ({n_pts} points)", fontsize=12)
-
     fig.tight_layout()
+    return fig
+
+
+def save_coverage_image(trial_dir: str, out_path: str | None = None) -> str:
+    """Render the static coverage plot to a PNG — no video, no interactive window.
+
+    This is the entry point ``run_mobo.py`` calls automatically at the end of a
+    trial (3D ternary / 4D tetrahedron only). Returns the path written.
+    """
+    if out_path is None:
+        out_path = os.path.join(trial_dir, "coverage.png")
+    fig = _build_static_figure(_prepare_coverage(trial_dir))
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Ternary/tetrahedron coverage plot + video")
+    parser.add_argument("trial_dir", help="Path to a trial_* folder (or any folder with points.csv)")
+    parser.add_argument("--no-video", action="store_true",
+                        help="Only show/save the static coverage plot; skip the mp4 video.")
+    args = parser.parse_args()
+
+    trial_dir = os.path.abspath(args.trial_dir)
+    try:
+        prep = _prepare_coverage(trial_dir)
+    except (FileNotFoundError, ValueError) as exc:
+        sys.exit(str(exc))
+
+    # ── Static plot (shown interactively) ──
+    fig = _build_static_figure(prep)
     plt.show()
 
+    if args.no_video:
+        return
+
     # ── Video (saved to trial folder) ──
+    dim = prep["dim"]
     video_path = os.path.join(trial_dir, "coverage.mp4")
-    print(f"Rendering coverage video ({n_pts} points) ...")
+    print(f"Rendering coverage video ({prep['n_pts']} points) ...")
     render_frame = _render_coverage_frame if dim == 3 else _render_coverage_frame_3d
     make_coverage_video(
-        video_path, pxy, y_vals, gxy, grid_vals, true_optima, maximize, title_base,
-        needle_xy=needle_xy, render_frame=render_frame, rotate=(dim == 4))
+        video_path, prep["pxy"], prep["y_vals"], prep["gxy"], prep["grid_vals"],
+        prep["true_optima"], prep["maximize"], prep["title_base"],
+        needle_xy=prep["needle_xy"], render_frame=render_frame, rotate=(dim == 4))
 
 
 if __name__ == "__main__":

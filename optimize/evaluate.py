@@ -341,13 +341,13 @@ def write_needles_csv(path: str, dh, cols: list[str], dim: int) -> None:
 def write_point_cloud_html(path: str, ackley_fn, dh, last_payload: dict) -> None:
     """Render the final ZoMBI state over the 4-simplex Ackley cloud (one HTML).
 
-    Uses ``synthetic_data/point_cloud_4d``'s overlay API.  Pared points, needle
-    markers, and the last LineBO lines are all exact (plain simplex compositions);
+    Uses ``synthetic_data/plot``'s overlay API.  Pared points, needle markers,
+    and the last LineBO lines are all exact (plain simplex compositions);
     needle penalisation ellipsoids are intentionally omitted because the run's
     tangent basis differs from the Helmert ILR basis the overlay assumes.
     """
     import plotly.graph_objects as go
-    import synthetic_data.plot_4d as pc4
+    import synthetic_data.plot as pc4
 
     comp = pc4.build_simplex_lattice(pc4.GRID_N)
     obj  = ackley_fn.predict(comp)
