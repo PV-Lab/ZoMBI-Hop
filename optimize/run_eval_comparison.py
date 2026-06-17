@@ -129,6 +129,7 @@ def collect_rows(eval_root: Path) -> list[dict]:
                     "run": run["run"],
                     "dist_to_needles": run["dist_to_needles"],
                     "dup_fraction": run["dup_fraction"],
+                    "pct_matched": run.get("pct_matched"),
                     "runtime_s": run["runtime_s"],
                     "n_true_optima": n_optima,
                     "path": str(ds_dir / f"trial_{trial}" / f"run_{run['run']}"),
@@ -141,6 +142,7 @@ def collect_rows(eval_root: Path) -> list[dict]:
                     "run": "mean",
                     "dist_to_needles": trial_entry["dist_to_needles"]["mean"],
                     "dup_fraction": trial_entry["dup_fraction"]["mean"],
+                    "pct_matched": trial_entry.get("pct_matched", {}).get("mean"),
                     "runtime_s": trial_entry["runtime_s"]["mean"],
                     "n_true_optima": n_optima,
                     "path": str(ds_dir / f"trial_{trial}"),
@@ -151,7 +153,7 @@ def collect_rows(eval_root: Path) -> list[dict]:
 def write_csv(path: Path, rows: list[dict]) -> None:
     fields = [
         "dataset", "trial", "run",
-        "dist_to_needles", "dup_fraction", "runtime_s",
+        "dist_to_needles", "dup_fraction", "pct_matched", "runtime_s",
         "n_true_optima", "path",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -162,16 +164,18 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 
 def print_table(rows: list[dict]) -> None:
     show_rows = [r for r in rows if r["run"] != "mean"] or rows
-    header = f"{'dataset':<16} {'trial':>6} {'run':>4} {'dist':>10} {'dup_frac':>10} {'runtime_s':>10} {'#optima':>8}"
+    header = f"{'dataset':<16} {'trial':>6} {'run':>4} {'dist':>10} {'dup_frac':>10} {'pct_match':>10} {'runtime_s':>10} {'#optima':>8}"
     print("\n" + header)
     print("-" * len(header))
     for r in sorted(show_rows, key=lambda x: (x["trial"], x["dataset"], str(x["run"]))):
         n_opt = r["n_true_optima"]
         n_opt_s = str(n_opt) if n_opt is not None else "?"
+        pct = r.get("pct_matched")
+        pct_s = f"{pct:.2f}" if pct is not None else "?"
         print(
             f"{r['dataset']:<16} {r['trial']:>6} {str(r['run']):>4} "
             f"{r['dist_to_needles']:>10.4f} {r['dup_fraction']:>10.4f} "
-            f"{r['runtime_s']:>10.1f} {n_opt_s:>8}"
+            f"{pct_s:>10} {r['runtime_s']:>10.1f} {n_opt_s:>8}"
         )
 
 

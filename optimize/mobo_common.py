@@ -67,45 +67,13 @@ def norm_to_hparams(x_norm: torch.Tensor) -> dict:
     return params
 
 
-# ─── Trial metrics ────────────────────────────────────────────────────────────
+# ─── Trial metrics (dimension-aware; see optimize/eval_metrics.py) ─────────────
 
-UNMATCHED_PENALTY = 10.0
-
-
-def metric_dist_to_needles(
-    discovered: np.ndarray,
-    true_optima: list[np.ndarray],
-) -> float:
-    if not true_optima:
-        return 0.0
-    if len(discovered) == 0:
-        return UNMATCHED_PENALTY
-    used: set[int] = set()
-    total = 0.0
-    for t in true_optima:
-        best_d, best_j = float("inf"), -1
-        for j, d in enumerate(discovered):
-            if j in used:
-                continue
-            dist = float(np.linalg.norm(np.asarray(d) - np.asarray(t)))
-            if dist < best_d:
-                best_d, best_j = dist, j
-        if best_j >= 0:
-            used.add(best_j)
-            total += best_d
-        else:
-            total += UNMATCHED_PENALTY
-    return total / len(true_optima)
-
-
-def metric_dup_fraction(X_all: np.ndarray, threshold: float) -> float:
-    n = len(X_all)
-    if n <= 1:
-        return 0.0
-    diff = X_all[:, None, :] - X_all[None, :, :]
-    dists = np.sqrt((diff ** 2).sum(axis=-1))
-    np.fill_diagonal(dists, np.inf)
-    return float((dists < threshold).any(axis=1).mean())
+from eval_metrics import (
+    UNMATCHED_PENALTY,
+    metric_dist_to_needles,
+    metric_dup_fraction,
+)
 
 
 def save_running_summary(

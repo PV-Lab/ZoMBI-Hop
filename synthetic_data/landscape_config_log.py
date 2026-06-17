@@ -78,6 +78,8 @@ def resolved_from_fn(fn: Any) -> dict[str, Any]:
             out["sigma_spread"] = True
     if hasattr(fn, "amplitude"):
         out["amplitude"] = float(fn.amplitude)
+    if hasattr(fn, "n_optima"):
+        out["n_optima"] = int(fn.n_optima)
     if hasattr(fn, "_noise_amp"):
         out["noise_amp"] = float(fn._noise_amp)
     if hasattr(fn, "_noise_freq"):

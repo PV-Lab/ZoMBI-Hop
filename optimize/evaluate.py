@@ -638,7 +638,7 @@ def run_single_eval(
         X_a, X_e, Y = gen_init_data(fn, maximize, dim, n_init_lines)
     except RuntimeError as exc:
         print(f"      [run] init failed: {exc}")
-        return {"dist": rm.UNMATCHED_PENALTY, "dup": 1.0, "runtime": 0.0}
+        return {"dist": rm.unmatched_penalty(dim), "dup": 1.0, "runtime": 0.0}
 
     hp = dict(hparams)
     if dim > 3 and (hp.get("top_m_points") is None or hp.get("top_m_points", 0) < dim + 1):
@@ -678,16 +678,20 @@ def run_single_eval(
     discovered = needle_t.detach().cpu().numpy() if needle_t.numel() > 0 else np.empty((0, dim))
     X_all_np = (dh.X_all_actual.detach().cpu().numpy()
                 if dh.X_all_actual is not None else np.empty((0, dim)))
-    dist = rm.metric_dist_to_needles(discovered, true_optima)
-    dup = rm.metric_dup_fraction(X_all_np, rm.NOISE_LEVEL / 2.0)
+    dist = rm.metric_dist_to_needles(discovered, true_optima, dim=dim)
+    dup = rm.metric_dup_fraction(X_all_np, dim=dim)
+    pct = rm.metric_pct_matched(discovered, true_optima, dim=dim)
     print(f"      [run]  iters={call_counter[0]}  dist={dist:.4f}  dup={dup:.4f}"
-          f"  t={runtime:.1f}s  needles={len(discovered)}/{len(true_optima)}")
+          f"  pct_matched={pct:.2f}  t={runtime:.1f}s"
+          f"  needles={len(discovered)}/{len(true_optima)}")
 
     try:
         write_points_csv(os.path.join(out_dir, "points.csv"), dh, snap_records, cols)
         write_needles_csv(os.path.join(out_dir, "needles.csv"), dh, cols, dim)
         rm.write_metrics_over_time_csv(
-            os.path.join(out_dir, "metrics_over_time.csv"), payloads, X_all_np, true_optima)
+            os.path.join(out_dir, "metrics_over_time.csv"), payloads, X_all_np, true_optima,
+            dim=dim,
+        )
     except Exception as exc:
         print(f"      [run] CSV write failed: {exc}")
 
@@ -742,6 +746,7 @@ def run_single_eval(
     metrics = {
         "dist_to_needles": round(dist, 6),
         "dup_fraction": round(dup, 6),
+        "pct_matched": round(pct, 4),
         "runtime_s": round(runtime, 3),
         "landscape_config": ds.get("landscape_config"),
     }
@@ -749,7 +754,7 @@ def run_single_eval(
         json.dump(metrics, f, indent=2)
     if interrupted:
         raise KeyboardInterrupt
-    return {"dist": dist, "dup": dup, "runtime": runtime}
+    return {"dist": dist, "dup": dup, "pct": pct, "runtime": runtime}
 
 
 # ─── Summary ────────────────────────────────────────────────────────────────────
@@ -768,7 +773,7 @@ def write_summary(path: str, per_trial: dict) -> None:
     for trial_num, runs in per_trial.items():
         entry = {"trial": trial_num, "n_runs": len(runs), "runs": runs}
         if runs:
-            for key in ("dist_to_needles", "dup_fraction", "runtime_s"):
+            for key in ("dist_to_needles", "dup_fraction", "pct_matched", "runtime_s"):
                 entry[key] = _agg([r[key] for r in runs])
         summary["trials"].append(entry)
     with open(path, "w") as f:
@@ -906,6 +911,7 @@ def evaluate_dataset(
                     "run": k,
                     "dist_to_needles": round(res["dist"], 6),
                     "dup_fraction": round(res["dup"], 6),
+                    "pct_matched": round(res["pct"], 4),
                     "runtime_s": round(res["runtime"], 3),
                 })
             except KeyboardInterrupt:

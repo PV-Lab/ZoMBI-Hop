@@ -14,6 +14,8 @@ from pathlib import Path
 
 import numpy as np
 
+from synthetic_data.ackley import SCALE_OPTIMA_WITH_DIM, scaled_n_optima
+
 _ACKLEY_A = 20.0
 ACKLEY_B_SKINNY = 1.2
 _ACKLEY_C = 2.0 * math.pi
@@ -225,7 +227,13 @@ class RastriginILROracle:
         cfg = load_rastrigin_config()
         self.d = d
         self.amplitude = float(amplitude if amplitude is not None else cfg["amplitude"])
-        _n = int(n_optima if n_optima is not None else cfg["n_optima"])
+        if n_optima is not None:
+            _n = int(n_optima)
+        elif SCALE_OPTIMA_WITH_DIM:
+            _n = scaled_n_optima(int(cfg["n_optima"]), d)
+        else:
+            _n = int(cfg["n_optima"])
+        self.n_optima = _n
         self._optima = rastrigin_ilr_optima(d, n_optima=_n, amplitude=self.amplitude)
 
     def __call__(self, x: np.ndarray) -> float:

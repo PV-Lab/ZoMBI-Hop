@@ -206,9 +206,7 @@ N_MOBO_SAMPLES   = 512
 # Per-trial wall-clock budget (hours) passed to ZoMBIHop.run(time_limit_hours=…).
 TIME_LIMIT_HOURS = 0.4
 
-# pct_matched: a needle counts as "valid" if it is within this Euclidean
-# (composition L2) radius of some true optimum.
-MATCH_RADIUS = 0.05
+# Needle-match / duplicate thresholds: see optimize/eval_metrics.py (ILR, dim-scaled).
 
 # Resumability: abort the overnight run only after this many trials fail back-to-back
 # (guards against a runaway loop on a systemic failure; transient failures just retry).
@@ -884,7 +882,7 @@ def collect_rederived_observations(runs_dir: str, new_maximize: bool,
             try:
                 if os.path.exists(needles_path):
                     needles = _read_needles_csv(needles_path, dim=run_dim)
-                    dist = metric_dist_to_needles(needles, new_optima)
+                    dist = metric_dist_to_needles(needles, new_optima, dim=run_dim)
                     rederived = True
                 else:
                     # No saved needles → cannot re-score; reuse stored dist as-is.
@@ -1118,103 +1116,20 @@ class ExtremaPicker:
         return self.extrema
 
 
-# ─── Metrics ──────────────────────────────────────────────────────────────────
+# ─── Metrics (dimension-aware; see optimize/eval_metrics.py) ───────────────────
 
-UNMATCHED_PENALTY = 10.0   # per-term penalty for an unmatched optimum OR needle
-
-
-def metric_dist_to_needles(
-    discovered: np.ndarray,
-    true_optima: list[np.ndarray],
-) -> float:
-    """Symmetric greedy matching distance between needles and true optima.
-
-    Each true optimum is greedily matched (no repeats) to its nearest discovered
-    needle and contributes that Euclidean (composition L2) distance.  Two kinds of
-    leftovers each contribute UNMATCHED_PENALTY:
-
-      • a true optimum with no needle left to match  (missed optimum — recall),
-      • a needle matched to no optimum               (spurious/duplicate — precision).
-
-    The score is the mean over ``max(#needles, #optima)`` terms.  Including a
-    per-needle penalty is what makes the metric symmetric: spawning extra needles
-    near already-matched optima now *raises* the score instead of lowering it, so
-    "needle spam" is penalised rather than rewarded.  When the needle and optimum
-    counts are equal and all match, this reduces to the old mean-distance score.
-    """
-    n_opt = len(true_optima)
-    if n_opt == 0:
-        return 0.0
-    n_disc = len(discovered)
-    if n_disc == 0:
-        return UNMATCHED_PENALTY
-    used: set[int] = set()
-    total = 0.0
-    for t in true_optima:
-        best_d, best_j = float("inf"), -1
-        for j, d in enumerate(discovered):
-            if j in used:
-                continue
-            dist = float(np.linalg.norm(np.asarray(d) - np.asarray(t)))
-            if dist < best_d:
-                best_d, best_j = dist, j
-        if best_j >= 0:
-            used.add(best_j)
-            total += best_d
-        else:
-            total += UNMATCHED_PENALTY          # fewer needles than optima (missed)
-    # Every needle not claimed by an optimum is a false positive (precision term).
-    total += (n_disc - len(used)) * UNMATCHED_PENALTY
-    return total / max(n_disc, n_opt)
-
-
-def metric_dup_fraction(X_all: np.ndarray, threshold: float) -> float:
-    """Fraction of points that have at least one neighbour within threshold."""
-    n = len(X_all)
-    if n <= 1:
-        return 0.0
-    diff  = X_all[:, None, :] - X_all[None, :, :]     # (n, n, d)
-    dists = np.sqrt((diff ** 2).sum(axis=-1))           # (n, n)
-    np.fill_diagonal(dists, np.inf)
-    return float((dists < threshold).any(axis=1).mean())
-
-
-def metric_pct_matched(
-    discovered: np.ndarray,
-    true_optima: list[np.ndarray],
-    radius: float = MATCH_RADIUS,
-) -> float:
-    """Percentage of DISCOVERED needles that lie within `radius` of a true optimum.
-
-    A precision-style score (true positives / all needles): spurious or spammed
-    needles that sit far from every true optimum drag it down, so — unlike a
-    coverage/recall score over the fixed set of true optima — it is NOT monotonic
-    in needle count.  Returns 0.0 when there are no needles (no valid needles yet)
-    or no reference optima (nothing to validate against).
-    """
-    if len(discovered) == 0 or not true_optima:
-        return 0.0
-    disc = np.asarray(discovered, dtype=float)
-    opt  = np.asarray(true_optima, dtype=float)
-    valid = 0
-    for d in disc:
-        if float(np.linalg.norm(opt - d, axis=1).min()) <= radius:
-            valid += 1
-    return 100.0 * valid / len(disc)
-
-
-def metric_avg_pairwise_dist(discovered: np.ndarray) -> float:
-    """Average pairwise Euclidean distance between discovered needles."""
-    disc = np.asarray(discovered, dtype=float)
-    n = len(disc)
-    if n < 2:
-        return 0.0
-    diff  = disc[:, None, :] - disc[None, :, :]
-    dists = np.sqrt((diff ** 2).sum(axis=-1))
-    iu = np.triu_indices(n, k=1)
-    return float(dists[iu].mean())
-
-
+from eval_metrics import (  # noqa: E402  — after sys.path setup in callers
+    MATCH_RADIUS,
+    SIMPLEX_L2_DIAMETER,
+    UNMATCHED_PENALTY,
+    dup_threshold_ilr,
+    match_radius_ilr,
+    metric_avg_pairwise_dist,
+    metric_dist_to_needles,
+    metric_dup_fraction,
+    metric_pct_matched,
+    unmatched_penalty,
+)
 # ─── ZoMBI sim-objective + LineBO wrapper ──────────────────────────────────────
 
 def make_sim_obj(fn_callable, device, dtype, *, maximize: bool):
@@ -1568,12 +1483,11 @@ def write_needles_csv(path: str, dh, *, dim: int = 3) -> None:
 
 
 def write_metrics_over_time_csv(path: str, payloads: list[dict], X_all: np.ndarray,
-                                true_optima: list[np.ndarray]) -> None:
-    thr = NOISE_LEVEL / 2.0
+                                true_optima: list[np.ndarray], *, dim: int = 3) -> None:
     rows = []
     for p in payloads:
         needles = p.get("needles")
-        disc = needles if needles is not None else np.empty((0, X_all.shape[1] if X_all.ndim == 2 and X_all.shape[0] else (true_optima[0].shape[0] if true_optima else 3)))
+        disc = needles if needles is not None else np.empty((0, X_all.shape[1] if X_all.ndim == 2 and X_all.shape[0] else (true_optima[0].shape[0] if true_optima else dim)))
         n_before = p.get("n_points_before", len(X_all))
         X_upto = X_all[:n_before] if n_before > 0 else np.empty_like(disc)
         # Value of the most recently discovered needle as of this iteration
@@ -1582,9 +1496,9 @@ def write_metrics_over_time_csv(path: str, payloads: list[dict], X_all: np.ndarr
         recent = float(nvals[-1]) if nvals is not None and len(nvals) > 0 else np.nan
         rows.append({
             "iteration": p["iter_num"],
-            "dist_to_needles":  round(metric_dist_to_needles(disc, true_optima), 6),
-            "dup_fraction":     round(metric_dup_fraction(X_upto, thr), 6),
-            "pct_matched":      round(metric_pct_matched(disc, true_optima), 4),
+            "dist_to_needles":  round(metric_dist_to_needles(disc, true_optima, dim=dim), 6),
+            "dup_fraction":     round(metric_dup_fraction(X_upto, dim=dim), 6),
+            "pct_matched":      round(metric_pct_matched(disc, true_optima, dim=dim), 4),
             "avg_pairwise_dist":round(metric_avg_pairwise_dist(disc), 6),
             "recent_needle_value": (round(recent, 6) if not math.isnan(recent) else np.nan),
         })
@@ -1758,7 +1672,7 @@ def run_single_trial(
         X_a, X_e, Y = _gen_init_data(fn_callable, maximize, dim=dim)
     except RuntimeError as exc:
         print(f"    [trial] init failed: {exc}")
-        return {"dist": UNMATCHED_PENALTY, "dup": 1.0, "runtime": 0.0, "payloads": []}
+        return {"dist": unmatched_penalty(dim), "dup": 1.0, "runtime": 0.0, "payloads": []}
 
     hp = dict(hparams)
     if dim > 3 and (hp.get("top_m_points") is None or hp.get("top_m_points", 0) < dim + 1):
@@ -1807,8 +1721,8 @@ def run_single_trial(
         dh.X_all_actual.detach().cpu().numpy()
         if dh.X_all_actual is not None else np.empty((0, dim))
     )
-    dist = metric_dist_to_needles(discovered, true_optima)
-    dup  = metric_dup_fraction(X_all_np, NOISE_LEVEL / 2.0)
+    dist = metric_dist_to_needles(discovered, true_optima, dim=dim)
+    dup  = metric_dup_fraction(X_all_np, dim=dim)
     print(f"    [trial]  iters={call_counter[0]}  dist={dist:.4f}  dup={dup:.4f}"
           f"  t={runtime:.1f}s  needles={len(discovered)}/{len(true_optima)}")
 
@@ -1816,7 +1730,9 @@ def run_single_trial(
         write_points_csv(os.path.join(trial_dir, "points.csv"), dh, snap_records, dim=dim)
         write_needles_csv(os.path.join(trial_dir, "needles.csv"), dh, dim=dim)
         write_metrics_over_time_csv(
-            os.path.join(trial_dir, "metrics_over_time.csv"), payloads, X_all_np, true_optima)
+            os.path.join(trial_dir, "metrics_over_time.csv"), payloads, X_all_np, true_optima,
+            dim=dim,
+        )
     except Exception as exc:
         print(f"    [trial] CSV write failed: {exc}")
 

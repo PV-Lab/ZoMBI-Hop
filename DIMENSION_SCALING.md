@@ -134,3 +134,15 @@ grows.
 | Acquisition restarts (`n_restarts`, at default 30) | 30 | 135 | **4.5×** |
 | LineBO lines per iteration (`num_lines`, base 10) | 10 | 45 | **4.5×** |
 
+
+## Evaluation metrics (`optimize/eval_metrics.py`)
+
+Run metrics use the same baseline-at-`d=3` philosophy:
+
+| Metric | Baseline at d=3 | Scales with | Notes |
+|--------|-----------------|-------------|-------|
+| `unmatched_penalty` | 10.0 | `(d−1)/2` (Group 2) | Paired with `scaled_n_optima` |
+| Matched terms in `dist_to_needles` | composition L2 | ÷ `√2` | Simplex diameter normalisation |
+| `match_radius_ilr` (`pct_matched`) | 0.12 ILR L2 | `√((d−1)/2)` (Group 1) | ILR needle–optimum test (≈ comp 0.05 at d=3) |
+| `dup_threshold_ilr` (`dup_fraction`) | `input_noise_ilr / 2` | `√((d−1)/2)` (Group 1) | ILR duplicate-neighbour test |
+

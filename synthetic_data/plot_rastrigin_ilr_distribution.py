@@ -36,6 +36,7 @@ from synthetic_data.compare_campaign_datasets import (
     OBJECTIVE_COL,
     resolve_campaign1a_path,
 )
+from synthetic_data.ackley import scaled_n_optima
 from synthetic_data.oracles import load_rastrigin_config
 
 DEFAULT_DIMENSIONS = (3, 4, 10)
@@ -153,18 +154,19 @@ def main() -> None:
     dims = _parse_dims(args.dims)
     cfg = load_rastrigin_config()
     amplitude = float(cfg["amplitude"])
-    n_optima = int(cfg["n_optima"])
+    n_base = int(cfg["n_optima"])
     rng = np.random.default_rng(SEED)
 
     panels: list[tuple[str, np.ndarray, str]] = []
     for dim in dims:
+        n_optima = scaled_n_optima(n_base, dim)
         pts = sample_simplex(dim, args.n_samples, rng)
         y = eval_rastrigin_ilr_batch(pts, amplitude)
         title = (
             f"Rastrigin in ILR\n"
             f"dim = {dim}, A = {amplitude:g}, {n_optima} optima"
         )
-        print(f"  dim={dim}: y ∈ [{y.min():.3g}, {y.max():.3g}]")
+        print(f"  dim={dim}: y ∈ [{y.min():.3g}, {y.max():.3g}], {n_optima} optima")
         panels.append((title, y, "steelblue"))
 
     if not args.no_rf:
