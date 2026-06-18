@@ -11,13 +11,18 @@ defaults (many optima, narrow basins, background noise).
 Each condition constructs its own ``Ackley("realistic", dim=10, ...)`` instance
 with explicit overrides, so the config-file defaults are bypassed entirely.
 
+``basin_width`` is the Ackley sharpness coefficient ``b`` (see ``ackley.py``):
+*larger* ``b`` means a *sharper, narrower* peak, not a wider one.  The sweep
+therefore goes from a small ``b`` (broad, easy-to-find basin) up to the
+production ``b=20`` (sharp peak), adding optima and noise along the way.
+
 Conditions (easiest → hardest)
 ------------------------------
-  1. 1 optimum,  basin_width=200, no noise   — huge single basin
-  2. 1 optimum,  basin_width=50,  no noise   — narrower single basin
-  3. 5 optima,   basin_width=50,  no noise   — a few well-separated peaks
-  4. 5 optima,   basin_width=20,  no noise   — narrow peaks
-  5. 20 optima,  basin_width=20,  no noise   — many narrow peaks, still clean
+  1. 1 optimum,  basin_width=2,   no noise   — broad single basin
+  2. 1 optimum,  basin_width=5,   no noise   — narrower single basin
+  3. 5 optima,   basin_width=5,   no noise   — a few well-separated peaks
+  4. 5 optima,   basin_width=20,  no noise   — sharp peaks
+  5. 20 optima,  basin_width=20,  no noise   — many sharp peaks, still clean
   6. 20 optima,  basin_width=20,  noise=20   — add background noise
   7. 90 optima,  basin_width=20,  noise=20   — full production config (scaled)
 
@@ -71,10 +76,12 @@ TIME_LIMIT_MIN = 39.0   # 0.65 hours
 DATASET_LABEL  = "ackley10d"
 
 # (name, n_optima, basin_width, noise_amp)
+# basin_width is the Ackley sharpness b: larger => sharper/narrower peak.
+# Ordered easiest -> hardest, i.e. broad (small b) -> sharp (production b=20).
 CONDITIONS = [
-    ("cond1_1peak_bw200_nonoise",   1,  200,  0.0),
-    ("cond2_1peak_bw50_nonoise",    1,   50,  0.0),
-    ("cond3_5peak_bw50_nonoise",    5,   50,  0.0),
+    ("cond1_1peak_bw2_nonoise",     1,    2,  0.0),
+    ("cond2_1peak_bw5_nonoise",     1,    5,  0.0),
+    ("cond3_5peak_bw5_nonoise",     5,    5,  0.0),
     ("cond4_5peak_bw20_nonoise",    5,   20,  0.0),
     ("cond5_20peak_bw20_nonoise",  20,   20,  0.0),
     ("cond6_20peak_bw20_noise20",  20,   20, 20.0),
