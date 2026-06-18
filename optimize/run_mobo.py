@@ -235,26 +235,26 @@ def unique_run_dir(parent: str, prefix: str) -> str:
 HPARAM_SPACE: dict[str, tuple] = {
     # Acquisition optimisation
     "nat_grad_step":               (0.001,  0.5,   "log"),
-    "nat_grad_max_steps":          (10,     200,   "int"),
+    "nat_grad_max_steps":          (10,     400,   "int"),
     "n_restarts":                  (20,     300,   "int"),
     "raw":                         (1,    300,  "int"),
     # Acquisition function
-    "ucb_beta":                    (0.05,   3.0,   "linear"),
+    "ucb_beta":                    (0.001,   3.0,   "linear"),
     # Zoom / convergence
     "max_zooms":                   (2,      10,    "int"),
-    "max_iterations":              (2,      10,    "int"),
+    "max_iterations":              (2,      30,    "int"),
     "top_m_points":                (2,      8,     "int"),
     "n_consecutive_converged":     (1,      5,    "int"),
     "convergence_pi_threshold":    (1e-4,   0.05,  "log"),
     "input_noise_threshold_mult":  (0.5,    6.0,   "linear"),
-    "output_noise_threshold_mult": (0.1,    2.0,   "linear"),
+    "output_noise_threshold_mult": (0.01,    2.0,   "linear"),
     # Penalisation & needle
-    "max_penalty_radius":          (0.2,    5.0,   "linear"),
-    "needle_shrink_factor":        (0.55,   0.99,  "linear"),
+    "max_penalty_radius":          (0.01,    5.0,   "linear"),
+    "needle_shrink_factor":        (0.1,   0.99,  "linear"),
     "needle_stop_noise_multiplier":(1.0,    8.0,   "linear"),
     # Point paring (deduplication)
-    "paring_spatial_halfnoise":    (0.1,    2.0,   "linear"),
-    "paring_y_noise_multiplier":   (0.1,    5.0,   "linear"),
+    "paring_spatial_halfnoise":    (0.1,    5.0,   "linear"),
+    "paring_y_noise_multiplier":   (0.1,    10.0,   "linear"),
 }
 HPARAM_NAMES = list(HPARAM_SPACE.keys())
 N_HPARAMS    = len(HPARAM_NAMES)
