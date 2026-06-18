@@ -206,21 +206,26 @@ CORNER_LABELS   = ("FAPbI3", "MAPbI3", "MAPbBr3")
 
 
 def unique_run_dir(parent: str, prefix: str) -> str:
-    """Create a timestamped directory under *parent*, appending ``_2``, ``_3``, …
-    if the base name already exists (prevents collisions between concurrent runs).
+    """Create a unique timestamped directory under *parent*, appending ``_2``,
+    ``_3``, … if the base name already exists (prevents collisions between
+    concurrent runs).
+
+    The base name carries second resolution plus the PID so two runs launched in
+    the same minute (e.g. from a sweep script) get distinct names without relying
+    on the suffix loop. Creation is atomic — ``os.makedirs(exist_ok=False)`` fails
+    if another process won the race — so the check-then-create TOCTOU window is
+    closed and two processes can never share a run directory.
     """
-    base = datetime.datetime.now().strftime(f"{prefix}_%d_%m_%H_%M")
-    candidate = os.path.join(parent, base)
-    if not os.path.exists(candidate):
-        os.makedirs(candidate)
-        return candidate
-    n = 2
+    base = datetime.datetime.now().strftime(f"{prefix}_%d_%m_%H_%M_%S") + f"_{os.getpid()}"
+    n = 1
     while True:
-        candidate = os.path.join(parent, f"{base}_{n}")
-        if not os.path.exists(candidate):
-            os.makedirs(candidate)
+        name = base if n == 1 else f"{base}_{n}"
+        candidate = os.path.join(parent, name)
+        try:
+            os.makedirs(candidate, exist_ok=False)
             return candidate
-        n += 1
+        except FileExistsError:
+            n += 1
 
 
 # ─── Hyperparameter search space ──────────────────────────────────────────────
