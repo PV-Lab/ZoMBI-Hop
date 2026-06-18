@@ -423,14 +423,13 @@ def _write_run_analytics(dh, run_dir, payloads, snap_records, maximize, log_fn):
             row.update({
                 "value": r.get("value"),
                 "median_value": (None if mv is None or (isinstance(mv, float) and math.isnan(mv)) else mv),
-                "activation": r.get("activation"),
                 "zoom": r.get("zoom"),
                 "iteration": r.get("iteration"),
                 "dist_to_centre": float(np.linalg.norm(pt - centroid)) if d > 0 else 0.0,
             })
             rows.append(row)
         cols = ["needle_idx"] + [f"x{j}" for j in range(d)] + [
-            "value", "median_value", "activation", "zoom", "iteration", "dist_to_centre"]
+            "value", "median_value", "zoom", "iteration", "dist_to_centre"]
         pd.DataFrame(rows, columns=cols).to_csv(str(run_dir / "needles.csv"), index=False)
         log_fn("  Wrote needles.csv", tag="info")
     except Exception as exc:
@@ -1080,7 +1079,7 @@ class NeedlesFrame(ttk.Frame):
 
         d    = rd.d
         ccols = [f"x[{i}]" for i in range(d)]
-        cols  = ["#"] + ccols + ["value", "med_val", "activation", "zoom", "iter"]
+        cols  = ["#"] + ccols + ["value", "med_val", "zoom", "iter"]
         self._tree["columns"] = cols
         for c in cols:
             self._tree.heading(c, text=c)
@@ -1094,7 +1093,6 @@ class NeedlesFrame(ttk.Frame):
             mv   = f"{n['median_value']:.5f}" if n.get("median_value") is not None else ""
             self._tree.insert("", "end", iid=str(i),
                               values=[str(i)] + comp + [val, mv,
-                                      n.get("activation", ""),
                                       n.get("zoom", ""),
                                       n.get("iteration", "")])
 

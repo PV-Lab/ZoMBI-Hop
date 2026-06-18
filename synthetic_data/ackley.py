@@ -12,14 +12,14 @@ maximum (value ~ 0) sits at a canonical simplex location:
     "vertex"      peak at [1,   0,   0]     (simplex vertex)
     "multimodal"  sum of three skinnier-peaked Ackleys
     "realistic"   Dirichlet-sampled peaks + background simplex noise,
-                  fully configurable via ``configs/defaults.json``
+                  fully configurable via ``synthetic_data/defaults/ackley.json``
 
 The ``Ackley`` class exposes a ``predict(X)`` method matching scikit-learn's
 ``RandomForestRegressor.predict`` signature ``(N, d) -> (N,)``.
 
 For the "realistic" variant, ``Ackley("realistic")`` reads its parameters
 (``n_optima``, ``basin_width``, ``noise_freq``, ``noise_amp``) from
-``synthetic_data/ackley/defaults.json``.  You can override any of them via
+``synthetic_data/defaults/ackley.json``.  You can override any of them via
 keyword arguments::
 
     fn = Ackley("realistic", dim=3, n_optima=5, noise_amp=10.0)
@@ -39,7 +39,7 @@ Example
     fn = Ackley("centroid")
     y = fn.predict(np.array([[1/3, 1/3, 1/3]]))   # ~ [0.0]
 
-    fn = Ackley("realistic")             # reads from configs/defaults.json
+    fn = Ackley("realistic")             # reads from synthetic_data/defaults/ackley.json
     fn = Ackley("realistic", n_optima=5) # override one param
 """
 
@@ -51,19 +51,51 @@ from pathlib import Path
 import numpy as np
 
 # ── Config file for tunable defaults ─────────────────────────────────────────
-_CONFIGS_DIR = Path(__file__).resolve().parent / "ackley"
-_DEFAULTS_PATH = _CONFIGS_DIR / "defaults.json"
+_CONFIGS_DIR = Path(__file__).resolve().parent / "defaults"
+_DEFAULTS_PATH = _CONFIGS_DIR / "ackley.json"
+
+SCALE_OPTIMA_WITH_DIM = True
+
+# The classic Ackley function has two parts: a smooth Gaussian-like envelope
+# (``t1``) that forms the basin, and an oscillatory cosine term (``t2``) that
+# studs that basin with fine local ripples / minima.  When this is False the
+# cosine term is dropped entirely, so each peak is a single smooth, monotonic
+# basin with no ripples — the envelope alone.
+USE_OSCILLATION = False
+
+# Hardcoded Ackley sharpness ``b`` (basin width) per simplex dimensionality.
+# When the "realistic" variant is built without an explicit ``basin_width``
+# override, the value for its ``dim`` is taken from here; dims not listed fall
+# back to the config ``basin_width``.
+BASIN_WIDTH_BY_DIM = {
+    3: 86.0,
+    4: 65.0,
+    10: 20,
+}
+
+# Hardcoded background-noise amplitude per simplex dimensionality, tuned by hand.
+# When the "realistic" variant is built without an explicit ``noise_amp``
+# override, the value for its ``dim`` is taken from here; dims not listed fall
+# back to the config ``noise_amp``.  (Interactive sliders pass noise_amp
+# explicitly, so they still override this.)
+NOISE_AMP_BY_DIM = {
+    3: 400.0,
+    4: 300.0,
+    10: 20.0,
+}
 
 _HARDCODED_DEFAULTS = {
     "n_optima": 10,
     "basin_width": 50,
+    "intensity_mean": 0.0,
+    "intensity_var": 0.0,
     "noise_freq": 8.0,
     "noise_amp": 5.0,
 }
 
 
 def load_config() -> dict:
-    """Load tunable defaults from ``synthetic_data/ackley/defaults.json``."""
+    """Load tunable defaults from ``synthetic_data/defaults/ackley.json``."""
     if _DEFAULTS_PATH.exists():
         with open(_DEFAULTS_PATH) as f:
             return json.load(f)
@@ -71,7 +103,7 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    """Write tunable defaults to ``synthetic_data/ackley/defaults.json``."""
+    """Write tunable defaults to ``synthetic_data/defaults/ackley.json``."""
     _CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
     with open(_DEFAULTS_PATH, "w") as f:
         json.dump(cfg, f, indent=4)
@@ -171,11 +203,17 @@ def _negated_ackley(
     scale: float = ACKLEY_SCALE,
 ) -> np.ndarray:
     X = np.atleast_2d(np.asarray(X, dtype=float))
-    d = X.shape[1]
-    delta = X - np.asarray(center, dtype=float)
-    t1 = -a * np.exp(-b * np.sqrt(np.sum(delta ** 2, axis=1) / d))
-    t2 = -np.exp(np.sum(np.cos(c * delta), axis=1) / d)
-    ackley = t1 + t2 + a + np.e
+    center = np.asarray(center, dtype=float).reshape(1, -1)
+    delta = X - center
+    d_eff = delta.shape[1]
+    t1 = -a * np.exp(-b * np.sqrt(np.sum(delta ** 2, axis=1) / d_eff))
+    if USE_OSCILLATION:
+        t2 = -np.exp(np.sum(np.cos(c * delta), axis=1) / d_eff)
+        ackley = t1 + t2 + a + np.e
+    else:
+        # Drop the cosine ripple: pure smooth envelope, 0 at the center rising
+        # to ``a`` far away (same peak value as the full form, no local minima).
+        ackley = t1 + a
     return -scale * ackley
 
 
@@ -214,7 +252,7 @@ class Ackley:
     """A negated Ackley objective on the ``dim``-element probability simplex.
 
     For the ``"realistic"`` variant, parameters are read from
-    ``synthetic_data/ackley/defaults.json`` and can be overridden via kwargs.
+    ``synthetic_data/defaults/ackley.json`` and can be overridden via kwargs.
     All other variants ignore the extra kwargs.
 
     Parameters
@@ -228,6 +266,10 @@ class Ackley:
         Unspecified values are read from the config file.  When ``n_optima`` is
         left unspecified it is scaled with ``dim`` by ``(d-1)/2`` relative to the
         configured (d=3) value; passing it explicitly uses that exact count.
+    intensity_mean, intensity_var : optional
+        Mean and variance of a nonneg offset added to each optimum's basin
+        width, producing varying peak intensities.  Sampled from a Gamma
+        distribution (constant when ``intensity_var`` is 0).
     noise_octaves, noise_seed, peak_seed : optional
         Additional "realistic" controls with sensible defaults.
     """
@@ -241,6 +283,8 @@ class Ackley:
         *,
         n_optima: int | None = None,
         basin_width: float | None = None,
+        intensity_mean: float | None = None,
+        intensity_var: float | None = None,
         noise_freq: float | None = None,
         noise_amp: float | None = None,
         noise_octaves: int = 4,
@@ -259,21 +303,41 @@ class Ackley:
 
         if variant == "realistic":
             cfg = load_config()
-            # An explicit n_optima is honoured exactly (e.g. the plot_3d/plot_4d
+            # An explicit n_optima is honoured exactly (e.g. the plot.py
             # sliders); otherwise the configured value is the d=3 baseline and is
             # scaled with dimension so higher-d benchmarks have proportionally
             # more optima (see ``scaled_n_optima``).
             if n_optima is not None:
                 _n = int(n_optima)
-            else:
+            elif SCALE_OPTIMA_WITH_DIM:
                 _n = scaled_n_optima(int(cfg["n_optima"]), dim)
-            _b = float(basin_width if basin_width is not None else cfg["basin_width"])
+            else:
+                _n = int(cfg["n_optima"])
+            # An explicit basin_width override wins; otherwise use the hardcoded
+            # per-dim value, falling back to the config for dims not listed.
+            if basin_width is not None:
+                _b = float(basin_width)
+            else:
+                _b = float(BASIN_WIDTH_BY_DIM.get(dim, cfg["basin_width"]))
+            _im = float(intensity_mean if intensity_mean is not None else cfg.get("intensity_mean", 0.0))
+            _iv = float(intensity_var if intensity_var is not None else cfg.get("intensity_var", 0.0))
             _nf = float(noise_freq if noise_freq is not None else cfg["noise_freq"])
-            _na = float(noise_amp if noise_amp is not None else cfg["noise_amp"])
+            # An explicit noise_amp override wins; otherwise use the hardcoded
+            # per-dim value, falling back to the config for dims not listed.
+            if noise_amp is not None:
+                _na = float(noise_amp)
+            else:
+                _na = float(NOISE_AMP_BY_DIM.get(dim, cfg["noise_amp"]))
 
             rng = np.random.default_rng(peak_seed)
             self.centers = [c.copy() for c in rng.dirichlet(np.ones(dim), size=_n)]
-            self.basin_widths = [_b] * _n
+            if _iv > 0 and _im > 0:
+                shape = _im ** 2 / _iv
+                scale = _iv / _im
+                offsets = rng.gamma(shape, scale, size=_n)
+            else:
+                offsets = np.full(_n, _im)
+            self.basin_widths = [max(1.0, _b - float(o)) for o in offsets]
             self.combine = "max"
 
             self._noise_freq = _nf
@@ -292,37 +356,61 @@ class Ackley:
             self._noise_octaves = 0
             self._noise_seed = 0
 
-        # Estimate raw range by sampling the simplex, then scale to [0.5, 1].
+        # For dims above 3 the [0.5, 1] map is fixed from the *noise-free* Ackley
+        # signal (peak -> 1, far-field floor -> 0.5); noise (level set per-dim via
+        # NOISE_AMP_BY_DIM) is then added through that same map and the result is
+        # clipped to [0.5, 1].  At dim <= 3 the Ackley+noise signal is normalized
+        # together and left unclamped, as before.
+        self._clip_to_unit = self.dim > 3
+
         _est_rng = np.random.default_rng(12345)
         _samples = _est_rng.dirichlet(np.ones(dim), size=_RANGE_SAMPLES)
-        _raw = self._predict_raw(_samples)
+        # Include the peak centers (the analytic maxima) so a sample-only max
+        # doesn't underestimate the peak in high dim.
+        if self.centers:
+            _samples = np.vstack([_samples, np.asarray(self.centers, dtype=float)])
+        # dim > 3 normalizes on the noise-free Ackley span; dim <= 3 on Ackley+noise.
+        _raw = self._ackley_raw(_samples) if self._clip_to_unit else self._predict_raw(_samples)
         self._raw_min = float(_raw.min())
         self._raw_max = float(_raw.max())
 
-    def _predict_raw(self, X: np.ndarray) -> np.ndarray:
+    def _ackley_raw(self, X: np.ndarray) -> np.ndarray:
+        """Noise-free negated-Ackley signal, combined over the peaks."""
         X = np.atleast_2d(np.asarray(X, dtype=float))
         terms = np.stack(
             [_negated_ackley(X, center, b=b)
              for center, b in zip(self.centers, self.basin_widths)],
             axis=0,
         )
-        result = terms.max(axis=0) if self.combine == "max" else terms.sum(axis=0)
-        if self._noise_amp > 0:
-            result = result + simplex_noise(
-                X,
-                frequency=self._noise_freq,
-                amplitude=self._noise_amp,
-                octaves=self._noise_octaves,
-                seed=self._noise_seed,
-            )
-        return result
+        return terms.max(axis=0) if self.combine == "max" else terms.sum(axis=0)
+
+    def _noise_raw(self, X: np.ndarray) -> np.ndarray:
+        """Background simplex-noise field in raw units (0 when noise is off)."""
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+        if self._noise_amp <= 0:
+            return np.zeros(X.shape[0])
+        return simplex_noise(
+            X,
+            frequency=self._noise_freq,
+            amplitude=self._noise_amp,
+            octaves=self._noise_octaves,
+            seed=self._noise_seed,
+        )
+
+    def _predict_raw(self, X: np.ndarray) -> np.ndarray:
+        return self._ackley_raw(X) + self._noise_raw(X)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         raw = self._predict_raw(X)
         span = self._raw_max - self._raw_min
         if span < 1e-12:
             return np.full(raw.shape, 0.75)
-        return 0.5 + 0.5 * (raw - self._raw_min) / span
+        y = 0.5 + 0.5 * (raw - self._raw_min) / span
+        if self._clip_to_unit:
+            # dim > 3: keep the (noisy) objective within [0.5, 1] -- the span is
+            # the noise-free Ackley range, so noise can push a value past it.
+            y = np.clip(y, 0.5, 1.0)
+        return y
 
     def __call__(self, x: np.ndarray) -> float:
         return float(self.predict(np.asarray(x, dtype=float).reshape(1, -1))[0])

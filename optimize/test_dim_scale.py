@@ -104,8 +104,8 @@ def _write_results(path: str, header: dict, per_cond: dict) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--num-runs", type=int, default=3,
-                    help="Repeats per condition (default: 3).")
+    ap.add_argument("--num-runs", type=int, default=2,
+                    help="Repeats per condition (default: 2).")
     ap.add_argument("--out", default=None,
                     help="Existing dimscale_test_* dir to resume into "
                          "(default: a fresh timestamped folder under optimize/runs).")
@@ -130,9 +130,7 @@ def main() -> None:
                 candidate = under_runs
         out_dir = candidate
     else:
-        out_dir = os.path.join(SCRIPT_DIR, "runs",
-                               datetime.datetime.now().strftime("dimscale_test_%d_%m_%H_%M"))
-    os.makedirs(out_dir, exist_ok=True)
+        out_dir = rm.unique_run_dir(os.path.join(SCRIPT_DIR, "runs"), "dimscale_test")
     results_path = os.path.join(out_dir, "results.json")
 
     header = {

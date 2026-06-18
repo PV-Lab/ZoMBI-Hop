@@ -44,8 +44,9 @@ A single ``rerun_DD_MM_HH_MM/`` folder (military clock, mirroring ``mobo_*``):
             metrics.json
             points.csv         (sample_idx, <coords>, Y, penalized, activation, zoom)
             needles.csv        (needle_idx, <coords>, value, median_value,
-                                activation, zoom, iteration, dist_to_centre)
+                                zoom, iteration, dist_to_centre)
             metrics_over_time.csv
+            convergence.png
             dist_from_centre.png
             line_length_hist.png
             hparam_edge_proximity.png
@@ -106,6 +107,10 @@ import run_mobo as rm
 # Dimension scaling helper for the LineBO seeding budget (run_mobo wires the
 # repo root onto sys.path, so src is importable after importing it).
 from src.core.linebo import dimension_line_scale
+
+# Process-wide dimension-scaling toggle (see src/utils/scaling.py).  Used to run
+# with scaling on (--scaling-on) or off (default) through the same code paths.
+from src.utils.scaling import dimension_scaling_disabled
 
 # Analytic benchmark objectives (negated Ackley on the d-simplex).
 from synthetic_data.ackley import Ackley
@@ -319,14 +324,13 @@ def write_needles_csv(path: str, dh, cols: list[str], dim: int) -> None:
         row.update({
             "value": r.get("value"),
             "median_value": (None if mv_ is None or (isinstance(mv_, float) and math.isnan(mv_)) else mv_),
-            "activation": r.get("activation"),
             "zoom": r.get("zoom"),
             "iteration": r.get("iteration"),
             "reason": r.get("reason"),
             "dist_to_centre": float(np.linalg.norm(pt - centroid)),
         })
         rows.append(row)
-    columns = ["needle_idx"] + cols + ["value", "median_value", "activation",
+    columns = ["needle_idx"] + cols + ["value", "median_value",
                                        "zoom", "iteration", "reason",
                                        "dist_to_centre"]
     pd.DataFrame(rows, columns=columns).to_csv(path, index=False)
@@ -337,13 +341,13 @@ def write_needles_csv(path: str, dh, cols: list[str], dim: int) -> None:
 def write_point_cloud_html(path: str, ackley_fn, dh, last_payload: dict) -> None:
     """Render the final ZoMBI state over the 4-simplex Ackley cloud (one HTML).
 
-    Uses ``synthetic_data/point_cloud_4d``'s overlay API.  Pared points, needle
-    markers, and the last LineBO lines are all exact (plain simplex compositions);
+    Uses ``synthetic_data/plot``'s overlay API.  Pared points, needle markers,
+    and the last LineBO lines are all exact (plain simplex compositions);
     needle penalisation ellipsoids are intentionally omitted because the run's
     tangent basis differs from the Helmert ILR basis the overlay assumes.
     """
     import plotly.graph_objects as go
-    import synthetic_data.plot_4d as pc4
+    import synthetic_data.plot as pc4
 
     comp = pc4.build_simplex_lattice(pc4.GRID_N)
     obj  = ackley_fn.predict(comp)
@@ -454,6 +458,8 @@ def run_single_eval(hparams: dict, ds: dict, dataset: str, out_dir: str,
             pared_X=pared_X, pared_Y=pared_Y,
             needles=(needles.detach().cpu().numpy()
                      if needles is not None and needles.shape[0] > 0 else None),
+            needle_vals=(dh.needle_vals.detach().cpu().numpy().ravel()
+                         if dh.needle_vals is not None and dh.needle_vals.shape[0] > 0 else None),
             needle_M_list=[m.detach().cpu().clone() if m is not None else None
                            for m in dh.needle_M_list],
             needle_B=(dh.needle_B.detach().cpu().clone() if dh.needle_B is not None else None),
@@ -531,6 +537,7 @@ def run_single_eval(hparams: dict, ds: dict, dataset: str, out_dir: str,
         rm.plot_hparam_edge_proximity(
             os.path.join(out_dir, "hparam_edge_proximity.png"),
             rm.hparams_to_norm(hparams))
+        rm.plot_convergence(os.path.join(out_dir, "convergence.png"), dh, maximize)
     except Exception as exc:
         print(f"      [run] static plot failed: {exc}")
 
@@ -650,6 +657,7 @@ def evaluate_dataset(dataset: str, out_dir: str, runs_path: str,
             "num_runs":        args.num_runs,
             "time_limit_min":  args.time_limit_min,
             "top_k":           args.top_k,
+            "scaling_on":      args.scaling_on,
             "true_optima":     [list(map(float, t.ravel())) for t in ds["true_optima"]],
         }, f, indent=2)
 
@@ -671,8 +679,16 @@ def evaluate_dataset(dataset: str, out_dir: str, runs_path: str,
             print(f"  [run {k}/{args.num_runs}]  (overall {done}/{total})")
             run_dir = os.path.join(trial_dir, f"run_{k}")
             try:
-                res = run_single_eval(hparams, ds, dataset, run_dir,
-                                      args.time_limit_min, top_k=args.top_k)
+                # Dimension scaling is on globally by default; --scaling-on keeps
+                # it on, otherwise the whole run is wrapped so both scaling
+                # factors collapse to 1.0 (identical code path, no separate branch).
+                if args.scaling_on:
+                    res = run_single_eval(hparams, ds, dataset, run_dir,
+                                          args.time_limit_min, top_k=args.top_k)
+                else:
+                    with dimension_scaling_disabled():
+                        res = run_single_eval(hparams, ds, dataset, run_dir,
+                                              args.time_limit_min, top_k=args.top_k)
                 per_trial[trial_num].append({
                     "run": k,
                     "dist_to_needles": round(res["dist"], 6),
@@ -718,6 +734,11 @@ def main() -> None:
     parser.add_argument("--ackley-variant", default="realistic",
                         choices=sorted(Ackley.VARIANTS),
                         help="Ackley variant for the ackley* datasets (default: realistic).")
+    parser.add_argument("--scaling-on", action="store_true",
+                        help="Scale the hyperparameters with the objective dimension "
+                             "(Group-1 radii by sqrt((d-1)/2), Group-2 budgets by "
+                             "(d-1)/2; both 1.0 at d=3). Off by default, so a 3-D-tuned "
+                             "config transfers verbatim to higher-dimensional datasets.")
     parser.add_argument("--out", default=None,
                         help="Parent directory for the rerun_* folder "
                              "(default: optimize/runs).")
@@ -739,8 +760,7 @@ def main() -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     out_parent = os.path.abspath(args.out) if args.out else os.path.join(script_dir, "runs")
     os.makedirs(out_parent, exist_ok=True)
-    rerun_dir = os.path.join(out_parent, datetime.datetime.now().strftime("rerun_%d_%m_%H_%M"))
-    os.makedirs(rerun_dir, exist_ok=True)
+    rerun_dir = rm.unique_run_dir(out_parent, "rerun")
 
     if args.hparams_json:
         hparams_by_trial = load_hparams_from_json(args.hparams_json)
@@ -752,7 +772,8 @@ def main() -> None:
     print("=" * 72)
     print(f"ZoMBI-Hop evaluate  |  datasets={datasets}  trials={trial_nums}  "
           f"num_runs={args.num_runs}  limit={args.time_limit_min} min"
-          + (f"  top_k={args.top_k}" if args.top_k is not None else ""))
+          + (f"  top_k={args.top_k}" if args.top_k is not None else "")
+          + f"  scaling={'ON' if args.scaling_on else 'OFF'}")
     if args.hparams_json:
         print(f"hparams: {os.path.abspath(args.hparams_json)}")
     print(f"source: {runs_path}")
