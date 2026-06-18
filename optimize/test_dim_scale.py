@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 optimize/test_dim_scale.py
 ==========================
