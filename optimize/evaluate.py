@@ -760,8 +760,7 @@ def main() -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     out_parent = os.path.abspath(args.out) if args.out else os.path.join(script_dir, "runs")
     os.makedirs(out_parent, exist_ok=True)
-    rerun_dir = os.path.join(out_parent, datetime.datetime.now().strftime("rerun_%d_%m_%H_%M"))
-    os.makedirs(rerun_dir, exist_ok=True)
+    rerun_dir = rm.unique_run_dir(out_parent, "rerun")
 
     if args.hparams_json:
         hparams_by_trial = load_hparams_from_json(args.hparams_json)

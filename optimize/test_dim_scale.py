@@ -129,9 +129,7 @@ def main() -> None:
                 candidate = under_runs
         out_dir = candidate
     else:
-        out_dir = os.path.join(SCRIPT_DIR, "runs",
-                               datetime.datetime.now().strftime("dimscale_test_%d_%m_%H_%M"))
-    os.makedirs(out_dir, exist_ok=True)
+        out_dir = rm.unique_run_dir(os.path.join(SCRIPT_DIR, "runs"), "dimscale_test")
     results_path = os.path.join(out_dir, "results.json")
 
     header = {

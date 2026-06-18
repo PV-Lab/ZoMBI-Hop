@@ -34,6 +34,7 @@ Usage
   conda activate zombi-hop
   python optimize/pareto.py                 # crawl optimize/runs, write there
   python optimize/pareto.py <runs_dir>      # crawl a specific runs directory
+  python optimize/pareto.py <run_dir>       # a single run dir (holds mobo_progress.json)
   python optimize/pareto.py --out <dir>     # write pareto.json / .png elsewhere
   python optimize/pareto.py --no-interactive # save static PNG instead of live window
   python optimize/pareto.py --with-old       # include mobo_old_jackson (excluded by default)
@@ -155,7 +156,12 @@ def collect_trials(
     """
     has_filter = only_runs or only_trials
     records: list[dict] = []
-    for path in sorted(glob.glob(os.path.join(runs_dir, "mobo_*", "mobo_progress.json"))):
+    # Accept either a runs *parent* directory (containing mobo_*/mobo_progress.json)
+    # or a single run directory (containing mobo_progress.json directly).
+    progress_paths = sorted(glob.glob(os.path.join(runs_dir, "mobo_*", "mobo_progress.json")))
+    if not progress_paths and os.path.isfile(os.path.join(runs_dir, "mobo_progress.json")):
+        progress_paths = [os.path.join(runs_dir, "mobo_progress.json")]
+    for path in progress_paths:
         run_name = os.path.basename(os.path.dirname(path))
         if has_filter and run_name not in (only_runs or set()) and run_name not in (only_trials or {}):
             continue
@@ -515,6 +521,16 @@ def main() -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     runs_dir = os.path.abspath(args.runs_dir) if args.runs_dir else os.path.join(script_dir, "runs")
     out_dir = os.path.abspath(args.out) if args.out else runs_dir
+
+    # If runs_dir is itself a single run directory (holds mobo_progress.json
+    # directly), trial dirs live in its parent under the run's own name, so the
+    # click-to-open-image lookup must resolve relative to that parent.
+    single_run = (
+        not glob.glob(os.path.join(runs_dir, "mobo_*", "mobo_progress.json"))
+        and os.path.isfile(os.path.join(runs_dir, "mobo_progress.json"))
+    )
+    plot_runs_dir = os.path.dirname(runs_dir) if single_run else runs_dir
+
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 70)
@@ -567,7 +583,7 @@ def main() -> None:
     if args.no_interactive:
         plot_pareto(M, mask, obj_labels, os.path.join(out_dir, "pareto_front.png"))
     else:
-        plot_pareto_interactive(M, mask, records, runs_dir, obj_labels,
+        plot_pareto_interactive(M, mask, records, plot_runs_dir, obj_labels,
                                 show_numberline=args.show_numberline)
 
     print("\n  Pareto-optimal configurations (best dist first):")

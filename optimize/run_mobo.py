@@ -78,6 +78,9 @@ Modifiers (combinable with any mode above):
                     Inherited from the saved config by --resume / --copy-config.
   --ackley-variant V  Ackley variant for the ackley* datasets (default realistic).
   --time-limit H    per-trial wall-clock budget in hours (default TIME_LIMIT_HOURS).
+  --resume-from DIR   resume from a SPECIFIC run directory: trust that run's
+                    stored metrics as prior history (no re-evaluation), reuse its
+                    config, and start a new run seeded with only that data.
   --start-from-best DIR [DIR ...]  RE-EVALUATE the hyperparameters of the given
                     trial_* dir(s) (or trial.json files) as initial trials on the
                     current objective — their stored metrics are ignored. These
@@ -92,6 +95,7 @@ Usage
   python optimize/run_mobo.py --dataset ackley10d --time-limit 0.5
   python optimize/run_mobo.py --resume                          # seed from all past runs
   python optimize/run_mobo.py --copy-config runs/mobo_04_06_11_47   # reuse config, no data
+  python optimize/run_mobo.py --resume-from runs/mobo_17_06_11_27          # seed from one specific run
   python optimize/run_mobo.py --start-from-best runs/mobo_04_06_11_47/trial_1 [trial_dir ...]
   python optimize/make_videos.py                       # newest run
   python optimize/make_videos.py <run_dir>             # specific run
@@ -199,6 +203,25 @@ TERNARY_GRID_N  = 80     # render/metric grid (kept coarse: drawn every trial fr
 PICKER_GRID_N   = 120    # interactive extrema picker only (matches interactive_test_zombi.py)
 _SQRT3_2        = math.sqrt(3) / 2
 CORNER_LABELS   = ("FAPbI3", "MAPbI3", "MAPbBr3")
+
+
+def unique_run_dir(parent: str, prefix: str) -> str:
+    """Create a timestamped directory under *parent*, appending ``_2``, ``_3``, …
+    if the base name already exists (prevents collisions between concurrent runs).
+    """
+    base = datetime.datetime.now().strftime(f"{prefix}_%d_%m_%H_%M")
+    candidate = os.path.join(parent, base)
+    if not os.path.exists(candidate):
+        os.makedirs(candidate)
+        return candidate
+    n = 2
+    while True:
+        candidate = os.path.join(parent, f"{base}_{n}")
+        if not os.path.exists(candidate):
+            os.makedirs(candidate)
+            return candidate
+        n += 1
+
 
 # ─── Hyperparameter search space ──────────────────────────────────────────────
 # Each entry: (lo, hi, transform) — transform ∈ {"log", "linear", "int"}
@@ -413,6 +436,35 @@ def _time_objective(metrics: dict) -> float:
     return float(metrics["runtime_s"])
 
 
+def _collect_from_progress(path: str, X_obs: list, Y_obs: list) -> int:
+    """Load (X_norm, Y) pairs from one mobo_progress.json; append to X_obs/Y_obs.
+
+    Returns the number of usable trials found.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as exc:
+        print(f"  [collect] {path} unreadable ({exc}); skipping.")
+        return 0
+    used = 0
+    for t in data.get("trials", []):
+        hp, m = t.get("hparams", {}), t.get("metrics", {})
+        if not all(name in hp for name in HPARAM_NAMES):
+            continue  # stale / different hyperparameter set
+        try:
+            x = hparams_to_norm(hp)
+            y = torch.tensor([-float(m["dist_to_needles"]),
+                              -float(m["dup_fraction"]),
+                              -_time_objective(m)], dtype=DTYPE)
+        except (KeyError, ValueError, TypeError):
+            continue
+        X_obs.append(x)
+        Y_obs.append(y)
+        used += 1
+    return used
+
+
 def collect_all_observations(runs_dir: str):
     """Crawl every runs/mobo_*/mobo_progress.json and collect all (X_norm, Y) pairs.
 
@@ -427,31 +479,28 @@ def collect_all_observations(runs_dir: str):
     X_obs, Y_obs = [], []
     n_runs = 0
     for path in sorted(glob.glob(os.path.join(runs_dir, "mobo_*", "mobo_progress.json"))):
-        try:
-            with open(path) as f:
-                data = json.load(f)
-        except Exception as exc:
-            print(f"  [collect] {path} unreadable ({exc}); skipping.")
-            continue
-        used = 0
-        for t in data.get("trials", []):
-            hp, m = t.get("hparams", {}), t.get("metrics", {})
-            if not all(name in hp for name in HPARAM_NAMES):
-                continue  # stale / different hyperparameter set
-            try:
-                x = hparams_to_norm(hp)
-                y = torch.tensor([-float(m["dist_to_needles"]),
-                                  -float(m["dup_fraction"]),
-                                  -_time_objective(m)], dtype=DTYPE)
-            except (KeyError, ValueError, TypeError):
-                continue
-            X_obs.append(x)
-            Y_obs.append(y)
-            used += 1
+        used = _collect_from_progress(path, X_obs, Y_obs)
         if used:
             n_runs += 1
             print(f"  [collect] {os.path.basename(os.path.dirname(path))}: {used} trial(s)")
     return X_obs, Y_obs, n_runs
+
+
+def collect_observations_from_run(run_dir: str):
+    """Load (X_norm, Y) pairs from a single run's mobo_progress.json.
+
+    Like ``collect_all_observations`` but scoped to one run directory. Used by
+    ``--resume-from`` to trust only a specific run's stored metrics without
+    re-evaluating anything.
+    Returns (X_obs, Y_obs).
+    """
+    path = os.path.join(run_dir, "mobo_progress.json")
+    if not os.path.exists(path):
+        sys.exit(f"--resume-from: no mobo_progress.json found in {run_dir}")
+    X_obs, Y_obs = [], []
+    used = _collect_from_progress(path, X_obs, Y_obs)
+    print(f"  [collect] {os.path.basename(run_dir)}: {used} trial(s)")
+    return X_obs, Y_obs
 
 
 def load_or_make_sobol(run_dir: str, bounds: torch.Tensor, n: int) -> torch.Tensor:
@@ -1845,8 +1894,7 @@ def _interactive_run_config(script_dir: str):
 def _launch_run(runs_dir, ds: dict, time_limit_hours: float, max_trials,
                 seed_X=None, X_prior=None, Y_prior=None) -> None:
     """Create a fresh runs/mobo_* folder, persist its config, and run MOBO."""
-    run_dir = os.path.join(runs_dir, datetime.datetime.now().strftime("mobo_%d_%m_%H_%M"))
-    os.makedirs(run_dir, exist_ok=True)
+    run_dir = unique_run_dir(runs_dir, "mobo")
     write_run_config(run_dir, ds["maximize"], ds["csv_path"], ds["true_optima"],
                      dataset=ds["label"], dim=ds["dim"],
                      ackley_variant=ds["ackley_variant"])
@@ -1888,10 +1936,16 @@ def main() -> None:
                              "direction) for a NEW run, WITHOUT inheriting its data points. PATH "
                              "is a run dir or a run_config.json file. Non-interactive; runs a "
                              "normal Sobol-init + BO run. Cannot combine with --resume.")
+    parser.add_argument("--resume-from", metavar="RUN_DIR", default=None,
+                        help="Resume from a SPECIFIC run directory (e.g. "
+                             "optimize/runs/mobo_17_06_11_27). Loads that run's config and "
+                             "trusts its stored metrics as prior history (no re-evaluation). "
+                             "Starts a new run seeded with only that run's data.")
     args = parser.parse_args()
 
-    if args.resume and args.copy_config:
-        sys.exit("Use only one of --resume / --copy-config.")
+    n_exclusive = sum([args.resume, args.copy_config is not None, args.resume_from is not None])
+    if n_exclusive > 1:
+        sys.exit("Use only one of --resume / --copy-config / --resume-from.")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     runs_dir   = os.path.join(script_dir, "runs")
@@ -1920,6 +1974,30 @@ def main() -> None:
         print("\n[collect] Crawling runs/mobo_*/mobo_progress.json for all (X,Y) pairs …")
         X_prior, Y_prior, n_runs = collect_all_observations(runs_dir)
         print(f"  [collect] {len(Y_prior)} trial(s) from {n_runs} run(s) -> prior history.")
+
+        ds = resolve_dataset_from_cfg(cfg)
+        _launch_run(runs_dir, ds, time_limit_hours, args.max_trials,
+                    seed_X=seed_X, X_prior=X_prior, Y_prior=Y_prior)
+        return
+
+    # ── Resume-from: seed from a SPECIFIC run's stored results (no re-eval) ──
+    if args.resume_from:
+        run_path = os.path.normpath(args.resume_from)
+        if not os.path.isdir(run_path):
+            sys.exit(f"--resume-from: directory not found: {run_path}")
+        cfg = load_run_config_from_path(run_path)
+        if cfg.get("hparam_names") and cfg["hparam_names"] != HPARAM_NAMES:
+            print("  [resume-from] WARNING: source run's hparam_names differ from the "
+                  "current HPARAM_SPACE; only matching trials are collected.")
+        print("=" * 70)
+        print(f"ZoMBI-Hop MOBO — RESUME-FROM {os.path.basename(run_path)}")
+        print(f"Device: {DEVICE}   |   time limit/trial: {time_limit_hours} h   |   "
+              f"{'maximize' if cfg['maximize'] else 'minimize'}")
+        print("=" * 70)
+
+        print(f"\n[collect] Loading prior data from {run_path} …")
+        X_prior, Y_prior = collect_observations_from_run(run_path)
+        print(f"  [collect] {len(Y_prior)} trial(s) -> prior history.")
 
         ds = resolve_dataset_from_cfg(cfg)
         _launch_run(runs_dir, ds, time_limit_hours, args.max_trials,
