@@ -58,6 +58,13 @@ MARKER_SIZE = 3.5
 MARKER_OPACITY = 0.18
 FIG_W, FIG_H = 950, 850
 
+# Objective threshold separating near-optimal "basins" from the background.
+# Compositions whose objective falls below it are de-emphasised: blacked out in
+# the 3D ternary heatmap, made transparent (hidden) in the 4D point cloud. The
+# same value is shared by both views and imported by analyze_basin_vol.py, which
+# draws it as the "basin threshold" line. Objectives are normalised to [0.5, 1].
+BASIN_THRESHOLD = 0.9
+
 # 3D ternary view (3-simplex heatmap).
 DEFAULT_GRID_N_3D = 120
 TERNARY_MARKER_SIZE = 4.0
@@ -98,6 +105,11 @@ def build_ternary_grid(grid_n: int) -> np.ndarray:
         for j in range(grid_n + 1 - i)
     ]
     return np.array(pts)
+
+
+def basin_mask(obj: np.ndarray, threshold: float = BASIN_THRESHOLD) -> np.ndarray:
+    """Boolean mask of compositions at or above ``threshold`` (the basins)."""
+    return np.asarray(obj) >= threshold
 
 
 def to_3d(comp: np.ndarray) -> np.ndarray:
@@ -499,6 +511,14 @@ def build_app():
                            tooltip={"placement": "bottom", "always_visible": True}),
             ], id="grid-4d-wrap", style={"padding": "10px", "display": "none"}),
             html.Div([
+                html.Label("Basin Threshold (below: blacked out in 3D, "
+                           "transparent in 4D)"),
+                dcc.Slider(id="basin-threshold", min=0.5, max=1.0, step=0.01,
+                           value=BASIN_THRESHOLD,
+                           marks={round(i, 2): f"{i:.2f}" for i in np.arange(0.5, 1.01, 0.1)},
+                           tooltip={"placement": "bottom", "always_visible": True}),
+            ], style={"padding": "10px"}),
+            html.Div([
                 html.Button("Save as Default", id="save-btn", n_clicks=0,
                             style={"marginTop": "10px", "padding": "8px 24px"}),
                 html.Span(id="save-status", style={"marginLeft": "12px"}),
@@ -596,11 +616,12 @@ def build_app():
         Input("grid-res-3d", "value"),
         Input("grid-res-4d", "value"),
         Input("ack-seed", "value"),
+        Input("basin-threshold", "value"),
     )
     def update_plot(dim_sel, objective, n_optima, noise_freq,
                     intensity_mean, intensity_var, n_major, n_micro, major_sigma,
                     micro_sigma, micro_weight, seed, grid_res_3d, grid_res_4d,
-                    ack_seed):
+                    ack_seed, basin_threshold):
         dim = 3 if dim_sel == "3d" else 4
 
         if objective == "bumps":
@@ -629,16 +650,25 @@ def build_app():
             comp = build_ternary_grid(int(grid_res_3d))
             obj = fn.predict(comp)
             obj_min, obj_max = float(np.nanmin(obj)), float(np.nanmax(obj))
+            above = basin_mask(obj, basin_threshold)
+            traces = []
+            if (~above).any():
+                traces.append(go.Scatterternary(
+                    a=comp[~above, 2], b=comp[~above, 0], c=comp[~above, 1],
+                    mode="markers", name="below basin threshold",
+                    hoverinfo="skip", showlegend=False,
+                    marker=dict(color="black", size=TERNARY_MARKER_SIZE),
+                ))
             heat = go.Scatterternary(
-                a=comp[:, 2], b=comp[:, 0], c=comp[:, 1], mode="markers",
+                a=comp[above, 2], b=comp[above, 0], c=comp[above, 1], mode="markers",
                 name="objective", hoverinfo="skip",
                 marker=dict(
-                    color=obj, colorscale="Viridis",
+                    color=obj[above], colorscale="Viridis",
                     cmin=obj_min, cmax=obj_max, size=TERNARY_MARKER_SIZE,
                     showscale=True, colorbar=dict(title="Objective", x=1.02),
                 ),
             )
-            traces = [heat]
+            traces.append(heat)
             if len(peaks):
                 traces.append(go.Scatterternary(
                     a=peaks[:, 2], b=peaks[:, 0], c=peaks[:, 1], mode="markers",
@@ -667,16 +697,21 @@ def build_app():
         xyz = to_3d(comp)
         obj_min, obj_max = float(obj.min()), float(obj.max())
 
+        # Below-threshold points become transparent (dropped) so the basins show
+        # through; the colourbar stays pinned to the full objective range.
+        above = basin_mask(obj, basin_threshold)
+        comp_v, xyz_v, obj_v = comp[above], xyz[above], obj[above]
+
         hover = [
             f"x=[{a:.2f}, {b:.2f}, {c:.2f}, {d:.2f}]<br>obj={v:.2f}"
-            for (a, b, c, d), v in zip(comp, obj)
+            for (a, b, c, d), v in zip(comp_v, obj_v)
         ]
 
         cloud = go.Scatter3d(
-            x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2], mode="markers",
+            x=xyz_v[:, 0], y=xyz_v[:, 1], z=xyz_v[:, 2], mode="markers",
             name="objective", text=hover, hoverinfo="text",
             marker=dict(
-                color=obj, colorscale="Viridis",
+                color=obj_v, colorscale="Viridis",
                 cmin=obj_min, cmax=obj_max,
                 size=MARKER_SIZE, opacity=MARKER_OPACITY,
                 showscale=True, colorbar=dict(title="Objective"),
