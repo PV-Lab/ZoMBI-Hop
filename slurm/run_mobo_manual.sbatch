@@ -151,12 +151,14 @@ _mobo_setup_env
 # ACTIVE COMMAND — edit this block only (one MOBO_CMD= assignment in this file)
 # =============================================================================
 
-MOBO_CMD=(
-  python optimize/run_mobo.py
-  --no-show
-  --device cuda
-  --resume-from optimize/runs/mobo_19_06_13_01_55_545039
-)
+  MOBO_CMD=(
+    python optimize/run_mobo.py
+    --no-show
+    --device cuda
+    --dataset ackley4d
+    --ackley-variant realistic
+    --time-limit 0.1
+  )
 
 # =============================================================================
 
