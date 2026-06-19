@@ -1,0 +1,10 @@
+{
+  "name": "synthetic_3d_rastrigin_ilr_rf_max",
+  "csv_path": "synthetic_data/data/campaign3d_synthetic_rastrigin_ilr.csv",
+  "metadata_path": "synthetic_data/data/campaign3d_synthetic_rastrigin_ilr_meta.json",
+  "objective_column": "Objective",
+  "composition_columns": ["Comp1", "Comp2", "Comp3"],
+  "maximize": true,
+  "max_trials": 20,
+  "time_limit_hours": 0.4
+}

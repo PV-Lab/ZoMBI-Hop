@@ -1,0 +1,7 @@
+{
+    "n_peaks": 20,
+    "sigma": 0.10,
+    "sigma_var": 0.01,
+    "noise_freq": 9.0,
+    "noise_amp": 0.0
+}

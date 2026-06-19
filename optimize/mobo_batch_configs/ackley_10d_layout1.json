@@ -1,0 +1,12 @@
+{
+  "name": "ackley_10d_layout1",
+  "landscape": "ackley",
+  "dim": 10,
+  "layout": "1",
+  "ackley_b": 1.2,
+  "maximize": true,
+  "n_init_trials": 8,
+  "max_trials": 28,
+  "time_limit_hours": null,
+  "max_activations": null
+}

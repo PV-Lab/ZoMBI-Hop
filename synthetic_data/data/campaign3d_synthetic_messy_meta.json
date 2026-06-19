@@ -1,0 +1,47 @@
+{
+  "oracle": "messy",
+  "dim": 3,
+  "layout": "2",
+  "seed": 42,
+  "maximize": true,
+  "true_optima": [
+    [
+      0.3333333333333333,
+      0.3333333333333333,
+      0.3333333333333333
+    ],
+    [
+      1.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.5,
+      0.5,
+      0.0
+    ],
+    [
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "composition_columns": [
+    "Comp1",
+    "Comp2",
+    "Comp3"
+  ],
+  "objective_column": "Objective",
+  "n_samples": 700,
+  "sampling": "campaign",
+  "sampling_desc": "52 lines \u00d7 8 pts + 42 local \u00d7 5 peaks + 70 uniform",
+  "noise_std": 0.07,
+  "outlier_frac": 0.06,
+  "csv_path": "/Users/steorra/ZoMBI-Hop/synthetic_data/data/campaign3d_synthetic_messy.csv",
+  "oracle_label": "Messy campaign (5 major + 150 signed micro + 30 ILR ripples)"
+}

@@ -1,12 +1,14 @@
 """
 optimize/run_mobo.py
 ====================
-Multi-objective Bayesian optimisation (MOBO) of ZoMBI-Hop hyperparameters,
-evaluated on a selectable objective (``--dataset``): the 3-simplex Random-Forest
-surrogate built from campaign1a.csv (default), or an analytic negated-Ackley
-benchmark on the 3-/4-/10-simplex (``ackley3d`` / ``ackley4d`` / ``ackley10d``).
-The hyperparameters are dimension-independent, so the same search works at any
-dimension.
+Multi-objective Bayesian optimisation (MOBO) of ZoMBI-Hop hyperparameters.
+
+Landscapes (``--landscape`` or batch JSON ``"landscape"`` field):
+  • ``rf`` (default) — Random-Forest surrogate on a composition CSV (campaign1a)
+  • ``synthetic``    — Direct analytic oracle (messy, gaussian, …) — MOBO default
+                       for synthetic benchmarks; RF is comparison-only (see
+                       synthetic_data/compare_campaign_datasets.py)
+  • ``ackley``       — Multi-Ackley sum on the d-dimensional probability simplex
 
 Three objectives (all minimised):
   1. dist_to_needles      – symmetric greedy matching distance between needles and
@@ -105,6 +107,29 @@ Usage
   python optimize/make_videos.py                       # newest run
   python optimize/make_videos.py <run_dir>             # specific run
   python optimize/make_videos.py <run_dir> --force     # rebuild all
+
+Non-interactive / MIT ORCD HPC
+------------------------------
+  # Campaign RF (headless JSON config):
+  MPLBACKEND=Agg python optimize/run_mobo.py --batch --config optimize/mobo_batch_configs/campaign1a_objective_min.json
+
+  # Synthetic 3D oracle (direct — no RF CSV):
+  MPLBACKEND=Agg python optimize/run_mobo.py --batch --config optimize/mobo_batch_configs/synthetic_3d_messy.json
+
+  # 10D Multi-Ackley synthetic benchmark:
+  MPLBACKEND=Agg python optimize/run_mobo.py --batch --config optimize/mobo_batch_configs/ackley_10d_layout1.json
+
+  # Submit one Slurm job (CPU or GPU):
+  cd ~/ZoMBI-Hop && bash scripts/submit_mobo.sh
+  MOBO_DEVICE=cuda MOBO_CONFIG=optimize/mobo_batch_configs/ackley_10d_layout1.json bash scripts/submit_mobo.sh
+
+  # Submit a batch (one array task per manifest entry):
+  cd ~/ZoMBI-Hop && bash scripts/submit_mobo_batch.sh
+  MOBO_DEVICE=cuda MOBO_MANIFEST=optimize/mobo_batch_manifest_synthetic_3d.json bash scripts/submit_mobo_batch.sh
+
+Each trial appends to ``trials_log.csv`` (hyperparameters + metrics) and
+``all_samples.csv`` (every ZoMBI sample point with trial/phase context).
+``mobo_progress.json`` is still rewritten atomically after every trial.
 """
 
 from __future__ import annotations
@@ -130,19 +155,18 @@ from scipy.optimize import minimize as sp_minimize
 from scipy.spatial import ConvexHull, cKDTree
 
 import matplotlib
-# Prefer the interactive TkAgg backend, but fall back to the headless Agg
-# backend when there is no display (e.g. a SLURM compute node). matplotlib.use()
-# defers loading the backend, so importing the canvas here forces any failure to
-# surface now rather than at the first draw() call (which would otherwise raise
-# "initialization failed" deep inside the plotting code).
-if os.environ.get("DISPLAY") or sys.platform == "darwin":
-    try:
-        matplotlib.use("TkAgg")
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # noqa: F401
-    except Exception:
+
+
+def _configure_mpl_backend(*, headless: bool) -> None:
+    """Pick a matplotlib backend: respect MPLBACKEND, else Agg when headless."""
+    if os.environ.get("MPLBACKEND"):
+        matplotlib.use(os.environ["MPLBACKEND"])
+    elif headless:
         matplotlib.use("Agg")
-else:
-    matplotlib.use("Agg")
+    else:
+        matplotlib.use("TkAgg")
+
+
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -180,6 +204,20 @@ from synthetic_data.ackley import Ackley
 # benchmarks on the d-simplex whose optima are known in closed form (no picker).
 DATASET_DIMS = {"RF": 3, "ackley3d": 3, "ackley4d": 4, "ackley10d": 10}
 
+from optimize.mobo_landscapes import (
+    LandscapeSpec,
+    build_ackley_landscape,
+    build_rf_landscape,
+    build_synthetic_landscape,
+    composition_column_names,
+    infer_composition_columns,
+    interactive_ackley_startup,
+    landscape_from_run_config,
+    parse_ackley_batch_fields,
+    parse_synthetic_batch_fields,
+)
+from synthetic_data.campaign_datasets import load_metadata, resolve_metadata_path
+
 # ─── Global config ────────────────────────────────────────────────────────────
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -199,9 +237,7 @@ N_MOBO_SAMPLES   = 512
 # Per-trial wall-clock budget (hours) passed to ZoMBIHop.run(time_limit_hours=…).
 TIME_LIMIT_HOURS = 0.4
 
-# pct_matched: a needle counts as "valid" if it is within this Euclidean
-# (composition L2) radius of some true optimum.
-MATCH_RADIUS = 0.05
+# Needle-match / duplicate thresholds: see optimize/eval_metrics.py (ILR, dim-scaled).
 
 # Resumability: abort the overnight run only after this many trials fail back-to-back
 # (guards against a runaway loop on a systemic failure; transient failures just retry).
@@ -351,47 +387,135 @@ def _log_error(run_dir: str, trial_num: int, exc: Exception) -> None:
 
 # ─── Deterministic RF surrogate (rebuilt identically on resume) ─────────────────
 
-def build_rf_and_grid(csv_path: str):
-    """Train the RF surrogate from campaign1a.csv and build the ternary grid.
+def build_rf_and_grid(
+    csv_path: str,
+    objective_column: str = "Objective",
+    composition_columns: list[str] | None = None,
+):
+    """Train the RF surrogate from a campaign or synthetic CSV.
 
     Deterministic (fixed random_state / tree count), so a resumed run rebuilds an
     identical surrogate without re-prompting the interactive extrema picker.
-    Returns (rf, rf_fn, grid_pts, grid_vals).
+    Returns (rf, rf_fn, grid_pts, grid_vals, composition_columns, dim).
     """
-    df = pd.read_csv(csv_path).dropna(subset=["FAPbI3", "MAPbI3", "MAPbBr3", "Objective"])
-    X_data = df[["FAPbI3", "MAPbI3", "MAPbBr3"]].values.astype(float)
+    df = pd.read_csv(csv_path)
+    comp_cols = infer_composition_columns(df, explicit=composition_columns)
+    dim = len(comp_cols)
+    df = df.dropna(subset=comp_cols + [objective_column])
+    X_data = df[comp_cols].values.astype(float)
     X_data /= X_data.sum(axis=1, keepdims=True)
-    y_data = df["Objective"].values.astype(float)
+    y_data = df[objective_column].values.astype(float)
     rf = RandomForestRegressor(n_estimators=RF_N_ESTIMATORS, n_jobs=-1, random_state=42)
     rf.fit(X_data, y_data)
-    grid_pts  = ternary_grid(TERNARY_GRID_N)
-    grid_vals = rf.predict(grid_pts)
+    if dim == 3:
+        grid_pts = ternary_grid(TERNARY_GRID_N)
+        grid_vals = rf.predict(grid_pts)
+    else:
+        grid_pts = grid_vals = None
     rf_fn = lambda x, _rf=rf: float(_rf.predict(x.reshape(1, -1))[0])
-    return rf, rf_fn, grid_pts, grid_vals
+    return rf, rf_fn, grid_pts, grid_vals, comp_cols, dim
+
+
+def _load_rf_batch_extras(cfg: dict, csv_path: str, repo_root: str) -> dict:
+    """Merge optional synthetic metadata sidecar into a batch RF config."""
+    meta_path = cfg.get("metadata_path")
+    if meta_path and not os.path.isabs(meta_path):
+        meta_path = os.path.normpath(os.path.join(repo_root, meta_path))
+    resolved = resolve_metadata_path(csv_path, meta_path)
+    extras = {
+        "composition_columns": cfg.get("composition_columns"),
+        "oracle": cfg.get("oracle"),
+        "metadata_path": resolved,
+        "maximize": bool(cfg.get("maximize", False)),
+        "true_optima": [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
+        if cfg.get("true_optima") else [],
+    }
+    if not resolved:
+        return extras
+    try:
+        meta = load_metadata(resolved)
+    except Exception as exc:
+        print(f"  [batch] WARNING: metadata unreadable ({resolved}): {exc}")
+        return extras
+    if not extras["composition_columns"] and meta.get("composition_columns"):
+        extras["composition_columns"] = list(meta["composition_columns"])
+    if not extras["oracle"] and meta.get("oracle"):
+        extras["oracle"] = str(meta["oracle"])
+    if not extras["true_optima"] and meta.get("true_optima"):
+        extras["true_optima"] = [np.asarray(t, dtype=float) for t in meta["true_optima"]]
+    if "maximize" not in cfg and "maximize" in meta:
+        extras["maximize"] = bool(meta["maximize"])
+    return extras
 
 
 # ─── Run-config persistence + resume ────────────────────────────────────────────
 
-def write_run_config(run_dir, maximize, csv_path, true_optima, *, dataset="RF",
-                     dim=3, ackley_variant=None) -> None:
-    """Persist the static run state needed for a fully non-interactive resume.
+def _slurm_metadata() -> dict:
+    """Capture Slurm / host context for reproducibility (best-effort)."""
+    keys = (
+        "SLURM_JOB_ID", "SLURM_ARRAY_TASK_ID", "SLURM_ARRAY_JOB_ID",
+        "SLURM_JOB_NAME", "SLURM_CLUSTER_NAME", "SLURM_CPUS_PER_TASK",
+        "SLURM_MEM_PER_NODE", "SLURM_JOB_PARTITION", "HOSTNAME",
+    )
+    meta = {k.lower(): os.environ[k] for k in keys if os.environ.get(k)}
+    meta["submitted_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+    return meta
 
-    ``dataset`` / ``dim`` / ``ackley_variant`` describe the objective so that
-    downstream tools (``coverage_plot.py``, ``evaluate.py``) can rebuild the same
-    ground truth.  ``csv_path`` is only meaningful for the RF dataset; it is
-    ``None`` for the analytic Ackley benchmarks.
-    """
+
+def write_run_config(run_dir, landscape: LandscapeSpec, *,
+                     batch_name: str | None = None,
+                     batch_config_path: str | None = None,
+                     n_init_trials: int = N_INIT_TRIALS) -> None:
+    """Persist the static run state needed for a fully non-interactive resume."""
     cfg = {
-        "maximize":       bool(maximize),
-        "dataset":        dataset,
-        "dim":            int(dim),
-        "ackley_variant": ackley_variant,
-        "csv_path":       os.path.abspath(csv_path) if csv_path else None,
-        "true_optima":    [list(map(float, np.asarray(t).ravel())) for t in true_optima],
-        "n_init_trials":  N_INIT_TRIALS,
-        "hparam_names":   HPARAM_NAMES,
-        "created":        datetime.datetime.now().isoformat(timespec="seconds"),
+        "landscape":       landscape.landscape,
+        "dim":             landscape.dim,
+        "maximize":        bool(landscape.maximize),
+        "true_optima":     [list(map(float, np.asarray(t).ravel())) for t in landscape.true_optima],
+        "n_init_trials":   n_init_trials,
+        "hparam_names":    HPARAM_NAMES,
+        "time_limit_hours": landscape.time_limit_hours,
+        "max_activations": landscape.max_activations,
+        "created":         datetime.datetime.now().isoformat(timespec="seconds"),
     }
+    if landscape.landscape == "rf":
+        cfg["csv_path"] = landscape.csv_path
+        cfg["objective_column"] = landscape.objective_column
+        if landscape.composition_columns:
+            cfg["composition_columns"] = landscape.composition_columns
+        if landscape.oracle:
+            cfg["oracle"] = landscape.oracle
+        if landscape.metadata_path:
+            cfg["metadata_path"] = landscape.metadata_path
+    if landscape.landscape == "ackley":
+        cfg["ackley_layout"] = landscape.ackley_layout
+        cfg["ackley_b"] = landscape.ackley_b
+    if landscape.landscape == "synthetic":
+        cfg["oracle"] = landscape.oracle
+        cfg["ackley_layout"] = landscape.ackley_layout
+        if landscape.synthetic_seed is not None:
+            cfg["seed"] = landscape.synthetic_seed
+    if batch_name:
+        cfg["batch_name"] = batch_name
+    if batch_config_path:
+        cfg["batch_config_path"] = os.path.abspath(batch_config_path)
+    from synthetic_data.landscape_config_log import build_landscape_config_log, dataset_label_for_landscape
+    cfg["landscape_config"] = build_landscape_config_log(
+        dataset=dataset_label_for_landscape(
+            landscape.landscape, dim=landscape.dim, oracle=landscape.oracle,
+        ),
+        ds={
+            "dim": landscape.dim,
+            "oracle": landscape.oracle,
+            "landscape": landscape.landscape,
+            "fn": landscape.fn_callable,
+            "csv_path": landscape.csv_path,
+            "metadata_path": landscape.metadata_path,
+            "seed": landscape.synthetic_seed,
+            "layout": landscape.ackley_layout,
+        },
+    )
+    cfg["slurm"] = _slurm_metadata()
     _atomic_write_text(os.path.join(run_dir, "run_config.json"), json.dumps(cfg, indent=2))
 
 
@@ -451,47 +575,232 @@ def load_run_config_from_path(path: str) -> dict:
     return cfg
 
 
-def _time_objective(metrics: dict) -> float:
-    """Third MOBO objective: average wall-clock seconds per ZoMBI iteration.
-
-    Prefers the current ``avg_time_per_iter_s`` key. Older runs stored total
-    ``runtime_s`` instead (the objective used to be whole-trial wall clock), so it
-    is used as a fallback to keep prior data seedable on resume — note such values
-    are totals, not per-iteration, so a resume mixing old and new trials is only
-    approximate on this objective.
-    """
-    if "avg_time_per_iter_s" in metrics:
-        return float(metrics["avg_time_per_iter_s"])
-    return float(metrics["runtime_s"])
-
-
-def _collect_from_progress(path: str, X_obs: list, Y_obs: list) -> int:
-    """Load (X_norm, Y) pairs from one mobo_progress.json; append to X_obs/Y_obs.
-
-    Returns the number of usable trials found.
-    """
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except Exception as exc:
-        print(f"  [collect] {path} unreadable ({exc}); skipping.")
-        return 0
-    used = 0
-    for t in data.get("trials", []):
-        hp, m = t.get("hparams", {}), t.get("metrics", {})
-        if not all(name in hp for name in HPARAM_NAMES):
-            continue  # stale / different hyperparameter set
-        try:
-            x = hparams_to_norm(hp)
-            y = torch.tensor([-float(m["dist_to_needles"]),
-                              -float(m["dup_fraction"]),
-                              -_time_objective(m)], dtype=DTYPE)
-        except (KeyError, ValueError, TypeError):
+def auto_detect_rf_optima(
+    rf: RandomForestRegressor,
+    grid_pts: np.ndarray,
+    grid_vals: np.ndarray,
+    *,
+    maximize: bool,
+    n_peaks: int = 3,
+    min_sep: float = 0.08,
+) -> list[np.ndarray]:
+    """Greedy top-grid peak picking + L-BFGS-B refinement (headless picker)."""
+    order = np.argsort(grid_vals)
+    if not maximize:
+        order = order[::-1]
+    chosen: list[np.ndarray] = []
+    for idx in order:
+        if len(chosen) >= n_peaks:
+            break
+        pt = grid_pts[idx]
+        if any(float(np.linalg.norm(pt - c)) < min_sep for c in chosen):
             continue
-        X_obs.append(x)
-        Y_obs.append(y)
-        used += 1
-    return used
+        x_ref, _ = _refine_extremum(rf, pt, maximize=maximize)
+        if any(float(np.linalg.norm(x_ref - c)) < min_sep for c in chosen):
+            continue
+        chosen.append(x_ref)
+    if not chosen:
+        chosen = [np.array([1 / 3, 1 / 3, 1 / 3], dtype=float)]
+    return chosen
+
+
+def load_batch_config(path: str, script_dir: str) -> dict:
+    """Load a headless run config JSON (paths resolved relative to repo root)."""
+    cfg_path = os.path.abspath(path)
+    if not os.path.exists(cfg_path):
+        sys.exit(f"--config: file not found: {cfg_path}")
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except Exception as exc:
+        sys.exit(f"--config: {cfg_path} unreadable ({exc}).")
+
+    repo_root = os.path.normpath(os.path.join(script_dir, ".."))
+    landscape_type = cfg.get("landscape", "rf")
+    maximize = bool(cfg.get("maximize", False))
+    time_limit = cfg.get("time_limit_hours")
+
+    if landscape_type == "ackley":
+        try:
+            ack = parse_ackley_batch_fields(cfg)
+        except ValueError as exc:
+            sys.exit(f"--config: {exc}")
+        landscape = build_ackley_landscape(
+            ack["dim"], ack["layout"], b=ack["ackley_b"],
+            time_limit_hours=time_limit,
+            max_activations=ack["max_activations"],
+        )
+        print(f"  [batch] Multi-Ackley d={ack['dim']} layout={ack['layout']} b={ack['ackley_b']}")
+        print(f"  [batch] {len(landscape.true_optima)} planted peaks  |  "
+              f"max_activations={landscape.max_activations}")
+        return {
+            "name":              cfg.get("name") or os.path.splitext(os.path.basename(cfg_path))[0],
+            "landscape":         landscape,
+            "maximize":          True,
+            "true_optima":       landscape.true_optima,
+            "max_trials":        cfg.get("max_trials"),
+            "time_limit_hours":  time_limit,
+            "n_init_trials":     cfg.get("n_init_trials", N_INIT_TRIALS),
+            "auto_optima":       None,
+            "config_path":       cfg_path,
+            "csv_path":          None,
+            "objective_column":  None,
+        }
+
+    if landscape_type == "synthetic":
+        try:
+            syn = parse_synthetic_batch_fields(cfg)
+        except ValueError as exc:
+            sys.exit(f"--config: {exc}")
+        landscape = build_synthetic_landscape(
+            syn["oracle"], syn["dim"], syn["layout"],
+            seed=syn["seed"],
+            time_limit_hours=time_limit,
+        )
+        maximize = bool(cfg.get("maximize", True))
+        print(f"  [batch] Synthetic oracle={syn['oracle']} d={syn['dim']} "
+              f"layout={syn['layout']} seed={syn['seed']}")
+        print(f"  [batch] {len(landscape.true_optima)} planted peaks (direct oracle, no RF)")
+        return {
+            "name":              cfg.get("name") or os.path.splitext(os.path.basename(cfg_path))[0],
+            "landscape":         landscape,
+            "maximize":          maximize,
+            "true_optima":       landscape.true_optima,
+            "max_trials":        cfg.get("max_trials"),
+            "time_limit_hours":  time_limit,
+            "n_init_trials":     cfg.get("n_init_trials", N_INIT_TRIALS),
+            "auto_optima":       None,
+            "config_path":       cfg_path,
+            "csv_path":          None,
+            "objective_column":  None,
+        }
+
+    csv_path = cfg.get("csv_path")
+    if not csv_path:
+        sys.exit(f"--config: {cfg_path} must include 'csv_path' for RF landscape.")
+    if not os.path.isabs(csv_path):
+        csv_path = os.path.normpath(os.path.join(repo_root, csv_path))
+    if not os.path.exists(csv_path):
+        sys.exit(f"--config: csv_path does not exist: {csv_path}")
+
+    rf_extras = _load_rf_batch_extras(cfg, csv_path, repo_root)
+    composition_columns = rf_extras.get("composition_columns")
+    oracle = rf_extras.get("oracle")
+    metadata_path = rf_extras.get("metadata_path")
+    maximize = rf_extras["maximize"]
+
+    true_optima: list[np.ndarray] = list(rf_extras.get("true_optima") or [])
+    if cfg.get("true_optima"):
+        true_optima = [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
+    elif not true_optima and cfg.get("regions_objective"):
+        regions_path = cfg.get("regions_path", "scripts/max_min_regions.json")
+        if not os.path.isabs(regions_path):
+            regions_path = os.path.normpath(os.path.join(repo_root, regions_path))
+        if not os.path.exists(regions_path):
+            sys.exit(f"--config: regions_path not found: {regions_path}")
+        with open(regions_path) as f:
+            regions = json.load(f)
+        obj_key = cfg["regions_objective"]
+        obj = regions.get("objectives", {}).get(obj_key)
+        if obj is None:
+            sys.exit(f"--config: regions_objective '{obj_key}' not in {regions_path}")
+        seed_key = "max_seeds" if maximize else "min_seeds"
+        seeds = obj.get(seed_key) or []
+        if not seeds:
+            sys.exit(f"--config: no {seed_key} for '{obj_key}' in {regions_path}")
+        true_optima = [np.asarray(s, dtype=float) for s in seeds]
+        print(f"  [batch] loaded {len(true_optima)} reference optima from "
+              f"{obj_key}/{seed_key}")
+
+    return {
+        "name":              cfg.get("name") or os.path.splitext(os.path.basename(cfg_path))[0],
+        "landscape":         None,
+        "csv_path":          csv_path,
+        "objective_column":  cfg.get("objective_column", "Objective"),
+        "composition_columns": composition_columns,
+        "oracle":            oracle,
+        "metadata_path":     metadata_path,
+        "maximize":          maximize,
+        "true_optima":       true_optima,
+        "max_trials":        cfg.get("max_trials"),
+        "time_limit_hours":  time_limit,
+        "n_init_trials":     cfg.get("n_init_trials", N_INIT_TRIALS),
+        "auto_optima":       cfg.get("auto_optima"),
+        "config_path":       cfg_path,
+    }
+
+
+def _append_csv_rows(path: str, fieldnames: list[str], rows: list[dict]) -> None:
+    """Append rows to a CSV, writing the header when the file is new."""
+    if not rows:
+        return
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if write_header:
+            w.writeheader()
+        for row in rows:
+            w.writerow(row)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def append_trial_logs(
+    run_dir: str,
+    trial_num: int,
+    phase: str,
+    hparams: dict,
+    metrics: dict,
+    trial_dir: str,
+    *,
+    dim: int = 3,
+) -> None:
+    """Append one trial row + all sample points for live analysis on HPC."""
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    trial_row = {
+        "timestamp": ts,
+        "trial": trial_num,
+        "phase": phase,
+        "dist_to_needles": round(metrics["dist"], 6),
+        "dup_fraction": round(metrics["dup"], 6),
+        "runtime_s": round(metrics["runtime"], 3),
+    }
+    for k, v in hparams.items():
+        trial_row[f"hp_{k}"] = v
+    hp_cols = [f"hp_{k}" for k in HPARAM_NAMES]
+    _append_csv_rows(
+        os.path.join(run_dir, "trials_log.csv"),
+        ["timestamp", "trial", "phase", "dist_to_needles", "dup_fraction", "runtime_s"]
+        + hp_cols,
+        [trial_row],
+    )
+
+    points_path = os.path.join(trial_dir, "points.csv")
+    if not os.path.exists(points_path):
+        return
+    comp_cols = composition_column_names(dim)
+    sample_rows: list[dict] = []
+    with open(points_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            sample_row = {
+                "timestamp": ts,
+                "trial": trial_num,
+                "phase": phase,
+                "sample_idx": row.get("sample_idx"),
+                "Y": row.get("Y"),
+                "penalized": row.get("penalized"),
+                "activation": row.get("activation"),
+                "zoom": row.get("zoom"),
+            }
+            for col in comp_cols:
+                sample_row[col] = row.get(col)
+            sample_rows.append(sample_row)
+    _append_csv_rows(
+        os.path.join(run_dir, "all_samples.csv"),
+        ["timestamp", "trial", "phase", "sample_idx"] + comp_cols
+        + ["Y", "penalized", "activation", "zoom"],
+        sample_rows,
+    )
 
 
 def collect_all_observations(runs_dir: str):
@@ -515,21 +824,140 @@ def collect_all_observations(runs_dir: str):
     return X_obs, Y_obs, n_runs
 
 
-def collect_observations_from_run(run_dir: str):
-    """Load (X_norm, Y) pairs from a single run's mobo_progress.json.
+def _read_needles_csv(path: str, dim: int = 3) -> np.ndarray:
+    """Read a trial's needles.csv → (N, dim) composition array."""
+    import csv as _csv
+    cols = composition_column_names(dim)
+    pts = []
+    with open(path, newline="") as f:
+        for row in _csv.DictReader(f):
+            pts.append([float(row[c]) for c in cols])
+    return np.array(pts, dtype=float) if pts else np.empty((0, dim))
 
-    Like ``collect_all_observations`` but scoped to one run directory. Used by
-    ``--resume-from`` to trust only a specific run's stored metrics without
-    re-evaluating anything.
-    Returns (X_obs, Y_obs).
+
+def collect_rederived_observations(runs_dir: str, new_maximize: bool,
+                                   new_optima: list[np.ndarray]):
+    """Crawl prior runs and rebuild (X, Y) under a freshly-picked run config.
+
+    Used by ``--resume-scratch``. ``dist_to_needles`` is the only objective that
+    depends on the picked optima, and it is a post-hoc geometric score over the
+    needles a trial discovered — those are persisted per trial in needles.csv, so
+    it can be recomputed against ``new_optima`` with no ZoMBI re-runs. ``dup`` and
+    ``runtime`` don't depend on the config and are reused as stored.
+
+    Trials whose needles.csv is missing (older runs that never wrote per-trial
+    dirs) cannot be re-scored. Rather than drop them, the stored
+    ``dist_to_needles`` is reused as-is with a per-run warning — an approximation
+    that is reasonable only when the new optima are close to the run's original
+    ones.
+
+    This is only valid when the search direction is unchanged: flipping max/min
+    changes which points are "good", so the stored needles would be invalid. If
+    any prior run's direction differs from ``new_maximize`` (case 2), this aborts
+    via ``sys.exit`` and nothing is run.
+
+    Returns (X_obs, Y_obs, n_runs).
     """
-    path = os.path.join(run_dir, "mobo_progress.json")
-    if not os.path.exists(path):
-        sys.exit(f"--resume-from: no mobo_progress.json found in {run_dir}")
+    run_dirs = sorted(glob.glob(os.path.join(runs_dir, "mobo_*")))
+
+    # ── Pass 1: verify every prior run's direction matches the new selection ──
+    mismatched, no_config = [], []
+    for rd in run_dirs:
+        if not os.path.exists(os.path.join(rd, "mobo_progress.json")):
+            continue
+        cfg_path = os.path.join(rd, "run_config.json")
+        if not os.path.exists(cfg_path):
+            no_config.append(os.path.basename(rd))
+            continue
+        try:
+            with open(cfg_path) as f:
+                prior_max = bool(json.load(f).get("maximize"))
+        except Exception:
+            no_config.append(os.path.basename(rd))
+            continue
+        if prior_max != new_maximize:
+            mismatched.append((os.path.basename(rd), prior_max))
+
+    if mismatched:
+        new_dir = "maximize" if new_maximize else "minimize"
+        print("\n" + "=" * 70)
+        print("  [resume-scratch] ABORT — direction flip detected (case 2).")
+        print(f"  You selected '{new_dir}', but these prior runs used the opposite "
+              f"direction:")
+        for name, pm in mismatched:
+            print(f"    - {name}: {'maximize' if pm else 'minimize'}")
+        print("  Flipping max/min changes the entire ZoMBI search, so the stored "
+              "needles are\n  invalid and dist_to_needles cannot be re-derived "
+              "without re-running every\n  trial. Nothing has been run. Re-pick the "
+              "matching direction, or start a\n  fresh run instead.")
+        print("=" * 70)
+        sys.exit(1)
+    if no_config:
+        print(f"  [resume-scratch] WARNING: skipping run(s) without a readable "
+              f"run_config.json (direction unverifiable): {', '.join(no_config)}")
+
+    # ── Pass 2: re-derive dist from saved needles; reuse stored dist if absent ──
     X_obs, Y_obs = [], []
-    used = _collect_from_progress(path, X_obs, Y_obs)
-    print(f"  [collect] {os.path.basename(run_dir)}: {used} trial(s)")
-    return X_obs, Y_obs
+    n_runs = 0
+    for rd in run_dirs:
+        run_name = os.path.basename(rd)
+        prog_path = os.path.join(rd, "mobo_progress.json")
+        if not os.path.exists(prog_path) or not os.path.exists(os.path.join(rd, "run_config.json")):
+            continue
+        try:
+            with open(prog_path) as f:
+                data = json.load(f)
+        except Exception as exc:
+            print(f"  [resume-scratch] {prog_path} unreadable ({exc}); skipping.")
+            continue
+        n_rederived = n_reused = 0
+        try:
+            with open(os.path.join(rd, "run_config.json")) as f:
+                run_dim = int(json.load(f).get("dim", 3))
+        except Exception:
+            run_dim = 3
+        for t in data.get("trials", []):
+            hp, m = t.get("hparams", {}), t.get("metrics", {})
+            if not all(name in hp for name in HPARAM_NAMES):
+                continue  # stale / different hyperparameter set
+            needles_path = os.path.join(rd, f"trial_{t.get('trial')}", "needles.csv")
+            try:
+                if os.path.exists(needles_path):
+                    needles = _read_needles_csv(needles_path, dim=run_dim)
+                    dist = metric_dist_to_needles(needles, new_optima, dim=run_dim)
+                    rederived = True
+                else:
+                    # No saved needles → cannot re-score; reuse stored dist as-is.
+                    dist = float(m["dist_to_needles"])
+                    rederived = False
+                x = hparams_to_norm(hp)
+                y = torch.tensor([-float(dist),
+                                  -float(m["dup_fraction"]),
+                                  -float(m["runtime_s"])], dtype=DTYPE)
+            except (KeyError, ValueError, TypeError) as exc:
+                print(f"  [resume-scratch] {run_name} trial "
+                      f"{t.get('trial')}: could not build observation ({exc}); skipping.")
+                continue
+            X_obs.append(x)
+            Y_obs.append(y)
+            if rederived:
+                n_rederived += 1
+            else:
+                n_reused += 1
+        used = n_rederived + n_reused
+        if used:
+            n_runs += 1
+            parts = []
+            if n_rederived:
+                parts.append(f"{n_rederived} re-derived")
+            if n_reused:
+                parts.append(f"{n_reused} reused as-is")
+            print(f"  [resume-scratch] {run_name}: {used} trial(s) ({', '.join(parts)})")
+            if n_reused:
+                print(f"  [resume-scratch]   WARNING: {run_name} has no saved needles — "
+                      f"its dist_to_needles was NOT re-scored to the new optima; reused as "
+                      f"stored (assumed close enough).")
+    return X_obs, Y_obs, n_runs
 
 
 def load_or_make_sobol(run_dir: str, bounds: torch.Tensor, n: int) -> torch.Tensor:
@@ -721,113 +1149,20 @@ class ExtremaPicker:
         return self.extrema
 
 
-# ─── Metrics ──────────────────────────────────────────────────────────────────
+# ─── Metrics (dimension-aware; see optimize/eval_metrics.py) ───────────────────
 
-UNMATCHED_PENALTY = 10.0   # per-term penalty for an unmatched optimum OR needle
-
-
-def metric_dist_to_needles(
-    discovered: np.ndarray,
-    true_optima: list[np.ndarray],
-) -> float:
-    """Symmetric greedy matching distance between needles and true optima.
-
-    Each true optimum is greedily matched (no repeats) to its nearest discovered
-    needle and contributes that Euclidean (composition L2) distance.  Two kinds of
-    leftovers each contribute UNMATCHED_PENALTY:
-
-      • a true optimum with no needle left to match  (missed optimum — recall),
-      • a needle matched to no optimum               (spurious/duplicate — precision).
-
-    The score is the mean over ``max(#needles, #optima)`` terms.  Including a
-    per-needle penalty is what makes the metric symmetric: spawning extra needles
-    near already-matched optima now *raises* the score instead of lowering it, so
-    "needle spam" is penalised rather than rewarded.  When the needle and optimum
-    counts are equal and all match, this reduces to the old mean-distance score.
-    """
-    n_opt = len(true_optima)
-    if n_opt == 0:
-        return 0.0
-    n_disc = len(discovered)
-    if n_disc == 0:
-        return UNMATCHED_PENALTY
-    used: set[int] = set()
-    total = 0.0
-    for t in true_optima:
-        best_d, best_j = float("inf"), -1
-        for j, d in enumerate(discovered):
-            if j in used:
-                continue
-            dist = float(np.linalg.norm(np.asarray(d) - np.asarray(t)))
-            if dist < best_d:
-                best_d, best_j = dist, j
-        if best_j >= 0:
-            used.add(best_j)
-            total += best_d
-        else:
-            total += UNMATCHED_PENALTY          # fewer needles than optima (missed)
-    # Every needle not claimed by an optimum is a false positive (precision term).
-    total += (n_disc - len(used)) * UNMATCHED_PENALTY
-    return total / max(n_disc, n_opt)
-
-
-def metric_dup_fraction(X_all: np.ndarray, threshold: float) -> float:
-    """Fraction of points that have at least one neighbour within threshold.
-
-    Uses a KD-tree (O(n log n)) instead of a dense (n, n, d) pairwise array: the
-    latter is O(n^2) in time and memory and, called once per iteration over the
-    cumulatively-growing point set in ``write_metrics_over_time_csv``, made
-    high-duplicate trials spend hours building distance matrices post-run.
-    """
-    n = len(X_all)
-    if n <= 1:
-        return 0.0
-    tree  = cKDTree(X_all)
-    pairs = tree.query_pairs(r=threshold, output_type="ndarray")  # excludes self
-    if pairs.size == 0:
-        return 0.0
-    has_neighbour = np.zeros(n, dtype=bool)
-    has_neighbour[pairs[:, 0]] = True
-    has_neighbour[pairs[:, 1]] = True
-    return float(has_neighbour.mean())
-
-
-def metric_pct_matched(
-    discovered: np.ndarray,
-    true_optima: list[np.ndarray],
-    radius: float = MATCH_RADIUS,
-) -> float:
-    """Percentage of DISCOVERED needles that lie within `radius` of a true optimum.
-
-    A precision-style score (true positives / all needles): spurious or spammed
-    needles that sit far from every true optimum drag it down, so — unlike a
-    coverage/recall score over the fixed set of true optima — it is NOT monotonic
-    in needle count.  Returns 0.0 when there are no needles (no valid needles yet)
-    or no reference optima (nothing to validate against).
-    """
-    if len(discovered) == 0 or not true_optima:
-        return 0.0
-    disc = np.asarray(discovered, dtype=float)
-    opt  = np.asarray(true_optima, dtype=float)
-    valid = 0
-    for d in disc:
-        if float(np.linalg.norm(opt - d, axis=1).min()) <= radius:
-            valid += 1
-    return 100.0 * valid / len(disc)
-
-
-def metric_avg_pairwise_dist(discovered: np.ndarray) -> float:
-    """Average pairwise Euclidean distance between discovered needles."""
-    disc = np.asarray(discovered, dtype=float)
-    n = len(disc)
-    if n < 2:
-        return 0.0
-    diff  = disc[:, None, :] - disc[None, :, :]
-    dists = np.sqrt((diff ** 2).sum(axis=-1))
-    iu = np.triu_indices(n, k=1)
-    return float(dists[iu].mean())
-
-
+from eval_metrics import (  # noqa: E402  — after sys.path setup in callers
+    MATCH_RADIUS,
+    SIMPLEX_L2_DIAMETER,
+    UNMATCHED_PENALTY,
+    dup_threshold_ilr,
+    match_radius_ilr,
+    metric_avg_pairwise_dist,
+    metric_dist_to_needles,
+    metric_dup_fraction,
+    metric_pct_matched,
+    unmatched_penalty,
+)
 # ─── ZoMBI sim-objective + LineBO wrapper ──────────────────────────────────────
 
 def make_sim_obj(fn_callable, device, dtype, *, maximize: bool):
@@ -886,19 +1221,11 @@ def make_linebo_wrapper(sim_obj, dim, num_lines, device, dtype, plot_state: dict
     return wrapper
 
 
-def _gen_init_data(fn_callable, maximize: bool, dim: int = 3,
-                   n_init_lines: int | None = None):
-    """Generate random simplex lines on the ``dim``-simplex; return (X_a, X_e, Y).
-
-    ``n_init_lines`` defaults to ``N_INIT_LINES`` (the 3-simplex budget); higher
-    dimensions pass a dimension-scaled count so the seeding effort grows with the
-    volume that must be covered.
-    """
-    if n_init_lines is None:
-        n_init_lines = N_INIT_LINES
+def _gen_init_data(fn_callable, maximize: bool, dim: int = 3):
+    """Generate N_INIT_LINES random simplex lines; return (X_a, X_e, Y)."""
     x_a_list, x_e_list, y_list = [], [], []
-    for _ in range(n_init_lines):
-        x0  = torch.full((dim,), 1.0 / dim, device=DEVICE, dtype=DTYPE)
+    x0 = torch.full((dim,), 1.0 / dim, device=DEVICE, dtype=DTYPE)
+    for _ in range(N_INIT_LINES):
         dir_ = zero_sum_dirs(1, dim, device=DEVICE, dtype=DTYPE).squeeze(0)
         seg  = line_simplex_segment(x0, dir_)
         if seg is None:
@@ -990,7 +1317,7 @@ def _draw_needle_ellipsoid(ax, needle_x, M, B) -> None:
 
 
 def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool,
-                 out_path: str) -> None:
+                 out_path: str, *, ref_title: str = "Reference: RF landscape") -> None:
     """Render one two-panel ternary iteration figure to out_path (no GUI)."""
     fig = Figure(figsize=(16, 6.8))
     FigureCanvasAgg(fig)
@@ -999,7 +1326,7 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
 
     # ── Left: RF reference ──
     draw_ternary_frame(ax_ref)
-    ax_ref.set_title("Reference: RF landscape", fontsize=11)
+    ax_ref.set_title(ref_title, fontsize=11)
     gxy = comp_to_xy(grid_pts)
     sc_ref = ax_ref.scatter(gxy[:, 0], gxy[:, 1], c=grid_vals, cmap="viridis",
                             s=6, alpha=0.72, zorder=2, rasterized=True)
@@ -1142,101 +1469,68 @@ def _activation_zoom_per_point(n_points: int, snap_records: list[tuple]) -> tupl
     return act, zm
 
 
-def coord_cols(dim: int, dataset: str) -> list[str]:
-    """Coordinate column names: FA/MA/Br for the 3-simplex RF (drop-in compatible
-    with the old ternary CSVs), else x1..xd for the analytic benchmarks."""
-    if dataset == "RF" and dim == 3:
-        return ["FA", "MA", "Br"]
-    return [f"x{i + 1}" for i in range(dim)]
-
-
-def write_points_csv(path: str, dh, snap_records: list[tuple], cols: list[str]) -> None:
+def write_points_csv(path: str, dh, snap_records: list[tuple], *, dim: int = 3) -> None:
     X = dh.X_all_actual.detach().cpu().numpy()
     Y = dh.Y_all.detach().cpu().numpy().ravel()
     n = X.shape[0]
-    mask = dh.get_penalty_mask()                 # True = NOT penalized
+    mask = dh.get_penalty_mask()
     penalized = (~mask.detach().cpu().numpy()) if mask is not None else np.zeros(n, bool)
     act, zm = _activation_zoom_per_point(n, snap_records)
-    data = {"sample_idx": np.arange(n)}
-    for j, c in enumerate(cols):
-        data[c] = X[:, j]
-    data.update({"Y": Y, "penalized": penalized.astype(int),
-                 "activation": act, "zoom": zm})
+    comp_cols = composition_column_names(dim)
+    data = {
+        "sample_idx": np.arange(n),
+        "Y": Y,
+        "penalized": penalized.astype(int),
+        "activation": act,
+        "zoom": zm,
+    }
+    for i, col in enumerate(comp_cols):
+        data[col] = X[:, i]
     pd.DataFrame(data).to_csv(path, index=False)
 
 
-def needle_fine_iterations(needle_results: list, payloads: list[dict]) -> list:
-    """Map each needle onto the fine-grained LineBO line-pick iteration it was
-    found in — the same counter that indexes metrics_over_time.csv.
-
-    Each payload records ``(n_points_before, iter_num)`` for one obj_wrapper call,
-    and the running sample count only grows, so ``n_points_before`` is sorted. A
-    needle declared when the count had reached ``n`` was found during the call
-    that pushed the count to ``n`` — the last payload whose ``n_points_before`` is
-    strictly below ``n``. Falls back to the needle's stored (coarse, zoom-local)
-    ``iteration`` when the count or payload trail is missing (e.g. a resumed run
-    whose needles predate this field).
-    """
-    import bisect
-    nb = [int(p.get("n_points_before", 0)) for p in payloads]
-    it = [p.get("iter_num") for p in payloads]
-    out = []
-    for r in needle_results:
-        npts = r.get("n_points")
-        if npts is None or not nb:
-            out.append(r.get("iteration"))
-            continue
-        j = max(0, bisect.bisect_left(nb, int(npts)) - 1)
-        out.append(it[j])
-    return out
-
-
-def write_needles_csv(path: str, dh, cols: list[str], dim: int,
-                      payloads: list[dict] | None = None) -> None:
+def write_needles_csv(path: str, dh, *, dim: int = 3) -> None:
     centroid = np.full(dim, 1.0 / dim)
-    results = dh.get_all_needle_results()
-    fine_iters = needle_fine_iterations(results, payloads or [])
+    comp_cols = composition_column_names(dim)
     rows = []
     for i, r in enumerate(results):
         pt = r["point"].detach().cpu().numpy().ravel()
         mv = r.get("median_value")
-        row = {"needle_idx": i}
-        for j, c in enumerate(cols):
-            row[c] = pt[j]
-        row.update({
+        row = {
+            "needle_idx": i,
             "value": r.get("value"),
             "median_value": (None if mv is None or (isinstance(mv, float) and math.isnan(mv)) else mv),
             "zoom": r.get("zoom"),
-            # Fine-grained LineBO line-pick iteration (consistent with
-            # metrics_over_time.csv), not ZoMBI's zoom-local iteration counter.
-            "iteration": fine_iters[i],
+            "iteration": r.get("iteration"),
             "reason": r.get("reason"),
             "dist_to_centre": float(np.linalg.norm(pt - centroid)),
-        })
+        }
+        for j, col in enumerate(comp_cols):
+            row[col] = pt[j]
         rows.append(row)
-    columns = ["needle_idx"] + cols + ["value", "median_value",
-                                       "zoom", "iteration", "reason", "dist_to_centre"]
-    pd.DataFrame(rows, columns=columns).to_csv(path, index=False)
+    cols = ["needle_idx"] + comp_cols + [
+        "value", "median_value", "activation", "zoom", "iteration", "reason", "dist_to_centre",
+    ]
+    pd.DataFrame(rows, columns=cols).to_csv(path, index=False)
 
 
 def write_metrics_over_time_csv(path: str, payloads: list[dict], X_all: np.ndarray,
-                                true_optima: list[np.ndarray]) -> None:
-    thr = NOISE_LEVEL / 2.0
+                                true_optima: list[np.ndarray], *, dim: int = 3) -> None:
     rows = []
     for p in payloads:
         needles = p.get("needles")
-        disc = needles if needles is not None else np.empty((0, 3))
+        disc = needles if needles is not None else np.empty((0, X_all.shape[1] if X_all.ndim == 2 and X_all.shape[0] else (true_optima[0].shape[0] if true_optima else dim)))
         n_before = p.get("n_points_before", len(X_all))
-        X_upto = X_all[:n_before] if n_before > 0 else np.empty((0, 3))
+        X_upto = X_all[:n_before] if n_before > 0 else np.empty_like(disc)
         # Value of the most recently discovered needle as of this iteration
         # (needles accumulate in chronological order, so the last one is newest).
         nvals = p.get("needle_vals")
         recent = float(nvals[-1]) if nvals is not None and len(nvals) > 0 else np.nan
         rows.append({
             "iteration": p["iter_num"],
-            "dist_to_needles":  round(metric_dist_to_needles(disc, true_optima), 6),
-            "dup_fraction":     round(metric_dup_fraction(X_upto, thr), 6),
-            "pct_matched":      round(metric_pct_matched(disc, true_optima), 4),
+            "dist_to_needles":  round(metric_dist_to_needles(disc, true_optima, dim=dim), 6),
+            "dup_fraction":     round(metric_dup_fraction(X_upto, dim=dim), 6),
+            "pct_matched":      round(metric_pct_matched(disc, true_optima, dim=dim), 4),
             "avg_pairwise_dist":round(metric_avg_pairwise_dist(disc), 6),
             "recent_needle_value": (round(recent, 6) if not math.isnan(recent) else np.nan),
         })
@@ -1482,43 +1776,18 @@ def reseed_ackley_dataset(ds: dict, seed: int) -> dict:
 
 def run_single_trial(
     hparams: dict,
-    ds: dict,
+    landscape: LandscapeSpec,
     trial_dir: str,
     time_limit_hours: float,
 ) -> dict:
-    """Run one time-limited ZoMBI trial on ``ds['fn']``, then write all per-trial
-    artifacts (dimension-general). Returns {"dist", "dup", "runtime",
-    "avg_time_per_iter", "n_iters", "payloads"}.
+    """Run one ZoMBI trial on the configured landscape, then write per-trial artifacts."""
+    dim = landscape.dim
+    maximize = landscape.maximize
+    fn_callable = landscape.fn_callable
+    true_optima = landscape.true_optima
+    grid_pts = landscape.grid_pts
+    grid_vals = landscape.grid_vals
 
-    Landscape plotting is dispatched by dimension: 3D renders per-iteration frames
-    plus an end-of-run static coverage plot; 4D renders a single end-of-run
-    interactive (rotatable) point-cloud HTML (no per-iteration frames); ≥5D
-    renders no landscape view at all. The metrics time-series plot is generated
-    for every dimension.
-
-    For the realistic Ackley (any dimensionality) the landscape is reseeded per
-    trial: a random seed drives both the optima placement and the noise, and it is
-    persisted to trial.json (``ackley_seed``) so the exact objective is
-    reproducible. Other objectives (RF, non-realistic Ackley variants) are
-    deterministic and left untouched.
-    """
-    ackley_seed = None
-    if ds.get("ackley_variant") == "realistic":
-        ackley_seed = draw_ackley_seed()
-        ds = reseed_ackley_dataset(ds, ackley_seed)
-        print(f"    [trial] realistic Ackley seed = {ackley_seed}")
-
-    dim         = ds["dim"]
-    dataset     = ds["label"]
-    fn          = ds["fn"]
-    maximize    = ds["maximize"]
-    true_optima = ds["true_optima"]
-    grid_pts    = ds["grid_pts"]
-    grid_vals   = ds["grid_vals"]
-    cols        = coord_cols(dim, dataset)
-
-    # Wipe any partial folder left by a crashed/interrupted attempt at this trial
-    # number so resumed runs never mix stale frames with fresh ones.
     if os.path.isdir(trial_dir):
         shutil.rmtree(trial_dir, ignore_errors=True)
     os.makedirs(trial_dir, exist_ok=True)
@@ -1529,9 +1798,7 @@ def run_single_trial(
     call_counter = [0]
     dh_ref = [None]
 
-    n_init_lines = N_INIT_LINES
-
-    sim_obj = make_sim_obj(fn, DEVICE, DTYPE, maximize=maximize)
+    sim_obj = make_sim_obj(fn_callable, DEVICE, DTYPE, maximize=maximize)
     inner   = make_linebo_wrapper(sim_obj, dim, NUM_LINES, DEVICE, DTYPE, plot_state)
 
     def obj_wrapper(x_tell, bounds, acq_fn):
@@ -1586,20 +1853,19 @@ def run_single_trial(
         return x_req, x_act, y
 
     try:
-        X_a, X_e, Y = _gen_init_data(fn, maximize, dim, n_init_lines)
+        X_a, X_e, Y = _gen_init_data(fn_callable, maximize, dim=dim)
     except RuntimeError as exc:
         print(f"    [trial] init failed: {exc}")
-        return {"dist": UNMATCHED_PENALTY, "dup": 1.0, "runtime": 0.0,
-                "avg_time_per_iter": time_limit_hours * 3600.0, "n_iters": 0,
-                "payloads": [], "ackley_seed": ackley_seed}
+        return {"dist": unmatched_penalty(dim), "dup": 1.0, "runtime": 0.0, "payloads": []}
 
-    # checkpoint_dir=None → no disk snapshots (keeps runtime_s clean); we still
-    # capture activation/zoom in-memory because take_snapshot updates the
-    # current_* counters before the save_enabled early-return.
+    hp = dict(hparams)
+    if dim > 3 and (hp.get("top_m_points") is None or hp.get("top_m_points", 0) < dim + 1):
+        hp["top_m_points"] = max(dim + 1, 4)
+
     optimizer = ZoMBIHop(
         objective=obj_wrapper,
         X_init_actual=X_a, X_init_expected=X_e, Y_init=Y,
-        **ZOMBI_FIXED, **hparams,
+        **ZOMBI_FIXED, **hp,
         device=str(DEVICE), dtype=DTYPE,
         run_uuid=None, checkpoint_dir=None,
     )
@@ -1616,65 +1882,68 @@ def run_single_trial(
 
     t0 = time.time()
     try:
-        optimizer.run(max_activations=float("inf"), time_limit_hours=time_limit_hours)
+        if landscape.time_limit_hours is not None:
+            optimizer.run(
+                max_activations=float("inf"),
+                time_limit_hours=landscape.time_limit_hours,
+            )
+        else:
+            optimizer.run(
+                max_activations=landscape.max_activations or float("inf"),
+                time_limit_hours=None,
+            )
     except Exception as exc:
         print(f"    [trial] ZoMBI crashed: {exc}")
     runtime = time.time() - t0
 
-    # ── Trial-level metrics ──
-    # An "iteration" is one LineBO main-line pick / one obj_wrapper call (== one
-    # payload / would-be frame). The third objective is average wall-clock time
-    # per iteration: total runtime amortised over the iterations actually run.
-    n_iters = call_counter[0]
-    avg_time_per_iter = runtime / n_iters if n_iters > 0 else 0.0
-
     needle_t   = dh.get_all_needle_locations()
-    discovered = needle_t.detach().cpu().numpy() if needle_t.numel() > 0 else np.empty((0, dim))
-    X_all_np   = dh.X_all_actual.detach().cpu().numpy() if dh.X_all_actual is not None else np.empty((0, dim))
-    dist = metric_dist_to_needles(discovered, true_optima)
-    dup  = metric_dup_fraction(X_all_np, NOISE_LEVEL / 2.0)
+    discovered = (
+        needle_t.detach().cpu().numpy()
+        if needle_t.numel() > 0 else np.empty((0, dim))
+    )
+    X_all_np   = (
+        dh.X_all_actual.detach().cpu().numpy()
+        if dh.X_all_actual is not None else np.empty((0, dim))
+    )
+    dist = metric_dist_to_needles(discovered, true_optima, dim=dim)
+    dup  = metric_dup_fraction(X_all_np, dim=dim)
+    print(f"    [trial]  iters={call_counter[0]}  dist={dist:.4f}  dup={dup:.4f}"
+          f"  t={runtime:.1f}s  needles={len(discovered)}/{len(true_optima)}")
 
-    # A trial that never evaluated the objective (n_iters == 0 — e.g. get_candidate
-    # returned None on the first iteration) did no real optimisation, yet scores
-    # best-in-class on dup (0.0) and per-iter time (0.0). Left unpenalised the MOBO
-    # treats it as Pareto-optimal and "farms" the degenerate region. Force all three
-    # objectives to their worst so an instant-terminating trial is never rewarded.
-    if n_iters == 0:
-        dist = UNMATCHED_PENALTY
-        dup  = 1.0
-        avg_time_per_iter = time_limit_hours * 3600.0
-        print("    [trial]  degenerate trial (0 iterations) — penalising all objectives")
-
-    print(f"    [trial]  iters={n_iters}  dist={dist:.4f}  dup={dup:.4f}"
-          f"  t/iter={avg_time_per_iter:.3f}s  (total {runtime:.1f}s)"
-          f"  needles={len(discovered)}/{len(true_optima)}")
-
-    # ── CSV / table artifacts ──
     try:
-        write_points_csv(os.path.join(trial_dir, "points.csv"), dh, snap_records, cols)
-        write_needles_csv(os.path.join(trial_dir, "needles.csv"), dh, cols, dim, payloads)
+        write_points_csv(os.path.join(trial_dir, "points.csv"), dh, snap_records, dim=dim)
+        write_needles_csv(os.path.join(trial_dir, "needles.csv"), dh, dim=dim)
         write_metrics_over_time_csv(
-            os.path.join(trial_dir, "metrics_over_time.csv"), payloads, X_all_np, true_optima)
+            os.path.join(trial_dir, "metrics_over_time.csv"), payloads, X_all_np, true_optima,
+            dim=dim,
+        )
     except Exception as exc:
         print(f"    [trial] CSV write failed: {exc}")
 
-    # ── Static (dimension-general) plots ──
     try:
         plot_dist_from_centre(os.path.join(trial_dir, "dist_from_centre.png"), dh, maximize)
-        plot_line_length_hist(os.path.join(trial_dir, "line_length_hist.png"), payloads)
+        if landscape.render_ternary:
+            plot_line_length_hist(os.path.join(trial_dir, "line_length_hist.png"), payloads)
         plot_convergence(os.path.join(trial_dir, "convergence.png"), dh, maximize)
     except Exception as exc:
         print(f"    [trial] static plot failed: {exc}")
 
-    # ── Per-iteration landscape frames: 3D only (4D/≥5D skip these) ──
-    if dim == 3:
+    if landscape.render_ternary and grid_pts is not None and grid_vals is not None:
         plots_dir = os.path.join(trial_dir, "plots")
         os.makedirs(plots_dir, exist_ok=True)
-        print(f"    [trial] rendering {len(payloads)} ternary frames …", flush=True)
+        print(f"    [trial] rendering {len(payloads)} frames …", flush=True)
         for p in payloads:
             try:
-                render_frame(p, grid_pts, grid_vals, true_optima, maximize,
-                             os.path.join(plots_dir, f"iter_{p['iter_num'] - 1:04d}.png"))
+                ref_title = (
+                    "Reference: oracle landscape"
+                    if landscape.landscape == "synthetic"
+                    else "Reference: RF landscape"
+                )
+                render_frame(
+                    p, grid_pts, grid_vals, true_optima, maximize,
+                    os.path.join(plots_dir, f"iter_{p['iter_num'] - 1:04d}.png"),
+                    ref_title=ref_title,
+                )
             except Exception as exc:
                 print(f"    [trial] frame {p['iter_num']} failed: {exc}")
 
@@ -1699,7 +1968,7 @@ def run_single_trial(
 # ─── Running summary (mobo_progress.json / mobo_results.json) ───────────────────
 
 def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
-                   n_seed: int = 0, n_sobol: int = 0) -> dict:
+                   prior_count: int = 0, *, n_init_trials: int = N_INIT_TRIALS) -> dict:
     n = len(Y_obs)
     metrics_all = [
         {
@@ -1714,9 +1983,7 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
     # resume), then BO ("mobo"). Pareto membership is intentionally NOT recorded
     # here — it is determined across all runs after the fact by optimize/pareto.py.
     def _phase(i: int) -> str:
-        if i < n_seed:
-            return "seed"
-        if i < n_seed + n_sobol:
+        if prior_count == 0 and i < n_init_trials:
             return "sobol"
         return "mobo"
     trials = [
@@ -1746,12 +2013,13 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
     }
 
 
-def save_running_summary(X_obs, Y_obs, run_dir: str, n_seed: int = 0,
-                         n_sobol: int = 0) -> None:
+def save_running_summary(X_obs, Y_obs, run_dir: str, prior_count: int = 0, *,
+                         n_init_trials: int = N_INIT_TRIALS) -> None:
     """Write mobo_progress.json + mobo_results.json + mobo_results.pt."""
     if not Y_obs:
         return
-    summary = _build_summary(X_obs, Y_obs, n_seed=n_seed, n_sobol=n_sobol)
+    summary = _build_summary(X_obs, Y_obs, prior_count=prior_count,
+                             n_init_trials=n_init_trials)
     summary_txt = json.dumps(summary, indent=2)
     _atomic_write_text(os.path.join(run_dir, "mobo_progress.json"), summary_txt)
     _atomic_write_text(os.path.join(run_dir, "mobo_results.json"), summary_txt)
@@ -1766,54 +2034,33 @@ def save_running_summary(X_obs, Y_obs, run_dir: str, n_seed: int = 0,
 
 # ─── MOBO loop (unbounded, resumable) ───────────────────────────────────────────
 
-def run_mobo(ds: dict, run_dir, time_limit_hours: float, max_trials=None,
-             seed_X=None, X_prior=None, Y_prior=None) -> None:
-    """Unbounded MOBO loop, writing trials into a fresh ``run_dir``.
-
-    The initial design has up to two stages that are both RUN as real trials:
-      1. ``seed_X`` — normalised hyperparameter vectors from ``--start-from-best``,
-         re-evaluated on the current objective (NOT trusted scores from prior runs).
-      2. Sobol — ``N_INIT_TRIALS`` quasi-random draws, run in full on a fresh run.
-         Sobol is skipped only when ``X_prior``/``Y_prior`` already seed the GP with
-         (X, Y) pairs harvested from past runs (``--resume`` family).
-    After the initial design, BO (qLogNEHVI) proposes the rest until Ctrl+C.
-
-    ``X_prior``/``Y_prior`` only feed GP fitting; the run's own progress.json /
-    results record only this run's own trials, so re-crawling never double-counts.
-    """
+def run_mobo(landscape: LandscapeSpec, run_dir,
+             max_trials=None, X_prior=None, Y_prior=None, *,
+             n_init_trials: int = N_INIT_TRIALS) -> None:
+    """Unbounded MOBO loop, writing trials into a fresh ``run_dir``."""
     bounds = torch.zeros(2, N_HPARAMS, dtype=DTYPE, device=DEVICE)
     bounds[1] = 1.0
 
-    # maximised objectives Y = (-dist, -dup, -avg_time_per_iter)
     X_prior = [x.detach().cpu() for x in X_prior] if X_prior else []
     Y_prior = [y.detach().cpu() for y in Y_prior] if Y_prior else []
     n_prior = len(Y_prior)
-    seed_X  = [x.detach().cpu() for x in seed_X] if seed_X else []
-    X_obs: list[torch.Tensor] = []   # this run's own trials only (written to disk)
+    X_obs: list[torch.Tensor] = []
     Y_obs: list[torch.Tensor] = []
 
-    # ── Build the initial design: re-evaluated seeds, then a full Sobol init.
-    # Sobol is skipped only when prior GP history is present (a --resume). The
-    # --start-from-best seeds never suppress Sobol — they are extra init trials. ──
-    n_seed  = len(seed_X)
-    # Top up the Sobol init so prior history + Sobol still reaches a full
-    # N_INIT_TRIALS initial design: a fresh run (n_prior == 0) draws the full
-    # N_INIT_TRIALS; a resume carrying fewer trials than that draws only the
-    # shortfall; a resume already at/past N_INIT_TRIALS draws none (straight to
-    # BO on the prior history). Seeds (--start-from-best) are orthogonal extra
-    # init trials and deliberately don't count toward this quota.
-    n_sobol = max(0, N_INIT_TRIALS - n_prior)
+    n_sobol = n_init_trials if n_prior == 0 else 0
     X_sobol = load_or_make_sobol(run_dir, bounds, n_sobol)
     init_design = ([(x, "seed") for x in seed_X]
                    + [(X_sobol[i], "sobol") for i in range(X_sobol.shape[0])])
     n_init = len(init_design)
 
+    stop_desc = (
+        f"time limit / trial: {landscape.time_limit_hours} h"
+        if landscape.time_limit_hours is not None
+        else f"max_activations / trial: {landscape.max_activations}"
+    )
     print(f"\n{'='*70}")
-    print(f"MOBO  |  {n_seed} re-evaluated seed(s) + {X_sobol.shape[0]} Sobol init, "
-          f"then BO until Ctrl+C")
-    print(f"Time limit / trial: {time_limit_hours} h    Run dir: {run_dir}")
-    print(f"Dataset: {ds['label']} (dim {ds['dim']}, "
-          f"{'maximize' if ds['maximize'] else 'minimize'})")
+    print(f"MOBO  |  {landscape.label}  |  {X_sobol.shape[0]} Sobol init, then BO until Ctrl+C")
+    print(f"{stop_desc}    Run dir: {run_dir}")
     if n_prior:
         if n_sobol:
             print(f"PRIOR HISTORY — seeding GP with {n_prior} (X,Y) pair(s) "
@@ -1867,21 +2114,18 @@ def run_mobo(ds: dict, run_dir, time_limit_hours: float, max_trials=None,
                 print(f"\n[trial {trial_num} | {phase}]  {hp_str}")
 
                 # ── Run the trial + write its artifacts ──
-                res = run_single_trial(hparams, ds, trial_dir, time_limit_hours)
+                res = run_single_trial(hparams, landscape, trial_dir)
                 try:
                     plot_hparam_edge_proximity(
                         os.path.join(trial_dir, "hparam_edge_proximity.png"), x_new)
                 except Exception as exc:
                     print(f"    [trial] hparam_edge_proximity failed: {exc}")
 
-                # ── Record (this is the point the trial becomes "done") ──
-                # Keep observations on CPU so prior + new entries share a device
-                # (zombihop sets the global default device to CUDA on import).
                 X_obs.append(x_new.detach().cpu())
-                Y_obs.append(torch.tensor(
-                    [-res["dist"], -res["dup"], -res["avg_time_per_iter"]],
-                    dtype=DTYPE, device="cpu"))
-                save_running_summary(X_obs, Y_obs, run_dir, n_seed=n_seed, n_sobol=n_sobol)
+                Y_obs.append(torch.tensor([-res["dist"], -res["dup"], -res["runtime"]],
+                                          dtype=DTYPE, device="cpu"))
+                save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior,
+                                     n_init_trials=n_init_trials)
                 write_trial_json(
                     os.path.join(trial_dir, "trial.json"),
                     trial_num, phase,
@@ -1890,6 +2134,12 @@ def run_mobo(ds: dict, run_dir, time_limit_hours: float, max_trials=None,
                      "runtime": res["runtime"], "n_iters": res["n_iters"]},
                     hparams,
                     ackley_seed=res.get("ackley_seed"),
+                )
+                append_trial_logs(
+                    run_dir, trial_num, phase, hparams,
+                    {"dist": res["dist"], "dup": res["dup"], "runtime": res["runtime"]},
+                    trial_dir,
+                    dim=landscape.dim,
                 )
                 consec_fail = 0
 
@@ -1909,8 +2159,12 @@ def run_mobo(ds: dict, run_dir, time_limit_hours: float, max_trials=None,
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user — finalising results …")
 
+    if max_trials is not None and len(Y_obs) >= max_trials:
+        print(f"\n[stop] max_trials={max_trials} reached ({len(Y_obs)} completed).")
+
     if Y_obs:
-        save_running_summary(X_obs, Y_obs, run_dir, n_seed=n_seed, n_sobol=n_sobol)
+        save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior,
+                             n_init_trials=n_init_trials)
     print(f"\nDone. {len(Y_obs)} trials completed this run "
           f"({n_prior} prior + {len(Y_obs)} new = {n_prior + len(Y_obs)} total). Results in {run_dir}")
     print(f"Resume (crawls all runs) with:  python optimize/run_mobo.py --resume")
@@ -1976,8 +2230,7 @@ def _interactive_run_config(script_dir: str):
     """Interactive run-config creation: locate campaign1a.csv, train the RF,
     prompt max/min, and interactively pick the reference optima.
 
-    Used by the fresh RF run. Returns
-    ``(rf_fn, grid_pts, grid_vals, csv_path, rf_maximize, true_optima)``.
+    Shared by the fresh run and ``--resume-scratch``. Returns a ``LandscapeSpec``.
     """
     csv_candidates = [
         os.path.join(script_dir, "..", "interactive_testing", "data", "campaign1a.csv"),
@@ -1988,7 +2241,7 @@ def _interactive_run_config(script_dir: str):
         sys.exit("campaign1a.csv not found. Tried:\n" +
                  "\n".join(f"  {os.path.normpath(p)}" for p in csv_candidates))
     print(f"\n[RF] Loading {csv_path} …  Training RF ({RF_N_ESTIMATORS} trees) …")
-    rf, rf_fn, grid_pts, grid_vals = build_rf_and_grid(csv_path)
+    rf, rf_fn, grid_pts, grid_vals, _, _ = build_rf_and_grid(csv_path)
     print("  RF trained.")
 
     raw_mm = input("  Maximize or minimize RF?  [max/min, default min]: ").strip().lower()
@@ -2004,36 +2257,74 @@ def _interactive_run_config(script_dir: str):
         extrema = [(np.array([1/3, 1/3, 1/3]), 0.0)]
     true_optima = [x for x, _ in extrema]
     print(f"  RF ready: {len(true_optima)} reference {goal}")
-    return rf_fn, grid_pts, grid_vals, csv_path, rf_maximize, true_optima
+    return build_rf_landscape(
+        rf_fn, true_optima, grid_pts, grid_vals,
+        maximize=rf_maximize, csv_path=csv_path,
+        time_limit_hours=TIME_LIMIT_HOURS,
+    )
 
 
-def _launch_run(runs_dir, ds: dict, time_limit_hours: float, max_trials,
-                seed_X=None, X_prior=None, Y_prior=None) -> None:
+def _launch_run(runs_dir, landscape: LandscapeSpec, max_trials,
+                X_prior=None, Y_prior=None, *,
+                batch_name: str | None = None,
+                batch_config_path: str | None = None,
+                run_dir: str | None = None,
+                n_init_trials: int = N_INIT_TRIALS) -> None:
     """Create a fresh runs/mobo_* folder, persist its config, and run MOBO."""
-    run_dir = unique_run_dir(runs_dir, "mobo")
-    write_run_config(run_dir, ds["maximize"], ds["csv_path"], ds["true_optima"],
-                     dataset=ds["label"], dim=ds["dim"],
-                     ackley_variant=ds["ackley_variant"])
+    if run_dir is None:
+        stamp = datetime.datetime.now().strftime("mobo_%d_%m_%H_%M")
+        suffix = f"_{batch_name}" if batch_name else ""
+        run_dir = os.path.join(runs_dir, f"{stamp}{suffix}")
+    os.makedirs(run_dir, exist_ok=True)
+    write_run_config(
+        run_dir, landscape,
+        batch_name=batch_name, batch_config_path=batch_config_path,
+        n_init_trials=n_init_trials,
+    )
     print(f"\n[run] Output folder: {run_dir}")
-    run_mobo(ds, run_dir, time_limit_hours, max_trials=max_trials,
-             seed_X=seed_X, X_prior=X_prior, Y_prior=Y_prior)
+    run_mobo(landscape, run_dir, max_trials=max_trials,
+             X_prior=X_prior, Y_prior=Y_prior, n_init_trials=n_init_trials)
+
+
+def _apply_runtime_overrides(*, device: str | None, time_limit_hours: float | None) -> None:
+    """Apply CLI overrides to module-level DEVICE and TIME_LIMIT_HOURS."""
+    global DEVICE, TIME_LIMIT_HOURS
+    if device is not None:
+        DEVICE = torch.device(device)
+    if time_limit_hours is not None:
+        TIME_LIMIT_HOURS = float(time_limit_hours)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ZoMBI-Hop MOBO hyperparameter optimisation.")
-    parser.add_argument("--dataset", default="RF", choices=sorted(DATASET_DIMS),
-                        help="Objective to search on (default: RF). RF is the 3-simplex "
-                             "Random-Forest surrogate (interactive extrema picker); "
-                             "ackley3d/ackley4d/ackley10d are analytic negated-Ackley "
-                             "benchmarks on the d-simplex (known optima, non-interactive). "
-                             "Ignored by --resume/--copy-config, which inherit the saved config.")
-    parser.add_argument("--ackley-variant", default="realistic",
-                        choices=sorted(Ackley.VARIANTS),
-                        help="Ackley variant for the ackley* datasets (default: realistic).")
-    parser.add_argument("--time-limit", type=float, default=TIME_LIMIT_HOURS,
-                        metavar="HOURS",
-                        help=f"Wall-clock budget per trial, in hours "
-                             f"(default: {TIME_LIMIT_HOURS}).")
+    parser = argparse.ArgumentParser(
+        description="ZoMBI-Hop MOBO hyperparameter optimisation (RF or Multi-Ackley).",
+    )
+    parser.add_argument("--landscape", choices=("rf", "ackley"), default="rf",
+                        help="Objective landscape (default: rf). Ackley = synthetic Δ^d benchmark.")
+    parser.add_argument("--dim", type=int, default=None,
+                        help="Simplex dimension for --landscape ackley (default 10).")
+    parser.add_argument("--layout", type=str, default=None, choices=["1", "2", "3"],
+                        help="Multi-Ackley peak layout (1/2/3).")
+    parser.add_argument("--ackley-b", type=float, default=None,
+                        help="Ackley peak width b (default 1.2 skinny).")
+    parser.add_argument("--n-init-trials", type=int, default=None,
+                        help=f"Sobol init trials before BO (default: {N_INIT_TRIALS}).")
+    parser.add_argument("--batch", action="store_true",
+                        help="Headless mode: read --config JSON, skip interactive picker "
+                             "(for Slurm / ORCD HPC).")
+    parser.add_argument("--config", metavar="PATH", default=None,
+                        help="Batch run config JSON (csv_path, maximize, true_optima or "
+                             "regions_objective, max_trials, time_limit_hours).")
+    parser.add_argument("--no-show", action="store_true",
+                        help="Use Agg matplotlib backend (no GUI windows). Implied by --batch.")
+    parser.add_argument("--device", choices=("cpu", "cuda"), default=None,
+                        help="Torch device (default: cuda if available else cpu).")
+    parser.add_argument("--time-limit-hours", type=float, default=None,
+                        help=f"Per-trial ZoMBI wall-clock budget in hours (default: {TIME_LIMIT_HOURS}).")
+    parser.add_argument("--runs-dir", metavar="DIR", default=None,
+                        help="Override output runs directory (default: optimize/runs).")
+    parser.add_argument("--run-dir", metavar="DIR", default=None,
+                        help="Explicit run output folder (array jobs: one dir per task).")
     parser.add_argument("--max-trials", type=int, default=None,
                         help="Optional cap on total number of trials (default: unbounded, Ctrl+C to stop).")
     parser.add_argument("--resume", action="store_true",
@@ -2061,41 +2352,151 @@ def main() -> None:
                              "Sobol init before BO begins.")
     args = parser.parse_args()
 
-    n_exclusive = sum([args.resume, args.copy_config is not None, args.resume_from is not None])
-    if n_exclusive > 1:
-        sys.exit("Use only one of --resume / --copy-config / --resume-from.")
+    if args.batch and not args.config:
+        sys.exit("--batch requires --config PATH.")
+    if args.config and not args.batch and not args.no_show:
+        print("  [hint] --config is usually paired with --batch on HPC.")
+
+    if sum(bool(x) for x in (args.resume, args.resume_scratch, args.copy_config)) > 1:
+        sys.exit("Use only one of --resume / --resume-scratch / --copy-config.")
+    if args.batch and any((args.resume, args.resume_scratch, args.copy_config)):
+        sys.exit("--batch cannot combine with --resume / --resume-scratch / --copy-config.")
+
+    headless = bool(args.batch or args.no_show or args.config
+                    or args.resume or args.copy_config)
+    _configure_mpl_backend(headless=headless)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    runs_dir   = os.path.join(script_dir, "runs")
+    runs_dir   = os.path.abspath(args.runs_dir or os.path.join(script_dir, "runs"))
     os.makedirs(runs_dir, exist_ok=True)
     time_limit_hours = args.time_limit
 
-    # "Start from best" seeds: hyperparameter vectors re-evaluated as initial
-    # trials (NOT copied scores). Shared by all run modes; orthogonal to Sobol.
-    seed_X: list[torch.Tensor] = []
+    max_trials = args.max_trials
+    batch_name = None
+    batch_config_path = None
+    run_dir_override = os.path.abspath(args.run_dir) if args.run_dir else None
+
+    if args.batch:
+        batch = load_batch_config(args.config, script_dir)
+        batch_name = batch["name"]
+        batch_config_path = batch["config_path"]
+        n_init = batch.get("n_init_trials") or args.n_init_trials or N_INIT_TRIALS
+        _apply_runtime_overrides(
+            device=args.device,
+            time_limit_hours=batch.get("time_limit_hours") or args.time_limit_hours,
+        )
+        max_trials = (
+            args.max_trials
+            if args.max_trials is not None
+            else batch.get("max_trials")
+        )
+
+        print("=" * 70)
+        print(f"ZoMBI-Hop MOBO — BATCH  |  {batch_name}")
+        print(f"Device: {DEVICE}   |   Sobol init: {n_init} trials   |   "
+              f"max_trials: {max_trials if max_trials is not None else 'unbounded (Ctrl+C)'}")
+        print("=" * 70)
+
+        if batch.get("landscape") is not None:
+            landscape = batch["landscape"]
+            if landscape.time_limit_hours is None and TIME_LIMIT_HOURS is not None:
+                pass  # Ackley uses max_activations
+            elif batch.get("time_limit_hours") is not None:
+                landscape.time_limit_hours = batch["time_limit_hours"]
+        else:
+            csv_path = batch["csv_path"]
+            obj_col = batch["objective_column"]
+            comp_cols = batch.get("composition_columns")
+            rf_maximize = batch["maximize"]
+            oracle = batch.get("oracle")
+            label_bits = [obj_col]
+            if oracle:
+                label_bits.append(f"oracle={oracle}")
+            if comp_cols:
+                label_bits.append(f"cols={','.join(comp_cols)}")
+            print(f"\n[RF] Loading {csv_path} ({', '.join(label_bits)}) …  "
+                  f"Training RF ({RF_N_ESTIMATORS} trees) …")
+            rf, rf_fn, grid_pts, grid_vals, comp_cols, dim = build_rf_and_grid(
+                csv_path, objective_column=obj_col, composition_columns=comp_cols,
+            )
+            print(f"  RF trained ({dim}D, {len(comp_cols)} composition columns).")
+
+            true_optima = batch["true_optima"]
+            if not true_optima:
+                auto = batch.get("auto_optima") or {}
+                n_peaks = int(auto.get("n_peaks", 3))
+                min_sep = float(auto.get("min_sep", 0.08))
+                print(f"  [batch] auto-detecting {n_peaks} reference "
+                      f"{'maxima' if rf_maximize else 'minima'} …")
+                true_optima = auto_detect_rf_optima(
+                    rf, grid_pts, grid_vals,
+                    maximize=rf_maximize, n_peaks=n_peaks, min_sep=min_sep,
+                )
+            goal = "maxima" if rf_maximize else "minima"
+            print(f"  RF ready: {len(true_optima)} reference {goal}")
+            for i, t in enumerate(true_optima):
+                print(f"    #{i + 1}  {np.round(t, 4).tolist()}")
+
+            landscape = build_rf_landscape(
+                rf_fn, true_optima, grid_pts, grid_vals,
+                maximize=rf_maximize, csv_path=csv_path,
+                objective_column=obj_col,
+                composition_columns=comp_cols,
+                dim=dim,
+                oracle=oracle,
+                metadata_path=batch.get("metadata_path"),
+                time_limit_hours=TIME_LIMIT_HOURS,
+            )
+
+        if landscape.landscape in ("ackley", "synthetic"):
+            for i, p in enumerate(landscape.true_optima):
+                print(f"  peak {i + 1}: {np.round(p, 4).tolist()}")
+        stop = (
+            f"time limit/trial: {landscape.time_limit_hours} h"
+            if landscape.time_limit_hours is not None
+            else f"max_activations/trial: {landscape.max_activations}"
+        )
+        print(f"  {landscape.label}  |  {stop}")
+
+        _launch_run(
+            runs_dir, landscape, max_trials,
+            batch_name=batch_name, batch_config_path=batch_config_path,
+            run_dir=run_dir_override, n_init_trials=n_init,
+        )
+        return
+
+    _apply_runtime_overrides(device=args.device, time_limit_hours=args.time_limit_hours)
+
+    # "Start from best" seeds: (X, Y) pairs copied straight into the GP prior
+    # history (never re-evaluated), shared by all run modes.
+    X_seed, Y_seed = [], []
     if args.start_from_best:
         print("\n[seed] Loading 'start from best' hyperparameters to re-evaluate …")
         seed_X = load_seed_hparams(args.start_from_best)
 
-    # ── Resume path: crawl all prior runs, seed a new run, rebuild objective ──
+    # ── Resume path: crawl all prior runs, seed a new run, rebuild RF, no GUI ──
+    n_init = args.n_init_trials or N_INIT_TRIALS
+
     if args.resume:
         cfg = load_latest_run_config(runs_dir)
         if cfg.get("hparam_names") != HPARAM_NAMES:
             print("  [resume] WARNING: latest run's hparam_names differ from the current "
                   "HPARAM_SPACE; only matching trials are collected.")
+        if cfg.get("time_limit_hours") is not None:
+            _apply_runtime_overrides(time_limit_hours=cfg["time_limit_hours"])
+        landscape = landscape_from_run_config(cfg, build_rf_and_grid=build_rf_and_grid)
+
         print("=" * 70)
-        print("ZoMBI-Hop MOBO — RESUMING (crawling all prior runs)")
-        print(f"Device: {DEVICE}   |   time limit/trial: {time_limit_hours} h   |   "
-              f"{'maximize' if cfg['maximize'] else 'minimize'}")
+        print(f"ZoMBI-Hop MOBO — RESUMING (crawling all prior runs)  |  {landscape.label}")
+        print(f"Device: {DEVICE}")
         print("=" * 70)
 
         print("\n[collect] Crawling runs/mobo_*/mobo_progress.json for all (X,Y) pairs …")
         X_prior, Y_prior, n_runs = collect_all_observations(runs_dir)
         print(f"  [collect] {len(Y_prior)} trial(s) from {n_runs} run(s) -> prior history.")
 
-        ds = resolve_dataset_from_cfg(cfg)
-        _launch_run(runs_dir, ds, time_limit_hours, args.max_trials,
-                    seed_X=seed_X, X_prior=X_prior, Y_prior=Y_prior)
+        _launch_run(runs_dir, landscape, max_trials, X_prior=X_prior, Y_prior=Y_prior,
+                    run_dir=run_dir_override, n_init_trials=n_init)
         return
 
     # ── Resume-from: seed from a SPECIFIC run's stored results (no re-eval) ──
@@ -2113,13 +2514,19 @@ def main() -> None:
               f"{'maximize' if cfg['maximize'] else 'minimize'}")
         print("=" * 70)
 
-        print(f"\n[collect] Loading prior data from {run_path} …")
-        X_prior, Y_prior = collect_observations_from_run(run_path)
-        print(f"  [collect] {len(Y_prior)} trial(s) -> prior history.")
+        # Re-pick the run config first; the new optima/direction determine how the
+        # prior (X,Y) pairs are re-derived (see collect_rederived_observations).
+        landscape = _interactive_run_config(script_dir)
 
-        ds = resolve_dataset_from_cfg(cfg)
-        _launch_run(runs_dir, ds, time_limit_hours, args.max_trials,
-                    seed_X=seed_X, X_prior=X_prior, Y_prior=Y_prior)
+        print("\n[collect] Re-deriving prior trials against the freshly-picked optima …")
+        X_prior, Y_prior, n_runs = collect_rederived_observations(
+            runs_dir, landscape.maximize, landscape.true_optima)
+        print(f"  [collect] {len(Y_prior)} trial(s) from {n_runs} run(s) -> prior history "
+              f"(dist re-scored where needles saved, else reused; dup/runtime reused).")
+        X_prior += X_seed; Y_prior += Y_seed
+
+        _launch_run(runs_dir, landscape, max_trials, X_prior=X_prior, Y_prior=Y_prior,
+                    run_dir=run_dir_override, n_init_trials=n_init)
         return
 
     # ── Copy-config: reuse another run's config, but start with NO prior data ──
@@ -2127,33 +2534,45 @@ def main() -> None:
         cfg = load_run_config_from_path(args.copy_config)
         if cfg.get("hparam_names") and cfg["hparam_names"] != HPARAM_NAMES:
             print("  [copy-config] WARNING: copied run's hparam_names differ from the current "
-                  "HPARAM_SPACE; only the static config (direction, dataset, optima) is reused.")
+                  "HPARAM_SPACE; only the static config is reused.")
+        if cfg.get("time_limit_hours") is not None:
+            _apply_runtime_overrides(time_limit_hours=cfg["time_limit_hours"])
+        landscape = landscape_from_run_config(cfg, build_rf_and_grid=build_rf_and_grid)
+
         print("=" * 70)
-        print("ZoMBI-Hop MOBO — COPY-CONFIG (reused config, no inherited data)")
-        print(f"Device: {DEVICE}   |   time limit/trial: {time_limit_hours} h   |   "
-              f"{'maximize' if cfg['maximize'] else 'minimize'}")
+        print(f"ZoMBI-Hop MOBO — COPY-CONFIG  |  {landscape.label}")
+        print(f"Device: {DEVICE}")
         print("=" * 70)
 
-        ds = resolve_dataset_from_cfg(cfg)
-        _launch_run(runs_dir, ds, time_limit_hours, args.max_trials,
-                    seed_X=seed_X, X_prior=[], Y_prior=[])
+        _launch_run(runs_dir, landscape, max_trials, X_prior=X_seed, Y_prior=Y_seed,
+                    run_dir=run_dir_override, n_init_trials=n_init)
         return
 
-    # ── Fresh run ──
+    if args.landscape == "ackley":
+        print("=" * 70)
+        print("ZoMBI-Hop MOBO — Multi-Ackley synthetic benchmark")
+        print(f"Device: {DEVICE}")
+        print("=" * 70)
+        if args.dim is not None or args.layout is not None:
+            dim = args.dim if args.dim is not None else 10
+            layout = args.layout if args.layout is not None else "1"
+            b = args.ackley_b if args.ackley_b is not None else 1.2
+            landscape = build_ackley_landscape(dim, layout, b=b, time_limit_hours=None)
+        else:
+            landscape = interactive_ackley_startup()
+        _launch_run(runs_dir, landscape, max_trials, X_prior=X_seed, Y_prior=Y_seed,
+                    run_dir=run_dir_override, n_init_trials=n_init)
+        return
+
     print("=" * 70)
     print(f"ZoMBI-Hop Hyperparameter Optimisation (MOBO)  —  dataset: {args.dataset}")
     print(f"Device: {DEVICE}   |   time limit/trial: {time_limit_hours} h")
     print("=" * 70)
 
-    if args.dataset == "RF":
-        rf_fn, grid_pts, grid_vals, csv_path, rf_maximize, true_optima = \
-            _interactive_run_config(script_dir)
-        ds = _ds_from_rf(rf_fn, grid_pts, grid_vals, csv_path, rf_maximize, true_optima)
-    else:
-        ds = _ds_ackley(args.dataset, args.ackley_variant)
+    landscape = _interactive_run_config(script_dir)
 
-    _launch_run(runs_dir, ds, time_limit_hours, args.max_trials,
-                seed_X=seed_X, X_prior=[], Y_prior=[])
+    _launch_run(runs_dir, landscape, max_trials, X_prior=X_seed, Y_prior=Y_seed,
+                run_dir=run_dir_override, n_init_trials=n_init)
 
 
 if __name__ == "__main__":

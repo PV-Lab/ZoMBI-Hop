@@ -98,6 +98,7 @@ def main():
     for ax, (title, y, color) in zip(axes, panels):
         ax.hist(y, bins=N_BINS, color=color, edgecolor="white", linewidth=0.3)
         ax.set_title(title, fontsize=12, fontweight="bold")
+        ax.set_xlabel("objective value")
         # Pin every panel to the full objective range and disable matplotlib's
         # offset notation.  Otherwise a high-dim panel whose values all collapse
         # to the floor (~0.5) gets auto-zoomed to a ~1e-5 sliver and relabelled
@@ -108,13 +109,12 @@ def main():
         if args.log:
             ax.set_yscale("log")
         ax.grid(axis="y", alpha=0.25)
-        ax.axvline(BASIN_THRESHOLD, color="red", linestyle=":", linewidth=1.4,
-                   label="basin threshold")
-        ax.legend(loc="upper left", fontsize=8)
-        # Uniform simplex samples => the share at/above the threshold estimates
-        # the fraction of simplex volume occupied by the basins.
-        pct_above = 100.0 * np.mean(y >= BASIN_THRESHOLD)
-        ax.set_xlabel(f"objective value\n{pct_above:.2g}% of simplex above threshold")
+        ax.axvline(y.max(), color="crimson", linestyle="--", linewidth=1.2)
+        ax.text(
+            0.97, 0.95, f"best sampled\n{y.max():.2f}",
+            transform=ax.transAxes, ha="right", va="top",
+            fontsize=9, color="crimson",
+        )
 
     axes[0].set_ylabel("count")
     fig.suptitle(

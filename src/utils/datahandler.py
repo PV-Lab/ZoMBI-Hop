@@ -1000,11 +1000,6 @@ class DataHandler:
             'zoom': zoom,
             'iteration': iteration,
             'reason': reason,
-            # Running count of accumulated samples when this needle was declared.
-            # Lets downstream logging map the needle onto the fine-grained LineBO
-            # line-pick iteration (the metrics_over_time.csv counter) via the
-            # (n_points_before -> iter_num) trail recorded per evaluation.
-            'n_points': self.X_all_actual.shape[0] if self.X_all_actual is not None else 0,
         })
 
         self._update_penalty_mask()
