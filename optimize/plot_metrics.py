@@ -21,7 +21,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from eval_metrics import MATCH_RADIUS
 
 
-def plot_metrics(csv_path: str, log_x: bool = False, log_y: bool = False):
+def plot_metrics(csv_path: str, log_x: bool = False, log_y: bool = False,
+                 save_path: str | None = None):
+    """Plot the time-series metrics from ``metrics_over_time.csv``.
+
+    When ``save_path`` is given the figure is written there (PNG) and closed —
+    no interactive window — so callers like ``run_mobo.py`` can generate the plot
+    automatically at the end of a trial. Otherwise the figure is shown.
+    """
     df = pd.read_csv(csv_path)
 
     metrics = [
@@ -79,7 +86,11 @@ def plot_metrics(csv_path: str, log_x: bool = False, log_y: bool = False):
         ax.axis("off")
 
     plt.tight_layout()
-    plt.show()
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
+    else:
+        plt.show()
 
 
 if __name__ == "__main__":

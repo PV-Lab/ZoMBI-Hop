@@ -12,14 +12,14 @@ maximum (value ~ 0) sits at a canonical simplex location:
     "vertex"      peak at [1,   0,   0]     (simplex vertex)
     "multimodal"  sum of three skinnier-peaked Ackleys
     "realistic"   Dirichlet-sampled peaks + background simplex noise,
-                  fully configurable via ``configs/defaults.json``
+                  fully configurable via ``synthetic_data/defaults/ackley.json``
 
 The ``Ackley`` class exposes a ``predict(X)`` method matching scikit-learn's
 ``RandomForestRegressor.predict`` signature ``(N, d) -> (N,)``.
 
 For the "realistic" variant, ``Ackley("realistic")`` reads its parameters
 (``n_optima``, ``basin_width``, ``noise_freq``, ``noise_amp``) from
-``synthetic_data/ackley/defaults.json``.  You can override any of them via
+``synthetic_data/defaults/ackley.json``.  You can override any of them via
 keyword arguments::
 
     fn = Ackley("realistic", dim=3, n_optima=5, noise_amp=10.0)
@@ -39,7 +39,7 @@ Example
     fn = Ackley("centroid")
     y = fn.predict(np.array([[1/3, 1/3, 1/3]]))   # ~ [0.0]
 
-    fn = Ackley("realistic")             # reads from configs/defaults.json
+    fn = Ackley("realistic")             # reads from synthetic_data/defaults/ackley.json
     fn = Ackley("realistic", n_optima=5) # override one param
 """
 
@@ -51,8 +51,8 @@ from pathlib import Path
 import numpy as np
 
 # ── Config file for tunable defaults ─────────────────────────────────────────
-_CONFIGS_DIR = Path(__file__).resolve().parent / "ackley"
-_DEFAULTS_PATH = _CONFIGS_DIR / "defaults.json"
+_CONFIGS_DIR = Path(__file__).resolve().parent / "defaults"
+_DEFAULTS_PATH = _CONFIGS_DIR / "ackley.json"
 
 SCALE_OPTIMA_WITH_DIM = True
 
@@ -95,7 +95,7 @@ _HARDCODED_DEFAULTS = {
 
 
 def load_config() -> dict:
-    """Load tunable defaults from ``synthetic_data/ackley/defaults.json``."""
+    """Load tunable defaults from ``synthetic_data/defaults/ackley.json``."""
     if _DEFAULTS_PATH.exists():
         with open(_DEFAULTS_PATH) as f:
             return json.load(f)
@@ -103,7 +103,7 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    """Write tunable defaults to ``synthetic_data/ackley/defaults.json``."""
+    """Write tunable defaults to ``synthetic_data/defaults/ackley.json``."""
     _CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
     with open(_DEFAULTS_PATH, "w") as f:
         json.dump(cfg, f, indent=4)
@@ -278,7 +278,7 @@ class Ackley:
     """A negated Ackley objective on the ``dim``-element probability simplex.
 
     For the ``"realistic"`` variant, parameters are read from
-    ``synthetic_data/ackley/defaults.json`` and can be overridden via kwargs.
+    ``synthetic_data/defaults/ackley.json`` and can be overridden via kwargs.
     All other variants ignore the extra kwargs.
 
     Parameters
@@ -329,7 +329,7 @@ class Ackley:
 
         if variant == "realistic":
             cfg = load_config()
-            # An explicit n_optima is honoured exactly (e.g. the plot_3d/plot_4d
+            # An explicit n_optima is honoured exactly (e.g. the plot.py
             # sliders); otherwise the configured value is the d=3 baseline and is
             # scaled with dimension so higher-d benchmarks have proportionally
             # more optima (see ``scaled_n_optima``).

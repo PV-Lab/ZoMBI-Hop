@@ -44,6 +44,21 @@ MATCH_RADIUS = 0.05
 # ILR L2 radius at d=3, calibrated ≈ composition-L2 ``MATCH_RADIUS`` on typical needles.
 MATCH_RADIUS_ILR = 0.12
 NOISE_LEVEL_ILR = 0.03
+def as_numpy(x, *, dtype=float) -> np.ndarray:
+    """Coerce numpy arrays or CPU/CUDA tensors to a host ndarray."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    arr = np.asarray(x, dtype=dtype)
+    if arr.dtype == np.dtype(object):
+        parts = [as_numpy(v, dtype=dtype) for v in arr.ravel()]
+        if not parts:
+            return np.empty((0,), dtype=dtype)
+        if parts[0].ndim == 1:
+            return np.stack([p.ravel() for p in parts], axis=0)
+        return np.array(parts, dtype=dtype)
+    return arr
+
+
 def infer_metric_dim(
     dim: int | None,
     *arrays: np.ndarray | list | None,
@@ -63,11 +78,11 @@ def infer_metric_dim(
 
 
 def compositions_to_ilr(X: np.ndarray) -> np.ndarray:
-    X = np.asarray(X, dtype=float)
+    X = as_numpy(X, dtype=float)
     if X.size == 0:
         return np.empty((0, max(infer_metric_dim(None, X) - 1, 0)), dtype=float)
     t = torch.as_tensor(X, dtype=torch.float64)
-    return composition_to_ilr(t).numpy()
+    return composition_to_ilr(t).detach().cpu().numpy()
 
 
 def unmatched_penalty(dim: int) -> float:
@@ -107,14 +122,16 @@ def metric_dist_to_needles(
     n_disc = len(discovered)
     if n_disc == 0:
         return pen
+    disc = as_numpy(discovered, dtype=float)
     used: set[int] = set()
     total = 0.0
     for t in true_optima:
+        t_np = as_numpy(t, dtype=float).ravel()
         best_d, best_j = float("inf"), -1
-        for j, needle in enumerate(discovered):
+        for j in range(len(disc)):
             if j in used:
                 continue
-            dist = float(np.linalg.norm(np.asarray(needle) - np.asarray(t)))
+            dist = float(np.linalg.norm(disc[j].ravel() - t_np))
             if dist < best_d:
                 best_d, best_j = dist, j
         if best_j >= 0:
@@ -133,7 +150,7 @@ def metric_dup_fraction(
     dim: int | None = None,
 ) -> float:
     """Fraction of samples with an ILR neighbour within ``dup_threshold_ilr(d)``."""
-    X_all = np.asarray(X_all, dtype=float)
+    X_all = as_numpy(X_all, dtype=float)
     n = len(X_all)
     if n <= 1:
         return 0.0
@@ -158,8 +175,8 @@ def metric_pct_matched_comp(
         return 0.0
     d = infer_metric_dim(dim, discovered, true_optima)
     r = float(radius if radius is not None else match_radius_comp(d))
-    disc = np.asarray(discovered, dtype=float)
-    opt = np.asarray(true_optima, dtype=float)
+    disc = as_numpy(discovered, dtype=float)
+    opt = as_numpy(true_optima, dtype=float)
     valid = 0
     for needle in disc:
         if float(np.linalg.norm(opt - needle, axis=1).min()) <= r:
@@ -179,8 +196,8 @@ def metric_pct_matched_ilr(
         return 0.0
     d = infer_metric_dim(dim, discovered, true_optima)
     r = float(radius if radius is not None else match_radius_ilr(d))
-    Z_disc = compositions_to_ilr(np.asarray(discovered, dtype=float))
-    Z_opt = compositions_to_ilr(np.asarray(true_optima, dtype=float))
+    Z_disc = compositions_to_ilr(as_numpy(discovered, dtype=float))
+    Z_opt = compositions_to_ilr(as_numpy(true_optima, dtype=float))
     valid = 0
     for z in Z_disc:
         if float(np.linalg.norm(Z_opt - z, axis=1).min()) <= r:
@@ -201,7 +218,7 @@ def metric_pct_matched(
 
 def metric_avg_pairwise_dist(discovered: np.ndarray) -> float:
     """Average pairwise Euclidean distance between discovered needles (composition L2)."""
-    disc = np.asarray(discovered, dtype=float)
+    disc = as_numpy(discovered, dtype=float)
     n = len(disc)
     if n < 2:
         return 0.0

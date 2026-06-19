@@ -265,6 +265,7 @@ class ZoMBIHop:
             nat_grad_max_steps=self.data_handler.nat_grad_max_steps,
             device=str(self.device),
             dtype=self.dtype,
+            verbose=self.verbose,
         )
 
     # --- Properties (expose data handler state) ---

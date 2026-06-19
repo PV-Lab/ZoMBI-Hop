@@ -51,12 +51,27 @@ Default parent: ``optimize/runs/rerun_DD_MM_HH_MM/`` (override with ``--out`` or
 ``--out-dir`` for a fixed directory).
 
   rerun_DD_MM_HH_MM/
-    rerun_config.json
-    rerun_summary.json
-    trial_<n>/
-      hparams.json
-      run_<k>/          one per ``--num-runs`` repeat
-        metrics.json, points.csv, needles.csv, plots/, …
+    rerun_config.json          static config (dataset, dim, optima, time limit …)
+    rerun_summary.json         per-trial mean/std of the three objectives + every
+                               individual run's metrics
+    trial_<n>/                 one per selected source trial
+        hparams.json           the hyperparameters being re-evaluated
+        run_<k>/               one per --num-runs repeat
+            metrics.json
+            points.csv         (sample_idx, <coords>, Y, penalized, activation, zoom)
+            needles.csv        (needle_idx, <coords>, value, median_value,
+                                zoom, iteration, reason, dist_to_centre)
+            metrics_over_time.csv
+            convergence.png
+            dist_from_centre.png
+            line_length_hist.png
+            hparam_edge_proximity.png
+            plots/iter_*.png    (dim == 3 only)  +  zombihop_timelapse.mp4
+            point_cloud.html    (dim == 4 only — final-state interactive cloud)
+            (dim >= 5: metrics + non-landscape plots only, no landscape view)
+
+``<coords>`` are ``FA/MA/Br`` for the 3-simplex RF (drop-in compatible with the
+mobo trial CSVs) and ``x1..xd`` otherwise.
 
 Usage
 -----
@@ -77,6 +92,19 @@ Usage
   python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
       --trials 112 --dataset gaussian3d,rastrigin_ilr \
       --true-optima-json optimize/reference_optima/mobo_05_06_15_32_campaign1a.json
+
+  python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
+      --trials 12 --dataset ackley10d --num-runs 3
+
+Instead of ``--trials``, you can pass ``--hparams`` (trial dir / trial.json /
+mobo_* dir) or ``--hparams-json`` with a path to a JSON file containing the
+hyperparameters directly (either a trial.json-style dict with an ``"hparams"``
+key, or a flat dict of hyperparameter values).  ``--hparams-json`` runs are
+labelled ``trial_0``.  ``--runs-path`` is still required for the RF dataset
+config::
+
+  python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
+      --hparams-json optimize/hparams.json --dataset RF --num-runs 3
 """
 
 from __future__ import annotations
@@ -101,7 +129,16 @@ for _stream in (sys.stdout, sys.stderr):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_mobo as rm
 from mobo_landscapes import build_synthetic_landscape, parse_synthetic_batch_fields, resolve_surrogate_csv_path
+
+# Dimension scaling helper for the LineBO seeding budget (run_mobo wires the
+# repo root onto sys.path, so src is importable after importing it).
 from src.core.linebo import dimension_line_scale
+
+# Process-wide dimension-scaling toggle (see src/utils/scaling.py).  Used to run
+# with scaling on (--scaling-on) or off (default) through the same code paths.
+from src.utils.scaling import dimension_scaling_disabled
+
+# Analytic benchmark objectives (negated Ackley on the d-simplex).
 from synthetic_data.ackley import Ackley
 from synthetic_data.gaussian_landscape import RealisticGaussian
 from synthetic_data.landscape_config_log import (
@@ -386,6 +423,13 @@ def load_hparams_path(path: str) -> tuple[dict[int, dict], str | None]:
 
 
 def load_hparams_from_json(json_path: str) -> dict[int, dict]:
+    """Load hyperparameters from a standalone JSON file.
+
+    Accepts two formats: (1) a trial.json-style dict with an ``"hparams"`` key,
+    or (2) a flat dict whose keys are all hyperparameter names.  Returns a
+    single-entry ``{0: hparams}`` dict (trial number 0) so it slots into the
+    same ``hparams_by_trial`` flow as ``load_trial_hparams``.
+    """
     if not os.path.exists(json_path):
         sys.exit(f"--hparams-json: file not found: {json_path}")
     try:
@@ -395,9 +439,15 @@ def load_hparams_from_json(json_path: str) -> dict[int, dict]:
         sys.exit(f"--hparams-json: {json_path} is not valid JSON ({exc}).")
     hp = raw.get("hparams", raw) if isinstance(raw, dict) else None
     if not isinstance(hp, dict):
-        sys.exit("--hparams-json: expected a dict with hparam keys (or an 'hparams' key).")
-    print(f"  [hparams-json] loaded from {json_path}")
-    return {0: _normalize_hparams(hp, source="--hparams-json")}
+        sys.exit(f"--hparams-json: expected a dict with hparam keys (or an "
+                 f"'hparams' key containing them).")
+    missing = [k for k in rm.HPARAM_NAMES if k not in hp]
+    if missing:
+        sys.exit(f"--hparams-json: missing hparams {missing} "
+                 f"(stale hyperparameter set?).")
+    hp = {k: hp[k] for k in rm.HPARAM_NAMES}
+    print(f"  [hparams-json] loaded {len(hp)} hyperparameters from {json_path}")
+    return {0: hp}
 
 
 def load_trial_hparams(runs_path: str, trial_nums: list[int]) -> dict[int, dict]:
@@ -432,6 +482,11 @@ def load_trial_hparams(runs_path: str, trial_nums: list[int]) -> dict[int, dict]
 # ─── Init data + CSV writers ────────────────────────────────────────────────────
 
 def gen_init_data(fn_callable, maximize: bool, dim: int, n_init_lines: int | None = None):
+    """Generate ``n_init_lines`` random simplex lines on the ``dim``-simplex.
+
+    ``n_init_lines`` defaults to ``run_mobo.N_INIT_LINES``; callers transferring a
+    3-D-tuned configuration to a higher dimension pass a dimension-scaled count.
+    """
     if n_init_lines is None:
         n_init_lines = rm.N_INIT_LINES
     x_a_list, x_e_list, y_list = [], [], []
@@ -498,22 +553,28 @@ def write_needles_csv(path: str, dh, cols: list[str], dim: int) -> None:
         row.update({
             "value": r.get("value"),
             "median_value": (None if mv_ is None or (isinstance(mv_, float) and math.isnan(mv_)) else mv_),
-            "activation": r.get("activation"),
             "zoom": r.get("zoom"),
             "iteration": r.get("iteration"),
             "reason": r.get("reason"),
             "dist_to_centre": float(np.linalg.norm(pt - centroid)),
         })
         rows.append(row)
-    columns = ["needle_idx"] + cols + [
-        "value", "median_value", "activation", "zoom", "iteration", "reason", "dist_to_centre",
-    ]
+    columns = ["needle_idx"] + cols + ["value", "median_value",
+                                       "zoom", "iteration", "reason",
+                                       "dist_to_centre"]
     pd.DataFrame(rows, columns=columns).to_csv(path, index=False)
 
 
 def write_point_cloud_html(path: str, ackley_fn, dh, last_payload: dict) -> None:
+    """Render the final ZoMBI state over the 4-simplex Ackley cloud (one HTML).
+
+    Uses ``synthetic_data/plot``'s overlay API.  Pared points, needle markers,
+    and the last LineBO lines are all exact (plain simplex compositions);
+    needle penalisation ellipsoids are intentionally omitted because the run's
+    tangent basis differs from the Helmert ILR basis the overlay assumes.
+    """
     import plotly.graph_objects as go
-    import synthetic_data.plot_4d as pc4
+    import synthetic_data.plot as pc4
 
     comp = pc4.build_simplex_lattice(pc4.GRID_N)
     obj = ackley_fn.predict(comp)
@@ -660,6 +721,9 @@ def run_single_eval(
     call_counter = [0]
     dh_ref = [None]
 
+    # Initial-seeding line budget scales with dimension (1.0 at d=3).  The
+    # per-iteration NUM_LINES budget is scaled inside LineBO.__init__, so it is
+    # passed through unchanged here.
     n_init_lines = max(1, int(round(rm.N_INIT_LINES * dimension_line_scale(dim))))
     sim_obj = rm.make_sim_obj(fn, rm.DEVICE, rm.DTYPE, maximize=maximize)
     inner = rm.make_linebo_wrapper(sim_obj, dim, rm.NUM_LINES, rm.DEVICE, rm.DTYPE, plot_state)
@@ -730,7 +794,7 @@ def run_single_eval(
     try:
         optimizer.run(max_activations=float("inf"), time_limit_hours=time_limit_min / 60.0)
     except _TopKReached as stop:
-        print(f"      [run] top-k reached: {int(stop.args[0])} needle(s) — stopping early")
+        print(f"      [run] top-k reached: {int(stop.args[0])} needle(s) found — stopping early")
     except KeyboardInterrupt:
         interrupted = True
         print("\n      [run] interrupted — writing artifacts before exit …")
@@ -765,7 +829,8 @@ def run_single_eval(
         if dim == 3 and ds.get("grid_pts") is not None:
             rm.plot_line_length_hist(os.path.join(out_dir, "line_length_hist.png"), payloads)
         rm.plot_hparam_edge_proximity(
-            os.path.join(out_dir, "hparam_edge_proximity.png"), rm.hparams_to_norm(hparams))
+            os.path.join(out_dir, "hparam_edge_proximity.png"),
+            rm.hparams_to_norm(hparams))
         rm.plot_convergence(os.path.join(out_dir, "convergence.png"), dh, maximize)
     except Exception as exc:
         print(f"      [run] static plot failed: {exc}")
@@ -877,6 +942,7 @@ def _build_rerun_config(
         "num_runs": args.num_runs,
         "time_limit_min": time_limit_min,
         "top_k": args.top_k,
+        "scaling_on": args.scaling_on,
         "true_optima": [list(map(float, t.ravel())) for t in ds["true_optima"]],
         "landscape_config": ds.get("landscape_config"),
     }
@@ -977,14 +1043,25 @@ def evaluate_dataset(
             print(f"  [run {k}/{args.num_runs}]  (overall {done}/{total})")
             run_dir = os.path.join(trial_dir, f"run_{k}")
             try:
-                res = run_single_eval(
-                    hparams, ds, dataset, run_dir, time_limit_min,
+                eval_kwargs = dict(
                     top_k=args.top_k,
                     no_video=args.no_video,
                     no_convergence_plot=args.no_convergence_plot,
                     log_x=args.log_x,
                     log_y=args.log_y,
                 )
+                # Dimension scaling is on globally by default; --scaling-on keeps
+                # it on, otherwise the whole run is wrapped so both scaling
+                # factors collapse to 1.0 (identical code path, no separate branch).
+                if args.scaling_on:
+                    res = run_single_eval(
+                        hparams, ds, dataset, run_dir, time_limit_min, **eval_kwargs,
+                    )
+                else:
+                    with dimension_scaling_disabled():
+                        res = run_single_eval(
+                            hparams, ds, dataset, run_dir, time_limit_min, **eval_kwargs,
+                        )
                 per_trial[trial_num].append({
                     "run": k,
                     "dist_to_needles": round(res["dist"], 6),
@@ -1049,6 +1126,11 @@ def main() -> None:
                         help="Skip convergence_metrics.png panel plot.")
     parser.add_argument("--log-x", action="store_true", help="Log x-axis on convergence_metrics.png.")
     parser.add_argument("--log-y", action="store_true", help="Log y-axis on convergence_metrics.png.")
+    parser.add_argument("--scaling-on", action="store_true",
+                        help="Scale the hyperparameters with the objective dimension "
+                             "(Group-1 radii by sqrt((d-1)/2), Group-2 budgets by "
+                             "(d-1)/2; both 1.0 at d=3). Off by default, so a 3-D-tuned "
+                             "config transfers verbatim to higher-dimensional datasets.")
     parser.add_argument("--out", default=None,
                         help="Parent directory for rerun_* output (default: optimize/runs).")
     parser.add_argument("--out-dir", default=None, metavar="DIR",
@@ -1064,7 +1146,6 @@ def main() -> None:
         sys.exit("--num-runs must be >= 1.")
     if args.top_k is not None and args.top_k < 1:
         sys.exit("--top-k must be >= 1.")
-
     config_meta: dict | None = None
     synthetic_defaults: dict | None = None
     if args.config:
@@ -1117,14 +1198,15 @@ def main() -> None:
     else:
         out_parent = os.path.abspath(args.out) if args.out else os.path.join(script_dir, "runs")
         os.makedirs(out_parent, exist_ok=True)
-        eval_dir = os.path.join(out_parent, datetime.datetime.now().strftime("rerun_%d_%m_%H_%M"))
-        os.makedirs(eval_dir, exist_ok=True)
+        eval_dir = rm.unique_run_dir(out_parent, "rerun")
+
 
     time_limit_min = args.time_limit_min
     print("=" * 72)
     print(f"ZoMBI-Hop evaluate  |  datasets={datasets}  trials={trial_nums}  "
           f"num_runs={args.num_runs}  limit={time_limit_min:.2g} min"
-          + (f"  top_k={args.top_k}" if args.top_k is not None else ""))
+          + (f"  top_k={args.top_k}" if args.top_k is not None else "")
+          + f"  scaling={'ON' if args.scaling_on else 'OFF'}")
     if args.hparams:
         print(f"hparams: {os.path.abspath(args.hparams)}")
     elif args.hparams_json:
@@ -1138,6 +1220,8 @@ def main() -> None:
     print(f"output: {eval_dir}")
     print("=" * 72)
 
+    # One dataset writes its artifacts directly into eval_dir (unchanged layout);
+    # multiple datasets each get their own sub-folder under it.
     done = 0
     for dataset in datasets:
         out_dir = eval_dir if len(datasets) == 1 else os.path.join(eval_dir, dataset)

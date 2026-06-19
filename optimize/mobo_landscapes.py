@@ -366,6 +366,7 @@ def build_rf_landscape(
         resolved_dim = int(np.asarray(true_optima[0]).size)
     if resolved_dim is None:
         resolved_dim = 3
+    tl = 0.4 if time_limit_hours is None else time_limit_hours
     return LandscapeSpec(
         landscape="rf",
         dim=resolved_dim,
@@ -374,7 +375,7 @@ def build_rf_landscape(
         fn_callable=rf_fn,
         grid_pts=grid_pts,
         grid_vals=grid_vals,
-        time_limit_hours=time_limit_hours,
+        time_limit_hours=tl,
         max_activations=float("inf"),
         csv_path=os.path.abspath(csv_path),
         objective_column=objective_column,

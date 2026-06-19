@@ -11,20 +11,30 @@ inconsistent). Pareto membership is a global property of all trials, so it is
 determined here, after the fact, over the union of every run.
 
 Objectives (all MINIMISED):
-    dist_to_needles   – distance from discovered needles to the reference optima
-    dup_fraction      – fraction of duplicated samples
-    runtime_s         – wall-clock seconds per trial
+    dist_to_needles      – distance from discovered needles to the reference optima
+    dup_fraction         – fraction of duplicated samples
+    avg_time_per_iter_s  – average wall-clock seconds per ZoMBI iteration (the
+                           current run_mobo objective). Older runs minimised total
+                           ``runtime_s`` instead; this script reads whichever key
+                           each trial recorded and labels the third axis to match
+                           (it warns if a single collection mixes the two).
 
 Each run's ``mobo_progress.json`` records only its own trials, so the union over
 all runs never double-counts (a resumed run seeds the GP with prior history but
 writes only its own new trials).  ``IGNORE_mobo_*`` directories are excluded by
 the ``mobo_*`` glob.
 
+Clicking a Pareto star opens that trial's landscape view (3D per-iteration frame,
+or the 4D interactive rotatable point_cloud.html). Higher-dimensional trials have
+no such landscape, so a click there is a no-op — the cross-subplot hover
+highlighting still works for every trial regardless of dimension.
+
 Usage
 -----
   conda activate zombi-hop
   python optimize/pareto.py                 # crawl optimize/runs, write there
   python optimize/pareto.py <runs_dir>      # crawl a specific runs directory
+  python optimize/pareto.py <run_dir>       # a single run dir (holds mobo_progress.json)
   python optimize/pareto.py --out <dir>     # write pareto.json / .png elsewhere
   python optimize/pareto.py --no-interactive # save static PNG instead of live window
   python optimize/pareto.py --with-old       # include mobo_old_jackson (excluded by default)
@@ -51,13 +61,19 @@ import matplotlib
 # Backend is set later: "Agg" for static PNG, system default for interactive.
 import matplotlib.pyplot as plt
 
-OBJECTIVES = ("dist_to_needles", "dup_fraction", "runtime_s")
+# The first two objectives are fixed; the third is a time metric whose key varies
+# by run age: current run_mobo writes ``avg_time_per_iter_s``, older runs wrote
+# total ``runtime_s``. ``_time_metric`` reads whichever a trial has (preferring the
+# current one) and the third plot axis is labelled to match the data collected.
+DIST_KEY  = "dist_to_needles"
+DUP_KEY   = "dup_fraction"
+TIME_KEYS = ("avg_time_per_iter_s", "runtime_s")
 
 HPARAM_SPACE: dict[str, tuple] = {
     "nat_grad_step":               (0.001,  0.5,   "log"),
     "nat_grad_max_steps":          (10,     200,   "int"),
     "n_restarts":                  (20,     300,   "int"),
-    "raw":                         (200,    2000,  "int"),
+    "raw":                         (1,      300,   "int"),
     "ucb_beta":                    (0.05,   3.0,   "linear"),
     "max_zooms":                   (2,      10,    "int"),
     "max_iterations":              (2,      10,    "int"),
@@ -76,6 +92,20 @@ HPARAM_NAMES = list(HPARAM_SPACE.keys())
 
 
 # ─── Collection ────────────────────────────────────────────────────────────────
+
+def _time_metric(m: dict) -> tuple[float, str] | None:
+    """Return (value, key) for a trial's time objective, or None if it has none.
+
+    Prefers the current ``avg_time_per_iter_s``; falls back to legacy ``runtime_s``.
+    """
+    for k in TIME_KEYS:
+        if k in m:
+            try:
+                return float(m[k]), k
+            except (TypeError, ValueError):
+                return None
+    return None
+
 
 def _parse_only(only_str: str) -> tuple[set[str], dict[str, set[int]]]:
     """Parse ``--only`` into (run_names, {run_name: {trial_nums}}).
@@ -117,15 +147,21 @@ def collect_trials(
 ) -> list[dict]:
     """Crawl ``runs_dir/mobo_*/mobo_progress.json`` → list of trial records.
 
-    Each record: {source_run, trial, metrics{...}, hparams{...}}. Trials missing
-    any of the three objective metrics are skipped.
+    Each record: {source_run, trial, metrics{...}, time_key, time_value,
+    hparams{...}}. Trials missing dist_to_needles, dup_fraction, or any time
+    objective (avg_time_per_iter_s / runtime_s) are skipped.
 
     *only_runs*: if set, include only these run directories (all trials).
     *only_trials*: if set, maps run names to specific trial numbers to include.
     """
     has_filter = only_runs or only_trials
     records: list[dict] = []
-    for path in sorted(glob.glob(os.path.join(runs_dir, "mobo_*", "mobo_progress.json"))):
+    # Accept either a runs *parent* directory (containing mobo_*/mobo_progress.json)
+    # or a single run directory (containing mobo_progress.json directly).
+    progress_paths = sorted(glob.glob(os.path.join(runs_dir, "mobo_*", "mobo_progress.json")))
+    if not progress_paths and os.path.isfile(os.path.join(runs_dir, "mobo_progress.json")):
+        progress_paths = [os.path.join(runs_dir, "mobo_progress.json")]
+    for path in progress_paths:
         run_name = os.path.basename(os.path.dirname(path))
         if has_filter and run_name not in (only_runs or set()) and run_name not in (only_trials or {}):
             continue
@@ -143,16 +179,23 @@ def collect_trials(
             if trial_filter is not None and t.get("trial") not in trial_filter:
                 continue
             m = t.get("metrics", {})
-            if not all(k in m for k in OBJECTIVES):
+            if DIST_KEY not in m or DUP_KEY not in m:
                 continue
+            tm = _time_metric(m)
+            if tm is None:
+                continue
+            time_value, time_key = tm
             try:
-                metrics = {k: float(m[k]) for k in OBJECTIVES}
+                metrics = {DIST_KEY: float(m[DIST_KEY]), DUP_KEY: float(m[DUP_KEY]),
+                           time_key: time_value}
             except (TypeError, ValueError):
                 continue
             records.append({
                 "source_run": run_name,
                 "trial":      t.get("trial"),
                 "metrics":    metrics,
+                "time_key":   time_key,
+                "time_value": time_value,
                 "hparams":    t.get("hparams", {}),
             })
             used += 1
@@ -182,21 +225,25 @@ def pareto_mask_min(M: np.ndarray) -> np.ndarray:
 
 # ─── Visualisation ─────────────────────────────────────────────────────────────
 
-_PAIRS = [
-    (0, 2, OBJECTIVES[0], OBJECTIVES[2]),
-    (0, 1, OBJECTIVES[0], OBJECTIVES[1]),
-    (1, 2, OBJECTIVES[1], OBJECTIVES[2]),
-]
+def _obj_pairs(obj_labels: list[str]) -> list[tuple[int, int, str, str]]:
+    """The three pairwise (x_idx, y_idx, x_label, y_label) panels."""
+    return [
+        (0, 2, obj_labels[0], obj_labels[2]),
+        (0, 1, obj_labels[0], obj_labels[1]),
+        (1, 2, obj_labels[1], obj_labels[2]),
+    ]
 
 
-def plot_pareto(M: np.ndarray, mask: np.ndarray, out_path: str) -> None:
+def plot_pareto(M: np.ndarray, mask: np.ndarray, obj_labels: list[str],
+                out_path: str) -> None:
     """Pairwise objective scatter; Pareto-optimal points starred (static PNG)."""
     matplotlib.use("Agg")
     plt.switch_backend("Agg")
+    pairs = _obj_pairs(obj_labels)
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     fig.suptitle(f"MOBO Pareto front across all runs  "
                  f"(★ = Pareto-optimal, {int(mask.sum())}/{len(mask)})", fontsize=12)
-    for ax, (ix, iy, xl, yl) in zip(axes, _PAIRS):
+    for ax, (ix, iy, xl, yl) in zip(axes, pairs):
         ax.scatter(M[~mask, ix], M[~mask, iy], c="steelblue", alpha=0.6,
                    edgecolors="k", linewidths=0.3, label="dominated")
         ax.scatter(M[mask, ix], M[mask, iy], marker="*", s=220, c="gold",
@@ -222,10 +269,22 @@ def _open_file(path: str) -> None:
 
 
 def _final_plot_for_trial(runs_dir: str, source_run: str, trial: int) -> str | None:
-    """Return the path of the last iter_*.png for a trial, or None."""
-    plots_dir = os.path.join(runs_dir, source_run, f"trial_{trial}", "plots")
-    pngs = sorted(glob.glob(os.path.join(plots_dir, "iter_*.png")))
-    return pngs[-1] if pngs else None
+    """Return a trial's landscape view to open on click, or None if it has none.
+
+    3D trials render per-iteration frames (``plots/iter_*.png`` — open the last);
+    4D trials render an interactive (rotatable) ``point_cloud.html`` (falling back
+    to a legacy static ``coverage.png`` for older runs). Higher-dimensional trials
+    have no landscape view, so this returns None and clicking is a silent no-op.
+    """
+    trial_dir = os.path.join(runs_dir, source_run, f"trial_{trial}")
+    pngs = sorted(glob.glob(os.path.join(trial_dir, "plots", "iter_*.png")))
+    if pngs:
+        return pngs[-1]
+    for name in ("point_cloud.html", "coverage.png"):
+        candidate = os.path.join(trial_dir, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def _hparam_normalised(value: float, name: str) -> float:
@@ -243,10 +302,12 @@ def plot_pareto_interactive(
     mask: np.ndarray,
     records: list[dict],
     runs_dir: str,
+    obj_labels: list[str],
     *,
     show_numberline: bool = False,
 ) -> None:
     """Interactive Pareto plot: hover highlights across all subplots, click opens trial image."""
+    pairs = _obj_pairs(obj_labels)
     pareto_idx = np.where(mask)[0]
     pareto_M = M[pareto_idx]
     n_pareto = len(pareto_idx)
@@ -272,7 +333,7 @@ def plot_pareto_interactive(
         fontsize=12,
     )
 
-    for ax, (ix, iy, xl, yl) in zip(axes, _PAIRS):
+    for ax, (ix, iy, xl, yl) in zip(axes, pairs):
         ax.scatter(
             M[~mask, ix], M[~mask, iy],
             c="steelblue", alpha=0.6, edgecolors="k", linewidths=0.3, label="dominated",
@@ -287,7 +348,7 @@ def plot_pareto_interactive(
         ax.legend(fontsize=8)
 
     highlight_artists = []
-    for ax, (ix, iy, _, _) in zip(axes, _PAIRS):
+    for ax, (ix, iy, _, _) in zip(axes, pairs):
         hl = ax.scatter(
             [], [], marker="*", s=400, c="red", zorder=10,
             edgecolors="k", linewidths=1.0,
@@ -350,7 +411,7 @@ def plot_pareto_interactive(
             panel = list(axes).index(ax)
         except ValueError:
             return None
-        ix, iy = _PAIRS[panel][0], _PAIRS[panel][1]
+        ix, iy = pairs[panel][0], pairs[panel][1]
         dx = pareto_M[:, ix] - event.xdata
         dy = pareto_M[:, iy] - event.ydata
         sx = ax.get_xlim()
@@ -397,14 +458,14 @@ def plot_pareto_interactive(
                 hl.set_offsets(np.empty((0, 2)))
             tooltip.set_text("")
         else:
-            for hl, (ix, iy, _, _) in zip(highlight_artists, _PAIRS):
+            for hl, (ix, iy, _, _) in zip(highlight_artists, pairs):
                 hl.set_offsets([[pareto_M[idx, ix], pareto_M[idx, iy]]])
             rec = records[pareto_idx[idx]]
             m = rec["metrics"]
             tooltip.set_text(
                 f"{rec['source_run']} trial {rec['trial']}  |  "
-                f"dist={m['dist_to_needles']:.4f}  dup={m['dup_fraction']:.4f}  "
-                f"runtime={m['runtime_s']:.1f}s"
+                f"dist={m[DIST_KEY]:.4f}  dup={m[DUP_KEY]:.4f}  "
+                f"{rec['time_key']}={rec['time_value']:.4g}"
             )
         fig.canvas.draw_idle()
         _update_hp_highlight(idx)
@@ -415,11 +476,15 @@ def plot_pareto_interactive(
             return
         rec = records[pareto_idx[idx]]
         img = _final_plot_for_trial(runs_dir, rec["source_run"], rec["trial"])
-        if img:
+        # Higher-dimensional trials have no landscape image: silently do nothing
+        # (no error, no popup) — hover highlighting still works for them.
+        if not img:
+            return
+        try:
             print(f"  Opening: {img}")
             _open_file(img)
-        else:
-            print(f"  No plots found for {rec['source_run']}/trial_{rec['trial']}")
+        except Exception as exc:
+            print(f"  Could not open {img}: {exc}")
 
     fig.canvas.mpl_connect("motion_notify_event", _on_motion)
     fig.canvas.mpl_connect("button_press_event", _on_click)
@@ -456,6 +521,16 @@ def main() -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     runs_dir = os.path.abspath(args.runs_dir) if args.runs_dir else os.path.join(script_dir, "runs")
     out_dir = os.path.abspath(args.out) if args.out else runs_dir
+
+    # If runs_dir is itself a single run directory (holds mobo_progress.json
+    # directly), trial dirs live in its parent under the run's own name, so the
+    # click-to-open-image lookup must resolve relative to that parent.
+    single_run = (
+        not glob.glob(os.path.join(runs_dir, "mobo_*", "mobo_progress.json"))
+        and os.path.isfile(os.path.join(runs_dir, "mobo_progress.json"))
+    )
+    plot_runs_dir = os.path.dirname(runs_dir) if single_run else runs_dir
+
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 70)
@@ -469,19 +544,33 @@ def main() -> None:
     if not records:
         sys.exit(f"No usable trials found under {runs_dir}/mobo_*/mobo_progress.json.")
 
-    M = np.array([[r["metrics"][k] for k in OBJECTIVES] for r in records], dtype=float)
+    # Third objective label tracks the time key the collected trials recorded.
+    time_keys_used = {r["time_key"] for r in records}
+    if time_keys_used == {"runtime_s"}:
+        time_label = "runtime_s"
+    elif time_keys_used == {"avg_time_per_iter_s"}:
+        time_label = "avg_time_per_iter_s"
+    else:
+        time_label = "avg_time_per_iter_s | runtime_s (MIXED)"
+        print("  [warn] collection mixes avg_time_per_iter_s and runtime_s trials; "
+              "the third objective combines per-iteration and total-runtime seconds "
+              "(different units). Filter with --only to compare like with like.")
+    obj_labels = [DIST_KEY, DUP_KEY, time_label]
+
+    M = np.array([[r["metrics"][DIST_KEY], r["metrics"][DUP_KEY], r["time_value"]]
+                  for r in records], dtype=float)
     mask = pareto_mask_min(M)
     n_total, n_pareto = len(records), int(mask.sum())
     print(f"\n  {n_total} trial(s) total -> {n_pareto} Pareto-optimal.")
 
     # Pareto records, best dist_to_needles first.
     pareto = [records[i] for i in np.where(mask)[0]]
-    pareto.sort(key=lambda r: r["metrics"]["dist_to_needles"])
+    pareto.sort(key=lambda r: r["metrics"][DIST_KEY])
 
     out = {
         "generated":      datetime.datetime.now().isoformat(timespec="seconds"),
         "runs_dir":       runs_dir,
-        "objectives":     {k: "minimize" for k in OBJECTIVES},
+        "objectives":     {lbl: "minimize" for lbl in obj_labels},
         "n_trials_total": n_total,
         "n_pareto":       n_pareto,
         "pareto":         pareto,
@@ -492,17 +581,17 @@ def main() -> None:
     print(f"  pareto.json -> {json_path}")
 
     if args.no_interactive:
-        plot_pareto(M, mask, os.path.join(out_dir, "pareto_front.png"))
+        plot_pareto(M, mask, obj_labels, os.path.join(out_dir, "pareto_front.png"))
     else:
-        plot_pareto_interactive(M, mask, records, runs_dir,
+        plot_pareto_interactive(M, mask, records, plot_runs_dir, obj_labels,
                                 show_numberline=args.show_numberline)
 
     print("\n  Pareto-optimal configurations (best dist first):")
     for r in pareto:
         m = r["metrics"]
         print(f"    {r['source_run']} trial {r['trial']}:  "
-              f"dist={m['dist_to_needles']:.4f}  dup={m['dup_fraction']:.4f}  "
-              f"runtime={m['runtime_s']:.1f}s")
+              f"dist={m[DIST_KEY]:.4f}  dup={m[DUP_KEY]:.4f}  "
+              f"{r['time_key']}={r['time_value']:.4g}")
 
 
 if __name__ == "__main__":
