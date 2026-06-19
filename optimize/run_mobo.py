@@ -68,6 +68,8 @@ may not seed the new run with data harvested from past runs:
   fresh (default)   interactive picker for config; no prior data.
   --resume          reuse the LATEST run's saved config; seed the GP with ALL
                     (X,Y) pairs crawled from every runs/mobo_*/mobo_progress.json.
+                    If fewer than N_INIT_TRIALS pairs are found, the shortfall is
+                    drawn as Sobol init before BO begins.
   --copy-config P   reuse a SPECIFIC run's saved config (P = run dir or
                     run_config.json), but start with NO prior data — a normal
                     Sobol-init + BO run under someone else's config.
@@ -80,7 +82,10 @@ Modifiers (combinable with any mode above):
   --time-limit H    per-trial wall-clock budget in hours (default TIME_LIMIT_HOURS).
   --resume-from DIR   resume from a SPECIFIC run directory: trust that run's
                     stored metrics as prior history (no re-evaluation), reuse its
-                    config, and start a new run seeded with only that data.
+                    config, and start a new run seeded with only that data. If that
+                    run holds fewer than N_INIT_TRIALS trials, the shortfall is
+                    drawn as Sobol init before BO begins (a full run's worth of
+                    prior history skips Sobol entirely, as before).
   --start-from-best DIR [DIR ...]  RE-EVALUATE the hyperparameters of the given
                     trial_* dir(s) (or trial.json files) as initial trials on the
                     current objective — their stored metrics are ignored. These
@@ -122,7 +127,7 @@ import torch
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from scipy.optimize import minimize as sp_minimize
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, cKDTree
 
 import matplotlib
 # Prefer the interactive TkAgg backend, but fall back to the headless Agg
@@ -767,14 +772,24 @@ def metric_dist_to_needles(
 
 
 def metric_dup_fraction(X_all: np.ndarray, threshold: float) -> float:
-    """Fraction of points that have at least one neighbour within threshold."""
+    """Fraction of points that have at least one neighbour within threshold.
+
+    Uses a KD-tree (O(n log n)) instead of a dense (n, n, d) pairwise array: the
+    latter is O(n^2) in time and memory and, called once per iteration over the
+    cumulatively-growing point set in ``write_metrics_over_time_csv``, made
+    high-duplicate trials spend hours building distance matrices post-run.
+    """
     n = len(X_all)
     if n <= 1:
         return 0.0
-    diff  = X_all[:, None, :] - X_all[None, :, :]     # (n, n, d)
-    dists = np.sqrt((diff ** 2).sum(axis=-1))           # (n, n)
-    np.fill_diagonal(dists, np.inf)
-    return float((dists < threshold).any(axis=1).mean())
+    tree  = cKDTree(X_all)
+    pairs = tree.query_pairs(r=threshold, output_type="ndarray")  # excludes self
+    if pairs.size == 0:
+        return 0.0
+    has_neighbour = np.zeros(n, dtype=bool)
+    has_neighbour[pairs[:, 0]] = True
+    has_neighbour[pairs[:, 1]] = True
+    return float(has_neighbour.mean())
 
 
 def metric_pct_matched(
@@ -1781,7 +1796,13 @@ def run_mobo(ds: dict, run_dir, time_limit_hours: float, max_trials=None,
     # Sobol is skipped only when prior GP history is present (a --resume). The
     # --start-from-best seeds never suppress Sobol — they are extra init trials. ──
     n_seed  = len(seed_X)
-    n_sobol = N_INIT_TRIALS if n_prior == 0 else 0
+    # Top up the Sobol init so prior history + Sobol still reaches a full
+    # N_INIT_TRIALS initial design: a fresh run (n_prior == 0) draws the full
+    # N_INIT_TRIALS; a resume carrying fewer trials than that draws only the
+    # shortfall; a resume already at/past N_INIT_TRIALS draws none (straight to
+    # BO on the prior history). Seeds (--start-from-best) are orthogonal extra
+    # init trials and deliberately don't count toward this quota.
+    n_sobol = max(0, N_INIT_TRIALS - n_prior)
     X_sobol = load_or_make_sobol(run_dir, bounds, n_sobol)
     init_design = ([(x, "seed") for x in seed_X]
                    + [(X_sobol[i], "sobol") for i in range(X_sobol.shape[0])])
@@ -1794,8 +1815,13 @@ def run_mobo(ds: dict, run_dir, time_limit_hours: float, max_trials=None,
     print(f"Dataset: {ds['label']} (dim {ds['dim']}, "
           f"{'maximize' if ds['maximize'] else 'minimize'})")
     if n_prior:
-        print(f"PRIOR HISTORY — seeding GP with {n_prior} (X,Y) pair(s) "
-              f"from prior runs; skipping Sobol init")
+        if n_sobol:
+            print(f"PRIOR HISTORY — seeding GP with {n_prior} (X,Y) pair(s) "
+                  f"from prior runs; topping up with {n_sobol} Sobol init "
+                  f"trial(s) to reach {N_INIT_TRIALS}")
+        else:
+            print(f"PRIOR HISTORY — seeding GP with {n_prior} (X,Y) pair(s) "
+                  f"from prior runs; skipping Sobol init")
     print(f"Hyperparameters ({N_HPARAMS}): {HPARAM_NAMES}")
     print(f"{'='*70}")
 
@@ -2030,7 +2056,9 @@ def main() -> None:
                         help="Resume from a SPECIFIC run directory (e.g. "
                              "optimize/runs/mobo_17_06_11_27). Loads that run's config and "
                              "trusts its stored metrics as prior history (no re-evaluation). "
-                             "Starts a new run seeded with only that run's data.")
+                             "Starts a new run seeded with only that run's data; if that run "
+                             "has fewer than N_INIT_TRIALS trials, the shortfall is drawn as "
+                             "Sobol init before BO begins.")
     args = parser.parse_args()
 
     n_exclusive = sum([args.resume, args.copy_config is not None, args.resume_from is not None])
