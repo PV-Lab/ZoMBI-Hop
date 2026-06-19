@@ -125,7 +125,19 @@ from scipy.optimize import minimize as sp_minimize
 from scipy.spatial import ConvexHull
 
 import matplotlib
-matplotlib.use("TkAgg")              # interactive backend for the extrema picker
+# Prefer the interactive TkAgg backend, but fall back to the headless Agg
+# backend when there is no display (e.g. a SLURM compute node). matplotlib.use()
+# defers loading the backend, so importing the canvas here forces any failure to
+# surface now rather than at the first draw() call (which would otherwise raise
+# "initialization failed" deep inside the plotting code).
+if os.environ.get("DISPLAY") or sys.platform == "darwin":
+    try:
+        matplotlib.use("TkAgg")
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # noqa: F401
+    except Exception:
+        matplotlib.use("Agg")
+else:
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -148,7 +160,7 @@ warnings.filterwarnings("ignore", category=InputDataWarning)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from src import ZoMBIHop, LineBO
-from src.core.linebo import line_simplex_segment, zero_sum_dirs, dimension_line_scale
+from src.core.linebo import line_simplex_segment, zero_sum_dirs
 from src.utils.simplex import (
     Ellipsoid,
     random_simplex,
@@ -271,6 +283,13 @@ def norm_to_hparams(x_norm: torch.Tensor) -> dict:
             params[name] = int(round(lo + v * (hi - lo)))
         else:
             params[name] = lo + v * (hi - lo)
+    # ``raw`` is the raw candidate pool that ``n_restarts`` local refinements are
+    # drawn from (gp_simplex.get_candidate), so raw < n_restarts is nonsensical:
+    # the pool can never supply enough unpenalized restarts and get_candidate
+    # bails out (returns None) on the first iteration, yielding a degenerate
+    # 0-iteration trial. Enforce raw ≥ n_restarts so that inversion is unreachable.
+    if "raw" in params and "n_restarts" in params:
+        params["raw"] = max(params["raw"], params["n_restarts"])
     return params
 
 
@@ -1131,10 +1150,39 @@ def write_points_csv(path: str, dh, snap_records: list[tuple], cols: list[str]) 
     pd.DataFrame(data).to_csv(path, index=False)
 
 
-def write_needles_csv(path: str, dh, cols: list[str], dim: int) -> None:
+def needle_fine_iterations(needle_results: list, payloads: list[dict]) -> list:
+    """Map each needle onto the fine-grained LineBO line-pick iteration it was
+    found in — the same counter that indexes metrics_over_time.csv.
+
+    Each payload records ``(n_points_before, iter_num)`` for one obj_wrapper call,
+    and the running sample count only grows, so ``n_points_before`` is sorted. A
+    needle declared when the count had reached ``n`` was found during the call
+    that pushed the count to ``n`` — the last payload whose ``n_points_before`` is
+    strictly below ``n``. Falls back to the needle's stored (coarse, zoom-local)
+    ``iteration`` when the count or payload trail is missing (e.g. a resumed run
+    whose needles predate this field).
+    """
+    import bisect
+    nb = [int(p.get("n_points_before", 0)) for p in payloads]
+    it = [p.get("iter_num") for p in payloads]
+    out = []
+    for r in needle_results:
+        npts = r.get("n_points")
+        if npts is None or not nb:
+            out.append(r.get("iteration"))
+            continue
+        j = max(0, bisect.bisect_left(nb, int(npts)) - 1)
+        out.append(it[j])
+    return out
+
+
+def write_needles_csv(path: str, dh, cols: list[str], dim: int,
+                      payloads: list[dict] | None = None) -> None:
     centroid = np.full(dim, 1.0 / dim)
+    results = dh.get_all_needle_results()
+    fine_iters = needle_fine_iterations(results, payloads or [])
     rows = []
-    for i, r in enumerate(dh.get_all_needle_results()):
+    for i, r in enumerate(results):
         pt = r["point"].detach().cpu().numpy().ravel()
         mv = r.get("median_value")
         row = {"needle_idx": i}
@@ -1144,7 +1192,9 @@ def write_needles_csv(path: str, dh, cols: list[str], dim: int) -> None:
             "value": r.get("value"),
             "median_value": (None if mv is None or (isinstance(mv, float) and math.isnan(mv)) else mv),
             "zoom": r.get("zoom"),
-            "iteration": r.get("iteration"),
+            # Fine-grained LineBO line-pick iteration (consistent with
+            # metrics_over_time.csv), not ZoMBI's zoom-local iteration counter.
+            "iteration": fine_iters[i],
             "reason": r.get("reason"),
             "dist_to_centre": float(np.linalg.norm(pt - centroid)),
         })
@@ -1464,9 +1514,7 @@ def run_single_trial(
     call_counter = [0]
     dh_ref = [None]
 
-    # Initial-seeding line budget scales with dimension (1.0 at d=3); the
-    # per-iteration NUM_LINES budget is scaled inside LineBO itself.
-    n_init_lines = max(1, int(round(N_INIT_LINES * dimension_line_scale(dim))))
+    n_init_lines = N_INIT_LINES
 
     sim_obj = make_sim_obj(fn, DEVICE, DTYPE, maximize=maximize)
     inner   = make_linebo_wrapper(sim_obj, dim, NUM_LINES, DEVICE, DTYPE, plot_state)
@@ -1475,30 +1523,51 @@ def run_single_trial(
         x_req, x_act, y = inner(x_tell, bounds, acq_fn)
         call_counter[0] += 1
         dh = dh_ref[0]
-        xp, yp = dh.X_pared, dh.Y_pared
-        if xp is not None and xp.shape[0] > 0:
-            pared_X = xp.detach().cpu().numpy()
-            pared_Y = yp.detach().cpu().numpy().ravel()
-            if not maximize:
-                pared_Y = -pared_Y
-        else:
-            pared_X = pared_Y = None
         needles = dh.needles
-        payloads.append(dict(
+        # Lightweight per-iteration payload: only the fields needed by the
+        # metrics-over-time CSV and the line-length histogram, both generated for
+        # EVERY dimension. Kept for the whole trial.
+        payload = dict(
             iter_num=call_counter[0],
-            pared_X=pared_X, pared_Y=pared_Y,
             needles=(needles.detach().cpu().numpy()
                      if needles is not None and needles.shape[0] > 0 else None),
             needle_vals=(dh.needle_vals.detach().cpu().numpy().ravel()
                          if dh.needle_vals is not None and dh.needle_vals.shape[0] > 0 else None),
-            needle_M_list=[m.detach().cpu().clone() if m is not None else None
-                           for m in dh.needle_M_list],
-            needle_B=(dh.needle_B.detach().cpu().clone() if dh.needle_B is not None else None),
-            bounds=(dh.bounds.detach().cpu().clone() if dh.bounds is not None else None),
             line_0=plot_state.get("line_0"),
-            line_1=plot_state.get("line_1"),
             n_points_before=(dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0),
-        ))
+        )
+        # Heavy fields (pared point cloud, needle ellipsoid matrices, trust
+        # bounds) are ONLY consumed by the rendered landscape views: the
+        # per-iteration ternary frames (3D) and the end-of-trial 4D point cloud,
+        # which uses just the LAST payload. So keep them on every frame at 3D, on
+        # only the most recent payload at 4D, and never at >=5D. Otherwise this
+        # list grows unbounded over a long / non-converging trial and exhausts
+        # RAM (the 10D OOM).
+        if dim <= 4:
+            if dim == 4 and payloads:
+                # Strip the heavy fields off the previous payload — only the final
+                # one is read by the 4D point cloud. Earlier payloads were already
+                # stripped on prior iterations, so just the last one remains.
+                for k in ("pared_X", "pared_Y", "needle_M_list",
+                          "needle_B", "bounds", "line_1"):
+                    payloads[-1].pop(k, None)
+            xp, yp = dh.X_pared, dh.Y_pared
+            if xp is not None and xp.shape[0] > 0:
+                pared_X = xp.detach().cpu().numpy()
+                pared_Y = yp.detach().cpu().numpy().ravel()
+                if not maximize:
+                    pared_Y = -pared_Y
+            else:
+                pared_X = pared_Y = None
+            payload.update(
+                pared_X=pared_X, pared_Y=pared_Y,
+                needle_M_list=[m.detach().cpu().clone() if m is not None else None
+                               for m in dh.needle_M_list],
+                needle_B=(dh.needle_B.detach().cpu().clone() if dh.needle_B is not None else None),
+                bounds=(dh.bounds.detach().cpu().clone() if dh.bounds is not None else None),
+                line_1=plot_state.get("line_1"),
+            )
+        payloads.append(payload)
         return x_req, x_act, y
 
     try:
@@ -1506,8 +1575,8 @@ def run_single_trial(
     except RuntimeError as exc:
         print(f"    [trial] init failed: {exc}")
         return {"dist": UNMATCHED_PENALTY, "dup": 1.0, "runtime": 0.0,
-                "avg_time_per_iter": 0.0, "n_iters": 0, "payloads": [],
-                "ackley_seed": ackley_seed}
+                "avg_time_per_iter": time_limit_hours * 3600.0, "n_iters": 0,
+                "payloads": [], "ackley_seed": ackley_seed}
 
     # checkpoint_dir=None → no disk snapshots (keeps runtime_s clean); we still
     # capture activation/zoom in-memory because take_snapshot updates the
@@ -1549,6 +1618,18 @@ def run_single_trial(
     X_all_np   = dh.X_all_actual.detach().cpu().numpy() if dh.X_all_actual is not None else np.empty((0, dim))
     dist = metric_dist_to_needles(discovered, true_optima)
     dup  = metric_dup_fraction(X_all_np, NOISE_LEVEL / 2.0)
+
+    # A trial that never evaluated the objective (n_iters == 0 — e.g. get_candidate
+    # returned None on the first iteration) did no real optimisation, yet scores
+    # best-in-class on dup (0.0) and per-iter time (0.0). Left unpenalised the MOBO
+    # treats it as Pareto-optimal and "farms" the degenerate region. Force all three
+    # objectives to their worst so an instant-terminating trial is never rewarded.
+    if n_iters == 0:
+        dist = UNMATCHED_PENALTY
+        dup  = 1.0
+        avg_time_per_iter = time_limit_hours * 3600.0
+        print("    [trial]  degenerate trial (0 iterations) — penalising all objectives")
+
     print(f"    [trial]  iters={n_iters}  dist={dist:.4f}  dup={dup:.4f}"
           f"  t/iter={avg_time_per_iter:.3f}s  (total {runtime:.1f}s)"
           f"  needles={len(discovered)}/{len(true_optima)}")
@@ -1556,7 +1637,7 @@ def run_single_trial(
     # ── CSV / table artifacts ──
     try:
         write_points_csv(os.path.join(trial_dir, "points.csv"), dh, snap_records, cols)
-        write_needles_csv(os.path.join(trial_dir, "needles.csv"), dh, cols, dim)
+        write_needles_csv(os.path.join(trial_dir, "needles.csv"), dh, cols, dim, payloads)
         write_metrics_over_time_csv(
             os.path.join(trial_dir, "metrics_over_time.csv"), payloads, X_all_np, true_optima)
     except Exception as exc:
@@ -1751,6 +1832,10 @@ def run_mobo(ds: dict, run_dir, time_limit_hours: float, max_trials=None,
                     x_new = candidate.squeeze(0).detach().cpu()
 
                 hparams = norm_to_hparams(x_new)
+                # norm_to_hparams may repair the proposal (e.g. raw ≥ n_restarts);
+                # re-derive x_new from the repaired hparams so the recorded design
+                # point matches the config actually run (and what resume reloads).
+                x_new = hparams_to_norm(hparams)
                 hp_str = "  ".join(f"{k}={round(v,4) if isinstance(v,float) else v}"
                                    for k, v in hparams.items())
                 print(f"\n[trial {trial_num} | {phase}]  {hp_str}")

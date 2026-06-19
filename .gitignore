@@ -1,3 +1,13 @@
+# Slurm outputs
+*.err
+*.out
+
+# UV artifacts
+.python-version
+pyproject.toml
+requirements_clean.txt
+uv.lock
+
 data/campaign1a.csv
 optimize/variance*
 synthetic_data/*.html

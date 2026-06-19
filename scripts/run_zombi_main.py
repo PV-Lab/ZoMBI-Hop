@@ -22,7 +22,6 @@ import torch
 from src import ZoMBIHop, LineBO
 from src.core.linebo import (
     batch_line_simplex_segments,
-    dimension_line_scale,
     line_simplex_segment,
     zero_sum_dirs,
 )
@@ -1037,8 +1036,7 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
         print("=" * 80 + "\n")
 
         print("Generating initial data via database...")
-        # Initial-seeding budget scales with dimension (no-op at d=3).
-        n_init_data = max(1, int(round(NUM_INIT_DATA * dimension_line_scale(dimensions))))
+        n_init_data = NUM_INIT_DATA
         ordered_endpoints = initial_lines_on_boundary(
             2 * n_init_data, bounds, device, dtype=torch.float64
         )

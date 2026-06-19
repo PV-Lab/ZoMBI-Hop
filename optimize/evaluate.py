@@ -104,14 +104,6 @@ for _stream in (sys.stdout, sys.stderr):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_mobo as rm
 
-# Dimension scaling helper for the LineBO seeding budget (run_mobo wires the
-# repo root onto sys.path, so src is importable after importing it).
-from src.core.linebo import dimension_line_scale
-
-# Process-wide dimension-scaling toggle (see src/utils/scaling.py).  Used to run
-# with scaling on (--scaling-on) or off (default) through the same code paths.
-from src.utils.scaling import dimension_scaling_disabled
-
 # Analytic benchmark objectives (negated Ackley on the d-simplex).
 from synthetic_data.ackley import Ackley
 
@@ -251,8 +243,7 @@ def load_trial_hparams(runs_path: str, trial_nums: list[int]) -> dict[int, dict]
 def gen_init_data(fn_callable, maximize: bool, dim: int, n_init_lines: int | None = None):
     """Generate ``n_init_lines`` random simplex lines on the ``dim``-simplex.
 
-    ``n_init_lines`` defaults to ``run_mobo.N_INIT_LINES``; callers transferring a
-    3-D-tuned configuration to a higher dimension pass a dimension-scaled count.
+    ``n_init_lines`` defaults to ``run_mobo.N_INIT_LINES``.
     """
     if n_init_lines is None:
         n_init_lines = rm.N_INIT_LINES
@@ -310,12 +301,15 @@ def write_points_csv(path: str, dh, snap_records: list[tuple], cols: list[str]) 
     pd.DataFrame(data).to_csv(path, index=False)
 
 
-def write_needles_csv(path: str, dh, cols: list[str], dim: int) -> None:
+def write_needles_csv(path: str, dh, cols: list[str], dim: int,
+                      payloads: list[dict] | None = None) -> None:
     import math
     import pandas as pd
     centroid = np.full(dim, 1.0 / dim)
+    results = dh.get_all_needle_results()
+    fine_iters = rm.needle_fine_iterations(results, payloads or [])
     rows = []
-    for i, r in enumerate(dh.get_all_needle_results()):
+    for i, r in enumerate(results):
         pt = r["point"].detach().cpu().numpy().ravel()
         mv_ = r.get("median_value")
         row = {"needle_idx": i}
@@ -325,7 +319,9 @@ def write_needles_csv(path: str, dh, cols: list[str], dim: int) -> None:
             "value": r.get("value"),
             "median_value": (None if mv_ is None or (isinstance(mv_, float) and math.isnan(mv_)) else mv_),
             "zoom": r.get("zoom"),
-            "iteration": r.get("iteration"),
+            # Fine-grained LineBO line-pick iteration (consistent with
+            # metrics_over_time.csv), not ZoMBI's zoom-local iteration counter.
+            "iteration": fine_iters[i],
             "reason": r.get("reason"),
             "dist_to_centre": float(np.linalg.norm(pt - centroid)),
         })
@@ -432,10 +428,7 @@ def run_single_eval(hparams: dict, ds: dict, dataset: str, out_dir: str,
     call_counter = [0]
     dh_ref = [None]
 
-    # Initial-seeding line budget scales with dimension (1.0 at d=3).  The
-    # per-iteration NUM_LINES budget is scaled inside LineBO.__init__, so it is
-    # passed through unchanged here.
-    n_init_lines = max(1, int(round(rm.N_INIT_LINES * dimension_line_scale(dim))))
+    n_init_lines = rm.N_INIT_LINES
 
     sim_obj = rm.make_sim_obj(fn, rm.DEVICE, rm.DTYPE, maximize=maximize)
     inner   = rm.make_linebo_wrapper(sim_obj, dim, rm.NUM_LINES, rm.DEVICE, rm.DTYPE, plot_state)
@@ -524,7 +517,7 @@ def run_single_eval(hparams: dict, ds: dict, dataset: str, out_dir: str,
     # ── CSV artifacts ──
     try:
         write_points_csv(os.path.join(out_dir, "points.csv"), dh, snap_records, cols)
-        write_needles_csv(os.path.join(out_dir, "needles.csv"), dh, cols, dim)
+        write_needles_csv(os.path.join(out_dir, "needles.csv"), dh, cols, dim, payloads)
         rm.write_metrics_over_time_csv(
             os.path.join(out_dir, "metrics_over_time.csv"), payloads, X_all_np, true_optima)
     except Exception as exc:
@@ -657,7 +650,6 @@ def evaluate_dataset(dataset: str, out_dir: str, runs_path: str,
             "num_runs":        args.num_runs,
             "time_limit_min":  args.time_limit_min,
             "top_k":           args.top_k,
-            "scaling_on":      args.scaling_on,
             "true_optima":     [list(map(float, t.ravel())) for t in ds["true_optima"]],
         }, f, indent=2)
 
@@ -679,16 +671,8 @@ def evaluate_dataset(dataset: str, out_dir: str, runs_path: str,
             print(f"  [run {k}/{args.num_runs}]  (overall {done}/{total})")
             run_dir = os.path.join(trial_dir, f"run_{k}")
             try:
-                # Dimension scaling is on globally by default; --scaling-on keeps
-                # it on, otherwise the whole run is wrapped so both scaling
-                # factors collapse to 1.0 (identical code path, no separate branch).
-                if args.scaling_on:
-                    res = run_single_eval(hparams, ds, dataset, run_dir,
-                                          args.time_limit_min, top_k=args.top_k)
-                else:
-                    with dimension_scaling_disabled():
-                        res = run_single_eval(hparams, ds, dataset, run_dir,
-                                              args.time_limit_min, top_k=args.top_k)
+                res = run_single_eval(hparams, ds, dataset, run_dir,
+                                      args.time_limit_min, top_k=args.top_k)
                 per_trial[trial_num].append({
                     "run": k,
                     "dist_to_needles": round(res["dist"], 6),
@@ -734,11 +718,6 @@ def main() -> None:
     parser.add_argument("--ackley-variant", default="realistic",
                         choices=sorted(Ackley.VARIANTS),
                         help="Ackley variant for the ackley* datasets (default: realistic).")
-    parser.add_argument("--scaling-on", action="store_true",
-                        help="Scale the hyperparameters with the objective dimension "
-                             "(Group-1 radii by sqrt((d-1)/2), Group-2 budgets by "
-                             "(d-1)/2; both 1.0 at d=3). Off by default, so a 3-D-tuned "
-                             "config transfers verbatim to higher-dimensional datasets.")
     parser.add_argument("--out", default=None,
                         help="Parent directory for the rerun_* folder "
                              "(default: optimize/runs).")
@@ -772,8 +751,7 @@ def main() -> None:
     print("=" * 72)
     print(f"ZoMBI-Hop evaluate  |  datasets={datasets}  trials={trial_nums}  "
           f"num_runs={args.num_runs}  limit={args.time_limit_min} min"
-          + (f"  top_k={args.top_k}" if args.top_k is not None else "")
-          + f"  scaling={'ON' if args.scaling_on else 'OFF'}")
+          + (f"  top_k={args.top_k}" if args.top_k is not None else ""))
     if args.hparams_json:
         print(f"hparams: {os.path.abspath(args.hparams_json)}")
     print(f"source: {runs_path}")

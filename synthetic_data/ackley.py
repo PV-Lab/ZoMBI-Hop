@@ -119,17 +119,13 @@ def scaled_n_optima(n_base: int, dim: int) -> int:
 
     Why linear: the room for distinct basins lives in the ``(d-1)``-dimensional
     simplex, so it expands with dimension; true geometric growth is exponential,
-    but (as with the sampling-budget scaling in ``DIMENSION_SCALING.md``) that is
-    both unrealistic for materials composition spaces — which are mostly
-    phase-separated, not densely packed with stable phases — and undiscoverable as
-    a benchmark.  Tying the optima count to the *same* ``(d-1)/2`` factor used for
-    sampling budgets keeps the benchmark equally hard *per unit budget* across
-    dimensions, so a budget-scaling A/B isn't confounded by a higher-d run getting
-    more budget to chase the same number of targets.
+    but that is both unrealistic for materials composition spaces — which are
+    mostly phase-separated, not densely packed with stable phases — and
+    undiscoverable as a benchmark. The linear ``(d-1)/2`` factor keeps the
+    benchmark's target count growing gently and predictably with dimension.
 
-    This is intentionally a *plain* function of ``dim`` — independent of the
-    runtime ``src.utils.scaling`` toggle — so both arms of such an A/B face the
-    identical objective.
+    This count scaling defines the benchmark objective itself; it is unrelated to
+    (and unaffected by) how ZoMBI-Hop's own hyperparameters are configured.
     """
     return max(1, int(round(n_base * (dim - 1) / 2.0)))
 

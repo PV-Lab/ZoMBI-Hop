@@ -18,7 +18,6 @@ from ..utils.simplex import (
     Ellipsoid,
     composition_to_ilr,
 )
-from ..utils.scaling import dimension_line_scale, dimension_radius_scale
 from ..utils.datahandler import DataHandler
 from ..utils.gp_simplex import GPSimplex
 
@@ -129,31 +128,7 @@ class ZoMBIHop:
         self.dtype = dtype
         self.verbose = verbose
 
-        # --- Dimension scaling of dimension-sensitive hyperparameters ---
-        # These hyperparameters were tuned on the 3-simplex (d=3).  To help them
-        # generalise to higher dimensions we scale two groups by the problem
-        # dimension d (= number of simplex components):
-        #   Group 1 — tangent/ILR-space distances & radii — by sqrt((d-1)/2)
-        #   Group 2 — acquisition sampling budgets        — linearly by (d-1)/2
-        # Both factors are exactly 1.0 at d=3, so a 3-D-tuned configuration is
-        # reproduced unchanged there.  (NUM_LINES / N_INIT_LINES live in the
-        # LineBO layer outside ZoMBIHop and are scaled at that call site.)
-        # The factors collapse to 1.0 everywhere when scaling is disabled via
-        # src.utils.scaling.dimension_scaling_disabled() (see test_dim_scale.py).
         d = X_init_actual.shape[1]
-        dim_scale_g1 = dimension_radius_scale(d)
-        dim_scale_g2 = dimension_line_scale(d)
-        paring_spatial_halfnoise *= dim_scale_g1
-        max_penalty_radius *= dim_scale_g1
-        min_axis_noise_mult *= dim_scale_g1
-        n_restarts = int(round(n_restarts * dim_scale_g2))
-        raw = int(round(raw * dim_scale_g2))
-        if verbose and d != 3:
-            print(f"Dimension scaling (d={d}): group1 ×{dim_scale_g1:.3f}, "
-                  f"group2 ×{dim_scale_g2:.3f} → n_restarts={n_restarts}, raw={raw}, "
-                  f"max_penalty_radius={max_penalty_radius:.4f}, "
-                  f"paring_spatial_halfnoise={paring_spatial_halfnoise:.4f}, "
-                  f"min_axis_noise_mult={min_axis_noise_mult:.4f}")
 
         self._needle_plot_points_ref = needle_plot_points_ref
         self.ellipsoid_drop_fraction = ellipsoid_drop_fraction

@@ -1,0 +1,12 @@
+#!/bin/bash
+#SBATCH --job-name=mobo_10d
+#SBATCH --output=optimize/scripts/mobo_10d_%j.out
+#SBATCH --error=optimize/scripts/mobo_10d_%j.err
+#SBATCH --time=12:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=32G
+#SBATCH --partition=sched_mit_sloan_gpu_r8
+#SBATCH --gres=gpu:1
+
+uv run python optimize/run_mobo.py --start-from-best optimize/runs/mobo_05_06_15_32/trial_112 --dataset ackley10d --time-limit 2

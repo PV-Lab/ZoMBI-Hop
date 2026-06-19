@@ -24,9 +24,6 @@ from ..utils.simplex import (
     sample_ellipsoid,
     proj_simplex,
 )
-# Re-exported so existing `from src.core.linebo import dimension_line_scale`
-# callers keep working; the canonical home is src/utils/scaling.py.
-from ..utils.scaling import dimension_line_scale
 
 # Backward-compatible aliases
 random_zero_sum_directions = random_simplex_direction
@@ -437,10 +434,8 @@ class LineBO:
     num_points_per_line : int
         Number of points to sample along each line for integration. Default: 100.
     num_lines : int or None
-        Number of candidate lines to generate and evaluate. An explicit value is
-        treated as the count tuned on the 3-simplex and scaled with dimension by
-        ``dimension_line_scale(d)`` (= ``(d-1)/2``, so it is unchanged at d=3 and
-        grows for higher-d problems). Default: None (legacy auto budget: 10*d).
+        Number of candidate lines to generate and evaluate per iteration, used
+        verbatim. Default: None (legacy auto budget: 10*d).
     device : str
         Device for computations. Default: 'cuda'.
     """
@@ -457,13 +452,12 @@ class LineBO:
         self.objective_function = objective_function
         self.d = dimensions
         self.num_points_per_line = num_points_per_line
-        # An explicit num_lines is the 3-simplex-tuned base; scale it with
-        # dimension so higher-d runs probe proportionally more lines per
-        # iteration (no-op at d=3).  num_lines=None keeps the legacy 10*d budget.
+        # num_lines=None keeps the legacy 10*d budget; an explicit value is used
+        # verbatim.
         if num_lines is None:
             self.num_lines = 10 * dimensions
         else:
-            self.num_lines = max(1, int(round(num_lines * dimension_line_scale(dimensions))))
+            self.num_lines = max(1, int(num_lines))
         self.device = torch.device(device)
         self.dtype = torch.float64
 

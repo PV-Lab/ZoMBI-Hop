@@ -64,7 +64,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import evaluate as ev
 import run_mobo as rm
 
-from src.utils.scaling import dimension_scaling_disabled
 from synthetic_data.ackley import Ackley
 
 # ── Fixed experiment configuration ─────────────────────────────────────────────
@@ -126,8 +125,8 @@ def _write_results(path: str, header: dict, per_cond: dict) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--num-runs", type=int, default=2,
-                    help="Repeats per condition (default: 2).")
+    ap.add_argument("--num-runs", type=int, default=1,
+                    help="Repeats per condition (default: 1).")
     ap.add_argument("--out", default=None,
                     help="Existing parametric_* dir to resume into "
                          "(default: a fresh timestamped folder under optimize/runs).")
@@ -215,9 +214,8 @@ def main() -> None:
             print(f"  {tag} — running …", flush=True)
             t0 = time.time()
             try:
-                with dimension_scaling_disabled():
-                    res = ev.run_single_eval(hparams, ds, DATASET_LABEL,
-                                             run_dir, limit)
+                res = ev.run_single_eval(hparams, ds, DATASET_LABEL,
+                                         run_dir, limit)
                 per_cond[name].append({"run": k,
                                        "dist_to_needles": round(res["dist"], 6),
                                        "dup_fraction":    round(res["dup"], 6),
