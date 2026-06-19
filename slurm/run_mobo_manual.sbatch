@@ -8,9 +8,10 @@
 #   cd ~/ZoMBI-Hop
 #   sbatch slurm/run_mobo_manual.sbatch
 #
-# This file is a template: edit the #SBATCH headers and MOBO_CMD block below,
-# exactly like typing ``python optimize/run_mobo.py ...`` locally. Always keep
-# ``--no-show`` on the cluster (``mobo_job_common.sh`` sets MPLBACKEND=Agg).
+# This file is a template: edit the #SBATCH headers and the single MOBO_CMD
+# block below, exactly like typing ``python optimize/run_mobo.py ...`` locally.
+# Always keep ``--no-show`` on the cluster (``mobo_job_common.sh`` sets
+# MPLBACKEND=Agg).
 #
 # Flag cheat sheet (pick ONE run mode — do not combine incompatible flags):
 #
@@ -45,7 +46,7 @@
 #     --batch  with  --resume | --resume-from | --copy-config | --resume-scratch
 #     more than one of --resume / --resume-from / --copy-config / --resume-scratch
 #
-# Slurm resources — edit for CPU vs GPU:
+# Slurm resources — edit #SBATCH headers for CPU vs GPU:
 #
 #   CPU (RF surrogate, long wall clock):
 #     #SBATCH --partition=mit_normal
@@ -61,6 +62,10 @@
 #     #SBATCH --mem=64G
 #     #SBATCH --time=6:00:00
 #     MOBO: --device cuda
+#
+# How to switch modes: replace the MOBO_CMD block with one of the examples
+# in the comment section below (copy/paste into MOBO_CMD, do not uncomment
+# a second MOBO_CMD= assignment — only one active block).
 #
 # =============================================================================
 
@@ -84,11 +89,10 @@ source "${REPO}/slurm/mobo_job_common.sh"
 _mobo_setup_env
 
 # =============================================================================
-# EDIT THIS BLOCK — one command, same flags as on your laptop
+# EXAMPLES
 # =============================================================================
 #
-# Active example: campaign1a RF repeat (batch JSON).
-
+# --- Batch RF (campaign1a repeat) --------------------------------------------
 # MOBO_CMD=(
 #   python optimize/run_mobo.py
 #   --no-show
@@ -97,7 +101,7 @@ _mobo_setup_env
 #   --config optimize/mobo_batch_configs/campaign1a_mobo_05_06_15_32_repeat.json
 #   --time-limit-hours 0.4
 # )
-
+#
 # --- Resume (crawl all optimize/runs/mobo_*, reuse latest run_config) --------
 # MOBO_CMD=(
 #   python optimize/run_mobo.py
@@ -105,15 +109,15 @@ _mobo_setup_env
 #   --device cuda
 #   --resume
 # )
-
+#
 # --- Resume from one run directory only --------------------------------------
-MOBO_CMD=(
-  python optimize/run_mobo.py
-  --no-show
-  --device cuda
-  --resume-from optimize/runs/mobo_19_06_13_01_55_545039
-)
-
+# MOBO_CMD=(
+#   python optimize/run_mobo.py
+#   --no-show
+#   --device cuda
+#   --resume-from optimize/runs/mobo_19_06_13_01_55_545039
+# )
+#
 # --- Copy config from a past run (fresh Sobol + BO, no prior trials) ---------
 # MOBO_CMD=(
 #   python optimize/run_mobo.py
@@ -122,7 +126,7 @@ MOBO_CMD=(
 #   --copy-config optimize/runs/mobo_05_06_15_32
 #   --time-limit-hours 0.4
 # )
-
+#
 # --- Ackley benchmark (no batch JSON; uses --dataset) ------------------------
 # MOBO_CMD=(
 #   python optimize/run_mobo.py
@@ -132,8 +136,8 @@ MOBO_CMD=(
 #   --ackley-variant realistic
 #   --time-limit 0.5
 # )
-
-# --- Seed from best trial hparams (re-evaluated; Sobol still runs) -------------
+#
+# --- Seed from best trial hparams (re-evaluated; Sobol still runs) -----------
 # MOBO_CMD=(
 #   python optimize/run_mobo.py
 #   --no-show
@@ -142,19 +146,20 @@ MOBO_CMD=(
 #   --config optimize/mobo_batch_configs/campaign1a_mobo_05_06_15_32_repeat.json
 #   --start-from-best optimize/runs/mobo_05_06_15_32/trial_315
 # )
+#
+# =============================================================================
+# ACTIVE COMMAND — edit this block only (one MOBO_CMD= assignment in this file)
+# =============================================================================
+
+MOBO_CMD=(
+  python optimize/run_mobo.py
+  --no-show
+  --device cuda
+  --resume-from optimize/runs/mobo_19_06_13_01_55_545039
+)
 
 # =============================================================================
 
-# MOBO_CMD=(
-#   python optimize/run_mobo.py
-#   --no-show
-#   --device cuda
-#   --batch
-#   --config optimize/mobo_batch_configs/campaign1a_mobo_05_06_15_32_repeat.json
-#   --time-limit-hours 0.4
-# )
-
---resume-from
 echo "=== MOBO command ==="
 printf '  %q' "${MOBO_CMD[@]}"
 echo
