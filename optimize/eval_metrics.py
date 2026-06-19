@@ -1,14 +1,14 @@
 """
 Dimension-aware evaluation metrics for ZoMBI-Hop runs.
 
-Baseline constants are tuned at the 3-simplex (d=3).  Higher dimensions apply the
-same scaling factors as ``DIMENSION_SCALING.md`` (Group 1 for ILR radii, Group 2
-for unmatched-needle penalties paired with ``scaled_n_optima`` growth).
+Baseline constants are tuned at the 3-simplex (d=3).  Higher dimensions apply Group 1
+scaling for ILR radii only (``match_radius_ilr``, ``dup_threshold_ilr``).
 
-  * ``unmatched_penalty(d)``     — ``UNMATCHED_PENALTY × (d−1)/2``
+  * ``match_radius_comp(d)``      — composition L2 radius (fixed 0.05; MOBO original)
   * ``match_radius_ilr(d)``       — ILR L2 radius ``× √((d−1)/2)``
   * ``dup_threshold_ilr(d)``      — ILR duplicate radius ``× √((d−1)/2)``
-  * Matched composition distances — normalised by ``√2`` (simplex L2 diameter)
+  * ``dist_to_needles`` matched terms — raw composition L2 (MOBO original; no ÷√2)
+  * ``dist_to_needles`` penalties — fixed ``UNMATCHED_PENALTY`` (MOBO original)
 """
 
 from __future__ import annotations
@@ -44,9 +44,6 @@ MATCH_RADIUS = 0.05
 # ILR L2 radius at d=3, calibrated ≈ composition-L2 ``MATCH_RADIUS`` on typical needles.
 MATCH_RADIUS_ILR = 0.12
 NOISE_LEVEL_ILR = 0.03
-SIMPLEX_L2_DIAMETER = math.sqrt(2.0)
-
-
 def infer_metric_dim(
     dim: int | None,
     *arrays: np.ndarray | list | None,
@@ -78,6 +75,12 @@ def unmatched_penalty(dim: int) -> float:
     return UNMATCHED_PENALTY * dimension_line_scale(dim)
 
 
+def match_radius_comp(dim: int) -> float:
+    """Needle–optimum match radius in composition L2 (MOBO original; diameter is √2 for all d)."""
+    del dim  # simplex L2 diameter does not grow with d
+    return MATCH_RADIUS
+
+
 def match_radius_ilr(dim: int) -> float:
     """Needle–optimum match radius in ILR L2, baseline at d=3."""
     return MATCH_RADIUS_ILR * dimension_radius_scale(dim)
@@ -95,9 +98,9 @@ def metric_dist_to_needles(
     dim: int | None = None,
     penalty: float | None = None,
 ) -> float:
-    """Symmetric greedy matching distance (composition L2 / √2 + scaled penalty)."""
+    """Symmetric greedy matching distance (raw composition L2 + fixed penalty; MOBO original)."""
     d = infer_metric_dim(dim, discovered, true_optima)
-    pen = float(penalty if penalty is not None else unmatched_penalty(d))
+    pen = float(penalty if penalty is not None else UNMATCHED_PENALTY)
     n_opt = len(true_optima)
     if n_opt == 0:
         return 0.0
@@ -116,7 +119,7 @@ def metric_dist_to_needles(
                 best_d, best_j = dist, j
         if best_j >= 0:
             used.add(best_j)
-            total += best_d / SIMPLEX_L2_DIAMETER
+            total += best_d
         else:
             total += pen
     total += (n_disc - len(used)) * pen
@@ -143,14 +146,35 @@ def metric_dup_fraction(
     return float((dists < thr).any(axis=1).mean())
 
 
-def metric_pct_matched(
+def metric_pct_matched_comp(
     discovered: np.ndarray,
     true_optima: list[np.ndarray],
     radius: float | None = None,
     *,
     dim: int | None = None,
 ) -> float:
-    """Percentage of discovered needles within ILR ``match_radius_ilr(d)`` of a true optimum."""
+    """% of discovered needles within composition-L2 ``match_radius_comp(d)`` of a true optimum."""
+    if len(discovered) == 0 or not true_optima:
+        return 0.0
+    d = infer_metric_dim(dim, discovered, true_optima)
+    r = float(radius if radius is not None else match_radius_comp(d))
+    disc = np.asarray(discovered, dtype=float)
+    opt = np.asarray(true_optima, dtype=float)
+    valid = 0
+    for needle in disc:
+        if float(np.linalg.norm(opt - needle, axis=1).min()) <= r:
+            valid += 1
+    return 100.0 * valid / len(disc)
+
+
+def metric_pct_matched_ilr(
+    discovered: np.ndarray,
+    true_optima: list[np.ndarray],
+    radius: float | None = None,
+    *,
+    dim: int | None = None,
+) -> float:
+    """% of discovered needles within ILR-L2 ``match_radius_ilr(d)`` of a true optimum."""
     if len(discovered) == 0 or not true_optima:
         return 0.0
     d = infer_metric_dim(dim, discovered, true_optima)
@@ -162,6 +186,17 @@ def metric_pct_matched(
         if float(np.linalg.norm(Z_opt - z, axis=1).min()) <= r:
             valid += 1
     return 100.0 * valid / len(Z_disc)
+
+
+def metric_pct_matched(
+    discovered: np.ndarray,
+    true_optima: list[np.ndarray],
+    radius: float | None = None,
+    *,
+    dim: int | None = None,
+) -> float:
+    """Alias for ``metric_pct_matched_comp`` (original MOBO definition)."""
+    return metric_pct_matched_comp(discovered, true_optima, radius, dim=dim)
 
 
 def metric_avg_pairwise_dist(discovered: np.ndarray) -> float:

@@ -1120,7 +1120,6 @@ class ExtremaPicker:
 
 from eval_metrics import (  # noqa: E402  — after sys.path setup in callers
     MATCH_RADIUS,
-    SIMPLEX_L2_DIAMETER,
     UNMATCHED_PENALTY,
     dup_threshold_ilr,
     match_radius_ilr,
@@ -1128,7 +1127,8 @@ from eval_metrics import (  # noqa: E402  — after sys.path setup in callers
     metric_dist_to_needles,
     metric_dup_fraction,
     metric_pct_matched,
-    unmatched_penalty,
+    metric_pct_matched_comp,
+    metric_pct_matched_ilr,
 )
 # ─── ZoMBI sim-objective + LineBO wrapper ──────────────────────────────────────
 
@@ -1498,11 +1498,14 @@ def write_metrics_over_time_csv(path: str, payloads: list[dict], X_all: np.ndarr
             "iteration": p["iter_num"],
             "dist_to_needles":  round(metric_dist_to_needles(disc, true_optima, dim=dim), 6),
             "dup_fraction":     round(metric_dup_fraction(X_upto, dim=dim), 6),
-            "pct_matched":      round(metric_pct_matched(disc, true_optima, dim=dim), 4),
+            "pct_matched_comp": round(metric_pct_matched_comp(disc, true_optima, dim=dim), 4),
+            "pct_matched_ilr":  round(metric_pct_matched_ilr(disc, true_optima, dim=dim), 4),
+            "pct_matched":      round(metric_pct_matched_comp(disc, true_optima, dim=dim), 4),
             "avg_pairwise_dist":round(metric_avg_pairwise_dist(disc), 6),
             "recent_needle_value": (round(recent, 6) if not math.isnan(recent) else np.nan),
         })
-    cols = ["iteration", "dist_to_needles", "dup_fraction", "pct_matched",
+    cols = ["iteration", "dist_to_needles", "dup_fraction",
+            "pct_matched_comp", "pct_matched_ilr", "pct_matched",
             "avg_pairwise_dist", "recent_needle_value"]
     pd.DataFrame(rows, columns=cols).to_csv(path, index=False)
 
@@ -1672,7 +1675,7 @@ def run_single_trial(
         X_a, X_e, Y = _gen_init_data(fn_callable, maximize, dim=dim)
     except RuntimeError as exc:
         print(f"    [trial] init failed: {exc}")
-        return {"dist": unmatched_penalty(dim), "dup": 1.0, "runtime": 0.0, "payloads": []}
+        return {"dist": UNMATCHED_PENALTY, "dup": 1.0, "runtime": 0.0, "payloads": []}
 
     hp = dict(hparams)
     if dim > 3 and (hp.get("top_m_points") is None or hp.get("top_m_points", 0) < dim + 1):

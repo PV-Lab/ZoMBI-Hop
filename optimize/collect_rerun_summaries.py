@@ -31,7 +31,8 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parent.parent
 _DEFAULT_RUNS = _REPO / "optimize" / "runs"
 _ACKLEY_DATASETS = ("ackley3d", "ackley4d", "ackley10d")
-_METRIC_KEYS = ("dist_to_needles", "dup_fraction", "pct_matched", "runtime_s")
+_METRIC_KEYS = ("dist_to_needles", "dup_fraction",
+                "pct_matched_comp", "pct_matched_ilr", "pct_matched", "runtime_s")
 
 
 def _parse_csv_ints(raw: str) -> list[int]:
@@ -103,7 +104,9 @@ def collect_rows(rerun_dirs: list[tuple[Path, dict]], *, runs_root: Path) -> lis
                     "run": run["run"],
                     "dist_to_needles": run["dist_to_needles"],
                     "dup_fraction": run["dup_fraction"],
-                    "pct_matched": run.get("pct_matched"),
+                    "pct_matched_comp": run.get("pct_matched_comp", run.get("pct_matched")),
+                    "pct_matched_ilr": run.get("pct_matched_ilr"),
+                    "pct_matched": run.get("pct_matched_comp", run.get("pct_matched")),
                     "runtime_s": run["runtime_s"],
                     "n_true_optima": n_optima,
                     "path": str(root / f"trial_{trial}" / f"run_{run['run']}"),
@@ -119,7 +122,9 @@ def collect_rows(rerun_dirs: list[tuple[Path, dict]], *, runs_root: Path) -> lis
                     "run": "mean",
                     "dist_to_needles": agg["dist_to_needles"]["mean"],
                     "dup_fraction": agg["dup_fraction"]["mean"],
-                    "pct_matched": agg.get("pct_matched", {}).get("mean"),
+                    "pct_matched_comp": agg.get("pct_matched_comp", agg.get("pct_matched", {})).get("mean"),
+                    "pct_matched_ilr": agg.get("pct_matched_ilr", {}).get("mean"),
+                    "pct_matched": agg.get("pct_matched_comp", agg.get("pct_matched", {})).get("mean"),
                     "runtime_s": agg["runtime_s"]["mean"],
                     "n_true_optima": n_optima,
                     "path": str(root / f"trial_{trial}"),
@@ -161,17 +166,19 @@ def print_table(rows: list[dict]) -> None:
     show = [r for r in rows if r["run"] != "mean"] or rows
     header = (
         f"{'dataset':<12} {'dim':>3} {'time_min':>8} {'trial':>5} {'run':>4} "
-        f"{'dist':>10} {'dup_frac':>10} {'pct_match':>10} {'runtime_s':>10}  {'rerun_dir'}"
+        f"{'dist':>10} {'dup_frac':>10} {'pct_comp':>10} {'pct_ilr':>10} {'runtime_s':>10}  {'rerun_dir'}"
     )
     print("\n" + header)
     print("-" * len(header))
     for r in sorted(show, key=lambda x: (x["dataset"], x["time_limit_min"], x["rerun_dir"], x["run"])):
-        pct = r.get("pct_matched")
-        pct_s = f"{pct:.2f}" if pct is not None else "?"
+        pct_comp = r.get("pct_matched_comp")
+        pct_ilr = r.get("pct_matched_ilr")
+        pct_comp_s = f"{pct_comp:.2f}" if pct_comp is not None else "?"
+        pct_ilr_s = f"{pct_ilr:.2f}" if pct_ilr is not None else "?"
         print(
             f"{r['dataset']:<12} {r['dim']:>3} {r['time_limit_min']:>8g} {r['trial']:>5} {str(r['run']):>4} "
             f"{r['dist_to_needles']:>10.4f} {r['dup_fraction']:>10.4f} "
-            f"{pct_s:>10} {r['runtime_s']:>10.1f}  {r['rerun_dir']}"
+            f"{pct_comp_s:>10} {pct_ilr_s:>10} {r['runtime_s']:>10.1f}  {r['rerun_dir']}"
         )
 
 
@@ -191,8 +198,9 @@ def print_coverage(matrix: dict, *, row_label: str, row_keys: list[str], time_li
 def write_csv(path: Path, rows: list[dict]) -> None:
     fields = [
         "rerun_dir", "dataset", "dim", "time_limit_min", "trial", "run",
-        "dist_to_needles", "dup_fraction", "pct_matched", "runtime_s",
-        "n_true_optima", "path",
+        "dist_to_needles", "dup_fraction",
+        "pct_matched_comp", "pct_matched_ilr", "pct_matched",
+        "runtime_s", "n_true_optima", "path",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)

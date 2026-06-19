@@ -141,8 +141,8 @@ Run metrics use the same baseline-at-`d=3` philosophy:
 
 | Metric | Baseline at d=3 | Scales with | Notes |
 |--------|-----------------|-------------|-------|
-| `unmatched_penalty` | 10.0 | `(d−1)/2` (Group 2) | Paired with `scaled_n_optima` |
-| Matched terms in `dist_to_needles` | composition L2 | ÷ `√2` | Simplex diameter normalisation |
+| `unmatched_penalty` | 10.0 | fixed (MOBO original) | ``dist_to_needles`` miss / spurious needle penalty |
+| Matched terms in `dist_to_needles` | composition L2 (raw) | fixed | MOBO original; not ÷ ``√2`` |
 | `match_radius_ilr` (`pct_matched`) | 0.12 ILR L2 | `√((d−1)/2)` (Group 1) | ILR needle–optimum test (≈ comp 0.05 at d=3) |
 | `dup_threshold_ilr` (`dup_fraction`) | `input_noise_ilr / 2` | `√((d−1)/2)` (Group 1) | ILR duplicate-neighbour test |
 
