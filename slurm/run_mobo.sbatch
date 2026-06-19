@@ -57,6 +57,7 @@ fi
 
 python optimize/run_mobo.py \
   --no-show \
+  --batch \
   --config "${REPO}/${CONFIG}" \
   --device "${DEVICE}" \
   "${EXTRA[@]}"

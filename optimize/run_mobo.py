@@ -130,6 +130,10 @@ Non-interactive / MIT ORCD HPC
 Each trial appends to ``trials_log.csv`` (hyperparameters + metrics) and
 ``all_samples.csv`` (every ZoMBI sample point with trial/phase context).
 ``mobo_progress.json`` is still rewritten atomically after every trial.
+
+``run_config.json`` also records ``device``, ``invocation`` (full argv, resolved
+effective settings, and notes on which source won when CLI/batch/saved-config
+values conflict), plus ``slurm`` metadata on HPC.
 """
 
 from __future__ import annotations
@@ -141,6 +145,7 @@ import glob
 import json
 import math
 import os
+import shlex
 import shutil
 import sys
 import time
@@ -451,12 +456,87 @@ def _slurm_metadata() -> dict:
     return meta
 
 
+def _cli_snapshot(args: argparse.Namespace) -> dict:
+    """Non-default CLI flags actually passed on the command line."""
+    snap: dict = {}
+    for key, val in vars(args).items():
+        if val is None or val == []:
+            continue
+        if val is False and key not in ("no_show", "batch", "resume", "resume_scratch"):
+            continue
+        if key == "dataset" and val == "RF":
+            continue
+        if key == "landscape" and val == "rf":
+            continue
+        if key == "ackley_variant" and val == "realistic":
+            continue
+        snap[key] = val
+    return snap
+
+
+def _effective_run_settings(
+    landscape: LandscapeSpec,
+    *,
+    max_trials: int | None,
+    n_init_trials: int,
+    runs_dir: str,
+    run_dir: str | None = None,
+) -> dict:
+    return {
+        "device": str(DEVICE),
+        "time_limit_hours": landscape.time_limit_hours,
+        "max_activations": landscape.max_activations,
+        "max_trials": max_trials,
+        "n_init_trials": n_init_trials,
+        "landscape": landscape.landscape,
+        "landscape_label": landscape.label,
+        "dim": landscape.dim,
+        "runs_dir": runs_dir,
+        "run_dir": run_dir,
+    }
+
+
+def build_invocation_log(
+    *,
+    argv: list[str],
+    run_mode: str,
+    cli: dict,
+    effective: dict,
+    resolutions: list[str] | None = None,
+) -> dict:
+    """Full snapshot of how this run was launched and what values were actually used."""
+    device_requested = cli.get("device")
+    return {
+        "argv": list(argv),
+        "command": shlex.join(argv),
+        "run_mode": run_mode,
+        "cli": cli,
+        "effective": effective,
+        "device_requested": device_requested,
+        "device_effective": effective.get("device", str(DEVICE)),
+        "cuda_available": torch.cuda.is_available(),
+        "resolutions": resolutions or [],
+        "hparam_space": {k: list(v) for k, v in HPARAM_SPACE.items()},
+    }
+
+
+def _log_invocation(invocation: dict) -> None:
+    eff = invocation["effective"]
+    print(f"  [invocation] mode={invocation['run_mode']}  "
+          f"device={eff.get('device')}  "
+          f"time_limit_hours={eff.get('time_limit_hours')}  "
+          f"max_trials={eff.get('max_trials')}", flush=True)
+    for note in invocation.get("resolutions", []):
+        print(f"  [invocation] {note}", flush=True)
+
+
 def write_run_config(run_dir, landscape: LandscapeSpec, *,
                      batch_name: str | None = None,
                      batch_config_path: str | None = None,
                      n_init_trials: int = N_INIT_TRIALS,
                      dataset: str | None = None,
-                     ackley_variant: str | None = None) -> None:
+                     ackley_variant: str | None = None,
+                     invocation: dict | None = None) -> None:
     """Persist the static run state needed for a fully non-interactive resume."""
     cfg = {
         "landscape":       landscape.landscape,
@@ -494,6 +574,9 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
         cfg["batch_name"] = batch_name
     if batch_config_path:
         cfg["batch_config_path"] = os.path.abspath(batch_config_path)
+    cfg["device"] = str(DEVICE)
+    if invocation is not None:
+        cfg["invocation"] = invocation
     from synthetic_data.landscape_config_log import build_landscape_config_log, dataset_label_for_landscape
     cfg["landscape_config"] = build_landscape_config_log(
         dataset=dataset_label_for_landscape(
@@ -2400,17 +2483,21 @@ def _launch_run(runs_dir, landscape: LandscapeSpec, max_trials,
                 run_dir: str | None = None,
                 n_init_trials: int = N_INIT_TRIALS,
                 dataset: str | None = None,
-                ackley_variant: str | None = None) -> None:
+                ackley_variant: str | None = None,
+                invocation: dict | None = None) -> None:
     """Create a fresh runs/mobo_* folder, persist its config, and run MOBO."""
     if run_dir is None:
         run_dir = unique_run_dir(runs_dir, "mobo")
     else:
         os.makedirs(run_dir, exist_ok=True)
+    if invocation is not None:
+        _log_invocation(invocation)
     write_run_config(
         run_dir, landscape,
         batch_name=batch_name, batch_config_path=batch_config_path,
         n_init_trials=n_init_trials,
         dataset=dataset, ackley_variant=ackley_variant,
+        invocation=invocation,
     )
     print(f"\n[run] Output folder: {run_dir}")
     run_mobo(landscape, run_dir, max_trials=max_trials,
@@ -2563,12 +2650,14 @@ def main() -> None:
               f"max_trials: {max_trials if max_trials is not None else 'unbounded (Ctrl+C)'}")
         print("=" * 70)
 
+        optima_note = ""
         if batch.get("landscape") is not None:
             landscape = batch["landscape"]
             if landscape.time_limit_hours is None and TIME_LIMIT_HOURS is not None:
                 pass  # Ackley uses max_activations
             elif batch.get("time_limit_hours") is not None:
                 landscape.time_limit_hours = batch["time_limit_hours"]
+            optima_note = "true_optima: planted by landscape builder (batch JSON)"
         else:
             csv_path = batch["csv_path"]
             obj_col = batch["objective_column"]
@@ -2598,6 +2687,12 @@ def main() -> None:
                     rf, grid_pts, grid_vals,
                     maximize=rf_maximize, n_peaks=n_peaks, min_sep=min_sep,
                 )
+                optima_note = (
+                    f"true_optima: auto_detect_rf_optima(n_peaks={n_peaks}, "
+                    f"min_sep={min_sep}) — NOT from batch JSON"
+                )
+            else:
+                optima_note = "true_optima: batch JSON or metadata sidecar"
             goal = "maxima" if rf_maximize else "minima"
             print(f"  RF ready: {len(true_optima)} reference {goal}")
             for i, t in enumerate(true_optima):
@@ -2624,10 +2719,54 @@ def main() -> None:
         )
         print(f"  {landscape.label}  |  {stop}")
 
+        resolutions: list[str] = []
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
+        if batch.get("time_limit_hours") is not None:
+            resolutions.append(
+                f"time_limit_hours: batch JSON ({batch['time_limit_hours']}) "
+                f"(CLI --time-limit-hours ignored)"
+                if time_limit_override is not None else
+                f"time_limit_hours: batch JSON ({batch['time_limit_hours']})"
+            )
+        elif time_limit_override is not None:
+            resolutions.append(f"time_limit_hours: CLI ({time_limit_override})")
+        else:
+            resolutions.append(f"time_limit_hours: default ({TIME_LIMIT_HOURS})")
+        if args.max_trials is not None:
+            resolutions.append(f"max_trials: CLI ({args.max_trials})")
+        elif batch.get("max_trials") is not None:
+            resolutions.append(f"max_trials: batch JSON ({batch['max_trials']})")
+        else:
+            resolutions.append("max_trials: unbounded")
+        if batch.get("n_init_trials") is not None:
+            resolutions.append(f"n_init_trials: batch JSON ({n_init})")
+        elif args.n_init_trials is not None:
+            resolutions.append(f"n_init_trials: CLI ({n_init})")
+        else:
+            resolutions.append(f"n_init_trials: default ({n_init})")
+        if optima_note:
+            resolutions.append(optima_note)
+
+        invocation = build_invocation_log(
+            argv=sys.argv,
+            run_mode="batch",
+            cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
         _launch_run(
             runs_dir, landscape, max_trials,
             batch_name=batch_name, batch_config_path=batch_config_path,
             run_dir=run_dir_override, n_init_trials=n_init,
+            invocation=invocation,
         )
         return
 
@@ -2663,11 +2802,39 @@ def main() -> None:
         X_prior, Y_prior, n_runs = collect_all_observations(runs_dir)
         print(f"  [collect] {len(Y_prior)} trial(s) from {n_runs} run(s) -> prior history.")
 
+        resolutions = [
+            "landscape + true_optima: saved run_config from latest mobo_* run",
+            f"time_limit_hours: saved run_config ({cfg.get('time_limit_hours')})"
+            if cfg.get("time_limit_hours") is not None else
+            f"time_limit_hours: default ({TIME_LIMIT_HOURS})",
+        ]
+        if time_limit_override is not None and cfg.get("time_limit_hours") is not None:
+            resolutions.append(
+                "CLI --time-limit-hours ignored on --resume when saved config has time_limit_hours"
+            )
+        if args.config:
+            resolutions.append("--config ignored on --resume (using saved run_config)")
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
+
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="resume", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
         _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
                     X_prior=X_prior, Y_prior=Y_prior,
                     run_dir=run_dir_override, n_init_trials=n_init,
                     dataset=_persist_dataset_fields(cfg)[0],
-                    ackley_variant=ackley_variant)
+                    ackley_variant=ackley_variant,
+                    invocation=invocation)
         return
 
     if args.resume_scratch:
@@ -2684,9 +2851,30 @@ def main() -> None:
         print(f"  [collect] {len(Y_prior)} trial(s) from {n_runs} run(s) -> prior history "
               f"(dist re-scored where needles saved, else reused; dup/runtime reused).")
 
+        resolutions = [
+            "landscape + true_optima: interactive picker (fresh config)",
+            f"time_limit_hours: {'CLI' if time_limit_override is not None else 'default'} "
+            f"({TIME_LIMIT_HOURS})",
+        ]
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
+
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="resume_scratch", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
         _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
                     X_prior=X_prior, Y_prior=Y_prior,
-                    run_dir=run_dir_override, n_init_trials=n_init)
+                    run_dir=run_dir_override, n_init_trials=n_init,
+                    invocation=invocation)
         return
 
     if args.resume_from:
@@ -2712,11 +2900,38 @@ def main() -> None:
         X_prior, Y_prior = collect_observations_from_run(run_path)
         print(f"  [collect] {len(Y_prior)} trial(s) -> prior history.")
 
+        resolutions = [
+            f"landscape + true_optima: saved run_config from {run_path}",
+            f"time_limit_hours: saved run_config ({cfg.get('time_limit_hours')})"
+            if cfg.get("time_limit_hours") is not None else
+            f"time_limit_hours: default ({TIME_LIMIT_HOURS})",
+        ]
+        if time_limit_override is not None and cfg.get("time_limit_hours") is not None:
+            resolutions.append(
+                "CLI --time-limit-hours ignored on --resume-from when saved config "
+                "has time_limit_hours"
+            )
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
+
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="resume_from", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
         _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
                     X_prior=X_prior, Y_prior=Y_prior,
                     run_dir=run_dir_override, n_init_trials=n_init,
                     dataset=_persist_dataset_fields(cfg)[0],
-                    ackley_variant=ackley_variant)
+                    ackley_variant=ackley_variant,
+                    invocation=invocation)
         return
 
     if args.copy_config:
@@ -2740,10 +2955,35 @@ def main() -> None:
         print(f"Device: {DEVICE}   |   time limit/trial: {landscape.time_limit_hours} h")
         print("=" * 70)
 
+        resolutions = [
+            f"landscape + true_optima: copied from {args.copy_config}",
+        ]
+        if time_limit_override is not None:
+            resolutions.append(f"time_limit_hours: CLI ({tl})")
+        elif cfg.get("time_limit_hours") is not None:
+            resolutions.append(f"time_limit_hours: saved run_config ({tl})")
+        else:
+            resolutions.append(f"time_limit_hours: default ({tl})")
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
+
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="copy_config", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
         _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
                     run_dir=run_dir_override, n_init_trials=n_init,
                     dataset=_persist_dataset_fields(cfg)[0],
-                    ackley_variant=ackley_variant)
+                    ackley_variant=ackley_variant,
+                    invocation=invocation)
         return
 
     if args.dataset != "RF":
@@ -2753,9 +2993,30 @@ def main() -> None:
         print("=" * 70)
         ds = _ds_ackley(args.dataset, args.ackley_variant)
         landscape = _landscape_from_legacy_ackley(ds)
+        resolutions = [
+            f"dataset: CLI --dataset {args.dataset}",
+            f"ackley_variant: {args.ackley_variant}",
+            f"time_limit_hours: {'CLI' if time_limit_override is not None else 'default'} "
+            f"({TIME_LIMIT_HOURS})",
+        ]
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="dataset", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
         _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
                     run_dir=run_dir_override, n_init_trials=n_init,
-                    dataset=args.dataset, ackley_variant=ds["ackley_variant"])
+                    dataset=args.dataset, ackley_variant=ds["ackley_variant"],
+                    invocation=invocation)
         return
 
     if args.landscape == "ackley":
@@ -2770,8 +3031,27 @@ def main() -> None:
             landscape = build_ackley_landscape(dim, layout, b=b, time_limit_hours=None)
         else:
             landscape = interactive_ackley_startup()
+        resolutions = [
+            "landscape: Multi-Ackley (--landscape ackley)",
+            "time_limit_hours: None (max_activations budget)",
+        ]
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="landscape_ackley", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
         _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
-                    run_dir=run_dir_override, n_init_trials=n_init)
+                    run_dir=run_dir_override, n_init_trials=n_init,
+                    invocation=invocation)
         return
 
     print("=" * 70)
@@ -2782,8 +3062,28 @@ def main() -> None:
 
     landscape = _interactive_run_config(script_dir)
 
+    resolutions = [
+        "landscape: interactive RF picker",
+        f"time_limit_hours: {'CLI' if time_limit_override is not None else 'default'} "
+        f"({TIME_LIMIT_HOURS})",
+    ]
+    if args.device:
+        resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+    else:
+        resolutions.append(
+            f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+        )
+    invocation = build_invocation_log(
+        argv=sys.argv, run_mode="fresh_rf", cli=_cli_snapshot(args),
+        effective=_effective_run_settings(
+            landscape, max_trials=max_trials, n_init_trials=n_init,
+            runs_dir=runs_dir, run_dir=run_dir_override,
+        ),
+        resolutions=resolutions,
+    )
     _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
-                run_dir=run_dir_override, n_init_trials=n_init)
+                run_dir=run_dir_override, n_init_trials=n_init,
+                invocation=invocation)
 
 
 if __name__ == "__main__":
