@@ -84,36 +84,6 @@ NOISE_AMP_BY_DIM = {
     10: 20.0,
 }
 
-SCALE_OPTIMA_WITH_DIM = True
-
-# The classic Ackley function has two parts: a smooth Gaussian-like envelope
-# (``t1``) that forms the basin, and an oscillatory cosine term (``t2``) that
-# studs that basin with fine local ripples / minima.  When this is False the
-# cosine term is dropped entirely, so each peak is a single smooth, monotonic
-# basin with no ripples — the envelope alone.
-USE_OSCILLATION = False
-
-# Hardcoded Ackley sharpness ``b`` (basin width) per simplex dimensionality.
-# When the "realistic" variant is built without an explicit ``basin_width``
-# override, the value for its ``dim`` is taken from here; dims not listed fall
-# back to the config ``basin_width``.
-BASIN_WIDTH_BY_DIM = {
-    3: 86.0,
-    4: 65.0,
-    10: 20,
-}
-
-# Hardcoded background-noise amplitude per simplex dimensionality, tuned by hand.
-# When the "realistic" variant is built without an explicit ``noise_amp``
-# override, the value for its ``dim`` is taken from here; dims not listed fall
-# back to the config ``noise_amp``.  (Interactive sliders pass noise_amp
-# explicitly, so they still override this.)
-NOISE_AMP_BY_DIM = {
-    3: 400.0,
-    4: 300.0,
-    10: 20.0,
-}
-
 _HARDCODED_DEFAULTS = {
     "n_optima": 10,
     "basin_width": 50,
@@ -410,11 +380,9 @@ class Ackley:
             self._noise_octaves = 0
             self._noise_seed = 0
 
-        # For dims above 3 the [0.5, 1] map is fixed from the *noise-free* Ackley
-        # signal (peak -> 1, far-field floor -> 0.5); noise (level set per-dim via
-        # NOISE_AMP_BY_DIM) is then added through that same map and the result is
-        # clipped to [0.5, 1].  At dim <= 3 the Ackley+noise signal is normalized
-        # together and left unclamped, as before.
+        # The [0.5, 1] map is fixed from the combined Ackley+noise signal at every
+        # dimensionality (peak -> 1, far-field floor -> 0.5).  For dim > 3 the
+        # mapped result is additionally clipped to [0.5, 1] as a safety net.
         self._clip_to_unit = self.dim > 3
 
         _est_rng = np.random.default_rng(12345)
@@ -423,8 +391,8 @@ class Ackley:
         # doesn't underestimate the peak in high dim.
         if self.centers:
             _samples = np.vstack([_samples, np.asarray(self.centers, dtype=float)])
-        # dim > 3 normalizes on the noise-free Ackley span; dim <= 3 on Ackley+noise.
-        _raw = self._ackley_raw(_samples) if self._clip_to_unit else self._predict_raw(_samples)
+        # Normalize on the Ackley+noise span at every dimensionality.
+        _raw = self._predict_raw(_samples)
         self._raw_min = float(_raw.min())
         self._raw_max = float(_raw.max())
 
@@ -461,8 +429,9 @@ class Ackley:
             return np.full(raw.shape, 0.75)
         y = 0.5 + 0.5 * (raw - self._raw_min) / span
         if self._clip_to_unit:
-            # dim > 3: keep the (noisy) objective within [0.5, 1] -- the span is
-            # the noise-free Ackley range, so noise can push a value past it.
+            # dim > 3: clip to [0.5, 1] as a safety net.  The span is estimated
+            # from sampled Ackley+noise values, so a rare unsampled point could
+            # still fall slightly outside the estimated range.
             y = np.clip(y, 0.5, 1.0)
         return y
 
