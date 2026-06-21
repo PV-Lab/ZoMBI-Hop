@@ -34,8 +34,8 @@ frames); ≥5D renders no landscape view. The metrics time-series plot
 
 Run layout
 ----------
-Each run creates a folder ``runs/mobo_DD_MM_HH_MM/`` (start date/time, military
-clock) containing:
+Each run creates a folder ``runs/mobo_<dim>d_DD_MM_HH_MM/`` (objective dimension
+then start date/time, military clock) containing:
   • mobo_progress.json / mobo_results.json / mobo_results.pt  – running summary
   • pareto_front.png                                          – on exit
   • trial_<n>/                                                – one per trial
@@ -80,6 +80,11 @@ Modifiers (combinable with any mode above):
                     Inherited from the saved config by --resume / --copy-config.
   --ackley-variant V  Ackley variant for the ackley* datasets (default realistic).
   --time-limit H    per-trial wall-clock budget in hours (default TIME_LIMIT_HOURS).
+  --resume-dim      resume on the --dataset objective, seeding the new run with
+                    ALL prior runs of the SAME dimensionality: crawl every
+                    runs/mobo_* run whose run_config dim matches the --dataset dim,
+                    collect their (X,Y) pairs and trust them as prior history (no
+                    re-evaluation). Non-interactive (ackley datasets only).
   --resume-from DIR   resume from a SPECIFIC run directory: trust that run's
                     stored metrics as prior history (no re-evaluation), reuse its
                     config, and start a new run seeded with only that data. If that
@@ -99,6 +104,7 @@ Usage
   python optimize/run_mobo.py --dataset ackley4d                # fresh 4D Ackley, non-interactive
   python optimize/run_mobo.py --dataset ackley10d --time-limit 0.5
   python optimize/run_mobo.py --resume                          # seed from all past runs
+  python optimize/run_mobo.py --resume-dim --dataset ackley4d   # seed from all past 4D runs
   python optimize/run_mobo.py --copy-config runs/mobo_04_06_11_47   # reuse config, no data
   python optimize/run_mobo.py --resume-from runs/mobo_17_06_11_27          # seed from one specific run
   python optimize/run_mobo.py --start-from-best runs/mobo_04_06_11_47/trial_1 [trial_dir ...]
@@ -530,6 +536,37 @@ def collect_observations_from_run(run_dir: str):
     used = _collect_from_progress(path, X_obs, Y_obs)
     print(f"  [collect] {os.path.basename(run_dir)}: {used} trial(s)")
     return X_obs, Y_obs
+
+
+def collect_observations_for_dim(runs_dir: str, dim: int):
+    """Crawl every runs/mobo_* run whose saved config dimension matches ``dim`` and
+    collect all (X_norm, Y) pairs from their mobo_progress.json.
+
+    Used by ``--resume-dim`` to seed a new run with the union of all prior runs of
+    the SAME dimensionality (e.g. every past 4-simplex run), trusting their stored
+    metrics without re-evaluation. Runs of a different dimension — or whose config
+    is missing/unreadable — are skipped, since their objective is incomparable.
+    Returns (X_obs, Y_obs, n_runs).
+    """
+    X_obs, Y_obs = [], []
+    n_runs = 0
+    for cfg_path in sorted(glob.glob(os.path.join(runs_dir, "mobo_*", "run_config.json"))):
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except Exception as exc:
+            print(f"  [collect] {cfg_path} unreadable ({exc}); skipping.")
+            continue
+        if int(cfg.get("dim", -1)) != int(dim):
+            continue
+        prog = os.path.join(os.path.dirname(cfg_path), "mobo_progress.json")
+        if not os.path.exists(prog):
+            continue
+        used = _collect_from_progress(prog, X_obs, Y_obs)
+        if used:
+            n_runs += 1
+            print(f"  [collect] {os.path.basename(os.path.dirname(cfg_path))}: {used} trial(s)")
+    return X_obs, Y_obs, n_runs
 
 
 def load_or_make_sobol(run_dir: str, bounds: torch.Tensor, n: int) -> torch.Tensor:
@@ -2009,8 +2046,8 @@ def _interactive_run_config(script_dir: str):
 
 def _launch_run(runs_dir, ds: dict, time_limit_hours: float, max_trials,
                 seed_X=None, X_prior=None, Y_prior=None) -> None:
-    """Create a fresh runs/mobo_* folder, persist its config, and run MOBO."""
-    run_dir = unique_run_dir(runs_dir, "mobo")
+    """Create a fresh runs/mobo_<dim>d_* folder, persist its config, and run MOBO."""
+    run_dir = unique_run_dir(runs_dir, f"mobo_{int(ds['dim'])}d")
     write_run_config(run_dir, ds["maximize"], ds["csv_path"], ds["true_optima"],
                      dataset=ds["label"], dim=ds["dim"],
                      ackley_variant=ds["ackley_variant"])
@@ -2052,6 +2089,12 @@ def main() -> None:
                              "direction) for a NEW run, WITHOUT inheriting its data points. PATH "
                              "is a run dir or a run_config.json file. Non-interactive; runs a "
                              "normal Sobol-init + BO run. Cannot combine with --resume.")
+    parser.add_argument("--resume-dim", action="store_true",
+                        help="Resume on the dataset given by --dataset, seeding the new run "
+                             "with ALL prior runs/mobo_* runs of the SAME dimensionality: "
+                             "crawl every run whose run_config dim matches the --dataset dim, "
+                             "collect their (X,Y) pairs, and trust them as prior history (no "
+                             "re-evaluation). Non-interactive (ackley datasets only).")
     parser.add_argument("--resume-from", metavar="RUN_DIR", default=None,
                         help="Resume from a SPECIFIC run directory (e.g. "
                              "optimize/runs/mobo_17_06_11_27). Loads that run's config and "
@@ -2061,9 +2104,10 @@ def main() -> None:
                              "Sobol init before BO begins.")
     args = parser.parse_args()
 
-    n_exclusive = sum([args.resume, args.copy_config is not None, args.resume_from is not None])
+    n_exclusive = sum([args.resume, args.resume_dim,
+                       args.copy_config is not None, args.resume_from is not None])
     if n_exclusive > 1:
-        sys.exit("Use only one of --resume / --copy-config / --resume-from.")
+        sys.exit("Use only one of --resume / --resume-dim / --copy-config / --resume-from.")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     runs_dir   = os.path.join(script_dir, "runs")
@@ -2094,6 +2138,26 @@ def main() -> None:
         print(f"  [collect] {len(Y_prior)} trial(s) from {n_runs} run(s) -> prior history.")
 
         ds = resolve_dataset_from_cfg(cfg)
+        _launch_run(runs_dir, ds, time_limit_hours, args.max_trials,
+                    seed_X=seed_X, X_prior=X_prior, Y_prior=Y_prior)
+        return
+
+    # ── Resume-dim: seed from ALL prior runs of the same dimensionality ──
+    if args.resume_dim:
+        if args.dataset == "RF":
+            sys.exit("--resume-dim requires an analytic --dataset (e.g. ackley4d); "
+                     "RF is interactive and 3-simplex only.")
+        dim = DATASET_DIMS[args.dataset]
+        print("=" * 70)
+        print(f"ZoMBI-Hop MOBO — RESUME-DIM (all {dim}-simplex runs) — dataset: {args.dataset}")
+        print(f"Device: {DEVICE}   |   time limit/trial: {time_limit_hours} h")
+        print("=" * 70)
+
+        print(f"\n[collect] Crawling runs/mobo_*/ for dim-{dim} runs' (X,Y) pairs …")
+        X_prior, Y_prior, n_runs = collect_observations_for_dim(runs_dir, dim)
+        print(f"  [collect] {len(Y_prior)} trial(s) from {n_runs} run(s) -> prior history.")
+
+        ds = _ds_ackley(args.dataset, args.ackley_variant)
         _launch_run(runs_dir, ds, time_limit_hours, args.max_trials,
                     seed_X=seed_X, X_prior=X_prior, Y_prior=Y_prior)
         return

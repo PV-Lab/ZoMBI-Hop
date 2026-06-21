@@ -9,4 +9,4 @@
 #SBATCH --partition=sched_mit_sloan_gpu_r8
 #SBATCH --gres=gpu:1
 
-uv run python optimize/run_mobo.py --resume-from optimize/runs/mobo_19_06_12_16_16_114064 --dataset ackley10d --time-limit 2
+uv run python optimize/run_mobo.py --resume-dim --dataset ackley10d --time-limit 2
