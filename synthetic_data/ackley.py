@@ -121,12 +121,11 @@ def scaled_n_optima(n_base: int, dim: int) -> int:
     simplex, so it expands with dimension; true geometric growth is exponential,
     but that is both unrealistic for materials composition spaces — which are
     mostly phase-separated, not densely packed with stable phases — and
-    undiscoverable as a benchmark. The linear ``(d-1)/2`` factor keeps the
-    benchmark's target count growing gently and predictably with dimension.
+    undiscoverable as a benchmark.  The linear ``(d-1)/2`` factor keeps the
+    benchmark difficulty growing gently and predictably with dimension.
 
-    This count scaling defines the benchmark objective itself; it is a plain
-    function of ``dim``, unrelated to (and unaffected by) how ZoMBI-Hop's own
-    hyperparameters are configured.
+    This is intentionally a *plain* function of ``dim`` (the benchmark's optima
+    count), so a given configuration yields the identical objective every run.
     """
     return max(1, int(round(n_base * (dim - 1) / 2.0)))
 
@@ -155,7 +154,6 @@ def resolve_scaled_n_optima(
     if mode == "multiplicative":
         return scaled_n_optima_multiplicative(n_base, dim, ref_dim=ref_dim)
     raise ValueError(f"Unknown peak scaling mode {mode!r}; use 'linear' or 'multiplicative'.")
-
 
 # ── Ackley constants ─────────────────────────────────────────────────────────
 ACKLEY_A = 20.0
@@ -327,7 +325,7 @@ class Ackley:
 
         if variant == "realistic":
             cfg = load_config()
-            # An explicit n_optima is honoured exactly (e.g. the plot_3d/plot_4d
+            # An explicit n_optima is honoured exactly (e.g. the plot.py
             # sliders); otherwise the configured value is the d=3 baseline and is
             # scaled with dimension so higher-d benchmarks have proportionally
             # more optima (see ``scaled_n_optima``).
@@ -380,9 +378,11 @@ class Ackley:
             self._noise_octaves = 0
             self._noise_seed = 0
 
-        # The [0.5, 1] map is fixed from the combined Ackley+noise signal at every
-        # dimensionality (peak -> 1, far-field floor -> 0.5).  For dim > 3 the
-        # mapped result is additionally clipped to [0.5, 1] as a safety net.
+        # For dims above 3 the [0.5, 1] map is fixed from the *noise-free* Ackley
+        # signal (peak -> 1, far-field floor -> 0.5); noise (level set per-dim via
+        # NOISE_AMP_BY_DIM) is then added through that same map and the result is
+        # clipped to [0.5, 1].  At dim <= 3 the Ackley+noise signal is normalized
+        # together and left unclamped, as before.
         self._clip_to_unit = self.dim > 3
 
         _est_rng = np.random.default_rng(12345)
@@ -391,8 +391,8 @@ class Ackley:
         # doesn't underestimate the peak in high dim.
         if self.centers:
             _samples = np.vstack([_samples, np.asarray(self.centers, dtype=float)])
-        # Normalize on the Ackley+noise span at every dimensionality.
-        _raw = self._predict_raw(_samples)
+        # dim > 3 normalizes on the noise-free Ackley span; dim <= 3 on Ackley+noise.
+        _raw = self._ackley_raw(_samples) if self._clip_to_unit else self._predict_raw(_samples)
         self._raw_min = float(_raw.min())
         self._raw_max = float(_raw.max())
 
@@ -429,9 +429,8 @@ class Ackley:
             return np.full(raw.shape, 0.75)
         y = 0.5 + 0.5 * (raw - self._raw_min) / span
         if self._clip_to_unit:
-            # dim > 3: clip to [0.5, 1] as a safety net.  The span is estimated
-            # from sampled Ackley+noise values, so a rare unsampled point could
-            # still fall slightly outside the estimated range.
+            # dim > 3: keep the (noisy) objective within [0.5, 1] -- the span is
+            # the noise-free Ackley range, so noise can push a value past it.
             y = np.clip(y, 0.5, 1.0)
         return y
 

@@ -50,7 +50,14 @@ if [[ -n "${RUN_DIR}" ]]; then
   EXTRA+=(--run-dir "${REPO}/${RUN_DIR}")
 fi
 
-python optimize/run_mobo.py --batch --no-show \
+# python optimize/run_mobo.py --batch --no-show \
+#   --config "${REPO}/${CONFIG}" \
+#   --device "${DEVICE}" \
+#   "${EXTRA[@]}"
+
+python optimize/run_mobo.py \
+  --no-show \
+  --batch \
   --config "${REPO}/${CONFIG}" \
   --device "${DEVICE}" \
   "${EXTRA[@]}"

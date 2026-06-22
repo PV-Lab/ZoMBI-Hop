@@ -10,7 +10,7 @@ _SYNTH_ROOT = Path(__file__).resolve().parent
 _REPO_ROOT = _SYNTH_ROOT.parent
 
 DEFAULTS_REL_PATHS: dict[str, str] = {
-    "ackley": "synthetic_data/ackley/defaults.json",
+    "ackley": "synthetic_data/defaults/ackley.json",
     "gaussian": "synthetic_data/gaussian/defaults.json",
     "rastrigin_ilr": "synthetic_data/rastrigin_ilr/defaults.json",
 }

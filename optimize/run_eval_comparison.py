@@ -53,6 +53,7 @@ _EVAL = _REPO / "optimize" / "evaluate.py"
 _DEFAULT_RUNS = _REPO / "optimize" / "runs" / "mobo_05_06_15_32"
 _DEFAULT_OUT = _REPO / "optimize" / "runs"
 _DEFAULT_DATASETS = ("RF", "gaussian3d", "rastrigin_ilr")
+_DEFAULT_TRUE_OPTIMA = _REPO / "optimize" / "reference_optima" / "mobo_05_06_15_32_campaign1a.json"
 
 
 def _parse_csv_ints(raw: str) -> list[int]:
@@ -129,7 +130,9 @@ def collect_rows(eval_root: Path) -> list[dict]:
                     "run": run["run"],
                     "dist_to_needles": run["dist_to_needles"],
                     "dup_fraction": run["dup_fraction"],
-                    "pct_matched": run.get("pct_matched"),
+                    "pct_matched_comp": run.get("pct_matched_comp", run.get("pct_matched")),
+                    "pct_matched_ilr": run.get("pct_matched_ilr"),
+                    "pct_matched": run.get("pct_matched_comp", run.get("pct_matched")),
                     "runtime_s": run["runtime_s"],
                     "n_true_optima": n_optima,
                     "path": str(ds_dir / f"trial_{trial}" / f"run_{run['run']}"),
@@ -142,7 +145,9 @@ def collect_rows(eval_root: Path) -> list[dict]:
                     "run": "mean",
                     "dist_to_needles": trial_entry["dist_to_needles"]["mean"],
                     "dup_fraction": trial_entry["dup_fraction"]["mean"],
-                    "pct_matched": trial_entry.get("pct_matched", {}).get("mean"),
+                    "pct_matched_comp": trial_entry.get("pct_matched_comp", trial_entry.get("pct_matched", {})).get("mean"),
+                    "pct_matched_ilr": trial_entry.get("pct_matched_ilr", {}).get("mean"),
+                    "pct_matched": trial_entry.get("pct_matched_comp", trial_entry.get("pct_matched", {})).get("mean"),
                     "runtime_s": trial_entry["runtime_s"]["mean"],
                     "n_true_optima": n_optima,
                     "path": str(ds_dir / f"trial_{trial}"),
@@ -153,8 +158,9 @@ def collect_rows(eval_root: Path) -> list[dict]:
 def write_csv(path: Path, rows: list[dict]) -> None:
     fields = [
         "dataset", "trial", "run",
-        "dist_to_needles", "dup_fraction", "pct_matched", "runtime_s",
-        "n_true_optima", "path",
+        "dist_to_needles", "dup_fraction",
+        "pct_matched_comp", "pct_matched_ilr", "pct_matched",
+        "runtime_s", "n_true_optima", "path",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -164,18 +170,20 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 
 def print_table(rows: list[dict]) -> None:
     show_rows = [r for r in rows if r["run"] != "mean"] or rows
-    header = f"{'dataset':<16} {'trial':>6} {'run':>4} {'dist':>10} {'dup_frac':>10} {'pct_match':>10} {'runtime_s':>10} {'#optima':>8}"
+    header = f"{'dataset':<16} {'trial':>6} {'run':>4} {'dist':>10} {'dup_frac':>10} {'pct_comp':>10} {'pct_ilr':>10} {'runtime_s':>10} {'#optima':>8}"
     print("\n" + header)
     print("-" * len(header))
     for r in sorted(show_rows, key=lambda x: (x["trial"], x["dataset"], str(x["run"]))):
         n_opt = r["n_true_optima"]
         n_opt_s = str(n_opt) if n_opt is not None else "?"
-        pct = r.get("pct_matched")
-        pct_s = f"{pct:.2f}" if pct is not None else "?"
+        pct_comp = r.get("pct_matched_comp")
+        pct_ilr = r.get("pct_matched_ilr")
+        pct_comp_s = f"{pct_comp:.2f}" if pct_comp is not None else "?"
+        pct_ilr_s = f"{pct_ilr:.2f}" if pct_ilr is not None else "?"
         print(
             f"{r['dataset']:<16} {r['trial']:>6} {str(r['run']):>4} "
             f"{r['dist_to_needles']:>10.4f} {r['dup_fraction']:>10.4f} "
-            f"{pct_s:>10} {r['runtime_s']:>10.1f} {n_opt_s:>8}"
+            f"{pct_comp_s:>10} {pct_ilr_s:>10} {r['runtime_s']:>10.1f} {n_opt_s:>8}"
         )
 
 
@@ -188,6 +196,7 @@ def build_eval_command(
     num_runs: int,
     out_dir: Path,
     seed: int,
+    true_optima_json: Path | None,
     extra: list[str],
 ) -> list[str]:
     cmd = [
@@ -201,6 +210,8 @@ def build_eval_command(
         "--seed", str(seed),
         "--out-dir", str(out_dir),
     ]
+    if true_optima_json is not None:
+        cmd.extend(["--true-optima-json", str(true_optima_json)])
     cmd.extend(extra)
     return cmd
 
@@ -250,6 +261,12 @@ def main() -> None:
         metavar="DIR",
         help="Skip evaluate; rebuild comparison_summary from an existing output dir",
     )
+    parser.add_argument(
+        "--true-optima-json",
+        default=str(_DEFAULT_TRUE_OPTIMA),
+        help="Reference optima JSON for all datasets (default: mobo_05_06_15_32 campaign1a; "
+             "pass empty string to use each landscape's native optima)",
+    )
     parser.add_argument("--dry-run", action="store_true",
                         help="Print evaluate.py command and exit")
     parser.add_argument(
@@ -296,6 +313,12 @@ def main() -> None:
         eval_root = Path(args.out).resolve() / f"{prefix}_{stamp}"
         eval_root.mkdir(parents=True, exist_ok=True)
 
+    true_optima_path: Path | None = None
+    if args.true_optima_json:
+        true_optima_path = Path(args.true_optima_json).resolve()
+        if not true_optima_path.is_file():
+            sys.exit(f"--true-optima-json not found: {true_optima_path}")
+
     cmd = build_eval_command(
         runs_path=runs_path,
         trials=trials,
@@ -304,6 +327,7 @@ def main() -> None:
         num_runs=args.num_runs,
         out_dir=eval_root,
         seed=args.seed,
+        true_optima_json=true_optima_path,
         extra=list(args.evaluate_extra),
     )
 
@@ -316,6 +340,7 @@ def main() -> None:
         "time_limit_min": args.time_limit_min,
         "num_runs": args.num_runs,
         "seed": args.seed,
+        "true_optima_json": str(true_optima_path) if true_optima_path else None,
         "eval_root": str(eval_root),
     }
     with open(eval_root / "comparison_config.json", "w", encoding="utf-8") as f:
@@ -326,6 +351,8 @@ def main() -> None:
     print(f"  trials:   {trials}")
     print(f"  datasets: {datasets}")
     print(f"  budget:   {args.num_runs} run(s) × {args.time_limit_min:g} min")
+    if true_optima_path:
+        print(f"  optima:   {true_optima_path}")
     print(f"  output:   {eval_root}")
     print("=" * 72)
     print("Command:")

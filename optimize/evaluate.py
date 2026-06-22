@@ -51,12 +51,27 @@ Default parent: ``optimize/runs/rerun_DD_MM_HH_MM/`` (override with ``--out`` or
 ``--out-dir`` for a fixed directory).
 
   rerun_DD_MM_HH_MM/
-    rerun_config.json
-    rerun_summary.json
-    trial_<n>/
-      hparams.json
-      run_<k>/          one per ``--num-runs`` repeat
-        metrics.json, points.csv, needles.csv, plots/, …
+    rerun_config.json          static config (dataset, dim, optima, time limit …)
+    rerun_summary.json         per-trial mean/std of the three objectives + every
+                               individual run's metrics
+    trial_<n>/                 one per selected source trial
+        hparams.json           the hyperparameters being re-evaluated
+        run_<k>/               one per --num-runs repeat
+            metrics.json
+            points.csv         (sample_idx, <coords>, Y, penalized, activation, zoom)
+            needles.csv        (needle_idx, <coords>, value, median_value,
+                                zoom, iteration, reason, dist_to_centre)
+            metrics_over_time.csv
+            convergence.png
+            dist_from_centre.png
+            line_length_hist.png
+            hparam_edge_proximity.png
+            plots/iter_*.png    (dim == 3 only)  +  zombihop_timelapse.mp4
+            point_cloud.html    (dim == 4 only — final-state interactive cloud)
+            (dim >= 5: metrics + non-landscape plots only, no landscape view)
+
+``<coords>`` are ``FA/MA/Br`` for the 3-simplex RF (drop-in compatible with the
+mobo trial CSVs) and ``x1..xd`` otherwise.
 
 Usage
 -----
@@ -72,6 +87,24 @@ Usage
 
   python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
       --trials 112 --dataset RF,gaussian --num-runs 1
+
+  # Same reference optima as mobo_05_06_15_32 on every landscape (transfer metrics):
+  python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
+      --trials 112 --dataset gaussian3d,rastrigin_ilr \
+      --true-optima-json optimize/reference_optima/mobo_05_06_15_32_campaign1a.json
+
+  python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
+      --trials 12 --dataset ackley10d --num-runs 3
+
+Instead of ``--trials``, you can pass ``--hparams`` (trial dir / trial.json /
+mobo_* dir) or ``--hparams-json`` with a path to a JSON file containing the
+hyperparameters directly (either a trial.json-style dict with an ``"hparams"``
+key, or a flat dict of hyperparameter values).  ``--hparams-json`` runs are
+labelled ``trial_0``.  ``--runs-path`` is still required for the RF dataset
+config::
+
+  python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
+      --hparams-json optimize/hparams.json --dataset RF --num-runs 3
 """
 
 from __future__ import annotations
@@ -96,6 +129,8 @@ for _stream in (sys.stdout, sys.stderr):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_mobo as rm
 from mobo_landscapes import build_synthetic_landscape, parse_synthetic_batch_fields, resolve_surrogate_csv_path
+
+# Analytic benchmark objectives (negated Ackley on the d-simplex).
 from synthetic_data.ackley import Ackley
 from synthetic_data.gaussian_landscape import RealisticGaussian
 from synthetic_data.landscape_config_log import (
@@ -113,9 +148,43 @@ ACKLEY_BENCHMARKS = {"ackley3d": 3, "ackley4d": 4, "ackley10d": 10}
 GAUSSIAN_BENCHMARKS = {"gaussian3d": 3, "gaussian4d": 4, "gaussian10d": 10}
 BUILTIN_DATASETS = {"RF", *ACKLEY_BENCHMARKS.keys(), *GAUSSIAN_BENCHMARKS.keys(), *ORACLE_CHOICES}
 
+# Canonical campaign1a RF reference optima from mobo_05_06_15_32 (interactive picker).
+TRIAL112_REFERENCE_OPTIMA = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "reference_optima",
+    "mobo_05_06_15_32_campaign1a.json",
+)
+
 
 class _TopKReached(Exception):
     """Internal signal: ``--top-k`` needles found, stop this run early."""
+
+
+# ─── Reference optima ───────────────────────────────────────────────────────────
+
+def load_true_optima_json(path: str) -> list[np.ndarray]:
+    """Load ``true_optima`` from a run_config-style JSON sidecar."""
+    cfg_path = os.path.abspath(path)
+    if not os.path.isfile(cfg_path):
+        sys.exit(f"--true-optima-json: file not found: {cfg_path}")
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except Exception as exc:
+        sys.exit(f"--true-optima-json: {cfg_path} unreadable ({exc}).")
+    raw = cfg.get("true_optima")
+    if not raw:
+        sys.exit(f"--true-optima-json: {cfg_path} has no 'true_optima' list.")
+    return [np.asarray(t, dtype=float) for t in raw]
+
+
+def apply_true_optima_override(ds: dict, true_optima: list[np.ndarray], *, source: str) -> None:
+    """Replace dataset-native reference optima (metrics + plots only)."""
+    n_before = len(ds.get("true_optima") or [])
+    ds["true_optima"] = true_optima
+    ds["true_optima_source"] = source
+    print(f"  [true_optima] using {len(true_optima)} reference point(s) from {source} "
+          f"(overrides {n_before} dataset-native optima)")
 
 
 # ─── Dataset resolution ─────────────────────────────────────────────────────────
@@ -346,21 +415,6 @@ def load_hparams_path(path: str) -> tuple[dict[int, dict], str | None]:
 
 
 def load_hparams_from_json(json_path: str) -> dict[int, dict]:
-    if not os.path.exists(json_path):
-        sys.exit(f"--hparams-json: file not found: {json_path}")
-    try:
-        with open(json_path) as f:
-            raw = json.load(f)
-    except Exception as exc:
-        sys.exit(f"--hparams-json: {json_path} is not valid JSON ({exc}).")
-    hp = raw.get("hparams", raw) if isinstance(raw, dict) else None
-    if not isinstance(hp, dict):
-        sys.exit("--hparams-json: expected a dict with hparam keys (or an 'hparams' key).")
-    print(f"  [hparams-json] loaded from {json_path}")
-    return {0: _normalize_hparams(hp, source="--hparams-json")}
-
-
-def load_hparams_from_json(json_path: str) -> dict[int, dict]:
     """Load hyperparameters from a standalone JSON file.
 
     Accepts two formats: (1) a trial.json-style dict with an ``"hparams"`` key,
@@ -419,11 +473,10 @@ def load_trial_hparams(runs_path: str, trial_nums: list[int]) -> dict[int, dict]
 
 # ─── Init data + CSV writers ────────────────────────────────────────────────────
 
-def gen_init_data(fn_callable, maximize: bool, dim: int, n_init_lines: int | None = None):
-    if n_init_lines is None:
-        n_init_lines = rm.N_INIT_LINES
+def gen_init_data(fn_callable, maximize: bool, dim: int):
+    """Generate ``run_mobo.N_INIT_LINES`` random simplex lines on the ``dim``-simplex."""
     x_a_list, x_e_list, y_list = [], [], []
-    for _ in range(n_init_lines):
+    for _ in range(rm.N_INIT_LINES):
         x0 = torch.full((dim,), 1.0 / dim, device=rm.DEVICE, dtype=rm.DTYPE)
         dir_ = rm.zero_sum_dirs(1, dim, device=rm.DEVICE, dtype=rm.DTYPE).squeeze(0)
         seg = rm.line_simplex_segment(x0, dir_)
@@ -472,15 +525,12 @@ def write_points_csv(path: str, dh, snap_records: list[tuple], cols: list[str]) 
     pd.DataFrame(data).to_csv(path, index=False)
 
 
-def write_needles_csv(path: str, dh, cols: list[str], dim: int,
-                      payloads: list[dict] | None = None) -> None:
+def write_needles_csv(path: str, dh, cols: list[str], dim: int) -> None:
     import math
     import pandas as pd
     centroid = np.full(dim, 1.0 / dim)
-    results = dh.get_all_needle_results()
-    fine_iters = rm.needle_fine_iterations(results, payloads or [])
     rows = []
-    for i, r in enumerate(results):
+    for i, r in enumerate(dh.get_all_needle_results()):
         pt = r["point"].detach().cpu().numpy().ravel()
         mv_ = r.get("median_value")
         row = {"needle_idx": i}
@@ -495,13 +545,20 @@ def write_needles_csv(path: str, dh, cols: list[str], dim: int,
             "dist_to_centre": float(np.linalg.norm(pt - centroid)),
         })
         rows.append(row)
-    columns = ["needle_idx"] + cols + [
-        "value", "median_value", "activation", "zoom", "iteration", "reason", "dist_to_centre",
-    ]
+    columns = ["needle_idx"] + cols + ["value", "median_value",
+                                       "zoom", "iteration", "reason",
+                                       "dist_to_centre"]
     pd.DataFrame(rows, columns=columns).to_csv(path, index=False)
 
 
 def write_point_cloud_html(path: str, ackley_fn, dh, last_payload: dict) -> None:
+    """Render the final ZoMBI state over the 4-simplex Ackley cloud (one HTML).
+
+    Uses ``synthetic_data/plot``'s overlay API.  Pared points, needle markers,
+    and the last LineBO lines are all exact (plain simplex compositions);
+    needle penalisation ellipsoids are intentionally omitted because the run's
+    tangent basis differs from the Helmert ILR basis the overlay assumes.
+    """
     import plotly.graph_objects as go
     import synthetic_data.plot as pc4
 
@@ -566,18 +623,19 @@ def save_convergence_metrics_plot(
 
     df = pd.read_csv(csv_path)
     metrics = [
-        ("dist_to_needles", "Distance to True Needles", "steelblue"),
-        ("dup_fraction", "Duplicate Sample Fraction", "tomato"),
-        ("pct_matched", "Pct Needles Matching True Needle", "seagreen"),
-        ("avg_pairwise_dist", "Avg Pairwise Needle Distance", "mediumpurple"),
-        ("recent_needle_value", "Most Recent Needle Value", "darkorange"),
+        ("dist_to_needles", "Distance to True Needles", "steelblue", False),
+        ("dup_fraction", "Duplicate Sample Fraction", "tomato", False),
+        ("avg_pairwise_dist", "Avg Pairwise Needle Distance", "mediumpurple", False),
+        ("recent_needle_value", "Most Recent Needle Value", "darkorange", True),
     ]
     metrics = [m for m in metrics if m[0] in df.columns]
 
     fig, axes = plt.subplots(2, 3, figsize=(16, 8))
     fig.suptitle("Convergence metrics over iterations")
-    for ax, (col, label, color) in zip(axes.flat, metrics):
-        if col == "recent_needle_value":
+    used = 0
+    for ax, (col, label, color, steps) in zip(axes.flat, metrics):
+        used += 1
+        if col == "recent_needle_value" or steps:
             ax.plot(df["iteration"], df[col], color=color, drawstyle="steps-post", marker="o", ms=3)
         else:
             ax.plot(df["iteration"], df[col], color=color)
@@ -589,7 +647,31 @@ def save_convergence_metrics_plot(
         ax.set_ylabel(label)
         ax.set_title(label)
         ax.grid(True, alpha=0.3)
-    for ax in axes.flat[len(metrics):]:
+
+    has_comp = "pct_matched_comp" in df.columns or "pct_matched" in df.columns
+    has_ilr = "pct_matched_ilr" in df.columns
+    if (has_comp or has_ilr) and used < len(axes.flat):
+        pct_axes = axes.flat[used]
+        if "pct_matched_comp" in df.columns:
+            pct_axes.plot(df["iteration"], df["pct_matched_comp"],
+                          color="seagreen", label=f"comp ≤ {rm.MATCH_RADIUS}")
+        elif "pct_matched" in df.columns:
+            pct_axes.plot(df["iteration"], df["pct_matched"],
+                          color="seagreen", label=f"comp ≤ {rm.MATCH_RADIUS} (legacy)")
+        if has_ilr:
+            pct_axes.plot(df["iteration"], df["pct_matched_ilr"],
+                          color="darkcyan", label="ILR (scaled)")
+        pct_axes.set_xlabel("Iteration")
+        pct_axes.set_ylabel("Pct matched")
+        pct_axes.set_title("Pct Needles Matching True Optimum")
+        pct_axes.legend(fontsize=8)
+        pct_axes.grid(True, alpha=0.3)
+        if log_x:
+            pct_axes.set_xscale("log")
+        if log_y:
+            pct_axes.set_yscale("log")
+        used += 1
+    for ax in axes.flat[used:]:
         ax.axis("off")
     fig.tight_layout()
     fig.savefig(out_png, dpi=120, bbox_inches="tight")
@@ -624,9 +706,6 @@ def run_single_eval(
     snap_records: list[tuple] = []
     call_counter = [0]
     dh_ref = [None]
-
-    n_init_lines = rm.N_INIT_LINES
-
 
     sim_obj = rm.make_sim_obj(fn, rm.DEVICE, rm.DTYPE, maximize=maximize)
     inner = rm.make_linebo_wrapper(sim_obj, dim, rm.NUM_LINES, rm.DEVICE, rm.DTYPE, plot_state)
@@ -666,10 +745,10 @@ def run_single_eval(
         return x_req, x_act, y
 
     try:
-        X_a, X_e, Y = gen_init_data(fn, maximize, dim, n_init_lines)
+        X_a, X_e, Y = gen_init_data(fn, maximize, dim)
     except RuntimeError as exc:
         print(f"      [run] init failed: {exc}")
-        return {"dist": rm.unmatched_penalty(dim), "dup": 1.0, "runtime": 0.0}
+        return {"dist": rm.UNMATCHED_PENALTY, "dup": 1.0, "runtime": 0.0}
 
     hp = dict(hparams)
     if dim > 3 and (hp.get("top_m_points") is None or hp.get("top_m_points", 0) < dim + 1):
@@ -697,7 +776,7 @@ def run_single_eval(
     try:
         optimizer.run(max_activations=float("inf"), time_limit_hours=time_limit_min / 60.0)
     except _TopKReached as stop:
-        print(f"      [run] top-k reached: {int(stop.args[0])} needle(s) — stopping early")
+        print(f"      [run] top-k reached: {int(stop.args[0])} needle(s) found — stopping early")
     except KeyboardInterrupt:
         interrupted = True
         print("\n      [run] interrupted — writing artifacts before exit …")
@@ -711,14 +790,15 @@ def run_single_eval(
                 if dh.X_all_actual is not None else np.empty((0, dim)))
     dist = rm.metric_dist_to_needles(discovered, true_optima, dim=dim)
     dup = rm.metric_dup_fraction(X_all_np, dim=dim)
-    pct = rm.metric_pct_matched(discovered, true_optima, dim=dim)
+    pct_comp = rm.metric_pct_matched_comp(discovered, true_optima, dim=dim)
+    pct_ilr = rm.metric_pct_matched_ilr(discovered, true_optima, dim=dim)
     print(f"      [run]  iters={call_counter[0]}  dist={dist:.4f}  dup={dup:.4f}"
-          f"  pct_matched={pct:.2f}  t={runtime:.1f}s"
+          f"  pct_comp={pct_comp:.2f}  pct_ilr={pct_ilr:.2f}  t={runtime:.1f}s"
           f"  needles={len(discovered)}/{len(true_optima)}")
 
     try:
         write_points_csv(os.path.join(out_dir, "points.csv"), dh, snap_records, cols)
-        write_needles_csv(os.path.join(out_dir, "needles.csv"), dh, cols, dim, payloads)
+        write_needles_csv(os.path.join(out_dir, "needles.csv"), dh, cols, dim)
         rm.write_metrics_over_time_csv(
             os.path.join(out_dir, "metrics_over_time.csv"), payloads, X_all_np, true_optima,
             dim=dim,
@@ -731,7 +811,8 @@ def run_single_eval(
         if dim == 3 and ds.get("grid_pts") is not None:
             rm.plot_line_length_hist(os.path.join(out_dir, "line_length_hist.png"), payloads)
         rm.plot_hparam_edge_proximity(
-            os.path.join(out_dir, "hparam_edge_proximity.png"), rm.hparams_to_norm(hparams))
+            os.path.join(out_dir, "hparam_edge_proximity.png"),
+            rm.hparams_to_norm(hparams))
         rm.plot_convergence(os.path.join(out_dir, "convergence.png"), dh, maximize)
     except Exception as exc:
         print(f"      [run] static plot failed: {exc}")
@@ -777,7 +858,9 @@ def run_single_eval(
     metrics = {
         "dist_to_needles": round(dist, 6),
         "dup_fraction": round(dup, 6),
-        "pct_matched": round(pct, 4),
+        "pct_matched_comp": round(pct_comp, 4),
+        "pct_matched_ilr": round(pct_ilr, 4),
+        "pct_matched": round(pct_comp, 4),
         "runtime_s": round(runtime, 3),
         "landscape_config": ds.get("landscape_config"),
     }
@@ -785,7 +868,11 @@ def run_single_eval(
         json.dump(metrics, f, indent=2)
     if interrupted:
         raise KeyboardInterrupt
-    return {"dist": dist, "dup": dup, "pct": pct, "runtime": runtime}
+    return {
+        "dist": dist, "dup": dup,
+        "pct_comp": pct_comp, "pct_ilr": pct_ilr, "pct": pct_comp,
+        "runtime": runtime,
+    }
 
 
 # ─── Summary ────────────────────────────────────────────────────────────────────
@@ -804,7 +891,8 @@ def write_summary(path: str, per_trial: dict) -> None:
     for trial_num, runs in per_trial.items():
         entry = {"trial": trial_num, "n_runs": len(runs), "runs": runs}
         if runs:
-            for key in ("dist_to_needles", "dup_fraction", "pct_matched", "runtime_s"):
+            for key in ("dist_to_needles", "dup_fraction",
+                        "pct_matched_comp", "pct_matched_ilr", "pct_matched", "runtime_s"):
                 entry[key] = _agg([r[key] for r in runs])
         summary["trials"].append(entry)
     with open(path, "w") as f:
@@ -839,6 +927,8 @@ def _build_rerun_config(
         "true_optima": [list(map(float, t.ravel())) for t in ds["true_optima"]],
         "landscape_config": ds.get("landscape_config"),
     }
+    if ds.get("true_optima_source"):
+        cfg["true_optima_source"] = ds["true_optima_source"]
     if config_meta:
         cfg["batch_config"] = config_meta.get("name")
         cfg["batch_config_path"] = config_meta.get("path")
@@ -906,6 +996,10 @@ def evaluate_dataset(
         time_limit_hours=time_limit_min / 60.0,
     )
 
+    if args.true_optima_json:
+        ref = load_true_optima_json(args.true_optima_json)
+        apply_true_optima_override(ds, ref, source=os.path.abspath(args.true_optima_json))
+
     with open(os.path.join(out_dir, "rerun_config.json"), "w") as f:
         json.dump(_build_rerun_config(
             dataset, ds, runs_path=runs_path, trial_nums=trial_nums,
@@ -930,19 +1024,23 @@ def evaluate_dataset(
             print(f"  [run {k}/{args.num_runs}]  (overall {done}/{total})")
             run_dir = os.path.join(trial_dir, f"run_{k}")
             try:
-                res = run_single_eval(
-                    hparams, ds, dataset, run_dir, time_limit_min,
+                eval_kwargs = dict(
                     top_k=args.top_k,
                     no_video=args.no_video,
                     no_convergence_plot=args.no_convergence_plot,
                     log_x=args.log_x,
                     log_y=args.log_y,
                 )
+                res = run_single_eval(
+                    hparams, ds, dataset, run_dir, time_limit_min, **eval_kwargs,
+                )
                 per_trial[trial_num].append({
                     "run": k,
                     "dist_to_needles": round(res["dist"], 6),
                     "dup_fraction": round(res["dup"], 6),
-                    "pct_matched": round(res["pct"], 4),
+                    "pct_matched_comp": round(res["pct_comp"], 4),
+                    "pct_matched_ilr": round(res["pct_ilr"], 4),
+                    "pct_matched": round(res["pct_comp"], 4),
                     "runtime_s": round(res["runtime"], 3),
                 })
             except KeyboardInterrupt:
@@ -1004,13 +1102,17 @@ def main() -> None:
                         help="Parent directory for rerun_* output (default: optimize/runs).")
     parser.add_argument("--out-dir", default=None, metavar="DIR",
                         help="Exact output directory (skip auto rerun_* naming).")
+    parser.add_argument(
+        "--true-optima-json", default=None, metavar="PATH",
+        help="Override reference optima for metrics/plots (run_config-style JSON). "
+             f"Canonical trial-112 set: {TRIAL112_REFERENCE_OPTIMA}",
+    )
     args = parser.parse_args()
 
     if args.num_runs < 1:
         sys.exit("--num-runs must be >= 1.")
     if args.top_k is not None and args.top_k < 1:
         sys.exit("--top-k must be >= 1.")
-
     config_meta: dict | None = None
     synthetic_defaults: dict | None = None
     if args.config:
@@ -1063,8 +1165,8 @@ def main() -> None:
     else:
         out_parent = os.path.abspath(args.out) if args.out else os.path.join(script_dir, "runs")
         os.makedirs(out_parent, exist_ok=True)
-        eval_dir = os.path.join(out_parent, datetime.datetime.now().strftime("rerun_%d_%m_%H_%M"))
-        os.makedirs(eval_dir, exist_ok=True)
+        eval_dir = rm.unique_run_dir(out_parent, "rerun")
+
 
     time_limit_min = args.time_limit_min
     print("=" * 72)
@@ -1079,9 +1181,13 @@ def main() -> None:
         print(f"source: {runs_path}")
     if args.config:
         print(f"config: {os.path.abspath(args.config)}")
+    if args.true_optima_json:
+        print(f"true_optima: {os.path.abspath(args.true_optima_json)}")
     print(f"output: {eval_dir}")
     print("=" * 72)
 
+    # One dataset writes its artifacts directly into eval_dir (unchanged layout);
+    # multiple datasets each get their own sub-folder under it.
     done = 0
     for dataset in datasets:
         out_dir = eval_dir if len(datasets) == 1 else os.path.join(eval_dir, dataset)

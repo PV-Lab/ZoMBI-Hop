@@ -10,20 +10,27 @@ Landscapes (``--landscape`` or batch JSON ``"landscape"`` field):
                        synthetic_data/compare_campaign_datasets.py)
   • ``ackley``       — Multi-Ackley sum on the d-dimensional probability simplex
 
+Objectives are selectable via ``--dataset``: RF (default, 3-simplex campaign1a
+surrogate) or analytic negated-Ackley benchmarks on the 3-/4-/10-simplex
+(``ackley3d`` / ``ackley4d`` / ``ackley10d``). The hyperparameters are
+dimension-independent. ``--landscape ackley`` is an alternate Multi-Ackley
+benchmark (layout/b configurable); ``--dataset ackley*`` uses the
+``synthetic_data.ackley.Ackley`` oracle (``--ackley-variant``).
+
 Three objectives (all minimised):
-  1. dist_to_needles      – symmetric greedy matching distance between needles and
-                            true optima (no-repeat matching; both unmatched true
-                            optima AND unmatched/spurious needles incur
-                            UNMATCHED_PENALTY, mean over max(#needles, #optima))
-  2. dup_fraction         – fraction of sampled points whose nearest neighbour
-                            in input space is within noise/2
+  1. dist_to_needles    – symmetric greedy matching distance between needles and
+                          true optima (no-repeat matching; both unmatched true
+                          optima AND unmatched/spurious needles incur
+                          UNMATCHED_PENALTY, mean over max(#needles, #optima))
+  2. dup_fraction       – fraction of sampled points whose nearest neighbour
+                          in input space is within noise/2
   3. avg_time_per_iter_s  – average wall-clock seconds per ZoMBI iteration, where
-                            an iteration is one LineBO main-line pick (== one
-                            obj_wrapper call / one would-be plot frame): total
-                            (timed) runtime / number of iterations. Plotting is
-                            rendered AFTER the timed region so it never pollutes
-                            this metric. (trial.json also records the raw
-                            runtime_s and n_iters for context.)
+                          an iteration is one LineBO main-line pick (== one
+                          obj_wrapper call / one would-be plot frame): total
+                          (timed) runtime / number of iterations. Plotting is
+                          rendered AFTER the timed region so it never pollutes
+                          this metric. (trial.json also records runtime_s and
+                          n_iters for context.)
 
 MOBO engine: qLogNEHVI (BoTorch, maximises negated objectives).
 
@@ -36,8 +43,8 @@ frames); ≥5D renders no landscape view. The metrics time-series plot
 
 Run layout
 ----------
-Each run creates a folder ``runs/mobo_<dim>d_DD_MM_HH_MM/`` (objective dimension
-then start date/time, military clock) containing:
+Each run creates a folder ``runs/mobo_DD_MM_HH_MM_SS_PID/`` (local or HPC;
+date/time + process id for uniqueness) containing:
   • mobo_progress.json / mobo_results.json / mobo_results.pt  – running summary
   • pareto_front.png                                          – on exit
   • trial_<n>/                                                – one per trial
@@ -45,7 +52,7 @@ then start date/time, military clock) containing:
         ├─ points.csv                 (sample_idx, FA, MA, Br, Y, penalized,
         │                              activation, zoom)
         ├─ needles.csv                (needle_idx, FA, MA, Br, value,
-        │                              median_value, zoom, iteration,
+        │                              median_value, zoom, iteration, reason,
         │                              dist_to_centre)
         ├─ metrics_over_time.csv      (iteration, dist_to_needles, dup_fraction,
         │                              pct_matched, avg_pairwise_dist,
@@ -57,9 +64,9 @@ then start date/time, military clock) containing:
         ├─ plots/iter_0000.png …      (one frame per iteration)
         └─ zombihop_timelapse.mp4
 
-Each trial runs ZoMBI-Hop until its wall-clock budget (``--time-limit``, default
-TIME_LIMIT_HOURS) expires. The number of trials is unbounded — the MOBO loop runs
-any re-evaluated seeds + Sobol init, then BO indefinitely until you press Ctrl+C.
+Each trial runs ZoMBI-Hop until its wall-clock budget (TIME_LIMIT_HOURS) expires.
+The number of trials is unbounded — the MOBO loop runs Sobol init then BO
+indefinitely until you press Ctrl+C.
 
 Run modes
 ---------
@@ -70,72 +77,68 @@ may not seed the new run with data harvested from past runs:
   fresh (default)   interactive picker for config; no prior data.
   --resume          reuse the LATEST run's saved config; seed the GP with ALL
                     (X,Y) pairs crawled from every runs/mobo_*/mobo_progress.json.
-                    If fewer than N_INIT_TRIALS pairs are found, the shortfall is
-                    drawn as Sobol init before BO begins.
+  --resume-scratch  re-prompt for config (picker); seed with ALL prior (X,Y),
+                    re-deriving dist_to_needles against the freshly-picked optima.
   --copy-config P   reuse a SPECIFIC run's saved config (P = run dir or
                     run_config.json), but start with NO prior data — a normal
                     Sobol-init + BO run under someone else's config.
 
 Modifiers (combinable with any mode above):
-  --dataset DS      objective to search on: RF (default, interactive picker) or
-                    ackley3d / ackley4d / ackley10d (analytic, non-interactive).
-                    Inherited from the saved config by --resume / --copy-config.
-  --ackley-variant V  Ackley variant for the ackley* datasets (default realistic).
-  --time-limit H    per-trial wall-clock budget in hours (default TIME_LIMIT_HOURS).
-  --resume-dim      resume on the --dataset objective, seeding the new run with
-                    ALL prior runs of the SAME dimensionality: crawl every
-                    runs/mobo_* run whose run_config dim matches the --dataset dim,
-                    collect their (X,Y) pairs and trust them as prior history (no
-                    re-evaluation). Non-interactive (ackley datasets only).
-  --resume-from DIR   resume from a SPECIFIC run directory: trust that run's
-                    stored metrics as prior history (no re-evaluation), reuse its
-                    config, and start a new run seeded with only that data. If that
-                    run holds fewer than N_INIT_TRIALS trials, the shortfall is
-                    drawn as Sobol init before BO begins (a full run's worth of
-                    prior history skips Sobol entirely, as before).
-  --start-from-best DIR [DIR ...]  RE-EVALUATE the hyperparameters of the given
-                    trial_* dir(s) (or trial.json files) as initial trials on the
-                    current objective — their stored metrics are ignored. These
-                    run IN ADDITION to the full Sobol init (Sobol is NOT skipped).
+  --dataset DS      objective: RF (default, interactive picker) or ackley3d /
+                    ackley4d / ackley10d (analytic, non-interactive). Inherited
+                    from saved config by --resume / --copy-config / --resume-from.
+  --ackley-variant V  Ackley variant for ackley* datasets (default: realistic).
+  --time-limit H    per-trial wall-clock budget in hours (alias: --time-limit-hours).
+  --resume-from DIR resume from one specific run (trust its metrics, reuse config).
+  --resume-dim      resume on the --dataset objective, seeding the new run with ALL
+                    prior runs/mobo_* of the SAME dimensionality (crawl every run
+                    whose run_config dim matches the --dataset dim, trust their
+                    (X,Y) pairs, no re-evaluation). Non-interactive (ackley only).
+  --start-from-best DIR [DIR ...]  RE-EVALUATE hparams from trial dir(s) as
+                    initial trials (metrics ignored; Sobol init is NOT skipped).
   --max-trials N    cap total trials (default: unbounded, Ctrl+C to stop).
 
 Usage
 -----
   conda activate zombi-hop
   python optimize/run_mobo.py                                   # fresh RF, interactive
-  python optimize/run_mobo.py --dataset ackley4d                # fresh 4D Ackley, non-interactive
+  python optimize/run_mobo.py --dataset ackley4d                # fresh 4D Ackley
   python optimize/run_mobo.py --dataset ackley10d --time-limit 0.5
   python optimize/run_mobo.py --resume                          # seed from all past runs
+  python optimize/run_mobo.py --resume-scratch                  # re-pick config + seed
   python optimize/run_mobo.py --resume-dim --dataset ackley4d   # seed from all past 4D runs
-  python optimize/run_mobo.py --copy-config runs/mobo_04_06_11_47   # reuse config, no data
-  python optimize/run_mobo.py --resume-from runs/mobo_17_06_11_27          # seed from one specific run
-  python optimize/run_mobo.py --start-from-best runs/mobo_04_06_11_47/trial_1 [trial_dir ...]
+  python optimize/run_mobo.py --copy-config optimize/runs/mobo_05_06_15_32   # reuse config, no data
+  python optimize/run_mobo.py --start-from-best optimize/runs/mobo_05_06_15_32/trial_1 [trial_dir ...]
   python optimize/make_videos.py                       # newest run
   python optimize/make_videos.py <run_dir>             # specific run
   python optimize/make_videos.py <run_dir> --force     # rebuild all
 
 Non-interactive / MIT ORCD HPC
 ------------------------------
-  # Campaign RF (headless JSON config):
-  MPLBACKEND=Agg python optimize/run_mobo.py --batch --config optimize/mobo_batch_configs/campaign1a_objective_min.json
+  Edit ``slurm/run_mobo_manual.sbatch`` (MOBO_CMD + #SBATCH headers), then:
 
-  # Synthetic 3D oracle (direct — no RF CSV):
-  MPLBACKEND=Agg python optimize/run_mobo.py --batch --config optimize/mobo_batch_configs/synthetic_3d_messy.json
+    cd ~/ZoMBI-Hop && sbatch slurm/run_mobo_manual.sbatch
 
-  # 10D Multi-Ackley synthetic benchmark:
-  MPLBACKEND=Agg python optimize/run_mobo.py --batch --config optimize/mobo_batch_configs/ackley_10d_layout1.json
+  Same flags as local CLI; always include ``--no-show``. Examples:
 
-  # Submit one Slurm job (CPU or GPU):
-  cd ~/ZoMBI-Hop && bash scripts/submit_mobo.sh
-  MOBO_DEVICE=cuda MOBO_CONFIG=optimize/mobo_batch_configs/ackley_10d_layout1.json bash scripts/submit_mobo.sh
+    # Fresh RF from batch JSON (--batch required with --config):
+    python optimize/run_mobo.py --no-show --batch --config optimize/mobo_batch_configs/....json
 
-  # Submit a batch (one array task per manifest entry):
-  cd ~/ZoMBI-Hop && bash scripts/submit_mobo_batch.sh
-  MOBO_DEVICE=cuda MOBO_MANIFEST=optimize/mobo_batch_manifest_synthetic_3d.json bash scripts/submit_mobo_batch.sh
+    # Resume after failure:
+    python optimize/run_mobo.py --no-show --resume --device cuda
+
+    # Ackley 4D benchmark:
+    python optimize/run_mobo.py --no-show --dataset ackley4d --device cuda
+
+  ``scripts/submit_mobo.sh`` is optional; it only wraps ``--batch --config`` jobs.
 
 Each trial appends to ``trials_log.csv`` (hyperparameters + metrics) and
 ``all_samples.csv`` (every ZoMBI sample point with trial/phase context).
 ``mobo_progress.json`` is still rewritten atomically after every trial.
+
+``run_config.json`` also records ``device``, ``invocation`` (full argv, resolved
+effective settings, and notes on which source won when CLI/batch/saved-config
+values conflict), plus ``slurm`` metadata on HPC.
 """
 
 from __future__ import annotations
@@ -147,6 +150,7 @@ import glob
 import json
 import math
 import os
+import shlex
 import shutil
 import sys
 import time
@@ -158,7 +162,7 @@ import torch
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from scipy.optimize import minimize as sp_minimize
-from scipy.spatial import ConvexHull, cKDTree
+from scipy.spatial import ConvexHull
 
 import matplotlib
 
@@ -203,12 +207,6 @@ from src.utils.simplex import (
     ilr_to_composition,
     proj_simplex,
 )
-from synthetic_data.ackley import Ackley
-
-# Datasets selectable via --dataset.  RF is the 3-simplex Random-Forest surrogate
-# (interactive extrema picker); the ackley* entries are analytic negated-Ackley
-# benchmarks on the d-simplex whose optima are known in closed form (no picker).
-DATASET_DIMS = {"RF": 3, "ackley3d": 3, "ackley4d": 4, "ackley10d": 10}
 
 from optimize.mobo_landscapes import (
     LandscapeSpec,
@@ -222,7 +220,10 @@ from optimize.mobo_landscapes import (
     parse_ackley_batch_fields,
     parse_synthetic_batch_fields,
 )
+from synthetic_data.ackley import Ackley
 from synthetic_data.campaign_datasets import load_metadata, resolve_metadata_path
+
+DATASET_DIMS = {"RF": 3, "ackley3d": 3, "ackley4d": 4, "ackley10d": 10}
 
 # ─── Global config ────────────────────────────────────────────────────────────
 
@@ -272,8 +273,7 @@ def unique_run_dir(parent: str, prefix: str) -> str:
     The base name carries second resolution plus the PID so two runs launched in
     the same minute (e.g. from a sweep script) get distinct names without relying
     on the suffix loop. Creation is atomic — ``os.makedirs(exist_ok=False)`` fails
-    if another process won the race — so the check-then-create TOCTOU window is
-    closed and two processes can never share a run directory.
+    if another process won the race — so two processes can never share a run directory.
     """
     base = datetime.datetime.now().strftime(f"{prefix}_%d_%m_%H_%M_%S") + f"_{os.getpid()}"
     n = 1
@@ -330,13 +330,6 @@ def norm_to_hparams(x_norm: torch.Tensor) -> dict:
             params[name] = int(round(lo + v * (hi - lo)))
         else:
             params[name] = lo + v * (hi - lo)
-    # ``raw`` is the raw candidate pool that ``n_restarts`` local refinements are
-    # drawn from (gp_simplex.get_candidate), so raw < n_restarts is nonsensical:
-    # the pool can never supply enough unpenalized restarts and get_candidate
-    # bails out (returns None) on the first iteration, yielding a degenerate
-    # 0-iteration trial. Enforce raw ≥ n_restarts so that inversion is unreachable.
-    if "raw" in params and "n_restarts" in params:
-        params["raw"] = max(params["raw"], params["n_restarts"])
     return params
 
 
@@ -468,10 +461,87 @@ def _slurm_metadata() -> dict:
     return meta
 
 
+def _cli_snapshot(args: argparse.Namespace) -> dict:
+    """Non-default CLI flags actually passed on the command line."""
+    snap: dict = {}
+    for key, val in vars(args).items():
+        if val is None or val == []:
+            continue
+        if val is False and key not in ("no_show", "batch", "resume", "resume_scratch"):
+            continue
+        if key == "dataset" and val == "RF":
+            continue
+        if key == "landscape" and val == "rf":
+            continue
+        if key == "ackley_variant" and val == "realistic":
+            continue
+        snap[key] = val
+    return snap
+
+
+def _effective_run_settings(
+    landscape: LandscapeSpec,
+    *,
+    max_trials: int | None,
+    n_init_trials: int,
+    runs_dir: str,
+    run_dir: str | None = None,
+) -> dict:
+    return {
+        "device": str(DEVICE),
+        "time_limit_hours": landscape.time_limit_hours,
+        "max_activations": landscape.max_activations,
+        "max_trials": max_trials,
+        "n_init_trials": n_init_trials,
+        "landscape": landscape.landscape,
+        "landscape_label": landscape.label,
+        "dim": landscape.dim,
+        "runs_dir": runs_dir,
+        "run_dir": run_dir,
+    }
+
+
+def build_invocation_log(
+    *,
+    argv: list[str],
+    run_mode: str,
+    cli: dict,
+    effective: dict,
+    resolutions: list[str] | None = None,
+) -> dict:
+    """Full snapshot of how this run was launched and what values were actually used."""
+    device_requested = cli.get("device")
+    return {
+        "argv": list(argv),
+        "command": shlex.join(argv),
+        "run_mode": run_mode,
+        "cli": cli,
+        "effective": effective,
+        "device_requested": device_requested,
+        "device_effective": effective.get("device", str(DEVICE)),
+        "cuda_available": torch.cuda.is_available(),
+        "resolutions": resolutions or [],
+        "hparam_space": {k: list(v) for k, v in HPARAM_SPACE.items()},
+    }
+
+
+def _log_invocation(invocation: dict) -> None:
+    eff = invocation["effective"]
+    print(f"  [invocation] mode={invocation['run_mode']}  "
+          f"device={eff.get('device')}  "
+          f"time_limit_hours={eff.get('time_limit_hours')}  "
+          f"max_trials={eff.get('max_trials')}", flush=True)
+    for note in invocation.get("resolutions", []):
+        print(f"  [invocation] {note}", flush=True)
+
+
 def write_run_config(run_dir, landscape: LandscapeSpec, *,
                      batch_name: str | None = None,
                      batch_config_path: str | None = None,
-                     n_init_trials: int = N_INIT_TRIALS) -> None:
+                     n_init_trials: int = N_INIT_TRIALS,
+                     dataset: str | None = None,
+                     ackley_variant: str | None = None,
+                     invocation: dict | None = None) -> None:
     """Persist the static run state needed for a fully non-interactive resume."""
     cfg = {
         "landscape":       landscape.landscape,
@@ -484,6 +554,10 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
         "max_activations": landscape.max_activations,
         "created":         datetime.datetime.now().isoformat(timespec="seconds"),
     }
+    if dataset is not None:
+        cfg["dataset"] = dataset
+    if ackley_variant is not None:
+        cfg["ackley_variant"] = ackley_variant
     if landscape.landscape == "rf":
         cfg["csv_path"] = landscape.csv_path
         cfg["objective_column"] = landscape.objective_column
@@ -505,6 +579,9 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
         cfg["batch_name"] = batch_name
     if batch_config_path:
         cfg["batch_config_path"] = os.path.abspath(batch_config_path)
+    cfg["device"] = str(DEVICE)
+    if invocation is not None:
+        cfg["invocation"] = invocation
     from synthetic_data.landscape_config_log import build_landscape_config_log, dataset_label_for_landscape
     cfg["landscape_config"] = build_landscape_config_log(
         dataset=dataset_label_for_landscape(
@@ -809,11 +886,54 @@ def append_trial_logs(
     )
 
 
+def _time_objective(metrics: dict) -> float:
+    """Third MOBO objective: average wall-clock seconds per ZoMBI iteration.
+
+    Prefers the current ``avg_time_per_iter_s`` key. Older runs stored total
+    ``runtime_s`` instead (the objective used to be whole-trial wall clock), so it
+    is used as a fallback to keep prior data seedable on resume — note such values
+    are totals, not per-iteration, so a resume mixing old and new trials is only
+    approximate on this objective.
+    """
+    if "avg_time_per_iter_s" in metrics:
+        return float(metrics["avg_time_per_iter_s"])
+    return float(metrics["runtime_s"])
+
+
+def _collect_from_progress(path: str, X_obs: list, Y_obs: list) -> int:
+    """Load (X_norm, Y) pairs from one mobo_progress.json; append to X_obs/Y_obs.
+
+    Returns the number of usable trials found.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as exc:
+        print(f"  [collect] {path} unreadable ({exc}); skipping.")
+        return 0
+    used = 0
+    for t in data.get("trials", []):
+        hp, m = t.get("hparams", {}), t.get("metrics", {})
+        if not all(name in hp for name in HPARAM_NAMES):
+            continue  # stale / different hyperparameter set
+        try:
+            x = hparams_to_norm(hp)
+            y = torch.tensor([-float(m["dist_to_needles"]),
+                              -float(m["dup_fraction"]),
+                              -_time_objective(m)], dtype=DTYPE)
+        except (KeyError, ValueError, TypeError):
+            continue
+        X_obs.append(x)
+        Y_obs.append(y)
+        used += 1
+    return used
+
+
 def collect_all_observations(runs_dir: str):
     """Crawl every runs/mobo_*/mobo_progress.json and collect all (X_norm, Y) pairs.
 
     X = normalised hyperparameter vector (inverted from the stored hparams),
-    Y = (-dist_to_needles, -dup_fraction, -runtime_s)  [the maximised objectives].
+    Y = (-dist_to_needles, -dup_fraction, -avg_time_per_iter_s)  [maximised objectives].
 
     Each run's progress.json records only its own trials, so the union across all
     runs has no double-counting.  Trials whose hparam keys don't cover the current
@@ -939,7 +1059,7 @@ def collect_rederived_observations(runs_dir: str, new_maximize: bool,
                 x = hparams_to_norm(hp)
                 y = torch.tensor([-float(dist),
                                   -float(m["dup_fraction"]),
-                                  -float(m["runtime_s"])], dtype=DTYPE)
+                                  -_time_objective(m)], dtype=DTYPE)
             except (KeyError, ValueError, TypeError) as exc:
                 print(f"  [resume-scratch] {run_name} trial "
                       f"{t.get('trial')}: could not build observation ({exc}); skipping.")
@@ -964,6 +1084,23 @@ def collect_rederived_observations(runs_dir: str, new_maximize: bool,
                       f"its dist_to_needles was NOT re-scored to the new optima; reused as "
                       f"stored (assumed close enough).")
     return X_obs, Y_obs, n_runs
+
+
+def collect_observations_from_run(run_dir: str):
+    """Load (X_norm, Y) pairs from a single run's mobo_progress.json.
+
+    Like ``collect_all_observations`` but scoped to one run directory. Used by
+    ``--resume-from`` to trust only a specific run's stored metrics without
+    re-evaluating anything.
+    Returns (X_obs, Y_obs).
+    """
+    path = os.path.join(run_dir, "mobo_progress.json")
+    if not os.path.exists(path):
+        sys.exit(f"--resume-from: no mobo_progress.json found in {run_dir}")
+    X_obs, Y_obs = [], []
+    used = _collect_from_progress(path, X_obs, Y_obs)
+    print(f"  [collect] {os.path.basename(run_dir)}: {used} trial(s)")
+    return X_obs, Y_obs
 
 
 def collect_observations_for_dim(runs_dir: str, dim: int):
@@ -1056,12 +1193,20 @@ def load_seed_hparams(trial_paths: list[str]) -> list[torch.Tensor]:
 # ─── Ternary helpers (RF interactive picker + plotting) ────────────────────────
 
 def comp_to_xy(comp: np.ndarray) -> np.ndarray:
-    p = np.asarray(comp, dtype=float)
+    p = as_numpy(comp, dtype=float)
     if p.ndim == 1:
         p = p.reshape(1, -1)
     s = p.sum(axis=-1, keepdims=True)
     p = p / np.where(s == 0, 1.0, s)
     return np.column_stack([p[:, 1] + 0.5 * p[:, 2], _SQRT3_2 * p[:, 2]])
+
+
+def _line_endpoints_array(line) -> np.ndarray | None:
+    """Stack a LineBO (left, right) pair as (2, d) host array."""
+    if line is None:
+        return None
+    left, right = line
+    return np.stack([as_numpy(left).ravel(), as_numpy(right).ravel()], axis=0)
 
 
 def xy_to_comp(x: float, y: float) -> np.ndarray:
@@ -1190,15 +1335,16 @@ class ExtremaPicker:
 
 from eval_metrics import (  # noqa: E402  — after sys.path setup in callers
     MATCH_RADIUS,
-    SIMPLEX_L2_DIAMETER,
     UNMATCHED_PENALTY,
+    as_numpy,
     dup_threshold_ilr,
     match_radius_ilr,
     metric_avg_pairwise_dist,
     metric_dist_to_needles,
     metric_dup_fraction,
     metric_pct_matched,
-    unmatched_penalty,
+    metric_pct_matched_comp,
+    metric_pct_matched_ilr,
 )
 # ─── ZoMBI sim-objective + LineBO wrapper ──────────────────────────────────────
 
@@ -1232,10 +1378,10 @@ def make_linebo_wrapper(sim_obj, dim, num_lines, device, dtype, plot_state: dict
         x_left_r, x_right_r = linebo.ranked_line_endpoints(x_tell, bounds, acq_fn)
         n_valid = x_left_r.shape[0]
         plot_state["line_0"] = (
-            (x_left_r[0].cpu().numpy(), x_right_r[0].cpu().numpy()) if n_valid > 0 else None
+            (as_numpy(x_left_r[0]), as_numpy(x_right_r[0])) if n_valid > 0 else None
         )
         plot_state["line_1"] = (
-            (x_left_r[1].cpu().numpy(), x_right_r[1].cpu().numpy()) if n_valid > 1 else None
+            (as_numpy(x_left_r[1]), as_numpy(x_right_r[1])) if n_valid > 1 else None
         )
         endpoints = torch.stack([x_left_r, x_right_r], dim=1)
         x_actual, y = sim_obj(endpoints)
@@ -1259,10 +1405,11 @@ def make_linebo_wrapper(sim_obj, dim, num_lines, device, dtype, plot_state: dict
 
 
 def _gen_init_data(fn_callable, maximize: bool, dim: int = 3):
-    """Generate N_INIT_LINES random simplex lines; return (X_a, X_e, Y)."""
+    """Generate ``N_INIT_LINES`` random simplex lines on the ``dim``-simplex;
+    return (X_a, X_e, Y)."""
     x_a_list, x_e_list, y_list = [], [], []
-    x0 = torch.full((dim,), 1.0 / dim, device=DEVICE, dtype=DTYPE)
     for _ in range(N_INIT_LINES):
+        x0 = torch.full((dim,), 1.0 / dim, device=DEVICE, dtype=DTYPE)
         dir_ = zero_sum_dirs(1, dim, device=DEVICE, dtype=DTYPE).squeeze(0)
         seg  = line_simplex_segment(x0, dir_)
         if seg is None:
@@ -1298,9 +1445,12 @@ def _draw_bounds_region(ax, bounds, n_sample: int = 5000) -> None:
     try:
         if isinstance(bounds, torch.Tensor) and bounds.shape[0] == 2:
             lo, hi = bounds[0], bounds[1]
-            samp = random_simplex(n_sample, lo, hi, device=str(lo.device), torch_dtype=lo.dtype)
+        elif isinstance(bounds, np.ndarray) and bounds.shape[0] == 2:
+            lo = torch.as_tensor(bounds[0], dtype=DTYPE, device=DEVICE)
+            hi = torch.as_tensor(bounds[1], dtype=DTYPE, device=DEVICE)
         else:
             return
+        samp = random_simplex(n_sample, lo, hi, device=str(lo.device), torch_dtype=lo.dtype)
     except Exception:
         return
     pts = samp.detach().cpu().numpy()
@@ -1327,14 +1477,14 @@ def _draw_needle_ellipsoid(ax, needle_x, M, B) -> None:
         return
     try:
         d = needle_x.shape[0]
-        M_np = M.cpu().numpy()
+        M_np = as_numpy(M, dtype=float)
         eigvals, eigvecs = np.linalg.eigh(M_np)
         eigvals = np.maximum(eigvals, 1e-12)
         angles = np.linspace(0, 2 * np.pi, 200)
         circle = np.column_stack([np.cos(angles), np.sin(angles)])
         u_ell = (eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ circle.T).T
         if B is not None:
-            B_np = B.cpu().numpy()
+            B_np = as_numpy(B, dtype=float)
             ell_pts = needle_x.reshape(1, d) + (B_np @ u_ell.T).T
         else:
             needle_t = torch.tensor(needle_x, dtype=torch.float64)
@@ -1406,12 +1556,12 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
             _draw_needle_ellipsoid(ax_exp, nx, Mi, B)
 
     if payload.get("line_0") is not None:
-        ll = comp_to_xy(np.array(payload["line_0"]))
+        ll = comp_to_xy(_line_endpoints_array(payload["line_0"]))
         (h0,) = ax_exp.plot(ll[:, 0], ll[:, 1], "-", color="orange", lw=2.5,
                             alpha=0.90, zorder=7, label="LineBO (main)")
         legend_handles.append(h0)
     if payload.get("line_1") is not None:
-        ll = comp_to_xy(np.array(payload["line_1"]))
+        ll = comp_to_xy(_line_endpoints_array(payload["line_1"]))
         (h1,) = ax_exp.plot(ll[:, 0], ll[:, 1], ":", color="cornflowerblue", lw=2.2,
                             alpha=0.85, zorder=7, label="LineBO (cache)")
         legend_handles.append(h1)
@@ -1530,13 +1680,14 @@ def write_needles_csv(path: str, dh, *, dim: int = 3) -> None:
     centroid = np.full(dim, 1.0 / dim)
     comp_cols = composition_column_names(dim)
     rows = []
-    for i, r in enumerate(results):
+    for i, r in enumerate(dh.get_all_needle_results()):
         pt = r["point"].detach().cpu().numpy().ravel()
         mv = r.get("median_value")
         row = {
             "needle_idx": i,
             "value": r.get("value"),
             "median_value": (None if mv is None or (isinstance(mv, float) and math.isnan(mv)) else mv),
+            "activation": r.get("activation"),
             "zoom": r.get("zoom"),
             "iteration": r.get("iteration"),
             "reason": r.get("reason"),
@@ -1556,9 +1707,12 @@ def write_metrics_over_time_csv(path: str, payloads: list[dict], X_all: np.ndarr
     rows = []
     for p in payloads:
         needles = p.get("needles")
-        disc = needles if needles is not None else np.empty((0, X_all.shape[1] if X_all.ndim == 2 and X_all.shape[0] else (true_optima[0].shape[0] if true_optima else dim)))
+        if needles is not None:
+            disc = as_numpy(needles, dtype=float)
+        else:
+            disc = np.empty((0, X_all.shape[1] if X_all.ndim == 2 and X_all.shape[0] else (true_optima[0].shape[0] if true_optima else dim)))
         n_before = p.get("n_points_before", len(X_all))
-        X_upto = X_all[:n_before] if n_before > 0 else np.empty_like(disc)
+        X_upto = as_numpy(X_all[:n_before], dtype=float) if n_before > 0 else np.empty_like(disc)
         # Value of the most recently discovered needle as of this iteration
         # (needles accumulate in chronological order, so the last one is newest).
         nvals = p.get("needle_vals")
@@ -1567,11 +1721,14 @@ def write_metrics_over_time_csv(path: str, payloads: list[dict], X_all: np.ndarr
             "iteration": p["iter_num"],
             "dist_to_needles":  round(metric_dist_to_needles(disc, true_optima, dim=dim), 6),
             "dup_fraction":     round(metric_dup_fraction(X_upto, dim=dim), 6),
-            "pct_matched":      round(metric_pct_matched(disc, true_optima, dim=dim), 4),
+            "pct_matched_comp": round(metric_pct_matched_comp(disc, true_optima, dim=dim), 4),
+            "pct_matched_ilr":  round(metric_pct_matched_ilr(disc, true_optima, dim=dim), 4),
+            "pct_matched":      round(metric_pct_matched_comp(disc, true_optima, dim=dim), 4),
             "avg_pairwise_dist":round(metric_avg_pairwise_dist(disc), 6),
             "recent_needle_value": (round(recent, 6) if not math.isnan(recent) else np.nan),
         })
-    cols = ["iteration", "dist_to_needles", "dup_fraction", "pct_matched",
+    cols = ["iteration", "dist_to_needles", "dup_fraction",
+            "pct_matched_comp", "pct_matched_ilr", "pct_matched",
             "avg_pairwise_dist", "recent_needle_value"]
     pd.DataFrame(rows, columns=cols).to_csv(path, index=False)
 
@@ -1612,7 +1769,7 @@ def plot_line_length_hist(path: str, payloads: list[dict]) -> None:
     for p in payloads:
         line = p.get("line_0")
         if line is not None:
-            left, right = np.asarray(line[0]), np.asarray(line[1])
+            left, right = as_numpy(line[0]).ravel(), as_numpy(line[1]).ravel()
             lengths.append(float(np.linalg.norm(right - left)))
     fig = Figure(figsize=(7, 5))
     FigureCanvasAgg(fig)
@@ -1670,9 +1827,6 @@ def write_trial_json(path: str, trial_num: int, phase: str,
         "metrics": {
             "dist_to_needles":     round(metrics["dist"], 6),
             "dup_fraction":        round(metrics["dup"], 6),
-            # Third objective: average wall-clock seconds per ZoMBI iteration
-            # (total runtime / number of LineBO main-line picks). runtime_s and
-            # n_iters are kept alongside for context but are not the objective.
             "avg_time_per_iter_s": round(metrics["avg_time_per_iter"], 4),
             "runtime_s":           round(metrics["runtime"], 3),
             "n_iters":             int(metrics["n_iters"]),
@@ -1682,11 +1836,10 @@ def write_trial_json(path: str, trial_num: int, phase: str,
         },
     }
     if ackley_seed is not None:
-        # Random per-trial seed driving this trial's realistic-Ackley landscape
-        # (optima placement + noise); recorded so the objective is reproducible.
         obj["ackley_seed"] = int(ackley_seed)
     with open(path, "w") as f:
         json.dump(obj, f, indent=2)
+
 
 
 # ─── End-of-trial auto plots (plot_metrics + coverage_plot; no videos) ─────────
@@ -1770,9 +1923,9 @@ def _render_4d_point_cloud(out_path: str, ackley_fn, dh, last_payload: dict | No
     needles  = (needle_t.detach().cpu().numpy()
                 if needle_t is not None and needle_t.numel() > 0 else None)
 
-    main_line  = (np.array(last_payload["line_0"]) if last_payload
+    main_line  = (_line_endpoints_array(last_payload["line_0"]) if last_payload
                   and last_payload.get("line_0") is not None else None)
-    cache_line = (np.array(last_payload["line_1"]) if last_payload
+    cache_line = (_line_endpoints_array(last_payload["line_1"]) if last_payload
                   and last_payload.get("line_1") is not None else None)
 
     pc4.add_simplex_overlays(
@@ -1808,6 +1961,24 @@ def reseed_ackley_dataset(ds: dict, seed: int) -> dict:
         new_ds["grid_vals"] = fn.predict(ds["grid_pts"])
     return new_ds
 
+def reseed_ackley_dataset(ds: dict, seed: int) -> dict:
+    """Return a shallow copy of an Ackley dataset bundle rebuilt for ``seed``.
+
+    The seed drives BOTH the optima placement (peak_seed) and the background noise
+    (noise_seed), so each trial faces a fresh random realisation of the
+    realistic-Ackley landscape. The function, its known optima, and — for 3D — the
+    render-grid values are recomputed to match (4D renders from ``fn`` directly;
+    ≥5D has no landscape view, so ``grid_vals`` stays ``None``).
+    """
+    dim = ds["dim"]
+    fn = Ackley(ds["ackley_variant"], dim=dim, peak_seed=seed, noise_seed=seed)
+    new_ds = dict(ds)
+    new_ds["fn"] = fn
+    new_ds["true_optima"] = [np.asarray(c, dtype=float) for c in fn.centers]
+    if dim == 3 and ds.get("grid_pts") is not None:
+        new_ds["grid_vals"] = fn.predict(ds["grid_pts"])
+    return new_ds
+
 
 # ─── Single trial: run ZoMBI on the objective + write all artifacts ────────────
 
@@ -1815,15 +1986,33 @@ def run_single_trial(
     hparams: dict,
     landscape: LandscapeSpec,
     trial_dir: str,
-    time_limit_hours: float,
+    *,
+    ackley_variant: str | None = None,
 ) -> dict:
-    """Run one ZoMBI trial on the configured landscape, then write per-trial artifacts."""
-    dim = landscape.dim
-    maximize = landscape.maximize
+    """Run one ZoMBI trial on the configured landscape, then write per-trial artifacts.
+
+    Returns {"dist", "dup", "runtime", "avg_time_per_iter", "n_iters", "payloads",
+    "ackley_seed"}.
+    """
+    ackley_seed = None
     fn_callable = landscape.fn_callable
-    true_optima = landscape.true_optima
+    true_optima = list(landscape.true_optima)
     grid_pts = landscape.grid_pts
     grid_vals = landscape.grid_vals
+    dim = landscape.dim
+    maximize = landscape.maximize
+
+    if ackley_variant == "realistic":
+        ackley_seed = draw_ackley_seed()
+        reseeded = reseed_ackley_dataset(
+            {"dim": dim, "ackley_variant": ackley_variant, "grid_pts": grid_pts},
+            ackley_seed,
+        )
+        fn_callable = reseeded["fn"]
+        true_optima = reseeded["true_optima"]
+        if reseeded.get("grid_vals") is not None:
+            grid_vals = reseeded["grid_vals"]
+        print(f"    [trial] realistic Ackley seed = {ackley_seed}")
 
     if os.path.isdir(trial_dir):
         shutil.rmtree(trial_dir, ignore_errors=True)
@@ -1842,70 +2031,57 @@ def run_single_trial(
         x_req, x_act, y = inner(x_tell, bounds, acq_fn)
         call_counter[0] += 1
         dh = dh_ref[0]
+        xp, yp = dh.X_pared, dh.Y_pared
+        if xp is not None and xp.shape[0] > 0:
+            pared_X = xp.detach().cpu().numpy()
+            pared_Y = yp.detach().cpu().numpy().ravel()
+            if not maximize:
+                pared_Y = -pared_Y
+        else:
+            pared_X = pared_Y = None
         needles = dh.needles
-        # Lightweight per-iteration payload: only the fields needed by the
-        # metrics-over-time CSV and the line-length histogram, both generated for
-        # EVERY dimension. Kept for the whole trial.
-        payload = dict(
+        payloads.append(dict(
             iter_num=call_counter[0],
-            needles=(needles.detach().cpu().numpy()
+            pared_X=pared_X, pared_Y=pared_Y,
+            needles=(as_numpy(needles)
                      if needles is not None and needles.shape[0] > 0 else None),
-            needle_vals=(dh.needle_vals.detach().cpu().numpy().ravel()
+            needle_vals=(as_numpy(dh.needle_vals).ravel()
                          if dh.needle_vals is not None and dh.needle_vals.shape[0] > 0 else None),
+            needle_M_list=[as_numpy(m) if m is not None else None
+                           for m in dh.needle_M_list],
+            needle_B=(as_numpy(dh.needle_B) if dh.needle_B is not None else None),
+            bounds=(as_numpy(dh.bounds) if dh.bounds is not None else None),
             line_0=plot_state.get("line_0"),
+            line_1=plot_state.get("line_1"),
             n_points_before=(dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0),
-        )
-        # Heavy fields (pared point cloud, needle ellipsoid matrices, trust
-        # bounds) are ONLY consumed by the rendered landscape views: the
-        # per-iteration ternary frames (3D) and the end-of-trial 4D point cloud,
-        # which uses just the LAST payload. So keep them on every frame at 3D, on
-        # only the most recent payload at 4D, and never at >=5D. Otherwise this
-        # list grows unbounded over a long / non-converging trial and exhausts
-        # RAM (the 10D OOM).
-        if dim <= 4:
-            if dim == 4 and payloads:
-                # Strip the heavy fields off the previous payload — only the final
-                # one is read by the 4D point cloud. Earlier payloads were already
-                # stripped on prior iterations, so just the last one remains.
-                for k in ("pared_X", "pared_Y", "needle_M_list",
-                          "needle_B", "bounds", "line_1"):
-                    payloads[-1].pop(k, None)
-            xp, yp = dh.X_pared, dh.Y_pared
-            if xp is not None and xp.shape[0] > 0:
-                pared_X = xp.detach().cpu().numpy()
-                pared_Y = yp.detach().cpu().numpy().ravel()
-                if not maximize:
-                    pared_Y = -pared_Y
-            else:
-                pared_X = pared_Y = None
-            payload.update(
-                pared_X=pared_X, pared_Y=pared_Y,
-                needle_M_list=[m.detach().cpu().clone() if m is not None else None
-                               for m in dh.needle_M_list],
-                needle_B=(dh.needle_B.detach().cpu().clone() if dh.needle_B is not None else None),
-                bounds=(dh.bounds.detach().cpu().clone() if dh.bounds is not None else None),
-                line_1=plot_state.get("line_1"),
-            )
-        payloads.append(payload)
+        ))
         return x_req, x_act, y
 
     try:
         X_a, X_e, Y = _gen_init_data(fn_callable, maximize, dim=dim)
-    except RuntimeError as exc:
+    except Exception as exc:
         print(f"    [trial] init failed: {exc}")
-        return {"dist": unmatched_penalty(dim), "dup": 1.0, "runtime": 0.0, "payloads": []}
+        return {"dist": UNMATCHED_PENALTY, "dup": 1.0, "runtime": 0.0,
+                "avg_time_per_iter": 0.0, "n_iters": 0, "payloads": [],
+                "ackley_seed": ackley_seed}
 
     hp = dict(hparams)
     if dim > 3 and (hp.get("top_m_points") is None or hp.get("top_m_points", 0) < dim + 1):
         hp["top_m_points"] = max(dim + 1, 4)
 
-    optimizer = ZoMBIHop(
-        objective=obj_wrapper,
-        X_init_actual=X_a, X_init_expected=X_e, Y_init=Y,
-        **ZOMBI_FIXED, **hp,
-        device=str(DEVICE), dtype=DTYPE,
-        run_uuid=None, checkpoint_dir=None,
-    )
+    try:
+        optimizer = ZoMBIHop(
+            objective=obj_wrapper,
+            X_init_actual=X_a, X_init_expected=X_e, Y_init=Y,
+            **ZOMBI_FIXED, **hp,
+            device=str(DEVICE), dtype=DTYPE,
+            run_uuid=None, checkpoint_dir=None,
+        )
+    except Exception as exc:
+        print(f"    [trial] ZoMBI init failed: {exc}")
+        return {"dist": UNMATCHED_PENALTY, "dup": 1.0, "runtime": 0.0,
+                "avg_time_per_iter": 0.0, "n_iters": 0, "payloads": [],
+                "ackley_seed": ackley_seed}
     dh = optimizer.data_handler
     dh_ref[0] = dh
 
@@ -1933,19 +2109,23 @@ def run_single_trial(
         print(f"    [trial] ZoMBI crashed: {exc}")
     runtime = time.time() - t0
 
+    n_iters = call_counter[0]
+    avg_time_per_iter = runtime / n_iters if n_iters > 0 else 0.0
+
     needle_t   = dh.get_all_needle_locations()
     discovered = (
-        needle_t.detach().cpu().numpy()
+        as_numpy(needle_t)
         if needle_t.numel() > 0 else np.empty((0, dim))
     )
     X_all_np   = (
-        dh.X_all_actual.detach().cpu().numpy()
+        as_numpy(dh.X_all_actual)
         if dh.X_all_actual is not None else np.empty((0, dim))
     )
     dist = metric_dist_to_needles(discovered, true_optima, dim=dim)
     dup  = metric_dup_fraction(X_all_np, dim=dim)
-    print(f"    [trial]  iters={call_counter[0]}  dist={dist:.4f}  dup={dup:.4f}"
-          f"  t={runtime:.1f}s  needles={len(discovered)}/{len(true_optima)}")
+    print(f"    [trial]  iters={n_iters}  dist={dist:.4f}  dup={dup:.4f}"
+          f"  t/iter={avg_time_per_iter:.3f}s  (total {runtime:.1f}s)"
+          f"  needles={len(discovered)}/{len(true_optima)}")
 
     try:
         write_points_csv(os.path.join(trial_dir, "points.csv"), dh, snap_records, dim=dim)
@@ -1959,8 +2139,7 @@ def run_single_trial(
 
     try:
         plot_dist_from_centre(os.path.join(trial_dir, "dist_from_centre.png"), dh, maximize)
-        if landscape.render_ternary:
-            plot_line_length_hist(os.path.join(trial_dir, "line_length_hist.png"), payloads)
+        plot_line_length_hist(os.path.join(trial_dir, "line_length_hist.png"), payloads)
         plot_convergence(os.path.join(trial_dir, "convergence.png"), dh, maximize)
     except Exception as exc:
         print(f"    [trial] static plot failed: {exc}")
@@ -1968,7 +2147,7 @@ def run_single_trial(
     if landscape.render_ternary and grid_pts is not None and grid_vals is not None:
         plots_dir = os.path.join(trial_dir, "plots")
         os.makedirs(plots_dir, exist_ok=True)
-        print(f"    [trial] rendering {len(payloads)} frames …", flush=True)
+        print(f"    [trial] rendering {len(payloads)} ternary frames …", flush=True)
         for p in payloads:
             try:
                 ref_title = (
@@ -1984,17 +2163,15 @@ def run_single_trial(
             except Exception as exc:
                 print(f"    [trial] frame {p['iter_num']} failed: {exc}")
 
-    # ── 4D landscape: one interactive (rotatable) point-cloud HTML at the end ──
-    if dim == 4:
+    if dim == 4 and hasattr(fn_callable, "predict"):
         try:
             print("    [trial] rendering 4D interactive point cloud …", flush=True)
             _render_4d_point_cloud(
                 os.path.join(trial_dir, "point_cloud.html"),
-                fn, dh, payloads[-1] if payloads else None)
+                fn_callable, dh, payloads[-1] if payloads else None)
         except Exception as exc:
             print(f"    [trial] 4D point cloud failed: {exc}")
 
-    # ── End-of-run plots: metrics time series (all dims) + coverage (3D only) ──
     _auto_generate_plots(trial_dir, dim)
 
     return {"dist": dist, "dup": dup, "runtime": runtime,
@@ -2005,7 +2182,7 @@ def run_single_trial(
 # ─── Running summary (mobo_progress.json / mobo_results.json) ───────────────────
 
 def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
-                   prior_count: int = 0, *, n_init_trials: int = N_INIT_TRIALS) -> dict:
+                   n_seed: int = 0, n_sobol: int = 0) -> dict:
     n = len(Y_obs)
     metrics_all = [
         {
@@ -2015,14 +2192,14 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
         }
         for i in range(n)
     ]
-    # The initial design is, in order: ``n_seed`` re-evaluated --start-from-best
-    # configs, then ``n_sobol`` Sobol draws (0 when seeded from prior history on a
-    # resume), then BO ("mobo"). Pareto membership is intentionally NOT recorded
-    # here — it is determined across all runs after the fact by optimize/pareto.py.
+
     def _phase(i: int) -> str:
-        if prior_count == 0 and i < n_init_trials:
+        if i < n_seed:
+            return "seed"
+        if i < n_seed + n_sobol:
             return "sobol"
         return "mobo"
+
     trials = [
         {
             "trial":   i + 1,
@@ -2050,17 +2227,15 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
     }
 
 
-def save_running_summary(X_obs, Y_obs, run_dir: str, prior_count: int = 0, *,
-                         n_init_trials: int = N_INIT_TRIALS) -> None:
+def save_running_summary(X_obs, Y_obs, run_dir: str, n_seed: int = 0,
+                         n_sobol: int = 0) -> None:
     """Write mobo_progress.json + mobo_results.json + mobo_results.pt."""
     if not Y_obs:
         return
-    summary = _build_summary(X_obs, Y_obs, prior_count=prior_count,
-                             n_init_trials=n_init_trials)
+    summary = _build_summary(X_obs, Y_obs, n_seed=n_seed, n_sobol=n_sobol)
     summary_txt = json.dumps(summary, indent=2)
     _atomic_write_text(os.path.join(run_dir, "mobo_progress.json"), summary_txt)
     _atomic_write_text(os.path.join(run_dir, "mobo_results.json"), summary_txt)
-    # mobo_results.pt is the resume source-of-truth → atomic + .bak.
     _atomic_torch_save(
         {"X_obs": torch.stack(X_obs).cpu(), "Y_obs": torch.stack(Y_obs).cpu(),
          "hparam_names": HPARAM_NAMES},
@@ -2069,11 +2244,13 @@ def save_running_summary(X_obs, Y_obs, run_dir: str, prior_count: int = 0, *,
     print(f"  [summary] {len(Y_obs)} trials recorded", flush=True)
 
 
+
 # ─── MOBO loop (unbounded, resumable) ───────────────────────────────────────────
 
 def run_mobo(landscape: LandscapeSpec, run_dir,
-             max_trials=None, X_prior=None, Y_prior=None, *,
-             n_init_trials: int = N_INIT_TRIALS) -> None:
+             max_trials=None, seed_X=None, X_prior=None, Y_prior=None, *,
+             n_init_trials: int = N_INIT_TRIALS,
+             ackley_variant: str | None = None) -> None:
     """Unbounded MOBO loop, writing trials into a fresh ``run_dir``."""
     bounds = torch.zeros(2, N_HPARAMS, dtype=DTYPE, device=DEVICE)
     bounds[1] = 1.0
@@ -2081,9 +2258,11 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
     X_prior = [x.detach().cpu() for x in X_prior] if X_prior else []
     Y_prior = [y.detach().cpu() for y in Y_prior] if Y_prior else []
     n_prior = len(Y_prior)
+    seed_X  = [x.detach().cpu() for x in seed_X] if seed_X else []
     X_obs: list[torch.Tensor] = []
     Y_obs: list[torch.Tensor] = []
 
+    n_seed  = len(seed_X)
     n_sobol = n_init_trials if n_prior == 0 else 0
     X_sobol = load_or_make_sobol(run_dir, bounds, n_sobol)
     init_design = ([(x, "seed") for x in seed_X]
@@ -2096,16 +2275,12 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
         else f"max_activations / trial: {landscape.max_activations}"
     )
     print(f"\n{'='*70}")
-    print(f"MOBO  |  {landscape.label}  |  {X_sobol.shape[0]} Sobol init, then BO until Ctrl+C")
+    print(f"MOBO  |  {landscape.label}  |  {n_seed} re-evaluated seed(s) + "
+          f"{X_sobol.shape[0]} Sobol init, then BO until Ctrl+C")
     print(f"{stop_desc}    Run dir: {run_dir}")
     if n_prior:
-        if n_sobol:
-            print(f"PRIOR HISTORY — seeding GP with {n_prior} (X,Y) pair(s) "
-                  f"from prior runs; topping up with {n_sobol} Sobol init "
-                  f"trial(s) to reach {N_INIT_TRIALS}")
-        else:
-            print(f"PRIOR HISTORY — seeding GP with {n_prior} (X,Y) pair(s) "
-                  f"from prior runs; skipping Sobol init")
+        print(f"PRIOR HISTORY — seeding GP with {n_prior} (X,Y) pair(s) "
+              f"from prior runs; skipping Sobol init")
     print(f"Hyperparameters ({N_HPARAMS}): {HPARAM_NAMES}")
     print(f"{'='*70}")
 
@@ -2119,7 +2294,6 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
             trial_dir = os.path.join(run_dir, f"trial_{trial_num}")
 
             try:
-                # ── Pick the next hyperparameter vector ──
                 if use_init:
                     x_new = init_design[n_done][0].detach().cpu().clone()
                 else:
@@ -2142,16 +2316,12 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                     x_new = candidate.squeeze(0).detach().cpu()
 
                 hparams = norm_to_hparams(x_new)
-                # norm_to_hparams may repair the proposal (e.g. raw ≥ n_restarts);
-                # re-derive x_new from the repaired hparams so the recorded design
-                # point matches the config actually run (and what resume reloads).
-                x_new = hparams_to_norm(hparams)
                 hp_str = "  ".join(f"{k}={round(v,4) if isinstance(v,float) else v}"
                                    for k, v in hparams.items())
                 print(f"\n[trial {trial_num} | {phase}]  {hp_str}")
 
-                # ── Run the trial + write its artifacts ──
-                res = run_single_trial(hparams, landscape, trial_dir)
+                res = run_single_trial(
+                    hparams, landscape, trial_dir, ackley_variant=ackley_variant)
                 try:
                     plot_hparam_edge_proximity(
                         os.path.join(trial_dir, "hparam_edge_proximity.png"), x_new)
@@ -2159,10 +2329,10 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                     print(f"    [trial] hparam_edge_proximity failed: {exc}")
 
                 X_obs.append(x_new.detach().cpu())
-                Y_obs.append(torch.tensor([-res["dist"], -res["dup"], -res["runtime"]],
-                                          dtype=DTYPE, device="cpu"))
-                save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior,
-                                     n_init_trials=n_init_trials)
+                Y_obs.append(torch.tensor(
+                    [-res["dist"], -res["dup"], -res["avg_time_per_iter"]],
+                    dtype=DTYPE, device="cpu"))
+                save_running_summary(X_obs, Y_obs, run_dir, n_seed=n_seed, n_sobol=n_sobol)
                 write_trial_json(
                     os.path.join(trial_dir, "trial.json"),
                     trial_num, phase,
@@ -2183,7 +2353,6 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
-                # Log & continue: a single failed trial must not end the night.
                 consec_fail += 1
                 _log_error(run_dir, trial_num, exc)
                 print(f"    [trial {trial_num}] FAILED: {exc} — logged to errors.log "
@@ -2200,8 +2369,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
         print(f"\n[stop] max_trials={max_trials} reached ({len(Y_obs)} completed).")
 
     if Y_obs:
-        save_running_summary(X_obs, Y_obs, run_dir, prior_count=n_prior,
-                             n_init_trials=n_init_trials)
+        save_running_summary(X_obs, Y_obs, run_dir, n_seed=n_seed, n_sobol=n_sobol)
     print(f"\nDone. {len(Y_obs)} trials completed this run "
           f"({n_prior} prior + {len(Y_obs)} new = {n_prior + len(Y_obs)} total). Results in {run_dir}")
     print(f"Resume (crawls all runs) with:  python optimize/run_mobo.py --resume")
@@ -2210,19 +2378,24 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
 
 # ─── Main ───────────────────────────────────────────────────────────────────────
 
-def _ds_from_rf(rf_fn, grid_pts, grid_vals, csv_path, maximize, true_optima) -> dict:
-    """Pack an RF (3-simplex) objective into the dataset bundle ``run_mobo`` uses."""
-    return dict(dim=3, label="RF", fn=rf_fn, maximize=maximize, true_optima=true_optima,
-                grid_pts=grid_pts, grid_vals=grid_vals, ackley_variant=None,
-                csv_path=csv_path)
+
+
+def _landscape_from_legacy_ackley(ds: dict) -> LandscapeSpec:
+    """Wrap a legacy ``--dataset ackley*`` bundle as a ``LandscapeSpec``."""
+    return LandscapeSpec(
+        landscape="ackley",
+        dim=ds["dim"],
+        maximize=ds["maximize"],
+        true_optima=ds["true_optima"],
+        fn_callable=ds["fn"],
+        grid_pts=ds.get("grid_pts"),
+        grid_vals=ds.get("grid_vals"),
+        time_limit_hours=TIME_LIMIT_HOURS,
+    )
 
 
 def _ds_ackley(dataset: str, ackley_variant: str) -> dict:
-    """Build an analytic negated-Ackley objective bundle on the d-simplex.
-
-    Optima are the function's known peak centers (no interactive picker needed),
-    so ackley runs are fully non-interactive at any dimension.
-    """
+    """Build an analytic negated-Ackley objective bundle on the d-simplex."""
     dim = DATASET_DIMS[dataset]
     fn  = Ackley(ackley_variant, dim=dim)
     true_optima = [np.asarray(c, dtype=float) for c in fn.centers]
@@ -2238,29 +2411,58 @@ def _ds_ackley(dataset: str, ackley_variant: str) -> dict:
                 csv_path=None)
 
 
-def resolve_dataset_from_cfg(cfg: dict) -> dict:
-    """Rebuild a dataset bundle from a saved run_config.json (resume/copy-config).
+def _legacy_ackley_dataset_key(cfg: dict) -> str | None:
+    """Return ackley3d/ackley4d/ackley10d when config is a legacy Ackley benchmark."""
+    dataset = cfg.get("dataset")
+    if dataset in DATASET_DIMS and dataset != "RF":
+        return dataset
+    # Runs saved before ``dataset`` was persisted: infer from variant + dim.
+    if (cfg.get("landscape") == "ackley"
+            and cfg.get("ackley_variant")
+            and not cfg.get("ackley_layout")):
+        dim = int(cfg.get("dim", 3))
+        key = f"ackley{dim}d"
+        if key in DATASET_DIMS:
+            return key
+    return None
 
-    RF retrains the surrogate from the stored CSV; ackley* rebuilds the analytic
-    function. In both cases the saved ``true_optima``/``maximize`` are reused so
-    the objective matches the original run exactly.
-    """
-    dataset     = cfg.get("dataset", "RF")
-    dim         = cfg.get("dim", 3)
-    maximize    = cfg["maximize"]
-    true_optima = [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
-    if dataset == "RF":
-        csv_path = cfg.get("csv_path")
-        if not csv_path or not os.path.exists(csv_path):
-            sys.exit(f"Saved CSV path no longer exists: {csv_path}")
-        print(f"\n[RF] Rebuilding surrogate from {csv_path} …")
-        _, rf_fn, grid_pts, grid_vals = build_rf_and_grid(csv_path)
-        print(f"  RF ready: reusing {len(true_optima)} saved reference optima")
-        return _ds_from_rf(rf_fn, grid_pts, grid_vals, csv_path, maximize, true_optima)
-    ds = _ds_ackley(dataset, cfg.get("ackley_variant", "realistic"))
-    ds["maximize"]    = maximize          # honour the stored direction
-    ds["true_optima"] = true_optima       # honour the stored optima
-    return ds
+
+def _persist_dataset_fields(cfg: dict) -> tuple[str | None, str | None]:
+    """Extract dataset / ackley_variant to re-save in a resumed run's config."""
+    legacy = _legacy_ackley_dataset_key(cfg)
+    if legacy:
+        return legacy, cfg.get("ackley_variant")
+    ds = cfg.get("dataset")
+    if ds and ds != "RF":
+        return ds, cfg.get("ackley_variant")
+    return None, cfg.get("ackley_variant")
+
+
+def _landscape_from_legacy_ackley_cfg(cfg: dict) -> tuple[LandscapeSpec, str]:
+    """Rebuild a ``--dataset ackley*`` landscape from run_config.json."""
+    dataset = _legacy_ackley_dataset_key(cfg)
+    if dataset is None:
+        raise ValueError("not a legacy ackley dataset config")
+    ackley_variant = cfg.get("ackley_variant") or "realistic"
+    ds = _ds_ackley(dataset, ackley_variant)
+    if "maximize" in cfg:
+        ds["maximize"] = bool(cfg["maximize"])
+    if cfg.get("true_optima"):
+        ds["true_optima"] = [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
+    return _landscape_from_legacy_ackley(ds), ds["ackley_variant"]
+
+
+def _landscape_from_run_config_legacy(cfg: dict) -> tuple[LandscapeSpec, str | None]:
+    """Rebuild landscape from run_config.json (RF, legacy ackley*, or Multi-Ackley)."""
+    ackley_variant = cfg.get("ackley_variant")
+    legacy_key = _legacy_ackley_dataset_key(cfg)
+    if legacy_key is not None:
+        return _landscape_from_legacy_ackley_cfg(cfg)
+    if cfg.get("landscape"):
+        return landscape_from_run_config(cfg, build_rf_and_grid=build_rf_and_grid), ackley_variant
+    return landscape_from_run_config(
+        {"landscape": "rf", **cfg}, build_rf_and_grid=build_rf_and_grid,
+    ), None
 
 
 def _interactive_run_config(script_dir: str):
@@ -2302,28 +2504,37 @@ def _interactive_run_config(script_dir: str):
 
 
 def _launch_run(runs_dir, landscape: LandscapeSpec, max_trials,
-                X_prior=None, Y_prior=None, *,
+                seed_X=None, X_prior=None, Y_prior=None, *,
                 batch_name: str | None = None,
                 batch_config_path: str | None = None,
                 run_dir: str | None = None,
-                n_init_trials: int = N_INIT_TRIALS) -> None:
+                n_init_trials: int = N_INIT_TRIALS,
+                dataset: str | None = None,
+                ackley_variant: str | None = None,
+                invocation: dict | None = None) -> None:
     """Create a fresh runs/mobo_* folder, persist its config, and run MOBO."""
     if run_dir is None:
-        stamp = datetime.datetime.now().strftime("mobo_%d_%m_%H_%M")
-        suffix = f"_{batch_name}" if batch_name else ""
-        run_dir = os.path.join(runs_dir, f"{stamp}{suffix}")
-    os.makedirs(run_dir, exist_ok=True)
+        run_dir = unique_run_dir(runs_dir, "mobo")
+    else:
+        os.makedirs(run_dir, exist_ok=True)
+    if invocation is not None:
+        _log_invocation(invocation)
     write_run_config(
         run_dir, landscape,
         batch_name=batch_name, batch_config_path=batch_config_path,
         n_init_trials=n_init_trials,
+        dataset=dataset, ackley_variant=ackley_variant,
+        invocation=invocation,
     )
     print(f"\n[run] Output folder: {run_dir}")
     run_mobo(landscape, run_dir, max_trials=max_trials,
-             X_prior=X_prior, Y_prior=Y_prior, n_init_trials=n_init_trials)
+             seed_X=seed_X, X_prior=X_prior, Y_prior=Y_prior,
+             n_init_trials=n_init_trials, ackley_variant=ackley_variant)
 
 
-def _apply_runtime_overrides(*, device: str | None, time_limit_hours: float | None) -> None:
+
+def _apply_runtime_overrides(*, device: str | None = None,
+                             time_limit_hours: float | None = None) -> None:
     """Apply CLI overrides to module-level DEVICE and TIME_LIMIT_HOURS."""
     global DEVICE, TIME_LIMIT_HOURS
     if device is not None:
@@ -2344,19 +2555,6 @@ def main() -> None:
                         help="Multi-Ackley peak layout (1/2/3).")
     parser.add_argument("--ackley-b", type=float, default=None,
                         help="Ackley peak width b (default 1.2 skinny).")
-    parser.add_argument("--dataset", default="RF", choices=sorted(DATASET_DIMS),
-                        help="Objective to search on (default: RF). RF is the 3-simplex "
-                             "Random-Forest surrogate (interactive extrema picker); "
-                             "ackley3d/ackley4d/ackley10d are analytic negated-Ackley "
-                             "benchmarks on the d-simplex (known optima, non-interactive). "
-                             "Used by --resume-dim.")
-    parser.add_argument("--ackley-variant", default="realistic",
-                        choices=sorted(Ackley.VARIANTS),
-                        help="Ackley variant for the ackley* datasets (default: realistic).")
-    parser.add_argument("--time-limit", type=float, default=TIME_LIMIT_HOURS,
-                        metavar="HOURS",
-                        help=f"Wall-clock budget per trial, in hours "
-                             f"(default: {TIME_LIMIT_HOURS}).")
     parser.add_argument("--n-init-trials", type=int, default=None,
                         help=f"Sobol init trials before BO (default: {N_INIT_TRIALS}).")
     parser.add_argument("--batch", action="store_true",
@@ -2371,6 +2569,20 @@ def main() -> None:
                         help="Torch device (default: cuda if available else cpu).")
     parser.add_argument("--time-limit-hours", type=float, default=None,
                         help=f"Per-trial ZoMBI wall-clock budget in hours (default: {TIME_LIMIT_HOURS}).")
+    parser.add_argument("--time-limit", type=float, default=None, metavar="HOURS",
+                        help="Alias for --time-limit-hours (parametric sweep compatibility).")
+    parser.add_argument("--dataset", default="RF", choices=sorted(DATASET_DIMS),
+                        help="Objective to search on (default: RF). RF uses the 3-simplex "
+                             "Random-Forest surrogate (interactive extrema picker); "
+                             "ackley3d/ackley4d/ackley10d are analytic negated-Ackley "
+                             "benchmarks (known optima, non-interactive). Ignored by "
+                             "--resume / --copy-config / --resume-from (inherit saved config).")
+    parser.add_argument("--ackley-variant", default="realistic",
+                        choices=sorted(Ackley.VARIANTS),
+                        help="Ackley variant for --dataset ackley* (default: realistic).")
+    parser.add_argument("--resume-from", metavar="RUN_DIR", default=None,
+                        help="Resume from a SPECIFIC run: trust its stored metrics "
+                             "as prior history (no re-evaluation), reuse its config.")
     parser.add_argument("--runs-dir", metavar="DIR", default=None,
                         help="Override output runs directory (default: optimize/runs).")
     parser.add_argument("--run-dir", metavar="DIR", default=None,
@@ -2381,55 +2593,69 @@ def main() -> None:
                         help="Resume optimisation using ALL prior data: crawl every "
                              "runs/mobo_*/mobo_progress.json, collect all (X,Y) pairs, and "
                              "seed a NEW runs/mobo_* run with them (reusing the latest run's "
-                             "saved config). Non-interactive.")
-    parser.add_argument("--start-from-best", nargs="+", metavar="TRIAL_DIR", default=None,
-                        help="One or more trial_* directories (or trial.json files) whose "
-                             "HYPERPARAMETERS are RE-EVALUATED as initial trials on the current "
-                             "objective (their stored metrics are ignored). These run IN "
-                             "ADDITION to — not instead of — the full Sobol init. Combinable "
-                             "with any run mode.")
-    parser.add_argument("--copy-config", metavar="PATH", default=None,
-                        help="Reuse another run's run_config.json (dataset, dim, optima, "
-                             "direction) for a NEW run, WITHOUT inheriting its data points. PATH "
-                             "is a run dir or a run_config.json file. Non-interactive; runs a "
-                             "normal Sobol-init + BO run. Cannot combine with --resume.")
+                             "saved RF settings + picked optima). Non-interactive.")
+    parser.add_argument("--resume-scratch", action="store_true",
+                        help="Like --resume (seed a NEW run with ALL prior (X,Y) pairs), but "
+                             "RE-PROMPT for run config (max/min + interactive optima picking) "
+                             "instead of reusing the latest saved config. Note: prior Y values "
+                             "were computed under the previous run's optima/direction, so a "
+                             "different selection makes the seeded history inconsistent.")
     parser.add_argument("--resume-dim", action="store_true",
                         help="Resume on the dataset given by --dataset, seeding the new run "
                              "with ALL prior runs/mobo_* runs of the SAME dimensionality: "
                              "crawl every run whose run_config dim matches the --dataset dim, "
                              "collect their (X,Y) pairs, and trust them as prior history (no "
                              "re-evaluation). Non-interactive (ackley datasets only).")
-    parser.add_argument("--resume-from", metavar="RUN_DIR", default=None,
-                        help="Resume from a SPECIFIC run directory (e.g. "
-                             "optimize/runs/mobo_17_06_11_27). Loads that run's config and "
-                             "trusts its stored metrics as prior history (no re-evaluation). "
-                             "Starts a new run seeded with only that run's data; if that run "
-                             "has fewer than N_INIT_TRIALS trials, the shortfall is drawn as "
-                             "Sobol init before BO begins.")
+    parser.add_argument("--start-from-best", nargs="+", metavar="TRIAL_DIR", default=None,
+                        help="One or more trial_* directories (or trial.json files) whose "
+                             "HYPERPARAMETERS are RE-EVALUATED as initial trials on the "
+                             "current objective (stored metrics ignored). Runs IN ADDITION "
+                             "to the full Sobol init. Combinable with any run mode.")
+    parser.add_argument("--copy-config", metavar="PATH", default=None,
+                        help="Reuse another run's run_config.json (max/min, csv_path, picked "
+                             "optima) for a NEW run, WITHOUT inheriting its data points. PATH "
+                             "is a run dir or a run_config.json file. Non-interactive; runs a "
+                             "normal Sobol-init + BO run. Cannot combine with "
+                             "--resume / --resume-scratch / --resume-from.")
     args = parser.parse_args()
 
     if args.batch and not args.config:
         sys.exit("--batch requires --config PATH.")
+    n_exclusive = sum([
+        args.resume, args.resume_scratch, args.resume_dim,
+        args.copy_config is not None, args.resume_from is not None,
+    ])
+    if args.config and not args.batch and not n_exclusive:
+        sys.exit(
+            "--config requires --batch for a headless run from JSON.\n"
+            "  Example: python optimize/run_mobo.py --no-show --batch "
+            "--config optimize/mobo_batch_configs/foo.json\n"
+            "  Do not pass --dataset RF with --config — that skips the batch "
+            "path and opens the interactive max/min picker (will hang on HPC)."
+        )
+    if args.config and n_exclusive:
+        print("  [warning] --config is ignored when using --resume / "
+              "--resume-from / --copy-config (config comes from the saved run).")
     if args.config and not args.batch and not args.no_show:
         print("  [hint] --config is usually paired with --batch on HPC.")
-
-    n_exclusive = sum([args.resume, args.resume_dim,
-                       args.copy_config is not None, args.resume_from is not None])
     if n_exclusive > 1:
-        sys.exit("Use only one of --resume / --resume-dim / --copy-config / --resume-from.")
-    if args.batch and any((args.resume, args.resume_dim, args.copy_config,
-                           args.resume_from)):
-        sys.exit("--batch cannot combine with --resume / --resume-dim / "
-                 "--copy-config / --resume-from.")
+        sys.exit("Use only one of --resume / --resume-scratch / --copy-config / --resume-from.")
+    if args.batch and n_exclusive:
+        sys.exit("--batch cannot combine with --resume / --resume-scratch / --copy-config / --resume-from.")
 
     headless = bool(args.batch or args.no_show or args.config
-                    or args.resume or args.resume_dim or args.copy_config)
+                    or args.resume or args.resume_scratch or args.copy_config
+                    or args.resume_from
+                    or (args.dataset != "RF"))
     _configure_mpl_backend(headless=headless)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     runs_dir   = os.path.abspath(args.runs_dir or os.path.join(script_dir, "runs"))
     os.makedirs(runs_dir, exist_ok=True)
-    time_limit_hours = args.time_limit
+
+    if args.time_limit is not None and args.time_limit_hours is not None:
+        sys.exit("Use only one of --time-limit / --time-limit-hours.")
+    time_limit_override = args.time_limit_hours if args.time_limit_hours is not None else args.time_limit
 
     max_trials = args.max_trials
     batch_name = None
@@ -2443,7 +2669,7 @@ def main() -> None:
         n_init = batch.get("n_init_trials") or args.n_init_trials or N_INIT_TRIALS
         _apply_runtime_overrides(
             device=args.device,
-            time_limit_hours=batch.get("time_limit_hours") or args.time_limit_hours,
+            time_limit_hours=batch.get("time_limit_hours") or time_limit_override,
         )
         max_trials = (
             args.max_trials
@@ -2457,12 +2683,14 @@ def main() -> None:
               f"max_trials: {max_trials if max_trials is not None else 'unbounded (Ctrl+C)'}")
         print("=" * 70)
 
+        optima_note = ""
         if batch.get("landscape") is not None:
             landscape = batch["landscape"]
             if landscape.time_limit_hours is None and TIME_LIMIT_HOURS is not None:
                 pass  # Ackley uses max_activations
             elif batch.get("time_limit_hours") is not None:
                 landscape.time_limit_hours = batch["time_limit_hours"]
+            optima_note = "true_optima: planted by landscape builder (batch JSON)"
         else:
             csv_path = batch["csv_path"]
             obj_col = batch["objective_column"]
@@ -2492,6 +2720,12 @@ def main() -> None:
                     rf, grid_pts, grid_vals,
                     maximize=rf_maximize, n_peaks=n_peaks, min_sep=min_sep,
                 )
+                optima_note = (
+                    f"true_optima: auto_detect_rf_optima(n_peaks={n_peaks}, "
+                    f"min_sep={min_sep}) — NOT from batch JSON"
+                )
+            else:
+                optima_note = "true_optima: batch JSON or metadata sidecar"
             goal = "maxima" if rf_maximize else "minima"
             print(f"  RF ready: {len(true_optima)} reference {goal}")
             for i, t in enumerate(true_optima):
@@ -2518,24 +2752,68 @@ def main() -> None:
         )
         print(f"  {landscape.label}  |  {stop}")
 
+        resolutions: list[str] = []
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
+        if batch.get("time_limit_hours") is not None:
+            resolutions.append(
+                f"time_limit_hours: batch JSON ({batch['time_limit_hours']}) "
+                f"(CLI --time-limit-hours ignored)"
+                if time_limit_override is not None else
+                f"time_limit_hours: batch JSON ({batch['time_limit_hours']})"
+            )
+        elif time_limit_override is not None:
+            resolutions.append(f"time_limit_hours: CLI ({time_limit_override})")
+        else:
+            resolutions.append(f"time_limit_hours: default ({TIME_LIMIT_HOURS})")
+        if args.max_trials is not None:
+            resolutions.append(f"max_trials: CLI ({args.max_trials})")
+        elif batch.get("max_trials") is not None:
+            resolutions.append(f"max_trials: batch JSON ({batch['max_trials']})")
+        else:
+            resolutions.append("max_trials: unbounded")
+        if batch.get("n_init_trials") is not None:
+            resolutions.append(f"n_init_trials: batch JSON ({n_init})")
+        elif args.n_init_trials is not None:
+            resolutions.append(f"n_init_trials: CLI ({n_init})")
+        else:
+            resolutions.append(f"n_init_trials: default ({n_init})")
+        if optima_note:
+            resolutions.append(optima_note)
+
+        invocation = build_invocation_log(
+            argv=sys.argv,
+            run_mode="batch",
+            cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
         _launch_run(
             runs_dir, landscape, max_trials,
             batch_name=batch_name, batch_config_path=batch_config_path,
             run_dir=run_dir_override, n_init_trials=n_init,
+            invocation=invocation,
         )
         return
 
-    _apply_runtime_overrides(device=args.device, time_limit_hours=args.time_limit_hours)
+    _apply_runtime_overrides(device=args.device, time_limit_hours=time_limit_override)
 
-    # "Start from best" seeds: (X, Y) pairs copied straight into the GP prior
-    # history (never re-evaluated), shared by all run modes.
-    X_seed, Y_seed = [], []
+    seed_X: list[torch.Tensor] = []
     if args.start_from_best:
         print("\n[seed] Loading 'start from best' hyperparameters to re-evaluate …")
         seed_X = load_seed_hparams(args.start_from_best)
 
-    # ── Resume path: crawl all prior runs, seed a new run, rebuild RF, no GUI ──
     n_init = args.n_init_trials or N_INIT_TRIALS
+    ackley_variant: str | None = (
+        args.ackley_variant if args.dataset.startswith("ackley") else None
+    )
 
     if args.resume:
         cfg = load_latest_run_config(runs_dir)
@@ -2544,7 +2822,9 @@ def main() -> None:
                   "HPARAM_SPACE; only matching trials are collected.")
         if cfg.get("time_limit_hours") is not None:
             _apply_runtime_overrides(time_limit_hours=cfg["time_limit_hours"])
-        landscape = landscape_from_run_config(cfg, build_rf_and_grid=build_rf_and_grid)
+        landscape, av = _landscape_from_run_config_legacy(cfg)
+        if av:
+            ackley_variant = av
 
         print("=" * 70)
         print(f"ZoMBI-Hop MOBO — RESUMING (crawling all prior runs)  |  {landscape.label}")
@@ -2555,8 +2835,39 @@ def main() -> None:
         X_prior, Y_prior, n_runs = collect_all_observations(runs_dir)
         print(f"  [collect] {len(Y_prior)} trial(s) from {n_runs} run(s) -> prior history.")
 
-        _launch_run(runs_dir, landscape, max_trials, X_prior=X_prior, Y_prior=Y_prior,
-                    run_dir=run_dir_override, n_init_trials=n_init)
+        resolutions = [
+            "landscape + true_optima: saved run_config from latest mobo_* run",
+            f"time_limit_hours: saved run_config ({cfg.get('time_limit_hours')})"
+            if cfg.get("time_limit_hours") is not None else
+            f"time_limit_hours: default ({TIME_LIMIT_HOURS})",
+        ]
+        if time_limit_override is not None and cfg.get("time_limit_hours") is not None:
+            resolutions.append(
+                "CLI --time-limit-hours ignored on --resume when saved config has time_limit_hours"
+            )
+        if args.config:
+            resolutions.append("--config ignored on --resume (using saved run_config)")
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
+
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="resume", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
+        _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
+                    X_prior=X_prior, Y_prior=Y_prior,
+                    run_dir=run_dir_override, n_init_trials=n_init,
+                    dataset=_persist_dataset_fields(cfg)[0],
+                    ackley_variant=ackley_variant,
+                    invocation=invocation)
         return
 
     # ── Resume-dim: seed from ALL prior runs of the same dimensionality ──
@@ -2567,7 +2878,7 @@ def main() -> None:
         dim = DATASET_DIMS[args.dataset]
         print("=" * 70)
         print(f"ZoMBI-Hop MOBO — RESUME-DIM (all {dim}-simplex runs) — dataset: {args.dataset}")
-        print(f"Device: {DEVICE}   |   time limit/trial: {time_limit_hours} h")
+        print(f"Device: {DEVICE}   |   time limit/trial: {TIME_LIMIT_HOURS} h")
         print("=" * 70)
 
         print(f"\n[collect] Crawling runs/mobo_*/ for dim-{dim} runs' (X,Y) pairs …")
@@ -2575,17 +2886,74 @@ def main() -> None:
         print(f"  [collect] {len(Y_prior)} trial(s) from {n_runs} run(s) -> prior history.")
 
         ds = _ds_ackley(args.dataset, args.ackley_variant)
-        landscape = LandscapeSpec(
-            landscape="ackley", dim=ds["dim"], maximize=ds["maximize"],
-            true_optima=ds["true_optima"], fn_callable=ds["fn"],
-            grid_pts=ds["grid_pts"], grid_vals=ds["grid_vals"],
-            time_limit_hours=time_limit_hours,
+        landscape = _landscape_from_legacy_ackley(ds)
+        resolutions = [
+            f"dataset: CLI --dataset {args.dataset} (resume-dim, all dim-{dim} runs)",
+            f"ackley_variant: {args.ackley_variant}",
+            f"time_limit_hours: {'CLI' if time_limit_override is not None else 'default'} "
+            f"({TIME_LIMIT_HOURS})",
+        ]
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="resume_dim", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
         )
-        _launch_run(runs_dir, landscape, max_trials,
-                    X_prior=X_prior, Y_prior=Y_prior, n_init_trials=n_init)
+        _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
+                    X_prior=X_prior, Y_prior=Y_prior,
+                    run_dir=run_dir_override, n_init_trials=n_init,
+                    dataset=args.dataset, ackley_variant=ds["ackley_variant"],
+                    invocation=invocation)
         return
 
-    # ── Resume-from: seed from a SPECIFIC run's stored results (no re-eval) ──
+    if args.resume_scratch:
+        print("=" * 70)
+        print("ZoMBI-Hop MOBO — RESUMING FROM SCRATCH (prior data + fresh config)")
+        print(f"Device: {DEVICE}   |   time limit/trial: {TIME_LIMIT_HOURS} h")
+        print("=" * 70)
+
+        landscape = _interactive_run_config(script_dir)
+
+        print("\n[collect] Re-deriving prior trials against the freshly-picked optima …")
+        X_prior, Y_prior, n_runs = collect_rederived_observations(
+            runs_dir, landscape.maximize, landscape.true_optima)
+        print(f"  [collect] {len(Y_prior)} trial(s) from {n_runs} run(s) -> prior history "
+              f"(dist re-scored where needles saved, else reused; dup/runtime reused).")
+
+        resolutions = [
+            "landscape + true_optima: interactive picker (fresh config)",
+            f"time_limit_hours: {'CLI' if time_limit_override is not None else 'default'} "
+            f"({TIME_LIMIT_HOURS})",
+        ]
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
+
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="resume_scratch", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
+        _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
+                    X_prior=X_prior, Y_prior=Y_prior,
+                    run_dir=run_dir_override, n_init_trials=n_init,
+                    invocation=invocation)
+        return
+
     if args.resume_from:
         run_path = os.path.normpath(args.resume_from)
         if not os.path.isdir(run_path):
@@ -2594,44 +2962,138 @@ def main() -> None:
         if cfg.get("hparam_names") and cfg["hparam_names"] != HPARAM_NAMES:
             print("  [resume-from] WARNING: source run's hparam_names differ from the "
                   "current HPARAM_SPACE; only matching trials are collected.")
+        if cfg.get("time_limit_hours") is not None:
+            _apply_runtime_overrides(time_limit_hours=cfg["time_limit_hours"])
+        landscape, av = _landscape_from_run_config_legacy(cfg)
+        if av:
+            ackley_variant = av
+
         print("=" * 70)
-        print(f"ZoMBI-Hop MOBO — RESUME-FROM {os.path.basename(run_path)}")
-        print(f"Device: {DEVICE}   |   time limit/trial: {time_limit_hours} h   |   "
-              f"{'maximize' if cfg['maximize'] else 'minimize'}")
+        print(f"ZoMBI-Hop MOBO — RESUME-FROM {os.path.basename(run_path)}  |  {landscape.label}")
+        print(f"Device: {DEVICE}")
         print("=" * 70)
 
-        # Re-pick the run config first; the new optima/direction determine how the
-        # prior (X,Y) pairs are re-derived (see collect_rederived_observations).
-        landscape = _interactive_run_config(script_dir)
+        print(f"\n[collect] Loading prior data from {run_path} …")
+        X_prior, Y_prior = collect_observations_from_run(run_path)
+        print(f"  [collect] {len(Y_prior)} trial(s) -> prior history.")
 
-        print("\n[collect] Re-deriving prior trials against the freshly-picked optima …")
-        X_prior, Y_prior, n_runs = collect_rederived_observations(
-            runs_dir, landscape.maximize, landscape.true_optima)
-        print(f"  [collect] {len(Y_prior)} trial(s) from {n_runs} run(s) -> prior history "
-              f"(dist re-scored where needles saved, else reused; dup/runtime reused).")
-        X_prior += X_seed; Y_prior += Y_seed
+        resolutions = [
+            f"landscape + true_optima: saved run_config from {run_path}",
+            f"time_limit_hours: saved run_config ({cfg.get('time_limit_hours')})"
+            if cfg.get("time_limit_hours") is not None else
+            f"time_limit_hours: default ({TIME_LIMIT_HOURS})",
+        ]
+        if time_limit_override is not None and cfg.get("time_limit_hours") is not None:
+            resolutions.append(
+                "CLI --time-limit-hours ignored on --resume-from when saved config "
+                "has time_limit_hours"
+            )
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
 
-        _launch_run(runs_dir, landscape, max_trials, X_prior=X_prior, Y_prior=Y_prior,
-                    run_dir=run_dir_override, n_init_trials=n_init)
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="resume_from", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
+        _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
+                    X_prior=X_prior, Y_prior=Y_prior,
+                    run_dir=run_dir_override, n_init_trials=n_init,
+                    dataset=_persist_dataset_fields(cfg)[0],
+                    ackley_variant=ackley_variant,
+                    invocation=invocation)
         return
 
-    # ── Copy-config: reuse another run's config, but start with NO prior data ──
     if args.copy_config:
         cfg = load_run_config_from_path(args.copy_config)
         if cfg.get("hparam_names") and cfg["hparam_names"] != HPARAM_NAMES:
             print("  [copy-config] WARNING: copied run's hparam_names differ from the current "
                   "HPARAM_SPACE; only the static config is reused.")
-        if cfg.get("time_limit_hours") is not None:
-            _apply_runtime_overrides(time_limit_hours=cfg["time_limit_hours"])
-        landscape = landscape_from_run_config(cfg, build_rf_and_grid=build_rf_and_grid)
+        tl = time_limit_override if time_limit_override is not None else cfg.get("time_limit_hours")
+        if tl is None and cfg.get("landscape", "rf") == "rf":
+            tl = TIME_LIMIT_HOURS
+            print(f"  [copy-config] no time_limit_hours in saved config — using default {tl} h")
+        if tl is not None:
+            _apply_runtime_overrides(time_limit_hours=tl)
+            cfg = {**cfg, "time_limit_hours": tl}
+        landscape, av = _landscape_from_run_config_legacy(cfg)
+        if av:
+            ackley_variant = av
 
         print("=" * 70)
         print(f"ZoMBI-Hop MOBO — COPY-CONFIG  |  {landscape.label}")
-        print(f"Device: {DEVICE}")
+        print(f"Device: {DEVICE}   |   time limit/trial: {landscape.time_limit_hours} h")
         print("=" * 70)
 
-        _launch_run(runs_dir, landscape, max_trials, X_prior=X_seed, Y_prior=Y_seed,
-                    run_dir=run_dir_override, n_init_trials=n_init)
+        resolutions = [
+            f"landscape + true_optima: copied from {args.copy_config}",
+        ]
+        if time_limit_override is not None:
+            resolutions.append(f"time_limit_hours: CLI ({tl})")
+        elif cfg.get("time_limit_hours") is not None:
+            resolutions.append(f"time_limit_hours: saved run_config ({tl})")
+        else:
+            resolutions.append(f"time_limit_hours: default ({tl})")
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
+
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="copy_config", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
+        _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
+                    run_dir=run_dir_override, n_init_trials=n_init,
+                    dataset=_persist_dataset_fields(cfg)[0],
+                    ackley_variant=ackley_variant,
+                    invocation=invocation)
+        return
+
+    if args.dataset != "RF":
+        print("=" * 70)
+        print(f"ZoMBI-Hop MOBO — dataset {args.dataset}  (variant={args.ackley_variant})")
+        print(f"Device: {DEVICE}   |   time limit/trial: {TIME_LIMIT_HOURS} h")
+        print("=" * 70)
+        ds = _ds_ackley(args.dataset, args.ackley_variant)
+        landscape = _landscape_from_legacy_ackley(ds)
+        resolutions = [
+            f"dataset: CLI --dataset {args.dataset}",
+            f"ackley_variant: {args.ackley_variant}",
+            f"time_limit_hours: {'CLI' if time_limit_override is not None else 'default'} "
+            f"({TIME_LIMIT_HOURS})",
+        ]
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="dataset", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
+        _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
+                    run_dir=run_dir_override, n_init_trials=n_init,
+                    dataset=args.dataset, ackley_variant=ds["ackley_variant"],
+                    invocation=invocation)
         return
 
     if args.landscape == "ackley":
@@ -2646,19 +3108,59 @@ def main() -> None:
             landscape = build_ackley_landscape(dim, layout, b=b, time_limit_hours=None)
         else:
             landscape = interactive_ackley_startup()
-        _launch_run(runs_dir, landscape, max_trials, X_prior=X_seed, Y_prior=Y_seed,
-                    run_dir=run_dir_override, n_init_trials=n_init)
+        resolutions = [
+            "landscape: Multi-Ackley (--landscape ackley)",
+            "time_limit_hours: None (max_activations budget)",
+        ]
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="landscape_ackley", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
+        _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
+                    run_dir=run_dir_override, n_init_trials=n_init,
+                    invocation=invocation)
         return
 
     print("=" * 70)
-    print(f"ZoMBI-Hop Hyperparameter Optimisation (MOBO)  —  dataset: {args.dataset}")
-    print(f"Device: {DEVICE}   |   time limit/trial: {time_limit_hours} h")
+    label = "RF surrogate"
+    print(f"ZoMBI-Hop Hyperparameter Optimisation (MOBO)  —  {label}")
+    print(f"Device: {DEVICE}   |   time limit/trial: {TIME_LIMIT_HOURS} h")
     print("=" * 70)
 
     landscape = _interactive_run_config(script_dir)
 
-    _launch_run(runs_dir, landscape, max_trials, X_prior=X_seed, Y_prior=Y_seed,
-                run_dir=run_dir_override, n_init_trials=n_init)
+    resolutions = [
+        "landscape: interactive RF picker",
+        f"time_limit_hours: {'CLI' if time_limit_override is not None else 'default'} "
+        f"({TIME_LIMIT_HOURS})",
+    ]
+    if args.device:
+        resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+    else:
+        resolutions.append(
+            f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+        )
+    invocation = build_invocation_log(
+        argv=sys.argv, run_mode="fresh_rf", cli=_cli_snapshot(args),
+        effective=_effective_run_settings(
+            landscape, max_trials=max_trials, n_init_trials=n_init,
+            runs_dir=runs_dir, run_dir=run_dir_override,
+        ),
+        resolutions=resolutions,
+    )
+    _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
+                run_dir=run_dir_override, n_init_trials=n_init,
+                invocation=invocation)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,0 @@
-{
-    "n_optima": 20,
-    "basin_width": 86.0,
-    "intensity_mean": 0.0,
-    "intensity_var": 0.0,
-    "noise_freq": 9.0,
-    "noise_amp": 400.0
-}
