@@ -1,0 +1,11 @@
+{
+  "name": "synthetic_3d_rastrigin_ilr",
+  "landscape": "synthetic",
+  "oracle": "rastrigin_ilr",
+  "dim": 3,
+  "layout": "2",
+  "seed": 42,
+  "maximize": true,
+  "max_trials": 20,
+  "time_limit_hours": 0.4
+}

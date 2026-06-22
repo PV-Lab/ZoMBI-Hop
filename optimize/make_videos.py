@@ -164,11 +164,19 @@ def main() -> None:
 
     run_dir = resolve_run_dir(args.run_dir, runs_dir)
 
-    if os.path.basename(run_dir).startswith("trial_"):
-        plots_dir = os.path.join(run_dir, "plots")
-        out_path  = os.path.join(run_dir, "zombihop_timelapse.mp4")
-        print(f"Building video for {run_dir}")
-        make_video_from_dir(plots_dir, out_path)
+    plots_dir = os.path.join(run_dir, "plots")
+    out_path  = os.path.join(run_dir, "zombihop_timelapse.mp4")
+    flat_run  = (
+        os.path.isdir(plots_dir)
+        and glob.glob(os.path.join(plots_dir, "iter_*.png"))
+    )
+
+    if os.path.basename(run_dir).startswith("trial_") or flat_run:
+        if not args.force and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            print(f"Video already present: {out_path}  (use --force to rebuild)")
+        else:
+            print(f"Building video for {run_dir}")
+            make_video_from_dir(plots_dir, out_path)
     else:
         print(f"Regenerating videos for {run_dir}")
         regenerate_videos(run_dir, force=args.force)

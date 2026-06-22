@@ -1,0 +1,10 @@
+{
+  "description": "Parallel 3D synthetic MOBO runs on direct analytic oracles (no RF CSV). RF surrogate comparison: mobo_batch_manifest_synthetic_3d_rf.json + compare_campaign_datasets.py.",
+  "configs": [
+    "optimize/mobo_batch_configs/synthetic_3d_messy.json",
+    "optimize/mobo_batch_configs/synthetic_3d_ackley.json",
+    "optimize/mobo_batch_configs/synthetic_3d_gaussian.json",
+    "optimize/mobo_batch_configs/synthetic_3d_planted_bumps.json",
+    "optimize/mobo_batch_configs/synthetic_3d_rastrigin_ilr.json"
+  ]
+}

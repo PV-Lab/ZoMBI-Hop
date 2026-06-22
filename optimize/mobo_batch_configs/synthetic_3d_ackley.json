@@ -1,0 +1,11 @@
+{
+  "name": "synthetic_3d_ackley",
+  "landscape": "synthetic",
+  "oracle": "ackley",
+  "dim": 3,
+  "layout": "2",
+  "seed": 42,
+  "maximize": true,
+  "max_trials": 20,
+  "time_limit_hours": 0.4
+}

@@ -124,10 +124,38 @@ def scaled_n_optima(n_base: int, dim: int) -> int:
     undiscoverable as a benchmark. The linear ``(d-1)/2`` factor keeps the
     benchmark's target count growing gently and predictably with dimension.
 
-    This count scaling defines the benchmark objective itself; it is unrelated to
-    (and unaffected by) how ZoMBI-Hop's own hyperparameters are configured.
+    This count scaling defines the benchmark objective itself; it is a plain
+    function of ``dim``, unrelated to (and unaffected by) how ZoMBI-Hop's own
+    hyperparameters are configured.
     """
     return max(1, int(round(n_base * (dim - 1) / 2.0)))
+
+
+def scaled_n_optima_multiplicative(n_base: int, dim: int, *, ref_dim: int = 3) -> int:
+    """Peak count scaling proportional to ``dim / ref_dim`` (multiplicative in d).
+
+    Alternative to ``scaled_n_optima`` (linear in ``(d-1)/2``).  At the default
+    ``ref_dim=3`` baseline this gives 20 → 27 → 67 peaks for d = 3, 4, 10 when
+    ``n_base=20``, vs 20 → 30 → 90 under linear scaling.
+    """
+    if ref_dim < 1:
+        raise ValueError("ref_dim must be >= 1")
+    return max(1, int(round(n_base * dim / ref_dim)))
+
+
+def resolve_scaled_n_optima(
+    n_base: int,
+    dim: int,
+    *,
+    mode: str = "linear",
+    ref_dim: int = 3,
+) -> int:
+    if mode == "linear":
+        return scaled_n_optima(n_base, dim)
+    if mode == "multiplicative":
+        return scaled_n_optima_multiplicative(n_base, dim, ref_dim=ref_dim)
+    raise ValueError(f"Unknown peak scaling mode {mode!r}; use 'linear' or 'multiplicative'.")
+
 
 # ── Ackley constants ─────────────────────────────────────────────────────────
 ACKLEY_A = 20.0
@@ -299,7 +327,7 @@ class Ackley:
 
         if variant == "realistic":
             cfg = load_config()
-            # An explicit n_optima is honoured exactly (e.g. the plot.py
+            # An explicit n_optima is honoured exactly (e.g. the plot_3d/plot_4d
             # sliders); otherwise the configured value is the d=3 baseline and is
             # scaled with dimension so higher-d benchmarks have proportionally
             # more optima (see ``scaled_n_optima``).
@@ -352,11 +380,9 @@ class Ackley:
             self._noise_octaves = 0
             self._noise_seed = 0
 
-        # For dims above 3 the [0.5, 1] map is fixed from the *noise-free* Ackley
-        # signal (peak -> 1, far-field floor -> 0.5); noise (level set per-dim via
-        # NOISE_AMP_BY_DIM) is then added through that same map and the result is
-        # clipped to [0.5, 1].  At dim <= 3 the Ackley+noise signal is normalized
-        # together and left unclamped, as before.
+        # The [0.5, 1] map is fixed from the combined Ackley+noise signal at every
+        # dimensionality (peak -> 1, far-field floor -> 0.5).  For dim > 3 the
+        # mapped result is additionally clipped to [0.5, 1] as a safety net.
         self._clip_to_unit = self.dim > 3
 
         _est_rng = np.random.default_rng(12345)
@@ -365,8 +391,8 @@ class Ackley:
         # doesn't underestimate the peak in high dim.
         if self.centers:
             _samples = np.vstack([_samples, np.asarray(self.centers, dtype=float)])
-        # dim > 3 normalizes on the noise-free Ackley span; dim <= 3 on Ackley+noise.
-        _raw = self._ackley_raw(_samples) if self._clip_to_unit else self._predict_raw(_samples)
+        # Normalize on the Ackley+noise span at every dimensionality.
+        _raw = self._predict_raw(_samples)
         self._raw_min = float(_raw.min())
         self._raw_max = float(_raw.max())
 
@@ -403,8 +429,9 @@ class Ackley:
             return np.full(raw.shape, 0.75)
         y = 0.5 + 0.5 * (raw - self._raw_min) / span
         if self._clip_to_unit:
-            # dim > 3: keep the (noisy) objective within [0.5, 1] -- the span is
-            # the noise-free Ackley range, so noise can push a value past it.
+            # dim > 3: clip to [0.5, 1] as a safety net.  The span is estimated
+            # from sampled Ackley+noise values, so a rare unsampled point could
+            # still fall slightly outside the estimated range.
             y = np.clip(y, 0.5, 1.0)
         return y
 

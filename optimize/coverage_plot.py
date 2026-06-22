@@ -28,6 +28,8 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from sklearn.ensemble import RandomForestRegressor
 
+from optimize.mobo_landscapes import resolve_surrogate_csv_path
+
 VIDEO_TARGET_DURATION_S = 60.0
 VIDEO_MIN_FPS = 1.0
 VIDEO_MAX_FPS = 60.0
@@ -208,7 +210,6 @@ def _render_coverage_frame(
     maximize: bool,
     title_base: str,
     needle_xy: np.ndarray | None = None,
-    azim: float | None = None,  # unused (ternary is 2D); kept for a uniform signature
 ) -> np.ndarray:
     fig = Figure(figsize=(8, 7))
     FigureCanvasAgg(fig)
@@ -323,8 +324,6 @@ def make_coverage_video(
     maximize: bool,
     title_base: str,
     needle_xy: np.ndarray | None = None,
-    render_frame=_render_coverage_frame,
-    rotate: bool = False,
 ) -> None:
     n_total = len(pxy)
     boundaries = _line_boundaries(n_total)
@@ -338,10 +337,9 @@ def make_coverage_video(
     bar_width = 40
     frames = []
     for frame_idx, n_visible in enumerate(boundaries, 1):
-        azim = -60 + 360 * (frame_idx - 1) / max(n_frames, 1) if rotate else None
-        img = render_frame(
+        img = _render_coverage_frame(
             n_visible, pxy, y_vals, gxy, grid_vals, true_optima, maximize, title_base,
-            needle_xy=needle_xy, azim=azim)
+            needle_xy=needle_xy)
         img = _stamp_counter(img, f"Points sampled: {n_visible}")
         frames.append(_even(img))
         filled = int(bar_width * frame_idx / n_frames)
@@ -385,12 +383,10 @@ def _prepare_coverage(trial_dir: str) -> dict:
     map_comp = comp_to_xy if dim == 3 else comp_to_xyz
 
     if dataset == "RF":
-        if dim != 3:
-            raise ValueError(f"RF surrogate ground truth is only available for dim=3 "
-                             f"(got dim={dim})")
-        csv_path = cfg["csv_path"]
-        if not os.path.isfile(csv_path):
-            raise FileNotFoundError(f"Surrogate CSV not found: {csv_path}")
+        try:
+            csv_path = resolve_surrogate_csv_path(cfg["csv_path"])
+        except FileNotFoundError as exc:
+            sys.exit(str(exc))
         grid_pts, grid_vals = _build_rf_ground_truth(csv_path)
     else:
         variant = cfg.get("ackley_variant", "realistic")
@@ -509,8 +505,45 @@ def main() -> None:
     except (FileNotFoundError, ValueError) as exc:
         sys.exit(str(exc))
 
+    # ── Load found needles ──
+    needles_path = os.path.join(trial_dir, "needles.csv")
+    needle_xy = None
+    if os.path.isfile(needles_path):
+        ndf = pd.read_csv(needles_path)
+        ncols = _detect_comp_cols(ndf)
+        needle_xy = comp_to_xy(ndf[ncols].values.astype(float))
+
     # ── Static plot (shown interactively) ──
-    fig = _build_static_figure(prep)
+    fig, ax = plt.subplots(figsize=(8, 7))
+    draw_ternary_frame(ax)
+
+    sc_bg = ax.scatter(gxy[:, 0], gxy[:, 1], c=grid_vals, cmap="viridis",
+                       s=6, alpha=0.72, zorder=2, rasterized=True)
+    fig.colorbar(sc_bg, ax=ax, label="Objective", fraction=0.046, pad=0.04)
+
+    ax.scatter(pxy[:, 0], pxy[:, 1], c=y_vals, cmap="viridis",
+               vmin=grid_vals.min(), vmax=grid_vals.max(),
+               s=40, alpha=1.0, zorder=5,
+               edgecolors="black", linewidths=0.6)
+
+    if true_optima:
+        mxy = comp_to_xy(np.array(true_optima))
+        label = "True maxima" if maximize else "True minima"
+        ax.scatter(mxy[:, 0], mxy[:, 1], marker="*", s=360, c="blue", alpha=0.45,
+                   zorder=11, edgecolors="navy", linewidths=1.3, label=label)
+
+    if needle_xy is not None and len(needle_xy):
+        ax.scatter(needle_xy[:, 0], needle_xy[:, 1], marker="*", s=360,
+                   c="red", alpha=0.55, zorder=12, edgecolors="darkred",
+                   linewidths=1.3, label="Found needles")
+
+    if true_optima or (needle_xy is not None and len(needle_xy)):
+        ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
+
+    n_pts = len(df)
+    ax.set_title(f"Coverage: {title_base}  ({n_pts} points)", fontsize=12)
+
+    fig.tight_layout()
     plt.show()
 
     if args.no_video:
@@ -522,9 +555,8 @@ def main() -> None:
     print(f"Rendering coverage video ({prep['n_pts']} points) ...")
     render_frame = _render_coverage_frame if dim == 3 else _render_coverage_frame_3d
     make_coverage_video(
-        video_path, prep["pxy"], prep["y_vals"], prep["gxy"], prep["grid_vals"],
-        prep["true_optima"], prep["maximize"], prep["title_base"],
-        needle_xy=prep["needle_xy"], render_frame=render_frame, rotate=(dim == 4))
+        video_path, pxy, y_vals, gxy, grid_vals, true_optima, maximize, title_base,
+        needle_xy=needle_xy)
 
 
 if __name__ == "__main__":
