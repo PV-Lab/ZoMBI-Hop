@@ -41,6 +41,8 @@ Usage
   python optimize/pareto.py --show-numberline # show hyperparameter number-line figure
   python optimize/pareto.py --only mobo_00_01,mobo_00_02          # only these runs
   python optimize/pareto.py --only mobo_00_01/trial_3,mobo_00_02  # specific trials
+  python optimize/pareto.py --only 4d        # all runs prefixed mobo_4d_*
+  python optimize/pareto.py --only 10d       # all runs prefixed mobo_10d_*
 """
 
 from __future__ import annotations
@@ -107,18 +109,25 @@ def _time_metric(m: dict) -> tuple[float, str] | None:
     return None
 
 
-def _parse_only(only_str: str) -> tuple[set[str], dict[str, set[int]]]:
-    """Parse ``--only`` into (run_names, {run_name: {trial_nums}}).
+def _parse_only(only_str: str) -> tuple[set[str], dict[str, set[int]], set[str]]:
+    """Parse ``--only`` into (run_names, {run_name: {trial_nums}}, run_prefixes).
 
     Entries like ``mobo_00_01`` add the full run. Entries like
     ``mobo_00_01/trial_3`` add only that trial from that run. Full paths
     (e.g. ``optimize/runs/mobo_00_01/trial_3``) and backslashes are handled.
+
+    A bare dimension token such as ``4d`` or ``10d`` is a shorthand that adds
+    every run directory prefixed with ``mobo_4d_`` / ``mobo_10d_`` respectively
+    (matched in ``collect_trials`` against each run name).
     """
     import re
     run_names: set[str] = set()
     run_trials: dict[str, set[int]] = {}
+    run_prefixes: set[str] = set()
     for part in only_str.split(","):
         part = part.strip().replace("\\", "/").rstrip("/")
+        if not part:
+            continue
         segments = part.split("/")
         mobo_seg = None
         trial_seg = None
@@ -128,14 +137,19 @@ def _parse_only(only_str: str) -> tuple[set[str], dict[str, set[int]]]:
             elif re.fullmatch(r"trial_\d+", seg):
                 trial_seg = seg
         if mobo_seg is None:
-            print(f"  [--only] skipping unrecognised entry: {part}")
+            # Shorthand: a bare dimension token (e.g. "4d", "10d") expands to a
+            # prefix match over all mobo_<dim>_* run directories.
+            if re.fullmatch(r"\d+d", part):
+                run_prefixes.add(f"mobo_{part}_")
+            else:
+                print(f"  [--only] skipping unrecognised entry: {part}")
             continue
         if trial_seg is not None:
             num = int(trial_seg.replace("trial_", ""))
             run_trials.setdefault(mobo_seg, set()).add(num)
         else:
             run_names.add(mobo_seg)
-    return run_names, run_trials
+    return run_names, run_trials, run_prefixes
 
 
 def collect_trials(
@@ -144,6 +158,7 @@ def collect_trials(
     exclude_old: bool = False,
     only_runs: set[str] | None = None,
     only_trials: dict[str, set[int]] | None = None,
+    only_prefixes: set[str] | None = None,
 ) -> list[dict]:
     """Crawl ``runs_dir/mobo_*/mobo_progress.json`` → list of trial records.
 
@@ -153,8 +168,10 @@ def collect_trials(
 
     *only_runs*: if set, include only these run directories (all trials).
     *only_trials*: if set, maps run names to specific trial numbers to include.
+    *only_prefixes*: if set, include every run whose name starts with any of
+    these prefixes (e.g. ``mobo_4d_`` from the ``--only 4d`` shorthand).
     """
-    has_filter = only_runs or only_trials
+    has_filter = only_runs or only_trials or only_prefixes
     records: list[dict] = []
     # Accept either a runs *parent* directory (containing mobo_*/mobo_progress.json)
     # or a single run directory (containing mobo_progress.json directly).
@@ -163,8 +180,12 @@ def collect_trials(
         progress_paths = [os.path.join(runs_dir, "mobo_progress.json")]
     for path in progress_paths:
         run_name = os.path.basename(os.path.dirname(path))
-        if has_filter and run_name not in (only_runs or set()) and run_name not in (only_trials or {}):
-            continue
+        if has_filter:
+            matches_prefix = any(run_name.startswith(p) for p in (only_prefixes or set()))
+            if (run_name not in (only_runs or set())
+                    and run_name not in (only_trials or {})
+                    and not matches_prefix):
+                continue
         if exclude_old and run_name == "mobo_old_jackson":
             continue
         try:
@@ -511,7 +532,8 @@ def main() -> None:
                         help="Save a static PNG instead of opening the interactive window.")
     parser.add_argument("--only", default=None,
                         help="Comma-separated list of runs or specific trials to include "
-                             "(e.g. mobo_00_01,mobo_00_02/trial_3).")
+                             "(e.g. mobo_00_01,mobo_00_02/trial_3). A bare dimension "
+                             "token like 4d or 10d includes all mobo_4d_* / mobo_10d_* runs.")
     parser.add_argument("--with-old", action="store_true",
                         help="Include trials from mobo_old_jackson (excluded by default).")
     parser.add_argument("--show-numberline", action="store_true",
@@ -537,10 +559,12 @@ def main() -> None:
     print(f"MOBO Pareto collection  |  runs: {runs_dir}")
     print("=" * 70)
 
-    only_runs, only_trials = _parse_only(args.only) if args.only else (None, None)
+    only_runs, only_trials, only_prefixes = (
+        _parse_only(args.only) if args.only else (None, None, None))
     records = collect_trials(runs_dir, exclude_old=not args.with_old,
                              only_runs=only_runs or None,
-                             only_trials=only_trials or None)
+                             only_trials=only_trials or None,
+                             only_prefixes=only_prefixes or None)
     if not records:
         sys.exit(f"No usable trials found under {runs_dir}/mobo_*/mobo_progress.json.")
 
