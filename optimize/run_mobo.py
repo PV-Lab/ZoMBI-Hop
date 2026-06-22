@@ -1879,7 +1879,7 @@ def _render_4d_point_cloud(out_path: str, ackley_fn, dh, last_payload: dict | No
     Helmert ILR basis the overlay assumes). Best-effort: needs plotly.
     """
     import plotly.graph_objects as go
-    import synthetic_data.plot as pc4
+    import synthetic_data.plot_ackley as pc4
 
     comp = pc4.build_simplex_lattice(pc4.GRID_N)
     obj  = ackley_fn.predict(comp)

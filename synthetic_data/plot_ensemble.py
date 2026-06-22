@@ -1,0 +1,379 @@
+"""Interactive viewer for the layered :class:`~synthetic_data.ensemble.Ensemble`
+objective on the simplex.
+
+A single Dash app shows **one plot at a time**:
+
+  * **dimensionality** dropdown — "3D" draws the 3-simplex as a ternary heatmap;
+    "4D" draws the 4-simplex as a tetrahedron point cloud (objective -> colour).
+
+Every parameter of every feature (true optima, weak optima, ridges, roughness,
+anisotropy, plateaus) has its own slider, plus a master **random seed** slider,
+**grid resolution** slider, and a **basin threshold**.  Each optional feature has
+an on/off checkbox; unchecking it passes the disabling value (count/amplitude 0)
+without losing the slider position.  There is intentionally no save/load of
+defaults.
+
+Geometry helpers (simplex lattices, tetra rendering) are reused from
+``plot_ackley.py`` so the two viewers stay visually consistent.
+
+Usage:
+    python plot_ensemble.py
+"""
+
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+import plotly.graph_objects as go
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+from synthetic_data.ensemble import Ensemble  # noqa: E402
+from synthetic_data.plot_ackley import (  # noqa: E402
+    BASIN_THRESHOLD,
+    DEFAULT_GRID_N,
+    DEFAULT_GRID_N_3D,
+    FIG_H,
+    FIG_W,
+    MARKER_OPACITY,
+    MARKER_SIZE,
+    TERNARY_MARKER_SIZE,
+    basin_mask,
+    build_simplex_lattice,
+    build_ternary_grid,
+    tetra_edges_trace,
+    to_3d,
+    vertex_labels_trace,
+)
+
+
+# ── Slider helper ────────────────────────────────────────────────────────────
+
+def _slider(label, sid, lo, hi, step, value, marks_every, fmt=str):
+    n_marks = int(round((hi - lo) / marks_every)) + 1
+    marks = {}
+    for i in range(n_marks):
+        v = lo + i * marks_every
+        v = round(v, 6)
+        marks[v] = fmt(v)
+    return html.Div([
+        html.Label(label),
+        dcc.Slider(id=sid, min=lo, max=hi, step=step, value=value, marks=marks,
+                   tooltip={"placement": "bottom", "always_visible": True}),
+    ], style={"padding": "8px"})
+
+
+def _feature_block(title, toggle_id, children, enabled=True):
+    return html.Div([
+        dcc.Checklist(id=toggle_id, options=[{"label": f"  {title}", "value": "on"}],
+                      value=["on"] if enabled else [],
+                      style={"fontWeight": "bold", "marginTop": "6px"}),
+        html.Div(children, style={"paddingLeft": "14px"}),
+    ], style={"borderTop": "1px solid #ddd", "padding": "4px 0"})
+
+
+# ── Dash app ─────────────────────────────────────────────────────────────────
+
+def build_app():
+    global html, dcc  # used by the helpers above after Dash import
+    from dash import Dash, Input, Output, State, callback, dcc, html, no_update  # noqa: F811
+
+    app = Dash(__name__)
+
+    controls = html.Div([
+        html.Div([
+            html.Label("Dimensionality"),
+            dcc.Dropdown(id="dim-select", clearable=False,
+                         options=[{"label": "3D (ternary heatmap)", "value": "3d"},
+                                  {"label": "4D (tetrahedron point cloud)", "value": "4d"}],
+                         value="3d"),
+        ], style={"padding": "8px"}),
+
+        # True optima (always on).
+        html.Div([
+            html.Label("True Optima", style={"fontWeight": "bold"}),
+            _slider("Number of Optima", "n-optima", 1, 20, 1, 4, 5, str),
+            _slider("Basin Width (b)", "basin-width", 5, 200, 1, 65, 35, str),
+            _slider("Optima Margin (normalized gap above background)",
+                    "optima-margin", 0.0, 0.5, 0.01, 0.2, 0.1,
+                    lambda v: f"{v:.2f}"),
+        ], style={"borderTop": "2px solid #999", "padding": "4px 0"}),
+
+        _feature_block("Weak Optima (distractors)", "tog-weak", [
+            _slider("Count", "n-weak", 0, 30, 1, 6, 5, str),
+            _slider("Basin Width (b)", "weak-width", 5, 300, 1, 120, 50, str),
+            _slider("Prominence", "weak-amp", 0.0, 1.0, 0.02, 0.6, 0.25,
+                    lambda v: f"{v:.2f}"),
+        ]),
+
+        _feature_block("Ridges", "tog-ridges", [
+            _slider("Count", "n-ridges", 0, 8, 1, 2, 2, str),
+            _slider("Tube Width", "ridge-width", 0.01, 0.25, 0.005, 0.06, 0.06,
+                    lambda v: f"{v:.2f}"),
+            _slider("Prominence", "ridge-amp", 0.0, 1.0, 0.02, 0.6, 0.25,
+                    lambda v: f"{v:.2f}"),
+        ]),
+
+        _feature_block("Roughness (Perlin noise)", "tog-rough", [
+            _slider("Frequency", "noise-freq", 0, 40, 0.5, 8, 10, str),
+            _slider("Amplitude (raw)", "noise-amp", 0, 2000, 100, 120, 200, str),
+            _slider("Octaves", "noise-oct", 1, 6, 1, 4, 1, str),
+        ]),
+
+        _feature_block("Anisotropy (stretch axes)", "tog-aniso", [
+            _slider("Strength", "aniso-strength", 0.0, 50, 1, 0.0, 10,
+                    lambda v: f"{v:.1f}"),
+        ]),
+
+        _feature_block("Plateaus", "tog-plateaus", [
+            _slider("Count", "n-plateaus", 0, 8, 1, 2, 2, str),
+            _slider("Radius", "plateau-radius", 0.02, 0.40, 0.01, 0.12, 0.1,
+                    lambda v: f"{v:.2f}"),
+            _slider("Mesa Height", "plateau-amp", 0.0, 1.0, 0.02, 0.7, 0.25,
+                    lambda v: f"{v:.2f}"),
+        ]),
+
+        # Global controls.
+        html.Div([
+            html.Label("Global", style={"fontWeight": "bold"}),
+            _slider("Random Seed", "seed", 0, 100, 1, 0, 20, str),
+            html.Div(_slider("Grid Resolution", "grid-res-3d", 30, 180, 10,
+                             160, 30, str), id="grid-3d-wrap"),
+            html.Div(_slider("Grid Resolution", "grid-res-4d", 15, 50, 5,
+                             DEFAULT_GRID_N, 5, str), id="grid-4d-wrap",
+                     style={"display": "none"}),
+            _slider("Basin Threshold (below: blacked out 3D / transparent 4D)",
+                    "basin-threshold", 0.0, 1.0, 0.01, 0.0, 0.1,
+                    lambda v: f"{v:.2f}"),
+        ], style={"borderTop": "2px solid #999", "padding": "4px 0"}),
+        html.Div([
+            html.Button("Randomize", id="randomize-btn", n_clicks=0,
+                         style={"fontSize": "16px", "padding": "8px 24px",
+                                "margin": "12px auto", "display": "block",
+                                "cursor": "pointer"}),
+        ]),
+    ], style={"width": "60%", "margin": "0 auto"})
+
+    app.layout = html.Div([
+        html.H2("Layered Synthetic Objective (Ensemble) on the Simplex",
+                style={"textAlign": "center"}),
+        controls,
+        dcc.Graph(id="cloud-plot", style={"height": f"{FIG_H}px"}),
+    ])
+
+    @callback(
+        Output("grid-3d-wrap", "style"),
+        Output("grid-4d-wrap", "style"),
+        Input("dim-select", "value"),
+    )
+    def toggle_grid_controls(dim_sel):
+        show, hide = {}, {"display": "none"}
+        return (hide, show) if dim_sel == "4d" else (show, hide)
+
+    @callback(
+        Output("n-optima", "value"),
+        Output("basin-width", "value"),
+        Output("n-weak", "value"),
+        Output("weak-width", "value"),
+        Output("weak-amp", "value"),
+        Output("n-ridges", "value"),
+        Output("ridge-width", "value"),
+        Output("ridge-amp", "value"),
+        Output("noise-freq", "value"),
+        Output("noise-amp", "value"),
+        Output("noise-oct", "value"),
+        Output("aniso-strength", "value"),
+        Output("n-plateaus", "value"),
+        Output("plateau-radius", "value"),
+        Output("plateau-amp", "value"),
+        Output("tog-weak", "value"),
+        Output("tog-ridges", "value"),
+        Output("tog-rough", "value"),
+        Output("tog-aniso", "value"),
+        Output("tog-plateaus", "value"),
+        Input("randomize-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def randomize(_n_clicks):
+        rng = random.Random()
+        toggle = lambda: ["on"] if rng.random() > 0.5 else []  # noqa: E731
+        return (
+            rng.randint(5, 20),                          # n-optima
+            rng.randint(40, 90),                         # basin-width
+            rng.randint(0, 30),                          # n-weak
+            rng.randint(5, 300),                         # weak-width
+            round(rng.uniform(0.0, 1.0), 2),             # weak-amp
+            rng.randint(0, 8),                           # n-ridges
+            round(rng.uniform(0.01, 0.25), 3),           # ridge-width
+            round(rng.uniform(0.0, 1.0), 2),             # ridge-amp
+            round(rng.uniform(0, 40), 1),                # noise-freq
+            rng.randint(0, 2000),                        # noise-amp
+            rng.randint(1, 6),                           # noise-oct
+            round(rng.uniform(0.0, 50), 1),              # aniso-strength
+            rng.randint(0, 8),                           # n-plateaus
+            round(rng.uniform(0.02, 0.40), 2),           # plateau-radius
+            round(rng.uniform(0.0, 1.0), 2),             # plateau-amp
+            toggle(),                                    # tog-weak
+            toggle(),                                    # tog-ridges
+            toggle(),                                    # tog-rough
+            toggle(),                                    # tog-aniso
+            toggle(),                                    # tog-plateaus
+        )
+
+    @callback(
+        Output("cloud-plot", "figure"),
+        Input("dim-select", "value"),
+        Input("n-optima", "value"),
+        Input("basin-width", "value"),
+        Input("optima-margin", "value"),
+        Input("tog-weak", "value"),
+        Input("n-weak", "value"),
+        Input("weak-width", "value"),
+        Input("weak-amp", "value"),
+        Input("tog-ridges", "value"),
+        Input("n-ridges", "value"),
+        Input("ridge-width", "value"),
+        Input("ridge-amp", "value"),
+        Input("tog-rough", "value"),
+        Input("noise-freq", "value"),
+        Input("noise-amp", "value"),
+        Input("noise-oct", "value"),
+        Input("tog-aniso", "value"),
+        Input("aniso-strength", "value"),
+        Input("tog-plateaus", "value"),
+        Input("n-plateaus", "value"),
+        Input("plateau-radius", "value"),
+        Input("plateau-amp", "value"),
+        Input("seed", "value"),
+        Input("grid-res-3d", "value"),
+        Input("grid-res-4d", "value"),
+        Input("basin-threshold", "value"),
+    )
+    def update_plot(dim_sel, n_optima, basin_width, optima_margin,
+                    tog_weak, n_weak, weak_width, weak_amp,
+                    tog_ridges, n_ridges, ridge_width, ridge_amp,
+                    tog_rough, noise_freq, noise_amp, noise_oct,
+                    tog_aniso, aniso_strength,
+                    tog_plateaus, n_plateaus, plateau_radius, plateau_amp,
+                    seed, grid_res_3d, grid_res_4d, basin_threshold):
+        dim = 3 if dim_sel == "3d" else 4
+        on = lambda t: bool(t)  # noqa: E731
+
+        fn = Ensemble(
+            dim=dim,
+            n_optima=int(n_optima),
+            basin_width=float(basin_width),
+            optima_margin=float(optima_margin),
+            n_weak=int(n_weak) if on(tog_weak) else 0,
+            weak_width=float(weak_width),
+            weak_amp=float(weak_amp),
+            n_ridges=int(n_ridges) if on(tog_ridges) else 0,
+            ridge_width=float(ridge_width),
+            ridge_amp=float(ridge_amp),
+            noise_freq=float(noise_freq),
+            noise_amp=float(noise_amp) if on(tog_rough) else 0.0,
+            noise_octaves=int(noise_oct),
+            aniso_strength=float(aniso_strength) if on(tog_aniso) else 0.0,
+            n_plateaus=int(n_plateaus) if on(tog_plateaus) else 0,
+            plateau_radius=float(plateau_radius),
+            plateau_amp=float(plateau_amp),
+            seed=int(seed),
+        )
+        peaks = np.asarray(fn.centers)
+        title = (f"Ensemble — {len(peaks)} optima, margin={optima_margin:g} "
+                 f"(dim {dim}, seed {seed})")
+
+        if dim == 3:
+            return _ternary_figure(fn, peaks, int(grid_res_3d), basin_threshold, title)
+        return _point_cloud_figure(fn, peaks, int(grid_res_4d), basin_threshold, title)
+
+    return app
+
+
+# ── Figure builders ──────────────────────────────────────────────────────────
+
+def _ternary_figure(fn, peaks, grid_n, basin_threshold, title):
+    comp = build_ternary_grid(grid_n)
+    obj = fn.predict(comp)
+    obj_min, obj_max = float(np.nanmin(obj)), float(np.nanmax(obj))
+    above = basin_mask(obj, basin_threshold)
+
+    traces = []
+    if (~above).any():
+        traces.append(go.Scatterternary(
+            a=comp[~above, 2], b=comp[~above, 0], c=comp[~above, 1],
+            mode="markers", name="below basin threshold", hoverinfo="skip",
+            showlegend=False, marker=dict(color="black", size=TERNARY_MARKER_SIZE),
+        ))
+    traces.append(go.Scatterternary(
+        a=comp[above, 2], b=comp[above, 0], c=comp[above, 1], mode="markers",
+        name="objective", hoverinfo="skip",
+        marker=dict(color=obj[above], colorscale="Viridis", cmin=obj_min, cmax=obj_max,
+                    size=TERNARY_MARKER_SIZE, showscale=True,
+                    colorbar=dict(title="Objective", x=1.02)),
+    ))
+    if len(peaks):
+        traces.append(go.Scatterternary(
+            a=peaks[:, 2], b=peaks[:, 0], c=peaks[:, 1], mode="markers",
+            name="known peak", visible="legendonly",
+            marker=dict(symbol="star", color="red", size=14,
+                        line=dict(color="white", width=1)),
+        ))
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        title=title,
+        ternary=dict(sum=1, aaxis=dict(title="x3"), baxis=dict(title="x1"),
+                     caxis=dict(title="x2")),
+        legend=dict(x=1.18, y=1.0), width=FIG_W, height=FIG_H, margin=dict(t=60),
+    )
+    return fig
+
+
+def _point_cloud_figure(fn, peaks, grid_n, basin_threshold, title):
+    comp = build_simplex_lattice(grid_n)
+    obj = fn.predict(comp)
+    xyz = to_3d(comp)
+    obj_min, obj_max = float(obj.min()), float(obj.max())
+
+    above = basin_mask(obj, basin_threshold)
+    xyz_v, obj_v, comp_v = xyz[above], obj[above], comp[above]
+    hover = [f"x=[{a:.2f}, {b:.2f}, {c:.2f}, {d:.2f}]<br>obj={v:.2f}"
+             for (a, b, c, d), v in zip(comp_v, obj_v)]
+
+    cloud = go.Scatter3d(
+        x=xyz_v[:, 0], y=xyz_v[:, 1], z=xyz_v[:, 2], mode="markers",
+        name="objective", text=hover, hoverinfo="text",
+        marker=dict(color=obj_v, colorscale="Viridis", cmin=obj_min, cmax=obj_max,
+                    size=MARKER_SIZE, opacity=MARKER_OPACITY, showscale=True,
+                    colorbar=dict(title="Objective")),
+    )
+    data = [cloud, tetra_edges_trace(), vertex_labels_trace()]
+    if len(peaks):
+        peaks_xyz = to_3d(peaks)
+        data.append(go.Scatter3d(
+            x=peaks_xyz[:, 0], y=peaks_xyz[:, 1], z=peaks_xyz[:, 2], mode="markers",
+            name="known peak", visible="legendonly",
+            marker=dict(symbol="diamond", color="red", size=6,
+                        line=dict(color="white", width=1)),
+            hoverinfo="name",
+        ))
+
+    fig = go.Figure(data=data)
+    fig.update_layout(
+        title=title,
+        scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False),
+                   zaxis=dict(visible=False), aspectmode="data"),
+        legend=dict(x=0.0, y=1.0), width=FIG_W, height=FIG_H,
+    )
+    return fig
+
+
+def main() -> None:
+    print("Starting Dash app at http://127.0.0.1:8051")
+    build_app().run(debug=True, port=8051)
+
+
+if __name__ == "__main__":
+    main()

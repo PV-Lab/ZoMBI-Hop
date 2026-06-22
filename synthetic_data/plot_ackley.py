@@ -18,7 +18,7 @@ The ackley panel adds a **Random Seed** slider that drives *both* optima
 placement and the background noise.
 
 Usage:
-    python plot.py
+    python plot_ackley.py
 
 Overlay API
 -----------
