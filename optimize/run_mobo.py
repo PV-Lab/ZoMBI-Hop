@@ -2133,34 +2133,47 @@ def run_single_trial(
     sim_obj = make_sim_obj(fn_callable, DEVICE, DTYPE, maximize=maximize)
     inner   = make_linebo_wrapper(sim_obj, dim, NUM_LINES, DEVICE, DTYPE, plot_state)
 
+    # The per-iteration "heavy" payload fields (pared point cloud, per-needle
+    # penalisation matrices, bounds) are consumed ONLY by render_frame, i.e. the
+    # 3D per-iteration ternary frames. At dim ≥ 4 no frames are drawn (the 4D
+    # point cloud reads final state straight from the data handler, not payloads),
+    # so storing them every iteration just grows host RAM without bound — on a
+    # long high-dim trial that exhausts the cgroup limit and triggers an OOM kill.
+    # Keep them only when ternary frames will actually be rendered.
+    keep_heavy = landscape.render_ternary
+
     def obj_wrapper(x_tell, bounds, acq_fn):
         x_req, x_act, y = inner(x_tell, bounds, acq_fn)
         call_counter[0] += 1
         dh = dh_ref[0]
-        xp, yp = dh.X_pared, dh.Y_pared
-        if xp is not None and xp.shape[0] > 0:
-            pared_X = xp.detach().cpu().numpy()
-            pared_Y = yp.detach().cpu().numpy().ravel()
-            if not maximize:
-                pared_Y = -pared_Y
-        else:
-            pared_X = pared_Y = None
         needles = dh.needles
-        payloads.append(dict(
+        payload = dict(
             iter_num=call_counter[0],
-            pared_X=pared_X, pared_Y=pared_Y,
             needles=(as_numpy(needles)
                      if needles is not None and needles.shape[0] > 0 else None),
             needle_vals=(as_numpy(dh.needle_vals).ravel()
                          if dh.needle_vals is not None and dh.needle_vals.shape[0] > 0 else None),
-            needle_M_list=[as_numpy(m) if m is not None else None
-                           for m in dh.needle_M_list],
-            needle_B=(as_numpy(dh.needle_B) if dh.needle_B is not None else None),
-            bounds=(as_numpy(dh.bounds) if dh.bounds is not None else None),
             line_0=plot_state.get("line_0"),
             line_1=plot_state.get("line_1"),
             n_points_before=(dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0),
-        ))
+        )
+        if keep_heavy:
+            xp, yp = dh.X_pared, dh.Y_pared
+            if xp is not None and xp.shape[0] > 0:
+                pared_X = xp.detach().cpu().numpy()
+                pared_Y = yp.detach().cpu().numpy().ravel()
+                if not maximize:
+                    pared_Y = -pared_Y
+            else:
+                pared_X = pared_Y = None
+            payload.update(
+                pared_X=pared_X, pared_Y=pared_Y,
+                needle_M_list=[as_numpy(m) if m is not None else None
+                               for m in dh.needle_M_list],
+                needle_B=(as_numpy(dh.needle_B) if dh.needle_B is not None else None),
+                bounds=(as_numpy(dh.bounds) if dh.bounds is not None else None),
+            )
+        payloads.append(payload)
         return x_req, x_act, y
 
     try:
@@ -2231,7 +2244,7 @@ def run_single_trial(
     dup  = metric_dup_fraction(X_all_np, dim=dim)
     print(f"    [trial]  iters={n_iters}  dist={dist:.4f}  dup={dup:.4f}"
           f"  t/iter={avg_time_per_iter:.3f}s  (total {runtime:.1f}s)"
-          f"  needles={len(discovered)}/{len(true_optima)}")
+          f"  needles={len(discovered)}/{len(true_optima)}", flush=True)
 
     try:
         write_points_csv(os.path.join(trial_dir, "points.csv"), dh, snap_records, dim=dim)
@@ -2494,7 +2507,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                 hparams = norm_to_hparams(x_new)
                 hp_str = "  ".join(f"{k}={round(v,4) if isinstance(v,float) else v}"
                                    for k, v in hparams.items())
-                print(f"\n[trial {trial_num} | {phase}]  {hp_str}")
+                print(f"\n[trial {trial_num} | {phase}]  {hp_str}", flush=True)
 
                 res = evaluate_hparams(
                     hparams, landscape, trial_dir, trial_num,
