@@ -11,11 +11,24 @@ Landscapes (``--landscape`` or batch JSON ``"landscape"`` field):
   • ``ackley``       — Multi-Ackley sum on the d-dimensional probability simplex
 
 Objectives are selectable via ``--dataset``: RF (default, 3-simplex campaign1a
-surrogate) or analytic negated-Ackley benchmarks on the 3-/4-/10-simplex
-(``ackley3d`` / ``ackley4d`` / ``ackley10d``). The hyperparameters are
-dimension-independent. ``--landscape ackley`` is an alternate Multi-Ackley
-benchmark (layout/b configurable); ``--dataset ackley*`` uses the
+surrogate), analytic negated-Ackley benchmarks on the 3-/4-/10-simplex
+(``ackley3d`` / ``ackley4d`` / ``ackley10d``), or ``ensemble`` (the layered
+``synthetic_data.ensemble`` objective, dimension from ``--dim``). The
+hyperparameters are dimension-independent. ``--landscape ackley`` is an alternate
+Multi-Ackley benchmark (layout/b configurable); ``--dataset ackley*`` uses the
 ``synthetic_data.ackley.Ackley`` oracle (``--ackley-variant``).
+
+``--dataset ensemble`` RE-RANDOMIZES the landscape for every evaluation (random
+feature counts/widths/amplitudes + a fresh master seed; the number of true optima
+is drawn from a dimension-specific range — 5–30 at dim 3, 20–50 at dim 4, 50–150
+at dim 10). To keep the MOBO model from chasing that landscape noise, each
+hyperparameter set is evaluated on ``ENSEMBLE_N_REPEATS`` (5) independently
+randomized landscapes per trial and the three metrics are AVERAGED before the next
+MOBO iteration. Every landscape is saved for reproducibility: each repeat writes
+``trial_<n>/run_<k>/ensemble_config.json`` and the full ``ensemble_configs`` list
+(plus per-repeat metrics) is recorded in ``trial_<n>/trial.json``. ``--ensemble-seed``
+makes the per-trial landscape sequence reproducible; ``--ensemble-margin`` sets the
+optima/background gap.
 
 Three objectives (all minimised):
   1. dist_to_needles    – symmetric greedy matching distance between needles and
@@ -104,11 +117,14 @@ Usage
   python optimize/run_mobo.py                                   # fresh RF, interactive
   python optimize/run_mobo.py --dataset ackley4d                # fresh 4D Ackley
   python optimize/run_mobo.py --dataset ackley10d --time-limit 0.5
+  python optimize/run_mobo.py --dataset ensemble --dim 4        # re-randomized ensemble,
+                                                                #   5 landscapes averaged/trial
+  python optimize/run_mobo.py --dataset ensemble --dim 3 --ensemble-seed 7 --ensemble-margin 0.15
   python optimize/run_mobo.py --resume                          # seed from all past runs
   python optimize/run_mobo.py --resume-scratch                  # re-pick config + seed
   python optimize/run_mobo.py --resume-dim --dataset ackley4d   # seed from all past 4D runs
   python optimize/run_mobo.py --copy-config optimize/runs/mobo_05_06_15_32   # reuse config, no data
-  python optimize/run_mobo.py --start-from-best optimize/runs/mobo_05_06_15_32/trial_1 [trial_dir ...]
+  python optimize/run_mobo.py --start-from-best optimize/runs/mobo_05_06_15_32/trial_112 [trial_dir ...]
   python optimize/make_videos.py                       # newest run
   python optimize/make_videos.py <run_dir>             # specific run
   python optimize/make_videos.py <run_dir> --force     # rebuild all
@@ -150,6 +166,7 @@ import glob
 import json
 import math
 import os
+import random
 import shlex
 import shutil
 import sys
@@ -222,8 +239,18 @@ from optimize.mobo_landscapes import (
 )
 from synthetic_data.ackley import Ackley
 from synthetic_data.campaign_datasets import load_metadata, resolve_metadata_path
+from synthetic_data.ensemble import (
+    Ensemble,
+    optima_count_range,
+    random_ensemble_config,
+)
 
 DATASET_DIMS = {"RF": 3, "ackley3d": 3, "ackley4d": 4, "ackley10d": 10}
+# Layered Ensemble objective: re-randomized per trial (dim from --dim), so it is
+# not a fixed-dim entry in DATASET_DIMS.
+ENSEMBLE_DATASET = "ensemble"
+ENSEMBLE_DEFAULT_DIM = 3
+DATASET_CHOICES = sorted([*DATASET_DIMS, ENSEMBLE_DATASET])
 
 # ─── Global config ────────────────────────────────────────────────────────────
 
@@ -240,6 +267,11 @@ N_INIT_LINES    = 2
 N_INIT_TRIALS    = 8       # Sobol initial designs before BO begins
 N_MOBO_RESTARTS  = 10
 N_MOBO_SAMPLES   = 512
+
+# For the re-randomized 'ensemble' dataset only: evaluate each hyperparameter set
+# on this many independently randomized landscapes per MOBO trial and average the
+# three metrics, to reduce the run-to-run landscape noise the MOBO model sees.
+ENSEMBLE_N_REPEATS = 5
 
 # Per-trial wall-clock budget (hours) passed to ZoMBIHop.run(time_limit_hours=…).
 TIME_LIMIT_HOURS = 0.4
@@ -541,6 +573,7 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
                      n_init_trials: int = N_INIT_TRIALS,
                      dataset: str | None = None,
                      ackley_variant: str | None = None,
+                     ensemble_spec: dict | None = None,
                      invocation: dict | None = None) -> None:
     """Persist the static run state needed for a fully non-interactive resume."""
     cfg = {
@@ -575,6 +608,10 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
         cfg["ackley_layout"] = landscape.ackley_layout
         if landscape.synthetic_seed is not None:
             cfg["seed"] = landscape.synthetic_seed
+    if ensemble_spec is not None:
+        cfg["ensemble_random_per_run"] = True
+        cfg["ensemble_seed"] = ensemble_spec["seed"]
+        cfg["ensemble_optima_margin"] = ensemble_spec["optima_margin"]
     if batch_name:
         cfg["batch_name"] = batch_name
     if batch_config_path:
@@ -1820,7 +1857,10 @@ def plot_hparam_edge_proximity(path: str, x_norm: torch.Tensor) -> None:
 
 def write_trial_json(path: str, trial_num: int, phase: str,
                      metrics: dict, hparams: dict,
-                     ackley_seed: int | None = None) -> None:
+                     ackley_seed: int | None = None,
+                     ensemble_config: dict | None = None,
+                     ensemble_configs: list[dict] | None = None,
+                     repeats: list[dict] | None = None) -> None:
     obj = {
         "trial": trial_num,
         "phase": phase,
@@ -1837,6 +1877,14 @@ def write_trial_json(path: str, trial_num: int, phase: str,
     }
     if ackley_seed is not None:
         obj["ackley_seed"] = int(ackley_seed)
+    if ensemble_config is not None:
+        obj["ensemble_config"] = ensemble_config
+    if ensemble_configs is not None:
+        # Averaged ensemble trial: metrics above are the mean over these landscapes.
+        obj["ensemble_n_repeats"] = len(ensemble_configs)
+        obj["ensemble_configs"] = ensemble_configs
+    if repeats is not None:
+        obj["repeats"] = repeats
     with open(path, "w") as f:
         json.dump(obj, f, indent=2)
 
@@ -1980,6 +2028,51 @@ def reseed_ackley_dataset(ds: dict, seed: int) -> dict:
     return new_ds
 
 
+# ─── Per-trial Ensemble re-randomization ───────────────────────────────────────
+
+def build_ensemble_landscape(
+    dim: int, *, optima_margin: float, seed: int, time_limit_hours: float | None,
+) -> LandscapeSpec:
+    """Base ``LandscapeSpec`` for the layered Ensemble objective.
+
+    The objective is re-randomized for every trial (see :func:`reseed_ensemble`),
+    so the function/optima carried here are just an initial draw that gives the
+    spec a valid ``true_optima`` and (for dim 3) a render grid. ``oracle`` is
+    tagged ``"ensemble"`` so resume can recognise and rebuild it.
+    """
+    rng = random.Random(f"{seed}-base")
+    cfg = random_ensemble_config(dim, rng, optima_margin=optima_margin)
+    fn = Ensemble(**cfg)
+    true_optima = [np.asarray(c, dtype=float) for c in fn.centers]
+    grid_pts = grid_vals = None
+    if dim == 3:
+        grid_pts = ternary_grid(TERNARY_GRID_N)
+        grid_vals = fn.predict(grid_pts)
+    lo, hi = optima_count_range(dim)
+    print(f"  [dataset] ensemble: Ensemble(dim={dim}) re-randomized per trial "
+          f"(n_optima in [{lo}, {hi}], ensemble_seed={seed}, margin={optima_margin})")
+    return LandscapeSpec(
+        landscape="synthetic", dim=dim, maximize=True, true_optima=true_optima,
+        fn_callable=fn, grid_pts=grid_pts, grid_vals=grid_vals,
+        time_limit_hours=time_limit_hours, max_activations=float("inf"),
+        oracle="ensemble", synthetic_seed=seed,
+    )
+
+
+def reseed_ensemble(landscape: LandscapeSpec, config: dict):
+    """Rebuild the Ensemble objective for one trial from a saved ``config``.
+
+    Returns ``(fn_callable, true_optima, grid_vals)`` — ``grid_vals`` is ``None``
+    unless the landscape renders a 3-simplex ternary grid.
+    """
+    fn = Ensemble(**config)
+    true_optima = [np.asarray(c, dtype=float) for c in fn.centers]
+    grid_vals = None
+    if landscape.dim == 3 and landscape.grid_pts is not None:
+        grid_vals = fn.predict(landscape.grid_pts)
+    return fn, true_optima, grid_vals
+
+
 # ─── Single trial: run ZoMBI on the objective + write all artifacts ────────────
 
 def run_single_trial(
@@ -1988,6 +2081,7 @@ def run_single_trial(
     trial_dir: str,
     *,
     ackley_variant: str | None = None,
+    ensemble_config: dict | None = None,
 ) -> dict:
     """Run one ZoMBI trial on the configured landscape, then write per-trial artifacts.
 
@@ -2014,9 +2108,21 @@ def run_single_trial(
             grid_vals = reseeded["grid_vals"]
         print(f"    [trial] realistic Ackley seed = {ackley_seed}")
 
+    if ensemble_config is not None:
+        fn_callable, true_optima, ens_grid_vals = reseed_ensemble(landscape, ensemble_config)
+        if ens_grid_vals is not None:
+            grid_vals = ens_grid_vals
+        print(f"    [trial] ensemble seed={ensemble_config.get('seed')}  "
+              f"n_optima={ensemble_config.get('n_optima')}  "
+              f"({len(true_optima)} true optima)")
+
     if os.path.isdir(trial_dir):
         shutil.rmtree(trial_dir, ignore_errors=True)
     os.makedirs(trial_dir, exist_ok=True)
+    if ensemble_config is not None:
+        # Persist the exact landscape so this trial is recreatable.
+        with open(os.path.join(trial_dir, "ensemble_config.json"), "w") as f:
+            json.dump(ensemble_config, f, indent=2)
 
     plot_state: dict = {"line_0": None, "line_1": None}
     payloads: list[dict] = []
@@ -2176,7 +2282,76 @@ def run_single_trial(
 
     return {"dist": dist, "dup": dup, "runtime": runtime,
             "avg_time_per_iter": avg_time_per_iter, "n_iters": n_iters,
-            "payloads": payloads, "ackley_seed": ackley_seed}
+            "payloads": payloads, "ackley_seed": ackley_seed,
+            "ensemble_config": ensemble_config}
+
+
+# ─── One MOBO trial: single eval, or averaged ensemble repeats ──────────────────
+
+def evaluate_hparams(
+    hparams: dict,
+    landscape: LandscapeSpec,
+    trial_dir: str,
+    trial_num: int,
+    *,
+    ackley_variant: str | None = None,
+    ensemble_spec: dict | None = None,
+) -> dict:
+    """Evaluate one hyperparameter set and return the metrics MOBO scores against.
+
+    For every dataset except the re-randomized ``ensemble``, this is a single
+    ``run_single_trial`` writing its artifacts straight into ``trial_dir``.
+
+    For ``ensemble`` it instead evaluates the same hyperparameters on
+    ``ENSEMBLE_N_REPEATS`` independently randomized landscapes — each in its own
+    ``trial_<n>/run_<k>/`` subfolder with the full artifact set — and **averages
+    the three MOBO metrics** (``dist_to_needles``, ``dup_fraction``,
+    ``avg_time_per_iter_s``) across the repeats before the next MOBO iteration.
+    The repeats are reproducible per ``(ensemble_seed, trial, k)``; every landscape
+    config is saved (per-run ``ensemble_config.json`` + the ``ensemble_configs``
+    list in ``trial.json``). The returned ``runtime``/``n_iters`` are summed over
+    the repeats (whole-trial cost), and ``repeats`` holds each repeat's metrics.
+    """
+    if ensemble_spec is None:
+        return run_single_trial(
+            hparams, landscape, trial_dir, ackley_variant=ackley_variant)
+
+    if os.path.isdir(trial_dir):
+        shutil.rmtree(trial_dir, ignore_errors=True)
+    os.makedirs(trial_dir, exist_ok=True)
+
+    configs: list[dict] = []
+    repeats: list[dict] = []
+    for k in range(1, ENSEMBLE_N_REPEATS + 1):
+        rng = random.Random(f"{ensemble_spec['seed']}-{trial_num}-{k}")
+        cfg = random_ensemble_config(
+            ensemble_spec["dim"], rng, optima_margin=ensemble_spec["optima_margin"])
+        configs.append(cfg)
+        run_dir = os.path.join(trial_dir, f"run_{k}")
+        print(f"    [ensemble repeat {k}/{ENSEMBLE_N_REPEATS}]", flush=True)
+        r = run_single_trial(hparams, landscape, run_dir, ensemble_config=cfg)
+        repeats.append({
+            "run": k,
+            "dist": round(r["dist"], 6),
+            "dup": round(r["dup"], 6),
+            "avg_time_per_iter": round(r["avg_time_per_iter"], 4),
+            "runtime": round(r["runtime"], 3),
+            "n_iters": int(r["n_iters"]),
+        })
+
+    dist = float(np.mean([r["dist"] for r in repeats]))
+    dup = float(np.mean([r["dup"] for r in repeats]))
+    avg_t = float(np.mean([r["avg_time_per_iter"] for r in repeats]))
+    runtime = float(np.sum([r["runtime"] for r in repeats]))
+    n_iters = int(np.sum([r["n_iters"] for r in repeats]))
+    print(f"    [trial] ensemble avg over {ENSEMBLE_N_REPEATS} landscapes — "
+          f"dist={dist:.4f}  dup={dup:.4f}  t/iter={avg_t:.3f}s")
+    return {
+        "dist": dist, "dup": dup, "runtime": runtime,
+        "avg_time_per_iter": avg_t, "n_iters": n_iters,
+        "payloads": [], "ackley_seed": None,
+        "ensemble_config": None, "ensemble_configs": configs, "repeats": repeats,
+    }
 
 
 # ─── Running summary (mobo_progress.json / mobo_results.json) ───────────────────
@@ -2250,7 +2425,8 @@ def save_running_summary(X_obs, Y_obs, run_dir: str, n_seed: int = 0,
 def run_mobo(landscape: LandscapeSpec, run_dir,
              max_trials=None, seed_X=None, X_prior=None, Y_prior=None, *,
              n_init_trials: int = N_INIT_TRIALS,
-             ackley_variant: str | None = None) -> None:
+             ackley_variant: str | None = None,
+             ensemble_spec: dict | None = None) -> None:
     """Unbounded MOBO loop, writing trials into a fresh ``run_dir``."""
     bounds = torch.zeros(2, N_HPARAMS, dtype=DTYPE, device=DEVICE)
     bounds[1] = 1.0
@@ -2320,8 +2496,9 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                                    for k, v in hparams.items())
                 print(f"\n[trial {trial_num} | {phase}]  {hp_str}")
 
-                res = run_single_trial(
-                    hparams, landscape, trial_dir, ackley_variant=ackley_variant)
+                res = evaluate_hparams(
+                    hparams, landscape, trial_dir, trial_num,
+                    ackley_variant=ackley_variant, ensemble_spec=ensemble_spec)
                 try:
                     plot_hparam_edge_proximity(
                         os.path.join(trial_dir, "hparam_edge_proximity.png"), x_new)
@@ -2341,6 +2518,9 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                      "runtime": res["runtime"], "n_iters": res["n_iters"]},
                     hparams,
                     ackley_seed=res.get("ackley_seed"),
+                    ensemble_config=res.get("ensemble_config"),
+                    ensemble_configs=res.get("ensemble_configs"),
+                    repeats=res.get("repeats"),
                 )
                 append_trial_logs(
                     run_dir, trial_num, phase, hparams,
@@ -2452,8 +2632,27 @@ def _landscape_from_legacy_ackley_cfg(cfg: dict) -> tuple[LandscapeSpec, str]:
     return _landscape_from_legacy_ackley(ds), ds["ackley_variant"]
 
 
+def _ensemble_spec_from_cfg(cfg: dict) -> dict | None:
+    """Reconstruct the per-trial ensemble randomization spec from a run_config."""
+    if cfg.get("dataset") == ENSEMBLE_DATASET or cfg.get("oracle") == "ensemble":
+        return {
+            "dim": int(cfg.get("dim", ENSEMBLE_DEFAULT_DIM)),
+            "optima_margin": float(cfg.get("ensemble_optima_margin", 0.2)),
+            "seed": int(cfg.get("ensemble_seed", cfg.get("seed", 0))),
+        }
+    return None
+
+
 def _landscape_from_run_config_legacy(cfg: dict) -> tuple[LandscapeSpec, str | None]:
-    """Rebuild landscape from run_config.json (RF, legacy ackley*, or Multi-Ackley)."""
+    """Rebuild landscape from run_config.json (RF, legacy ackley*, Multi-Ackley,
+    or the re-randomized Ensemble objective)."""
+    ens = _ensemble_spec_from_cfg(cfg)
+    if ens is not None:
+        landscape = build_ensemble_landscape(
+            ens["dim"], optima_margin=ens["optima_margin"], seed=ens["seed"],
+            time_limit_hours=cfg.get("time_limit_hours"),
+        )
+        return landscape, None
     ackley_variant = cfg.get("ackley_variant")
     legacy_key = _legacy_ackley_dataset_key(cfg)
     if legacy_key is not None:
@@ -2511,6 +2710,7 @@ def _launch_run(runs_dir, landscape: LandscapeSpec, max_trials,
                 n_init_trials: int = N_INIT_TRIALS,
                 dataset: str | None = None,
                 ackley_variant: str | None = None,
+                ensemble_spec: dict | None = None,
                 invocation: dict | None = None) -> None:
     """Create a fresh runs/mobo_* folder, persist its config, and run MOBO."""
     if run_dir is None:
@@ -2524,12 +2724,14 @@ def _launch_run(runs_dir, landscape: LandscapeSpec, max_trials,
         batch_name=batch_name, batch_config_path=batch_config_path,
         n_init_trials=n_init_trials,
         dataset=dataset, ackley_variant=ackley_variant,
+        ensemble_spec=ensemble_spec,
         invocation=invocation,
     )
     print(f"\n[run] Output folder: {run_dir}")
     run_mobo(landscape, run_dir, max_trials=max_trials,
              seed_X=seed_X, X_prior=X_prior, Y_prior=Y_prior,
-             n_init_trials=n_init_trials, ackley_variant=ackley_variant)
+             n_init_trials=n_init_trials, ackley_variant=ackley_variant,
+             ensemble_spec=ensemble_spec)
 
 
 
@@ -2550,7 +2752,8 @@ def main() -> None:
     parser.add_argument("--landscape", choices=("rf", "ackley"), default="rf",
                         help="Objective landscape (default: rf). Ackley = synthetic Δ^d benchmark.")
     parser.add_argument("--dim", type=int, default=None,
-                        help="Simplex dimension for --landscape ackley (default 10).")
+                        help="Simplex dimension for --landscape ackley (default 10) or "
+                             "--dataset ensemble (default 3).")
     parser.add_argument("--layout", type=str, default=None, choices=["1", "2", "3"],
                         help="Multi-Ackley peak layout (1/2/3).")
     parser.add_argument("--ackley-b", type=float, default=None,
@@ -2571,15 +2774,23 @@ def main() -> None:
                         help=f"Per-trial ZoMBI wall-clock budget in hours (default: {TIME_LIMIT_HOURS}).")
     parser.add_argument("--time-limit", type=float, default=None, metavar="HOURS",
                         help="Alias for --time-limit-hours (parametric sweep compatibility).")
-    parser.add_argument("--dataset", default="RF", choices=sorted(DATASET_DIMS),
+    parser.add_argument("--dataset", default="RF", choices=DATASET_CHOICES,
                         help="Objective to search on (default: RF). RF uses the 3-simplex "
                              "Random-Forest surrogate (interactive extrema picker); "
                              "ackley3d/ackley4d/ackley10d are analytic negated-Ackley "
-                             "benchmarks (known optima, non-interactive). Ignored by "
-                             "--resume / --copy-config / --resume-from (inherit saved config).")
+                             "benchmarks (known optima, non-interactive); 'ensemble' is the "
+                             "layered synthetic objective, RE-RANDOMIZED PER TRIAL (dim from "
+                             "--dim). Ignored by --resume / --copy-config / --resume-from "
+                             "(inherit saved config).")
     parser.add_argument("--ackley-variant", default="realistic",
                         choices=sorted(Ackley.VARIANTS),
                         help="Ackley variant for --dataset ackley* (default: realistic).")
+    parser.add_argument("--ensemble-seed", type=int, default=0,
+                        help="Master seed for per-trial 'ensemble' randomization (same value "
+                             "reproduces the per-trial landscape sequence; default: 0).")
+    parser.add_argument("--ensemble-margin", type=float, default=0.2,
+                        help="optima_margin for --dataset ensemble — normalized gap the "
+                             "background stays below the optima (default: 0.2).")
     parser.add_argument("--resume-from", metavar="RUN_DIR", default=None,
                         help="Resume from a SPECIFIC run: trust its stored metrics "
                              "as prior history (no re-evaluation), reuse its config.")
@@ -2867,14 +3078,16 @@ def main() -> None:
                     run_dir=run_dir_override, n_init_trials=n_init,
                     dataset=_persist_dataset_fields(cfg)[0],
                     ackley_variant=ackley_variant,
+                    ensemble_spec=_ensemble_spec_from_cfg(cfg),
                     invocation=invocation)
         return
 
     # ── Resume-dim: seed from ALL prior runs of the same dimensionality ──
     if args.resume_dim:
-        if args.dataset == "RF":
-            sys.exit("--resume-dim requires an analytic --dataset (e.g. ackley4d); "
-                     "RF is interactive and 3-simplex only.")
+        if args.dataset not in DATASET_DIMS or args.dataset == "RF":
+            sys.exit("--resume-dim requires a fixed-dim analytic --dataset (e.g. ackley4d); "
+                     "RF is interactive and 3-simplex only, and 'ensemble' is re-randomized "
+                     "per trial (no shared landscape to pool across runs).")
         dim = DATASET_DIMS[args.dataset]
         print("=" * 70)
         print(f"ZoMBI-Hop MOBO — RESUME-DIM (all {dim}-simplex runs) — dataset: {args.dataset}")
@@ -3008,6 +3221,7 @@ def main() -> None:
                     run_dir=run_dir_override, n_init_trials=n_init,
                     dataset=_persist_dataset_fields(cfg)[0],
                     ackley_variant=ackley_variant,
+                    ensemble_spec=_ensemble_spec_from_cfg(cfg),
                     invocation=invocation)
         return
 
@@ -3060,6 +3274,48 @@ def main() -> None:
                     run_dir=run_dir_override, n_init_trials=n_init,
                     dataset=_persist_dataset_fields(cfg)[0],
                     ackley_variant=ackley_variant,
+                    ensemble_spec=_ensemble_spec_from_cfg(cfg),
+                    invocation=invocation)
+        return
+
+    if args.dataset == ENSEMBLE_DATASET:
+        dim = args.dim if args.dim is not None else ENSEMBLE_DEFAULT_DIM
+        if dim < 2:
+            sys.exit("--dataset ensemble requires --dim >= 2.")
+        print("=" * 70)
+        print(f"ZoMBI-Hop MOBO — dataset ensemble (re-randomized per trial)  dim={dim}")
+        print(f"Device: {DEVICE}   |   time limit/trial: {TIME_LIMIT_HOURS} h")
+        print("=" * 70)
+        landscape = build_ensemble_landscape(
+            dim, optima_margin=args.ensemble_margin, seed=args.ensemble_seed,
+            time_limit_hours=TIME_LIMIT_HOURS)
+        ensemble_spec = {
+            "dim": dim, "optima_margin": args.ensemble_margin, "seed": args.ensemble_seed,
+        }
+        lo, hi = optima_count_range(dim)
+        resolutions = [
+            f"dataset: CLI --dataset ensemble (re-randomized per trial, n_optima in [{lo}, {hi}])",
+            f"ensemble_seed: {args.ensemble_seed}   ensemble_margin: {args.ensemble_margin}",
+            f"time_limit_hours: {'CLI' if time_limit_override is not None else 'default'} "
+            f"({TIME_LIMIT_HOURS})",
+        ]
+        if args.device:
+            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
+        else:
+            resolutions.append(
+                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
+            )
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="dataset_ensemble", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
+        _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
+                    run_dir=run_dir_override, n_init_trials=n_init,
+                    dataset=ENSEMBLE_DATASET, ensemble_spec=ensemble_spec,
                     invocation=invocation)
         return
 

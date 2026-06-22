@@ -150,7 +150,7 @@ from mobo_landscapes import build_synthetic_landscape, parse_synthetic_batch_fie
 
 # Analytic benchmark objectives (negated Ackley on the d-simplex).
 from synthetic_data.ackley import Ackley
-from synthetic_data.ensemble import Ensemble
+from synthetic_data.ensemble import Ensemble, random_ensemble_config
 from synthetic_data.gaussian_landscape import RealisticGaussian
 from synthetic_data.landscape_config_log import (
     build_landscape_config_log,
@@ -375,41 +375,6 @@ def resolve_dataset(
 
 
 # ─── Ensemble (re-randomized per run) ────────────────────────────────────────────
-
-def random_ensemble_config(dim: int, rng: random.Random, *, optima_margin: float = 0.2) -> dict:
-    """Draw a random ``Ensemble`` configuration.
-
-    Mirrors the "Randomize" button in ``synthetic_data/plot_ensemble.py`` — the
-    same per-feature ranges and the same on/off toggles (a disabled feature
-    passes its count/amplitude as 0) — and additionally draws a random master
-    ``seed`` so each call also relocates every feature.  Returns a kwargs dict
-    accepted directly by ``Ensemble(**config)``; ``optima_margin`` is held fixed
-    (it is not randomized by the viewer either).
-    """
-    toggle = lambda: rng.random() > 0.5  # noqa: E731
-    weak_on, ridges_on, rough_on, aniso_on, plateaus_on = (
-        toggle(), toggle(), toggle(), toggle(), toggle())
-    return {
-        "dim": int(dim),
-        "n_optima": rng.randint(5, 20),
-        "basin_width": float(rng.randint(40, 90)),
-        "optima_margin": float(optima_margin),
-        "n_weak": rng.randint(0, 30) if weak_on else 0,
-        "weak_width": float(rng.randint(5, 300)),
-        "weak_amp": round(rng.uniform(0.0, 1.0), 2),
-        "n_ridges": rng.randint(0, 8) if ridges_on else 0,
-        "ridge_width": round(rng.uniform(0.01, 0.25), 3),
-        "ridge_amp": round(rng.uniform(0.0, 1.0), 2),
-        "noise_freq": round(rng.uniform(0.0, 40.0), 1),
-        "noise_amp": float(rng.randint(0, 2000)) if rough_on else 0.0,
-        "noise_octaves": rng.randint(1, 6),
-        "aniso_strength": round(rng.uniform(0.0, 50.0), 1) if aniso_on else 0.0,
-        "n_plateaus": rng.randint(0, 8) if plateaus_on else 0,
-        "plateau_radius": round(rng.uniform(0.02, 0.40), 2),
-        "plateau_amp": round(rng.uniform(0.0, 1.0), 2),
-        "seed": rng.randint(0, 10_000),
-    }
-
 
 def build_ensemble_ds(config: dict, dataset: str, *, time_limit_hours: float | None = None) -> dict:
     """Instantiate an ``Ensemble`` from ``config`` and wrap it as a dataset dict.

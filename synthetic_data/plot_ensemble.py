@@ -29,7 +29,10 @@ import plotly.graph_objects as go
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-from synthetic_data.ensemble import Ensemble  # noqa: E402
+from synthetic_data.ensemble import (  # noqa: E402
+    Ensemble,
+    random_ensemble_config,
+)
 from synthetic_data.plot_ackley import (  # noqa: E402
     BASIN_THRESHOLD,
     DEFAULT_GRID_N,
@@ -93,7 +96,7 @@ def build_app():
         # True optima (always on).
         html.Div([
             html.Label("True Optima", style={"fontWeight": "bold"}),
-            _slider("Number of Optima", "n-optima", 1, 20, 1, 4, 5, str),
+            _slider("Number of Optima", "n-optima", 1, 150, 1, 4, 25, str),
             _slider("Basin Width (b)", "basin-width", 5, 200, 1, 65, 35, str),
             _slider("Optima Margin (normalized gap above background)",
                     "optima-margin", 0.0, 0.5, 0.01, 0.2, 0.1,
@@ -193,32 +196,37 @@ def build_app():
         Output("tog-aniso", "value"),
         Output("tog-plateaus", "value"),
         Input("randomize-btn", "n_clicks"),
+        State("dim-select", "value"),
         prevent_initial_call=True,
     )
-    def randomize(_n_clicks):
-        rng = random.Random()
-        toggle = lambda: ["on"] if rng.random() > 0.5 else []  # noqa: E731
+    def randomize(_n_clicks, dim_sel):
+        # Draw exactly what optimize/run_mobo.py and optimize/evaluate.py generate
+        # per run, so the viewer's "Randomize" matches the benchmark landscapes.
+        # n_optima is drawn from the dimension-specific optima_count_range.
+        dim = 3 if dim_sel == "3d" else 4
+        cfg = random_ensemble_config(dim, random.Random())
+        on = lambda v: ["on"] if v else []  # noqa: E731
         return (
-            rng.randint(5, 20),                          # n-optima
-            rng.randint(40, 90),                         # basin-width
-            rng.randint(0, 30),                          # n-weak
-            rng.randint(5, 300),                         # weak-width
-            round(rng.uniform(0.0, 1.0), 2),             # weak-amp
-            rng.randint(0, 8),                           # n-ridges
-            round(rng.uniform(0.01, 0.25), 3),           # ridge-width
-            round(rng.uniform(0.0, 1.0), 2),             # ridge-amp
-            round(rng.uniform(0, 40), 1),                # noise-freq
-            rng.randint(0, 2000),                        # noise-amp
-            rng.randint(1, 6),                           # noise-oct
-            round(rng.uniform(0.0, 50), 1),              # aniso-strength
-            rng.randint(0, 8),                           # n-plateaus
-            round(rng.uniform(0.02, 0.40), 2),           # plateau-radius
-            round(rng.uniform(0.0, 1.0), 2),             # plateau-amp
-            toggle(),                                    # tog-weak
-            toggle(),                                    # tog-ridges
-            toggle(),                                    # tog-rough
-            toggle(),                                    # tog-aniso
-            toggle(),                                    # tog-plateaus
+            cfg["n_optima"],                             # n-optima
+            cfg["basin_width"],                          # basin-width
+            cfg["n_weak"],                               # n-weak
+            cfg["weak_width"],                           # weak-width
+            cfg["weak_amp"],                             # weak-amp
+            cfg["n_ridges"],                             # n-ridges
+            cfg["ridge_width"],                          # ridge-width
+            cfg["ridge_amp"],                            # ridge-amp
+            cfg["noise_freq"],                           # noise-freq
+            cfg["noise_amp"],                            # noise-amp
+            cfg["noise_octaves"],                        # noise-oct
+            cfg["aniso_strength"],                       # aniso-strength
+            cfg["n_plateaus"],                           # n-plateaus
+            cfg["plateau_radius"],                       # plateau-radius
+            cfg["plateau_amp"],                          # plateau-amp
+            on(cfg["n_weak"] > 0),                       # tog-weak
+            on(cfg["n_ridges"] > 0),                     # tog-ridges
+            on(cfg["noise_amp"] > 0),                    # tog-rough
+            on(cfg["aniso_strength"] > 0),               # tog-aniso
+            on(cfg["n_plateaus"] > 0),                   # tog-plateaus
         )
 
     @callback(

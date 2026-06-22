@@ -95,6 +95,73 @@ _SEED_ANISO = 404
 _SEED_NOISE = 505
 
 
+# ── Per-run randomization ─────────────────────────────────────────────────────
+# Hardcoded range of *true* optima to draw for each simplex dimension.  These are
+# the only feature counts that scale with ``dim`` (every other Ensemble knob means
+# the same thing at any dimension); higher-dimensional simplices have far more room
+# so they get many more basins.  ``random_ensemble_config`` is the single source of
+# truth shared by optimize/run_mobo.py, optimize/evaluate.py and plot_ensemble.py.
+OPTIMA_COUNT_RANGES: dict[int, tuple[int, int]] = {
+    3: (5, 30),
+    4: (20, 50),
+    10: (50, 150),
+}
+
+
+def optima_count_range(dim: int) -> tuple[int, int]:
+    """Inclusive ``(lo, hi)`` range of true optima to draw at simplex ``dim``.
+
+    Uses the hardcoded :data:`OPTIMA_COUNT_RANGES` table for the benchmarked
+    dimensions (3/4/10); other dimensions fall back to ``(5*dim, 15*dim)`` — the
+    same slope the 10-simplex anchor sits on.
+    """
+    if dim in OPTIMA_COUNT_RANGES:
+        return OPTIMA_COUNT_RANGES[dim]
+    return (5 * dim, 15 * dim)
+
+
+def random_ensemble_config(dim: int, rng, *, optima_margin: float = 0.2) -> dict:
+    """Draw a random :class:`Ensemble` configuration for one run.
+
+    Mirrors the "Randomize" button in ``synthetic_data/plot_ensemble.py`` — the
+    same per-feature ranges and the same on/off toggles (a disabled feature passes
+    its count/amplitude as 0) — and additionally draws a random master ``seed`` so
+    each call also relocates every feature.  ``n_optima`` is drawn from the
+    dimension-specific :func:`optima_count_range`; ``optima_margin`` is held fixed
+    (the viewer does not randomize it either).  Returns a kwargs dict accepted
+    directly by ``Ensemble(**config)``, so a saved config exactly recreates the
+    landscape.
+
+    ``rng`` is any object with the ``random.Random`` interface; seed it
+    deterministically (e.g. ``random.Random(f"{master_seed}-{trial}")``) for a
+    reproducible per-trial landscape sequence.
+    """
+    opt_lo, opt_hi = optima_count_range(int(dim))
+    toggle = lambda: rng.random() > 0.5  # noqa: E731
+    weak_on, ridges_on, rough_on, aniso_on, plateaus_on = (
+        toggle(), toggle(), toggle(), toggle(), toggle())
+    return {
+        "dim": int(dim),
+        "n_optima": rng.randint(opt_lo, opt_hi),
+        "basin_width": float(rng.randint(40, 90)),
+        "optima_margin": float(optima_margin),
+        "n_weak": rng.randint(0, 30) if weak_on else 0,
+        "weak_width": float(rng.randint(5, 300)),
+        "weak_amp": round(rng.uniform(0.0, 1.0), 2),
+        "n_ridges": rng.randint(0, 8) if ridges_on else 0,
+        "ridge_width": round(rng.uniform(0.01, 0.25), 3),
+        "ridge_amp": round(rng.uniform(0.0, 1.0), 2),
+        "noise_freq": round(rng.uniform(0.0, 40.0), 1),
+        "noise_amp": float(rng.randint(0, 2000)) if rough_on else 0.0,
+        "noise_octaves": rng.randint(1, 6),
+        "aniso_strength": round(rng.uniform(0.0, 50.0), 1) if aniso_on else 0.0,
+        "n_plateaus": rng.randint(0, 8) if plateaus_on else 0,
+        "plateau_radius": round(rng.uniform(0.02, 0.40), 2),
+        "plateau_amp": round(rng.uniform(0.0, 1.0), 2),
+        "seed": rng.randint(0, 10_000),
+    }
+
+
 # ── Geometry helpers ─────────────────────────────────────────────────────────
 
 def _anisotropy_scale(dim: int, strength: float, seed: int) -> np.ndarray:
