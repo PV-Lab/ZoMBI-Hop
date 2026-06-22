@@ -10,6 +10,7 @@ dependencies:
   - libffi=3.5.2=h3435931_0
   - libgcc=15.2.0=he0feb66_19
   - libgcc-ng=15.2.0=h69a702a_19
+  - libstdcxx-ng=15.2.0
   - libgomp=15.2.0=he0feb66_19
   - liblzma=5.8.3=hb03c661_0
   - libnsl=2.0.1=hb9d3cd8_1

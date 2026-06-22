@@ -15,7 +15,7 @@
 #
 # Flag cheat sheet (pick ONE run mode — do not combine incompatible flags):
 #
-#   Fresh RF / synthetic / Multi-Ackley from JSON (MUST include --batch):
+#   Fresh RF / synthetic from JSON (MUST include --batch):
 #     --batch --config optimize/mobo_batch_configs/<name>.json
 #     (Do NOT add --dataset RF — that opens the interactive picker instead.)
 #
@@ -73,7 +73,7 @@
 #SBATCH --partition=mit_normal_gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
+#SBATCH --mem=128G
 #SBATCH --time=6:00:00
 #SBATCH --output=logs/mobo-%j.out
 #SBATCH --error=logs/mobo-%j.err
@@ -156,7 +156,7 @@ _mobo_setup_env
     --no-show
     --device cuda
     --dataset ackley4d
-    --ackley-variant realistic
+    --resume-dim
     --time-limit 0.1
   )
 

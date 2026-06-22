@@ -1,0 +1,8 @@
+{
+  "name": "ackley_10d_realistic",
+  "landscape": "ackley",
+  "dim": 10,
+  "ackley_variant": "realistic",
+  "seed": 42,
+  "time_limit_hours": 0.1
+}

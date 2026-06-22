@@ -5,18 +5,15 @@ Multi-objective Bayesian optimisation (MOBO) of ZoMBI-Hop hyperparameters.
 
 Landscapes (``--landscape`` or batch JSON ``"landscape"`` field):
   • ``rf`` (default) — Random-Forest surrogate on a composition CSV (campaign1a)
-  • ``synthetic``    — Direct analytic oracle (messy, gaussian, …) — MOBO default
-                       for synthetic benchmarks; RF is comparison-only (see
-                       synthetic_data/compare_campaign_datasets.py)
-  • ``ackley``       — Multi-Ackley sum on the d-dimensional probability simplex
+  • ``synthetic``    — Direct analytic oracle (messy, gaussian, ackley, …)
 
 Objectives are selectable via ``--dataset``: RF (default, 3-simplex campaign1a
 surrogate), analytic negated-Ackley benchmarks on the 3-/4-/10-simplex
 (``ackley3d`` / ``ackley4d`` / ``ackley10d``), or ``ensemble`` (the layered
 ``synthetic_data.ensemble`` objective, dimension from ``--dim``). The
-hyperparameters are dimension-independent. ``--landscape ackley`` is an alternate
-Multi-Ackley benchmark (layout/b configurable); ``--dataset ackley*`` uses the
-``synthetic_data.ackley.Ackley`` oracle (``--ackley-variant``).
+hyperparameters are dimension-independent. ``--dataset ackley*`` uses the
+``synthetic_data.ackley.Ackley`` oracle (``--ackley-variant``). Legacy batch
+JSON with ``"landscape": "ackley"`` is rebuilt as realistic Ackley.
 
 ``--dataset ensemble`` RE-RANDOMIZES the landscape for every evaluation (random
 feature counts/widths/amplitudes + a fresh master seed; the number of true optima
@@ -227,14 +224,12 @@ from src.utils.simplex import (
 
 from optimize.mobo_landscapes import (
     LandscapeSpec,
-    build_ackley_landscape,
+    build_ackley_oracle_landscape,
     build_rf_landscape,
     build_synthetic_landscape,
     composition_column_names,
     infer_composition_columns,
-    interactive_ackley_startup,
     landscape_from_run_config,
-    parse_ackley_batch_fields,
     parse_synthetic_batch_fields,
 )
 from synthetic_data.ackley import Ackley
@@ -600,9 +595,6 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
             cfg["oracle"] = landscape.oracle
         if landscape.metadata_path:
             cfg["metadata_path"] = landscape.metadata_path
-    if landscape.landscape == "ackley":
-        cfg["ackley_layout"] = landscape.ackley_layout
-        cfg["ackley_b"] = landscape.ackley_b
     if landscape.landscape == "synthetic":
         cfg["oracle"] = landscape.oracle
         cfg["ackley_layout"] = landscape.ackley_layout
@@ -742,18 +734,17 @@ def load_batch_config(path: str, script_dir: str) -> dict:
     time_limit = cfg.get("time_limit_hours")
 
     if landscape_type == "ackley":
-        try:
-            ack = parse_ackley_batch_fields(cfg)
-        except ValueError as exc:
-            sys.exit(f"--config: {exc}")
-        landscape = build_ackley_landscape(
-            ack["dim"], ack["layout"], b=ack["ackley_b"],
-            time_limit_hours=time_limit,
-            max_activations=ack["max_activations"],
+        dim = int(cfg.get("dim", 10))
+        variant = str(cfg.get("ackley_variant", "realistic"))
+        seed = int(cfg.get("seed", 42))
+        print(
+            f"  [batch] landscape 'ackley' is discontinued (layout-based Multi-Ackley); "
+            f"using Ackley('{variant}', dim={dim}, peak_seed={seed})",
         )
-        print(f"  [batch] Multi-Ackley d={ack['dim']} layout={ack['layout']} b={ack['ackley_b']}")
-        print(f"  [batch] {len(landscape.true_optima)} planted peaks  |  "
-              f"max_activations={landscape.max_activations}")
+        landscape = build_ackley_oracle_landscape(
+            dim, variant=variant, peak_seed=seed, time_limit_hours=time_limit,
+        )
+        print(f"  [batch] {len(landscape.true_optima)} analytic peaks (direct oracle, no RF)")
         return {
             "name":              cfg.get("name") or os.path.splitext(os.path.basename(cfg_path))[0],
             "landscape":         landscape,
@@ -2763,17 +2754,12 @@ def _apply_runtime_overrides(*, device: str | None = None,
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="ZoMBI-Hop MOBO hyperparameter optimisation (RF or Multi-Ackley).",
+        description="ZoMBI-Hop MOBO hyperparameter optimisation (RF or synthetic benchmarks).",
     )
-    parser.add_argument("--landscape", choices=("rf", "ackley"), default="rf",
-                        help="Objective landscape (default: rf). Ackley = synthetic Δ^d benchmark.")
+    parser.add_argument("--landscape", choices=("rf",), default="rf",
+                        help="Objective landscape (default: rf). Use --dataset for analytic benchmarks.")
     parser.add_argument("--dim", type=int, default=None,
-                        help="Simplex dimension for --landscape ackley (default 10) or "
-                             "--dataset ensemble (default 3).")
-    parser.add_argument("--layout", type=str, default=None, choices=["1", "2", "3"],
-                        help="Multi-Ackley peak layout (1/2/3).")
-    parser.add_argument("--ackley-b", type=float, default=None,
-                        help="Ackley peak width b (default 1.2 skinny).")
+                        help="Simplex dimension for --dataset ensemble (default 3).")
     parser.add_argument("--n-init-trials", type=int, default=None,
                         help=f"Sobol init trials before BO (default: {N_INIT_TRIALS}).")
     parser.add_argument("--batch", action="store_true",
@@ -2975,7 +2961,7 @@ def main() -> None:
                 time_limit_hours=TIME_LIMIT_HOURS,
             )
 
-        if landscape.landscape in ("ackley", "synthetic"):
+        if landscape.landscape == "synthetic":
             for i, p in enumerate(landscape.true_optima):
                 print(f"  peak {i + 1}: {np.round(p, 4).tolist()}")
         stop = (
@@ -3373,41 +3359,6 @@ def main() -> None:
         _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
                     run_dir=run_dir_override, n_init_trials=n_init,
                     dataset=args.dataset, ackley_variant=ds["ackley_variant"],
-                    invocation=invocation)
-        return
-
-    if args.landscape == "ackley":
-        print("=" * 70)
-        print("ZoMBI-Hop MOBO — Multi-Ackley synthetic benchmark")
-        print(f"Device: {DEVICE}")
-        print("=" * 70)
-        if args.dim is not None or args.layout is not None:
-            dim = args.dim if args.dim is not None else 10
-            layout = args.layout if args.layout is not None else "1"
-            b = args.ackley_b if args.ackley_b is not None else 1.2
-            landscape = build_ackley_landscape(dim, layout, b=b, time_limit_hours=None)
-        else:
-            landscape = interactive_ackley_startup()
-        resolutions = [
-            "landscape: Multi-Ackley (--landscape ackley)",
-            "time_limit_hours: None (max_activations budget)",
-        ]
-        if args.device:
-            resolutions.append(f"device: CLI --device {args.device} -> {DEVICE}")
-        else:
-            resolutions.append(
-                f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
-            )
-        invocation = build_invocation_log(
-            argv=sys.argv, run_mode="landscape_ackley", cli=_cli_snapshot(args),
-            effective=_effective_run_settings(
-                landscape, max_trials=max_trials, n_init_trials=n_init,
-                runs_dir=runs_dir, run_dir=run_dir_override,
-            ),
-            resolutions=resolutions,
-        )
-        _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
-                    run_dir=run_dir_override, n_init_trials=n_init,
                     invocation=invocation)
         return
 

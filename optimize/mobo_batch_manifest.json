@@ -2,7 +2,6 @@
   "description": "One Slurm array task per entry. Paths are relative to the repo root.",
   "configs": [
     "optimize/mobo_batch_configs/campaign1a_objective_min.json",
-    "optimize/mobo_batch_configs/campaign1a_bandgap_max.json",
-    "optimize/mobo_batch_configs/ackley_10d_layout1.json"
+    "optimize/mobo_batch_configs/campaign1a_bandgap_max.json"
   ]
 }

@@ -5,7 +5,7 @@
 #   bash scripts/submit_mobo.sh
 #   MOBO_DEVICE=cuda bash scripts/submit_mobo.sh
 #   MOBO_DEVICE=cuda MOBO_CONFIG=optimize/mobo_batch_configs/synthetic_3d_messy.json bash scripts/submit_mobo.sh
-#   MOBO_DEVICE=cuda MOBO_CONFIG=optimize/mobo_batch_configs/ackley_10d_layout1.json bash scripts/submit_mobo.sh
+#   MOBO_DEVICE=cuda MOBO_CONFIG=optimize/mobo_batch_configs/ackley_10d_realistic.json bash scripts/submit_mobo.sh
 #   MOBO_MAX_TRIALS=1 MOBO_DEVICE=cuda bash scripts/submit_mobo.sh
 
 set -euo pipefail

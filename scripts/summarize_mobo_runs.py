@@ -36,8 +36,14 @@ def _run_label(run_dir: str) -> str:
     except Exception:
         return label
     landscape = cfg.get("landscape", "rf")
-    if landscape == "ackley":
-        return f"{label}  (Ackley d={cfg.get('dim', '?')} L{cfg.get('ackley_layout', '?')})"
+    dataset = cfg.get("dataset")
+    if dataset and str(dataset).startswith("ackley"):
+        return f"{label}  (Ackley d={cfg.get('dim', '?')}, {dataset})"
+    if landscape == "ackley" or (landscape == "synthetic" and cfg.get("oracle") == "ackley"):
+        return f"{label}  (Ackley d={cfg.get('dim', '?')})"
+    if landscape == "synthetic":
+        oracle = cfg.get("oracle", "?")
+        return f"{label}  (synthetic {oracle} d={cfg.get('dim', '?')})"
     return f"{label}  (RF)"
 
 

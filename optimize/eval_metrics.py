@@ -1,14 +1,5 @@
 """
 Dimension-aware evaluation metrics for ZoMBI-Hop runs.
-
-Baseline constants are tuned at the 3-simplex (d=3).  Higher dimensions apply Group 1
-scaling for ILR radii only (``match_radius_ilr``, ``dup_threshold_ilr``).
-
-  * ``match_radius_comp(d)``      — composition L2 radius (fixed 0.05; MOBO original)
-  * ``match_radius_ilr(d)``       — ILR L2 radius ``× √((d−1)/2)``
-  * ``dup_threshold_ilr(d)``      — ILR duplicate radius ``× √((d−1)/2)``
-  * ``dist_to_needles`` matched terms — raw composition L2 (MOBO original; no ÷√2)
-  * ``dist_to_needles`` penalties — fixed ``UNMATCHED_PENALTY`` (MOBO original)
 """
 
 from __future__ import annotations

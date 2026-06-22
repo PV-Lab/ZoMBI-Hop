@@ -11,11 +11,6 @@ import math
 
 import numpy as np
 
-_ACKLEY_A = 20.0
-ACKLEY_B_SKINNY = 1.2
-_ACKLEY_C = 2.0 * math.pi
-_ACKLEY_SCALE = 30.0
-
 ORACLE_CHOICES = (
     "messy",
     "ackley",
@@ -64,43 +59,6 @@ def ackley_centers_for_layout(d: int, layout: str) -> list[np.ndarray]:
     if layout not in ("1", "2", "3"):
         raise ValueError(f"Unknown layout {layout!r}; use '1', '2', or '3'.")
     return centers
-
-
-def _ackley_negated(
-    x: np.ndarray,
-    center: np.ndarray,
-    *,
-    b: float = ACKLEY_B_SKINNY,
-) -> float:
-    x = np.asarray(x, dtype=float)
-    center = np.asarray(center, dtype=float)
-    d = x.shape[0]
-    delta = x - center
-    t1 = -_ACKLEY_A * math.exp(-b * math.sqrt(np.sum(delta ** 2) / d))
-    t2 = -math.exp(float(np.sum(np.cos(_ACKLEY_C * delta)) / d))
-    return _ACKLEY_SCALE * (t1 + t2 + _ACKLEY_A + math.e)
-
-
-class MultiAckleyND:
-    maximize = True
-
-    def __init__(
-        self,
-        centers: list[np.ndarray],
-        *,
-        b: float = ACKLEY_B_SKINNY,
-        layout_name: str = "custom",
-    ):
-        self.centers = [np.asarray(c, dtype=float).copy() for c in centers]
-        self.b = b
-        self.layout_name = layout_name
-
-    def __call__(self, x: np.ndarray) -> float:
-        return float(sum(_ackley_negated(x, c, b=self.b) for c in self.centers))
-
-    @property
-    def true_optima(self) -> list[np.ndarray]:
-        return [c.copy() for c in self.centers]
 
 
 def composition_to_ilr_np(x: np.ndarray) -> np.ndarray:
@@ -318,17 +276,21 @@ def build_oracle(
     layout: str,
     *,
     seed: int,
-    ackley_b: float = ACKLEY_B_SKINNY,
+    ackley_b: float | None = None,
 ) -> tuple[object, list[np.ndarray], str]:
     """Return (callable oracle, reference optima, display label)."""
+    if name == "ackley":
+        from synthetic_data.ackley import Ackley
+
+        obj = Ackley("realistic", dim=d, peak_seed=seed)
+        optima = [c.copy() for c in obj.centers]
+        label = f"Realistic Ackley ({len(optima)} peaks, dim={d}, seed={seed})"
+        return obj, optima, label
+
     centers = ackley_centers_for_layout(d, layout)
     if name == "messy":
         obj = MessyCampaignOracle(centers, n_micro=150, n_ripples=30, seed=seed)
         label = f"Messy campaign ({len(centers)} major + 150 signed micro + 30 ILR ripples)"
-        return obj, obj.true_optima, label
-    if name == "ackley":
-        obj = MultiAckleyND(centers, b=ackley_b, layout_name=f"layout-{layout}")
-        label = f"Multi-Ackley (layout {layout}, b={ackley_b})"
         return obj, obj.true_optima, label
     if name == "gaussian":
         obj = GaussianMixtureOracle(centers, sigma=0.07)

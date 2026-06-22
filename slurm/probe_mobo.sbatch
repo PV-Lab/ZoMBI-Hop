@@ -33,7 +33,7 @@ if [[ "${PROBE_TARGET}" == "gpu" ]]; then
   DEVICE="cuda"
   CPUS="${SLURM_CPUS_PER_TASK:-8}"
   if [[ "${PROBE_LANDSCAPE}" == "ackley" ]]; then
-    CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/ackley_10d_layout1.json}"
+    CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/ackley_10d_realistic.json}"
   elif [[ "${PROBE_LANDSCAPE}" == "synthetic" ]]; then
     CONFIG="${MOBO_CONFIG:-optimize/mobo_batch_configs/synthetic_3d_messy.json}"
   else

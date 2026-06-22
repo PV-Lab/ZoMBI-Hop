@@ -16,10 +16,8 @@ import plotly.graph_objects as go
 
 from synthetic_data.ackley import Ackley, load_config as load_ackley_config, save_config as save_ackley_config
 from synthetic_data.oracles import (
-    ACKLEY_B_SKINNY,
     GaussianMixtureOracle,
     MessyCampaignOracle,
-    MultiAckleyND,
     PlantedBumpField,
     RastriginILROracle,
     ackley_centers_for_layout,
@@ -31,7 +29,6 @@ CONFIG_DIR = HERE / "oracle_configs"
 ORACLE_CHOICES = (
     "realistic_ackley",
     "messy",
-    "ackley",
     "gaussian",
     "planted_bumps",
     "rastrigin_ilr",
@@ -40,7 +37,6 @@ ORACLE_CHOICES = (
 DISPLAY_LABELS = {
     "realistic_ackley": "Realistic Ackley (Dirichlet peaks + noise)",
     "messy": "Messy campaign (bumps + ILR ripples)",
-    "ackley": "Multi-Ackley sum",
     "gaussian": "Gaussian mixture",
     "planted_bumps": "Planted bumps (major + micro)",
     "rastrigin_ilr": "Rastrigin in ILR",
@@ -61,11 +57,6 @@ DEFAULT_PARAMS: dict[str, dict[str, Any]] = {
         "n_micro": 150,
         "n_ripples": 30,
         "major_sigma": 0.055,
-    },
-    "ackley": {
-        "layout": "2",
-        "seed": 42,
-        "ackley_b": ACKLEY_B_SKINNY,
     },
     "gaussian": {
         "layout": "2",
@@ -90,7 +81,6 @@ DEFAULT_PARAMS: dict[str, dict[str, Any]] = {
 SLIDER_GROUPS: dict[str, tuple[str, ...]] = {
     "realistic_ackley": ("common", "realistic"),
     "messy": ("common", "messy"),
-    "ackley": ("common", "ackley"),
     "gaussian": ("common", "gaussian"),
     "planted_bumps": ("common", "planted"),
     "rastrigin_ilr": ("common", "rastrigin"),
@@ -171,11 +161,6 @@ def build_tuned_oracle(oracle: str, params: dict[str, Any], *, dim: int = 3):
         )
         suffix = f"{len(centers)} major, {params.get('n_micro')} micro, {params.get('n_ripples')} ripples"
         return obj, obj.true_optima, suffix
-
-    if oracle == "ackley":
-        b = float(params.get("ackley_b", ACKLEY_B_SKINNY))
-        obj = MultiAckleyND(centers, b=b, layout_name=f"layout-{layout}")
-        return obj, obj.true_optima, f"layout {layout}, b={b}"
 
     if oracle == "gaussian":
         sigma = float(params.get("sigma", 0.07))

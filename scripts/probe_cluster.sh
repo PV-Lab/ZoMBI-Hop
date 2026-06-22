@@ -61,7 +61,7 @@ print_cluster_info() {
   echo "Example configs:"
   echo "  campaign1a_objective_min.json — 3D RF campaign"
   echo "  synthetic_3d_messy.json       — 3D messy synthetic oracle"
-  echo "  ackley_10d_layout1.json       — Ackley 10D synthetic benchmark"
+  echo "  ackley_10d_realistic.json     — Realistic Ackley 10D (legacy landscape: ackley)"
   echo ""
   echo "Synthetic data:"
   echo "  bash scripts/generate_synthetic_mobo_data.sh"
