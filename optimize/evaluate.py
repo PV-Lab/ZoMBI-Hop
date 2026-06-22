@@ -31,6 +31,14 @@ Synthetic oracle names (direct analytic landscapes from ``synthetic_data/oracles
 
   messy, gaussian, ackley, planted_bumps, rastrigin_ilr
 
+  ensemble     layered ``synthetic_data/ensemble.py`` objective, RE-RANDOMIZED PER
+               RUN like the "Randomize" button in ``plot_ensemble.py`` (random
+               feature counts/widths/amplitudes + on/off toggles + a fresh seed).
+               Each run writes ``ensemble_config.json`` (full Ensemble kwargs) so
+               the exact landscape can be recreated.  ``--ensemble-seed`` makes the
+               per-run sequence reproducible; ``--dim`` sets the simplex dimension;
+               ``--ensemble-margin`` sets the optima/background gap.
+
   For ``gaussian``, use ``"variant": "realistic"`` in a batch JSON (or ``--oracle-variant
   realistic``) for random Dirichlet peaks like ``gaussian3d``; default ``layout`` uses
   fixed symmetric peak geometry (3/5/7 peaks via ``--layout``).
@@ -105,6 +113,15 @@ config::
 
   python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
       --hparams-json optimize/hparams.json --dataset RF --num-runs 3
+
+New flags for ensemble data: 
+    --ensemble-seed (default 0; makes the per-run landscape sequence reproducible)
+    --ensemble-margin (optima/background gap, default 0.2)
+    --dim sets the simplex dimension
+
+    python optimize/evaluate.py \
+        --hparams optimize/runs/mobo_05_06_15_32/trial_1/trial.json \
+        --dataset ensemble --dim 3 --num-runs 5 --ensemble-seed 0
 """
 
 from __future__ import annotations
@@ -113,6 +130,7 @@ import argparse
 import datetime
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -132,6 +150,7 @@ from mobo_landscapes import build_synthetic_landscape, parse_synthetic_batch_fie
 
 # Analytic benchmark objectives (negated Ackley on the d-simplex).
 from synthetic_data.ackley import Ackley
+from synthetic_data.ensemble import Ensemble
 from synthetic_data.gaussian_landscape import RealisticGaussian
 from synthetic_data.landscape_config_log import (
     build_landscape_config_log,
@@ -146,7 +165,10 @@ except Exception:  # pragma: no cover
 
 ACKLEY_BENCHMARKS = {"ackley3d": 3, "ackley4d": 4, "ackley10d": 10}
 GAUSSIAN_BENCHMARKS = {"gaussian3d": 3, "gaussian4d": 4, "gaussian10d": 10}
-BUILTIN_DATASETS = {"RF", *ACKLEY_BENCHMARKS.keys(), *GAUSSIAN_BENCHMARKS.keys(), *ORACLE_CHOICES}
+# Layered ``Ensemble`` objective: re-randomized per run (see random_ensemble_config).
+ENSEMBLE_DATASETS = {"ensemble"}
+BUILTIN_DATASETS = {"RF", *ACKLEY_BENCHMARKS.keys(), *GAUSSIAN_BENCHMARKS.keys(),
+                    *ORACLE_CHOICES, *ENSEMBLE_DATASETS}
 
 # Canonical campaign1a RF reference optima from mobo_05_06_15_32 (interactive picker).
 TRIAL112_REFERENCE_OPTIMA = os.path.join(
@@ -350,6 +372,68 @@ def resolve_dataset(
 
     sys.exit(f"--dataset: '{dataset}' is not known "
              f"(choose from {', '.join(sorted(BUILTIN_DATASETS))}).")
+
+
+# ─── Ensemble (re-randomized per run) ────────────────────────────────────────────
+
+def random_ensemble_config(dim: int, rng: random.Random, *, optima_margin: float = 0.2) -> dict:
+    """Draw a random ``Ensemble`` configuration.
+
+    Mirrors the "Randomize" button in ``synthetic_data/plot_ensemble.py`` — the
+    same per-feature ranges and the same on/off toggles (a disabled feature
+    passes its count/amplitude as 0) — and additionally draws a random master
+    ``seed`` so each call also relocates every feature.  Returns a kwargs dict
+    accepted directly by ``Ensemble(**config)``; ``optima_margin`` is held fixed
+    (it is not randomized by the viewer either).
+    """
+    toggle = lambda: rng.random() > 0.5  # noqa: E731
+    weak_on, ridges_on, rough_on, aniso_on, plateaus_on = (
+        toggle(), toggle(), toggle(), toggle(), toggle())
+    return {
+        "dim": int(dim),
+        "n_optima": rng.randint(5, 20),
+        "basin_width": float(rng.randint(40, 90)),
+        "optima_margin": float(optima_margin),
+        "n_weak": rng.randint(0, 30) if weak_on else 0,
+        "weak_width": float(rng.randint(5, 300)),
+        "weak_amp": round(rng.uniform(0.0, 1.0), 2),
+        "n_ridges": rng.randint(0, 8) if ridges_on else 0,
+        "ridge_width": round(rng.uniform(0.01, 0.25), 3),
+        "ridge_amp": round(rng.uniform(0.0, 1.0), 2),
+        "noise_freq": round(rng.uniform(0.0, 40.0), 1),
+        "noise_amp": float(rng.randint(0, 2000)) if rough_on else 0.0,
+        "noise_octaves": rng.randint(1, 6),
+        "aniso_strength": round(rng.uniform(0.0, 50.0), 1) if aniso_on else 0.0,
+        "n_plateaus": rng.randint(0, 8) if plateaus_on else 0,
+        "plateau_radius": round(rng.uniform(0.02, 0.40), 2),
+        "plateau_amp": round(rng.uniform(0.0, 1.0), 2),
+        "seed": rng.randint(0, 10_000),
+    }
+
+
+def build_ensemble_ds(config: dict, dataset: str, *, time_limit_hours: float | None = None) -> dict:
+    """Instantiate an ``Ensemble`` from ``config`` and wrap it as a dataset dict.
+
+    The true optima are the strong-basin ``centers`` (the guaranteed global
+    maxima).  dim == 3 gets a ternary grid for landscape frames; dim == 4 passes
+    the ``Ensemble`` itself as ``ackley_fn`` so ``run_single_eval`` renders the
+    final-state point cloud over the objective.
+    """
+    fn = Ensemble(**config)
+    dim = int(config["dim"])
+    true_optima = [np.asarray(c, dtype=float) for c in fn.centers]
+    grid_pts = grid_vals = None
+    if dim == 3:
+        grid_pts = rm.ternary_grid(rm.TERNARY_GRID_N)
+        grid_vals = fn.predict(grid_pts)
+    spec = rm.LandscapeSpec(
+        landscape="synthetic", dim=dim, maximize=True, true_optima=true_optima,
+        fn_callable=fn, grid_pts=grid_pts, grid_vals=grid_vals,
+        time_limit_hours=time_limit_hours, oracle="ensemble",
+        synthetic_seed=int(config.get("seed", 0)),
+    )
+    return _landscape_to_ds(spec, dataset, ackley_fn=(fn if dim == 4 else None),
+                            variant="ensemble")
 
 
 # ─── Hyperparameter loading ─────────────────────────────────────────────────────
@@ -985,26 +1069,56 @@ def evaluate_dataset(
 ) -> int:
     time_limit_min = args.time_limit_min
     syn_defaults = synthetic_defaults or {}
+    is_ensemble = dataset in ENSEMBLE_DATASETS
+    ens_dim = int(syn_defaults.get("dim", args.dim))
 
-    ds = resolve_dataset(
-        dataset, runs_path, args.ackley_variant,
-        dim=syn_defaults.get("dim", args.dim),
-        layout=syn_defaults.get("layout", args.layout),
-        seed=syn_defaults.get("seed", args.seed),
-        oracle_variant=syn_defaults.get("variant", args.oracle_variant),
-        config=synthetic_defaults,
-        time_limit_hours=time_limit_min / 60.0,
-    )
-
-    if args.true_optima_json:
-        ref = load_true_optima_json(args.true_optima_json)
-        apply_true_optima_override(ds, ref, source=os.path.abspath(args.true_optima_json))
-
-    with open(os.path.join(out_dir, "rerun_config.json"), "w") as f:
-        json.dump(_build_rerun_config(
+    if is_ensemble:
+        # No single shared landscape: each run gets a fresh randomized Ensemble
+        # (built in the run loop below), so true_optima vary per run.
+        ds = None
+        rerun_cfg = {
+            "generated": datetime.datetime.now().isoformat(timespec="seconds"),
+            "dataset": dataset,
+            "dim": ens_dim,
+            "maximize": True,
+            "landscape": "synthetic",
+            "oracle": "ensemble",
+            "ensemble_random_per_run": True,
+            "ensemble_seed": args.ensemble_seed,
+            "ensemble_optima_margin": args.ensemble_margin,
+            "runs_path": runs_path,
+            "trials": trial_nums,
+            "num_runs": args.num_runs,
+            "time_limit_min": time_limit_min,
+            "top_k": args.top_k,
+        }
+        if config_meta:
+            rerun_cfg["batch_config"] = config_meta.get("name")
+            rerun_cfg["batch_config_path"] = config_meta.get("path")
+        if args.hparams:
+            rerun_cfg["hparams_source"] = os.path.abspath(args.hparams)
+        elif args.hparams_json:
+            rerun_cfg["hparams_source"] = os.path.abspath(args.hparams_json)
+    else:
+        ds = resolve_dataset(
+            dataset, runs_path, args.ackley_variant,
+            dim=ens_dim,
+            layout=syn_defaults.get("layout", args.layout),
+            seed=syn_defaults.get("seed", args.seed),
+            oracle_variant=syn_defaults.get("variant", args.oracle_variant),
+            config=synthetic_defaults,
+            time_limit_hours=time_limit_min / 60.0,
+        )
+        if args.true_optima_json:
+            ref = load_true_optima_json(args.true_optima_json)
+            apply_true_optima_override(ds, ref, source=os.path.abspath(args.true_optima_json))
+        rerun_cfg = _build_rerun_config(
             dataset, ds, runs_path=runs_path, trial_nums=trial_nums,
             args=args, time_limit_min=time_limit_min, config_meta=config_meta,
-        ), f, indent=2)
+        )
+
+    with open(os.path.join(out_dir, "rerun_config.json"), "w") as f:
+        json.dump(rerun_cfg, f, indent=2)
 
     total = len(trial_nums) * args.num_runs
     done = 0
@@ -1023,6 +1137,18 @@ def evaluate_dataset(
             done += 1
             print(f"  [run {k}/{args.num_runs}]  (overall {done}/{total})")
             run_dir = os.path.join(trial_dir, f"run_{k}")
+            run_ds = ds
+            if is_ensemble:
+                # Reproducible per (trial, run): same --ensemble-seed regenerates
+                # the identical landscape sequence; ensemble_config.json records it.
+                rng = random.Random(f"{args.ensemble_seed}-{trial_num}-{k}")
+                ens_cfg = random_ensemble_config(
+                    ens_dim, rng, optima_margin=args.ensemble_margin)
+                run_ds = build_ensemble_ds(
+                    ens_cfg, dataset, time_limit_hours=time_limit_min / 60.0)
+                os.makedirs(run_dir, exist_ok=True)
+                with open(os.path.join(run_dir, "ensemble_config.json"), "w") as f:
+                    json.dump(ens_cfg, f, indent=2)
             try:
                 eval_kwargs = dict(
                     top_k=args.top_k,
@@ -1032,7 +1158,7 @@ def evaluate_dataset(
                     log_y=args.log_y,
                 )
                 res = run_single_eval(
-                    hparams, ds, dataset, run_dir, time_limit_min, **eval_kwargs,
+                    hparams, run_ds, dataset, run_dir, time_limit_min, **eval_kwargs,
                 )
                 per_trial[trial_num].append({
                     "run": k,
@@ -1091,6 +1217,12 @@ def main() -> None:
                         help="Peak layout for synthetic oracles (default: 2).")
     parser.add_argument("--seed", type=int, default=42,
                         help="RNG seed for synthetic oracles (default: 42).")
+    parser.add_argument("--ensemble-seed", type=int, default=0,
+                        help="Master seed for per-run 'ensemble' randomization "
+                             "(same value reproduces the landscape sequence; default: 0).")
+    parser.add_argument("--ensemble-margin", type=float, default=0.2,
+                        help="optima_margin for the 'ensemble' dataset — normalized gap "
+                             "the background stays below the optima (default: 0.2).")
     parser.add_argument("--device", choices=("cpu", "cuda"), default=None,
                         help="Override compute device.")
     parser.add_argument("--no-video", action="store_true", help="Skip timelapse MP4 assembly.")
