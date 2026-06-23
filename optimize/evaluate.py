@@ -96,11 +96,6 @@ Usage
   python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
       --trials 112 --dataset RF,gaussian --num-runs 1
 
-  # Same reference optima as mobo_05_06_15_32 on every landscape (transfer metrics):
-  python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
-      --trials 112 --dataset gaussian3d,rastrigin_ilr \
-      --true-optima-json optimize/reference_optima/mobo_05_06_15_32_campaign1a.json
-
   python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
       --trials 12 --dataset ackley10d --num-runs 3
 
@@ -188,25 +183,16 @@ def load_true_optima_json(path: str) -> list[np.ndarray]:
     """Load ``true_optima`` from a run_config-style JSON sidecar."""
     cfg_path = os.path.abspath(path)
     if not os.path.isfile(cfg_path):
-        sys.exit(f"--true-optima-json: file not found: {cfg_path}")
+        sys.exit(f"reference optima file not found: {cfg_path}")
     try:
         with open(cfg_path) as f:
             cfg = json.load(f)
     except Exception as exc:
-        sys.exit(f"--true-optima-json: {cfg_path} unreadable ({exc}).")
+        sys.exit(f"reference optima file {cfg_path} unreadable ({exc}).")
     raw = cfg.get("true_optima")
     if not raw:
-        sys.exit(f"--true-optima-json: {cfg_path} has no 'true_optima' list.")
+        sys.exit(f"reference optima file {cfg_path} has no 'true_optima' list.")
     return [np.asarray(t, dtype=float) for t in raw]
-
-
-def apply_true_optima_override(ds: dict, true_optima: list[np.ndarray], *, source: str) -> None:
-    """Replace dataset-native reference optima (metrics + plots only)."""
-    n_before = len(ds.get("true_optima") or [])
-    ds["true_optima"] = true_optima
-    ds["true_optima_source"] = source
-    print(f"  [true_optima] using {len(true_optima)} reference point(s) from {source} "
-          f"(overrides {n_before} dataset-native optima)")
 
 
 # ─── Dataset resolution ─────────────────────────────────────────────────────────
@@ -296,12 +282,15 @@ def resolve_dataset(
         except FileNotFoundError as exc:
             sys.exit(str(exc))
         maximize = bool(cfg["maximize"])
-        true_optima = [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
+        # Always use the canonical mobo_05_06_15_32 campaign1a optima as the
+        # reference set, regardless of which source run supplies the CSV/surrogate.
+        true_optima = load_true_optima_json(TRIAL112_REFERENCE_OPTIMA)
         obj_col = cfg.get("objective_column", "Objective")
         comp_cols = cfg.get("composition_columns")
         print(f"  [dataset] RF surrogate from {csv_path} "
               f"({'maximize' if maximize else 'minimize'}, "
-              f"{len(true_optima)} reference optima from {os.path.basename(runs_path)})")
+              f"{len(true_optima)} reference optima from "
+              f"{os.path.basename(TRIAL112_REFERENCE_OPTIMA)})")
         _, rf_fn, grid_pts, grid_vals, resolved_cols, dim = rm.build_rf_and_grid(
             csv_path, objective_column=obj_col, composition_columns=comp_cols,
         )
@@ -976,8 +965,6 @@ def _build_rerun_config(
         "true_optima": [list(map(float, t.ravel())) for t in ds["true_optima"]],
         "landscape_config": ds.get("landscape_config"),
     }
-    if ds.get("true_optima_source"):
-        cfg["true_optima_source"] = ds["true_optima_source"]
     if config_meta:
         cfg["batch_config"] = config_meta.get("name")
         cfg["batch_config_path"] = config_meta.get("path")
@@ -1074,9 +1061,6 @@ def evaluate_dataset(
             config=synthetic_defaults,
             time_limit_hours=time_limit_min / 60.0,
         )
-        if args.true_optima_json:
-            ref = load_true_optima_json(args.true_optima_json)
-            apply_true_optima_override(ds, ref, source=os.path.abspath(args.true_optima_json))
         rerun_cfg = _build_rerun_config(
             dataset, ds, runs_path=runs_path, trial_nums=trial_nums,
             args=args, time_limit_min=time_limit_min, config_meta=config_meta,
@@ -1199,11 +1183,6 @@ def main() -> None:
                         help="Parent directory for rerun_* output (default: optimize/runs).")
     parser.add_argument("--out-dir", default=None, metavar="DIR",
                         help="Exact output directory (skip auto rerun_* naming).")
-    parser.add_argument(
-        "--true-optima-json", default=None, metavar="PATH",
-        help="Override reference optima for metrics/plots (run_config-style JSON). "
-             f"Canonical trial-112 set: {TRIAL112_REFERENCE_OPTIMA}",
-    )
     args = parser.parse_args()
 
     if args.num_runs < 1:
@@ -1278,8 +1257,6 @@ def main() -> None:
         print(f"source: {runs_path}")
     if args.config:
         print(f"config: {os.path.abspath(args.config)}")
-    if args.true_optima_json:
-        print(f"true_optima: {os.path.abspath(args.true_optima_json)}")
     print(f"output: {eval_dir}")
     print("=" * 72)
 
