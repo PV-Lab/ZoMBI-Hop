@@ -120,7 +120,7 @@ def optima_count_range(dim: int) -> tuple[int, int]:
     return (5 * dim, 15 * dim)
 
 
-def random_ensemble_config(dim: int, rng, *, optima_margin: float = 0.2) -> dict:
+def random_ensemble_config(dim: int, rng, *, optima_margin: float = 0.1) -> dict:
     """Draw a random :class:`Ensemble` configuration for one run.
 
     Mirrors the "Randomize" button in ``synthetic_data/plot_ensemble.py`` — the
