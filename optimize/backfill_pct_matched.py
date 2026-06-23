@@ -16,7 +16,6 @@ from eval_metrics import (
     metric_dist_to_needles,
     metric_dup_fraction,
     metric_pct_matched_comp,
-    metric_pct_matched_ilr,
 )
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -214,7 +213,6 @@ def metrics_for_run_dir(run_dir: Path) -> dict[str, float] | None:
         "dist_to_needles": round(metric_dist_to_needles(discovered, optima, dim=dim), 6),
         "dup_fraction": round(metric_dup_fraction(X_all, dim=dim), 6),
         "pct_matched_comp": round(metric_pct_matched_comp(discovered, optima, dim=dim), 4),
-        "pct_matched_ilr": round(metric_pct_matched_ilr(discovered, optima, dim=dim), 4),
         "pct_matched": round(metric_pct_matched_comp(discovered, optima, dim=dim), 4),
     }
 
@@ -244,7 +242,7 @@ def backfill_metrics_over_time_csv(path: Path, run_dir: Path) -> bool:
     if mot.empty or "iteration" not in mot.columns:
         return False
 
-    for col in ("pct_matched_comp", "pct_matched_ilr", "pct_matched"):
+    for col in ("pct_matched_comp", "pct_matched"):
         if col not in mot.columns:
             mot[col] = np.nan
 
@@ -258,14 +256,12 @@ def backfill_metrics_over_time_csv(path: Path, run_dir: Path) -> bool:
             disc = sub[coord_cols].to_numpy(dtype=float)
         dist = round(metric_dist_to_needles(disc, optima, dim=dim), 6)
         pct_comp = round(metric_pct_matched_comp(disc, optima, dim=dim), 4)
-        pct_ilr = round(metric_pct_matched_ilr(disc, optima, dim=dim), 4)
         apd = round(metric_avg_pairwise_dist(disc), 6)
         if row.get("dist_to_needles") != dist:
             mot.at[idx, "dist_to_needles"] = dist
             changed = True
         for col, val in (
             ("pct_matched_comp", pct_comp),
-            ("pct_matched_ilr", pct_ilr),
             ("pct_matched", pct_comp),
         ):
             if row.get(col) != val:
@@ -316,7 +312,7 @@ def backfill_rerun_summary(path: Path, *, dry_run: bool = False) -> bool:
     changed = False
     root = path.parent
     metric_keys = ("dist_to_needles", "dup_fraction",
-                   "pct_matched_comp", "pct_matched_ilr", "pct_matched")
+                   "pct_matched_comp", "pct_matched")
     for trial in summary.get("trials", []):
         trial_num = trial.get("trial")
         if trial_num is None:

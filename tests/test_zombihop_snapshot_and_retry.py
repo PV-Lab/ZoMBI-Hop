@@ -184,7 +184,7 @@ def test_successive_demotion_stops_when_needles_exhausted(torch):
             self.needle_vals = torch.tensor([[1.0]], dtype=dtype, device=device)
             # Empty M list → _all_needle_axes_below_min returns True immediately
             self.needle_M_list = []
-            self.input_noise_ilr = 0.03
+            self.input_noise = 0.01
             self.max_gp_points = 100
 
         def get_iteration_state(self):

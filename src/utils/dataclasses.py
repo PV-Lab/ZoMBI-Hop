@@ -24,7 +24,7 @@ class ZoMBIHopConfig:
     raw: int = 500
 
     # Penalization parameters
-    max_penalty_radius: float = 1.0  # Max ellipsoid semi-axis in ILR space
+    max_penalty_radius: float = 1.0  # Max ellipsoid semi-axis in tangent space
 
     # Acquisition-guided trust-ellipsoid optimisation (after each needle is found)
     bounds_opt_steps: int = 200
@@ -57,13 +57,14 @@ class ZoMBIHopConfig:
     nat_grad_max_steps: int = 50
 
     # Point paring (deduplicate near-identical observations before GP fitting)
-    paring_spatial_halfnoise: float = 0.5   # spatial threshold = factor × input_noise_ilr
+    paring_spatial_halfnoise: float = 0.5   # spatial threshold = factor × input_noise
     paring_y_noise_multiplier: float = 1.0  # Y threshold = factor × GP output noise
-    input_noise_ilr: float = 0.03           # known input noise std in ILR space
+    input_noise: float = 0.01               # known input noise std per composition component (before renorm)
+    input_noise_ilr: Optional[float] = None  # deprecated; converted to input_noise when loading old configs
 
     # Needle-ellipsoid shrink on repeated failure
     needle_shrink_factor: float = 0.85          # per-step exclusion-radius fraction
-    needle_stop_noise_multiplier: float = 3.0   # stop when all axes < factor × input_noise_ilr
+    needle_stop_noise_multiplier: float = 3.0   # stop when all axes < factor × input_noise
 
     # Jaccard sliding-window bounds
     jaccard_window: int = 3          # number of recent bounds to compare against
@@ -86,6 +87,8 @@ class ZoMBIHopConfig:
         """Create config from dictionary."""
         known_fields = {f.name for f in ZoMBIHopConfig.__dataclass_fields__.values()}
         filtered_data = {k: v for k, v in data.items() if k in known_fields}
+        if 'input_noise' not in filtered_data and data.get('input_noise_ilr') is not None:
+            filtered_data['input_noise'] = float(data['input_noise_ilr']) / 3.0
         return cls(**filtered_data)
 
     def get_torch_dtype(self) -> torch.dtype:
@@ -151,7 +154,8 @@ class Checkpoint:
     zoom_ellipsoid_eps: float = 1e-4
     paring_spatial_halfnoise: float = 0.5
     paring_y_noise_multiplier: float = 1.0
-    input_noise_ilr: float = 0.03
+    input_noise: float = 0.01
+    input_noise_ilr: Optional[float] = None
     needle_shrink_factor: float = 0.85
     needle_stop_noise_multiplier: float = 3.0
     device: str = 'cuda'

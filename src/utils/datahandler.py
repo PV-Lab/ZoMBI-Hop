@@ -26,8 +26,7 @@ from .dataclasses import ZoMBIHopConfig
 from .simplex import (
     Ellipsoid,
     proj_simplex,
-    composition_to_ilr,
-    ilr_to_composition,
+    get_tangent_basis,
 )
 
 
@@ -94,7 +93,8 @@ class DataHandler:
         # --- Point paring ---
         paring_spatial_halfnoise: float = 0.5,
         paring_y_noise_multiplier: float = 1.0,
-        input_noise_ilr: float = 0.03,
+        input_noise: Optional[float] = None,
+        input_noise_ilr: Optional[float] = None,
         # --- Jaccard sliding-window bounds ---
         jaccard_window: int = 3,
         jaccard_threshold: float = 0.9,
@@ -122,7 +122,10 @@ class DataHandler:
             nat_grad_max_steps = getattr(cfg, 'nat_grad_max_steps', nat_grad_max_steps)
             paring_spatial_halfnoise = getattr(cfg, 'paring_spatial_halfnoise', paring_spatial_halfnoise)
             paring_y_noise_multiplier = getattr(cfg, 'paring_y_noise_multiplier', paring_y_noise_multiplier)
-            input_noise_ilr = getattr(cfg, 'input_noise_ilr', input_noise_ilr)
+            if getattr(cfg, 'input_noise', None) is not None:
+                input_noise = cfg.input_noise
+            elif getattr(cfg, 'input_noise_ilr', None) is not None:
+                input_noise = cfg.input_noise_ilr / 3.0
 
         # --- Store all control variables as plain attributes ---
         self.max_zooms = max_zooms
@@ -144,7 +147,12 @@ class DataHandler:
         # Point paring
         self.paring_spatial_halfnoise = float(paring_spatial_halfnoise)
         self.paring_y_noise_multiplier = float(paring_y_noise_multiplier)
-        self.input_noise_ilr = float(input_noise_ilr)
+        if input_noise is not None:
+            self.input_noise = float(input_noise)
+        elif input_noise_ilr is not None:
+            self.input_noise = float(input_noise_ilr) / 3.0
+        else:
+            self.input_noise = 0.01
 
         # Jaccard sliding-window
         self.jaccard_window = int(jaccard_window)
@@ -317,6 +325,8 @@ class DataHandler:
             'ucb_beta': self.ucb_beta,
             'nat_grad_step': self.nat_grad_step,
             'nat_grad_max_steps': self.nat_grad_max_steps,
+            'input_noise': self.input_noise,
+            'paring_spatial_halfnoise': self.paring_spatial_halfnoise,
             'device': str(self.device),
             'dtype': str(self.dtype),
         }
@@ -990,8 +1000,11 @@ class DataHandler:
 
         # Store ellipsoid (or None for sphere fallback)
         self.needle_M_list.append(M.to(device=self.device, dtype=self.dtype) if M is not None else None)
-        if B is not None:
-            self.needle_B = B.to(device=self.device, dtype=self.dtype)
+        if M is not None:
+            if B is not None:
+                self.needle_B = B.to(device=self.device, dtype=self.dtype)
+            elif self.needle_B is None:
+                self.needle_B = get_tangent_basis(self.d, self.device, self.dtype)
 
         self.needles_results.append({
             'point': needle.clone(),
@@ -1066,23 +1079,12 @@ class DataHandler:
 
         # --- Regular needles ---
         if self.needles is not None and self.needles.shape[0] > 0:
-            # ILR mode: needle_B is None, M matrices live in ILR space.
-            use_ilr = self.needle_B is None and any(M is not None for M in self.needle_M_list)
-            X_ilr = composition_to_ilr(X_flat.to(dtype=torch.float64)) if use_ilr else None
-
             for idx in range(self.needles.shape[0]):
                 needle = self.needles[idx]  # (d,)
                 diff = X_flat - needle.unsqueeze(0)  # (num_pts, d)
 
                 M = self.needle_M_list[idx] if idx < len(self.needle_M_list) else None
-                if M is not None and use_ilr:
-                    # ILR-space ellipsoid: delta_z = ilr(x) - ilr(needle)
-                    needle_ilr = composition_to_ilr(needle.unsqueeze(0).to(dtype=torch.float64))
-                    delta_z = X_ilr - needle_ilr          # (num_pts, d-1)
-                    quad = (delta_z @ M * delta_z).sum(dim=-1)
-                    inside = quad <= 1.0
-                elif M is not None and self.needle_B is not None:
-                    # Legacy tangent-space ellipsoid
+                if M is not None and self.needle_B is not None:
                     u = diff @ self.needle_B
                     quad = (u @ M * u).sum(dim=-1)
                     inside = quad <= 1.0
@@ -1239,7 +1241,7 @@ class DataHandler:
 
     def _relabel_pared_with_medians(self) -> None:
         """Replace each pared Y with the median of all Y_all values whose X_all
-        lies within paring_spatial_halfnoise * input_noise_ilr in ILR space.
+        lies within paring_spatial_halfnoise * input_noise in composition L2.
 
         Smooths noise spikes so the GP always trains on a clean, representative
         signal.  Called once after each activation completes.
@@ -1249,19 +1251,12 @@ class DataHandler:
         if self.X_all_actual is None or self.X_all_actual.shape[0] == 0:
             return
 
-        thresh = self.paring_spatial_halfnoise * self.input_noise_ilr
-        X_pared_ilr = composition_to_ilr(
-            self.X_pared.to(dtype=torch.float64)
-        ).to(dtype=self.dtype)
-        X_all_ilr = composition_to_ilr(
-            self.X_all_actual.to(dtype=torch.float64)
-        ).to(dtype=self.dtype)
-
+        thresh = self.paring_spatial_halfnoise * self.input_noise
         Y_new = self.Y_pared.clone()
         changed = False
         _t0 = time.time()
         for i in range(self.X_pared.shape[0]):
-            dists = torch.norm(X_all_ilr - X_pared_ilr[i].unsqueeze(0), dim=1)
+            dists = torch.norm(self.X_all_actual - self.X_pared[i].unsqueeze(0), dim=1)
             nearby = dists <= thresh
             if nearby.any():
                 median_y = self.Y_all[nearby].reshape(-1).median()
@@ -1290,7 +1285,7 @@ class DataHandler:
         """Incrementally add new UNPENALIZED points to the pared (noise-deduplicated) dataset.
 
         For each new point, if a near-duplicate already exists in the pared set
-        (within half the ILR noise distance AND within one output-noise unit),
+        (within half the composition noise distance AND within one output-noise unit),
         we flip a fair coin: keep the old point or replace it with the new one.
         Equal probability avoids biasing toward noise spikes.
         If no near-duplicate exists, the point is added unconditionally.
@@ -1298,7 +1293,7 @@ class DataHandler:
         Penalized points are never added — they must not influence GP training
         or corrupt deduplication for unpenalized points near ellipsoid boundaries.
 
-        Distances are computed in ILR space to match the GP's metric.
+        Distances are computed in composition L2 to match the GP's ambient metric.
         """
         if X_new.shape[0] == 0:
             return
@@ -1317,16 +1312,14 @@ class DataHandler:
             Y_new = Y_new[unpen]
 
         # Paring thresholds (both in their natural units after normalization)
-        spatial_thresh = self.paring_spatial_halfnoise * self.input_noise_ilr
+        spatial_thresh = self.paring_spatial_halfnoise * self.input_noise
         y_thresh = self.paring_y_noise_multiplier * max(self._gp_output_noise, 1e-6)
 
         d = X_new.shape[1]
         min_pts = max(2 * (d - 1), 5)
 
-        X_new_ilr = composition_to_ilr(X_new)  # (n, d-1)
-
         for i in range(X_new.shape[0]):
-            x_ilr_i = X_new_ilr[i]
+            x_i = X_new[i]
             y_i = Y_new[i, 0].item()
 
             if self.X_pared is None or self.X_pared.shape[0] == 0:
@@ -1335,8 +1328,7 @@ class DataHandler:
                 self._pared_version += 1
                 continue
 
-            X_pared_ilr = composition_to_ilr(self.X_pared)
-            dists = torch.norm(X_pared_ilr - x_ilr_i.unsqueeze(0), dim=1)
+            dists = torch.norm(self.X_pared - x_i.unsqueeze(0), dim=1)
             y_diffs = torch.abs(self.Y_pared.reshape(-1) - y_i)
             is_dup = (dists < spatial_thresh) & (y_diffs < y_thresh)
 
@@ -1465,7 +1457,7 @@ class DataHandler:
         self._update_penalty_mask()
 
     def max_needle_radius(self) -> float:
-        """Return the largest semi-axis (in ILR units) across all active needles."""
+        """Return the largest semi-axis (in tangent/composition units) across all active needles."""
         max_r = 0.0
         for M in self.needle_M_list:
             if M is None:

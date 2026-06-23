@@ -16,7 +16,6 @@ from botorch.utils.multi_objective.pareto import is_non_dominated
 # ─── Simulation / ZoMBI constants ─────────────────────────────────────────────
 
 NOISE_LEVEL = 0.01
-NOISE_LEVEL_ILR = 0.03
 NUM_EXPERIMENTS = 24
 NUM_LINES = 10
 N_INIT_LINES = 2
@@ -24,7 +23,7 @@ N_INIT_LINES = 2
 ZOMBI_FIXED = dict(
     max_gp_points=3000,
     acquisition_type="ucb",
-    input_noise_ilr=NOISE_LEVEL_ILR,
+    input_noise=NOISE_LEVEL,
     verbose=False,
 )
 

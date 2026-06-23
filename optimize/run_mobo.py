@@ -217,8 +217,7 @@ from src.core.linebo import line_simplex_segment, zero_sum_dirs
 from src.utils.simplex import (
     Ellipsoid,
     random_simplex,
-    composition_to_ilr,
-    ilr_to_composition,
+    add_composition_noise,
     proj_simplex,
 )
 
@@ -253,7 +252,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE  = torch.float64
 
 NOISE_LEVEL     = 0.01
-NOISE_LEVEL_ILR = 0.03
 NUM_EXPERIMENTS = 24
 NUM_LINES       = 10
 N_INIT_LINES    = 2
@@ -271,7 +269,7 @@ ENSEMBLE_N_REPEATS = 5
 # Per-trial wall-clock budget (hours) passed to ZoMBIHop.run(time_limit_hours=…).
 TIME_LIMIT_HOURS = 0.4
 
-# Needle-match / duplicate thresholds: see optimize/eval_metrics.py (ILR, dim-scaled).
+# Needle-match / duplicate thresholds: see optimize/eval_metrics.py.
 
 # Resumability: abort the overnight run only after this many trials fail back-to-back
 # (guards against a runaway loop on a systemic failure; transient failures just retry).
@@ -281,7 +279,7 @@ MAX_CONSEC_FAIL = 5
 ZOMBI_FIXED = dict(
     max_gp_points=3000,
     acquisition_type="ucb",
-    input_noise_ilr=NOISE_LEVEL_ILR,
+    input_noise=NOISE_LEVEL,
     verbose=False,
 )
 
@@ -1366,14 +1364,11 @@ from eval_metrics import (  # noqa: E402  — after sys.path setup in callers
     MATCH_RADIUS,
     UNMATCHED_PENALTY,
     as_numpy,
-    dup_threshold_ilr,
-    match_radius_ilr,
     metric_avg_pairwise_dist,
     metric_dist_to_needles,
     metric_dup_fraction,
     metric_pct_matched,
     metric_pct_matched_comp,
-    metric_pct_matched_ilr,
 )
 # ─── ZoMBI sim-objective + LineBO wrapper ──────────────────────────────────────
 
@@ -1386,9 +1381,7 @@ def make_sim_obj(fn_callable, device, dtype, *, maximize: bool):
         t     = torch.linspace(0.0, 1.0, NUM_EXPERIMENTS,
                                dtype=torch.float64, device=left.device)
         pts_t = left.unsqueeze(0) + t.unsqueeze(1) * (right - left).unsqueeze(0)
-        z     = composition_to_ilr(pts_t)
-        z     = z + torch.randn_like(z) * NOISE_LEVEL_ILR
-        pts_t = ilr_to_composition(z, d=pts_t.shape[1])
+        pts_t = add_composition_noise(pts_t, NOISE_LEVEL)
         pts_np = pts_t.detach().cpu().numpy()
         raw    = np.array([fn_callable(x) for x in pts_np], dtype=float)
         y      = torch.tensor(raw if maximize else -raw, dtype=dtype, device=device)
@@ -1447,9 +1440,7 @@ def _gen_init_data(fn_callable, maximize: bool, dim: int = 3):
         t     = torch.linspace(0.0, 1.0, NUM_EXPERIMENTS, dtype=torch.float64, device=DEVICE)
         pts_t = (x_left.to(torch.float64).unsqueeze(0)
                  + t.unsqueeze(1) * (x_right - x_left).to(torch.float64).unsqueeze(0))
-        z     = composition_to_ilr(pts_t)
-        z     = z + torch.randn_like(z) * NOISE_LEVEL_ILR
-        pts_t = ilr_to_composition(z, d=dim)
+        pts_t = add_composition_noise(pts_t, NOISE_LEVEL)
         pts_np = pts_t.detach().cpu().numpy()
         raw    = np.array([fn_callable(x) for x in pts_np], dtype=float)
         y_t    = torch.tensor(raw if maximize else -raw, dtype=DTYPE, device=DEVICE)
@@ -1516,10 +1507,7 @@ def _draw_needle_ellipsoid(ax, needle_x, M, B) -> None:
             B_np = as_numpy(B, dtype=float)
             ell_pts = needle_x.reshape(1, d) + (B_np @ u_ell.T).T
         else:
-            needle_t = torch.tensor(needle_x, dtype=torch.float64)
-            needle_ilr = composition_to_ilr(needle_t.unsqueeze(0)).squeeze(0).cpu().numpy()
-            z_ell = needle_ilr + u_ell
-            ell_pts = ilr_to_composition(torch.tensor(z_ell, dtype=torch.float64), d).cpu().numpy()
+            return
         ell_pts = np.clip(ell_pts, 0, 1)
         s = ell_pts.sum(axis=1, keepdims=True)
         ell_pts = ell_pts / np.where(s < 1e-9, 1.0, s)
@@ -1751,13 +1739,12 @@ def write_metrics_over_time_csv(path: str, payloads: list[dict], X_all: np.ndarr
             "dist_to_needles":  round(metric_dist_to_needles(disc, true_optima, dim=dim), 6),
             "dup_fraction":     round(metric_dup_fraction(X_upto, dim=dim), 6),
             "pct_matched_comp": round(metric_pct_matched_comp(disc, true_optima, dim=dim), 4),
-            "pct_matched_ilr":  round(metric_pct_matched_ilr(disc, true_optima, dim=dim), 4),
             "pct_matched":      round(metric_pct_matched_comp(disc, true_optima, dim=dim), 4),
             "avg_pairwise_dist":round(metric_avg_pairwise_dist(disc), 6),
             "recent_needle_value": (round(recent, 6) if not math.isnan(recent) else np.nan),
         })
     cols = ["iteration", "dist_to_needles", "dup_fraction",
-            "pct_matched_comp", "pct_matched_ilr", "pct_matched",
+            "pct_matched_comp", "pct_matched",
             "avg_pairwise_dist", "recent_needle_value"]
     pd.DataFrame(rows, columns=cols).to_csv(path, index=False)
 

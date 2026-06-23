@@ -535,9 +535,7 @@ def gen_init_data(fn_callable, maximize: bool, dim: int):
         t = torch.linspace(0.0, 1.0, rm.NUM_EXPERIMENTS, dtype=torch.float64, device=rm.DEVICE)
         pts_t = (x_left.to(torch.float64).unsqueeze(0)
                  + t.unsqueeze(1) * (x_right - x_left).to(torch.float64).unsqueeze(0))
-        z = rm.composition_to_ilr(pts_t)
-        z = z + torch.randn_like(z) * rm.NOISE_LEVEL_ILR
-        pts_t = rm.ilr_to_composition(z, d=dim)
+        pts_t = rm.add_composition_noise(pts_t, rm.NOISE_LEVEL)
         pts_np = pts_t.detach().cpu().numpy()
         raw = np.array([fn_callable(x) for x in pts_np], dtype=float)
         y_t = torch.tensor(raw if maximize else -raw, dtype=rm.DTYPE, device=rm.DEVICE)
@@ -698,8 +696,7 @@ def save_convergence_metrics_plot(
         ax.grid(True, alpha=0.3)
 
     has_comp = "pct_matched_comp" in df.columns or "pct_matched" in df.columns
-    has_ilr = "pct_matched_ilr" in df.columns
-    if (has_comp or has_ilr) and used < len(axes.flat):
+    if has_comp and used < len(axes.flat):
         pct_axes = axes.flat[used]
         if "pct_matched_comp" in df.columns:
             pct_axes.plot(df["iteration"], df["pct_matched_comp"],
@@ -707,9 +704,6 @@ def save_convergence_metrics_plot(
         elif "pct_matched" in df.columns:
             pct_axes.plot(df["iteration"], df["pct_matched"],
                           color="seagreen", label=f"comp ≤ {rm.MATCH_RADIUS} (legacy)")
-        if has_ilr:
-            pct_axes.plot(df["iteration"], df["pct_matched_ilr"],
-                          color="darkcyan", label="ILR (scaled)")
         pct_axes.set_xlabel("Iteration")
         pct_axes.set_ylabel("Pct matched")
         pct_axes.set_title("Pct Needles Matching True Optimum")
@@ -840,9 +834,8 @@ def run_single_eval(
     dist = rm.metric_dist_to_needles(discovered, true_optima, dim=dim)
     dup = rm.metric_dup_fraction(X_all_np, dim=dim)
     pct_comp = rm.metric_pct_matched_comp(discovered, true_optima, dim=dim)
-    pct_ilr = rm.metric_pct_matched_ilr(discovered, true_optima, dim=dim)
     print(f"      [run]  iters={call_counter[0]}  dist={dist:.4f}  dup={dup:.4f}"
-          f"  pct_comp={pct_comp:.2f}  pct_ilr={pct_ilr:.2f}  t={runtime:.1f}s"
+          f"  pct_comp={pct_comp:.2f}  t={runtime:.1f}s"
           f"  needles={len(discovered)}/{len(true_optima)}")
 
     try:
@@ -908,7 +901,6 @@ def run_single_eval(
         "dist_to_needles": round(dist, 6),
         "dup_fraction": round(dup, 6),
         "pct_matched_comp": round(pct_comp, 4),
-        "pct_matched_ilr": round(pct_ilr, 4),
         "pct_matched": round(pct_comp, 4),
         "runtime_s": round(runtime, 3),
         "landscape_config": ds.get("landscape_config"),
@@ -919,7 +911,7 @@ def run_single_eval(
         raise KeyboardInterrupt
     return {
         "dist": dist, "dup": dup,
-        "pct_comp": pct_comp, "pct_ilr": pct_ilr, "pct": pct_comp,
+        "pct_comp": pct_comp, "pct": pct_comp,
         "runtime": runtime,
     }
 
@@ -941,7 +933,7 @@ def write_summary(path: str, per_trial: dict) -> None:
         entry = {"trial": trial_num, "n_runs": len(runs), "runs": runs}
         if runs:
             for key in ("dist_to_needles", "dup_fraction",
-                        "pct_matched_comp", "pct_matched_ilr", "pct_matched", "runtime_s"):
+                        "pct_matched_comp", "pct_matched", "runtime_s"):
                 entry[key] = _agg([r[key] for r in runs])
         summary["trials"].append(entry)
     with open(path, "w") as f:
@@ -1130,7 +1122,6 @@ def evaluate_dataset(
                     "dist_to_needles": round(res["dist"], 6),
                     "dup_fraction": round(res["dup"], 6),
                     "pct_matched_comp": round(res["pct_comp"], 4),
-                    "pct_matched_ilr": round(res["pct_ilr"], 4),
                     "pct_matched": round(res["pct_comp"], 4),
                     "runtime_s": round(res["runtime"], 3),
                 })

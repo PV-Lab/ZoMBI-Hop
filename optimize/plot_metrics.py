@@ -59,8 +59,7 @@ def plot_metrics(csv_path: str, log_x: bool = False, log_y: bool = False,
         ax.grid(True, alpha=0.3)
 
     has_comp = "pct_matched_comp" in df.columns or "pct_matched" in df.columns
-    has_ilr = "pct_matched_ilr" in df.columns
-    if (has_comp or has_ilr) and used < len(axes.flat):
+    if has_comp and used < len(axes.flat):
         pct_axes = axes.flat[used]
         if "pct_matched_comp" in df.columns:
             pct_axes.plot(df["iteration"], df["pct_matched_comp"],
@@ -68,9 +67,6 @@ def plot_metrics(csv_path: str, log_x: bool = False, log_y: bool = False,
         elif "pct_matched" in df.columns:
             pct_axes.plot(df["iteration"], df["pct_matched"],
                           color="seagreen", label=f"comp ≤ {MATCH_RADIUS} (legacy)")
-        if has_ilr:
-            pct_axes.plot(df["iteration"], df["pct_matched_ilr"],
-                          color="darkcyan", label="ILR (scaled)")
         pct_axes.set_xlabel("Iteration")
         pct_axes.set_ylabel("Pct matched")
         pct_axes.set_title("Pct Needles Matching True Optimum")

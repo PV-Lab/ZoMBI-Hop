@@ -16,7 +16,6 @@ from ..utils.simplex import (
     random_simplex,
     random_zero_sum_directions,
     Ellipsoid,
-    composition_to_ilr,
 )
 from ..utils.datahandler import DataHandler
 from ..utils.gp_simplex import GPSimplex
@@ -115,7 +114,8 @@ class ZoMBIHop:
                  max_penalty_radius: float = 1.0,
                  paring_spatial_halfnoise: float = 0.5,
                  paring_y_noise_multiplier: float = 1.0,
-                 input_noise_ilr: float = 0.03,
+                 input_noise: float = 0.01,
+                 input_noise_ilr: Optional[float] = None,
                  needle_shrink_factor: float = 0.85,
                  needle_stop_noise_multiplier: float = 3.0,
                  zoom_jaccard_threshold: float = 0.75,
@@ -191,6 +191,7 @@ class ZoMBIHop:
             d=d,
             paring_spatial_halfnoise=paring_spatial_halfnoise,
             paring_y_noise_multiplier=paring_y_noise_multiplier,
+            input_noise=input_noise,
             input_noise_ilr=input_noise_ilr,
             jaccard_window=jaccard_window,
             jaccard_threshold=jaccard_threshold,
@@ -267,8 +268,8 @@ class ZoMBIHop:
         return self.data_handler.d
 
     def _all_needle_axes_below_min(self, dh) -> bool:
-        """True when every semi-axis is below min_axis_noise_mult × input_noise_ilr."""
-        threshold = self.min_axis_noise_mult * dh.input_noise_ilr
+        """True when every semi-axis is below min_axis_noise_mult × input_noise."""
+        threshold = self.min_axis_noise_mult * dh.input_noise
         if threshold <= 0:
             return False
         for M in dh.needle_M_list:
@@ -378,10 +379,8 @@ class ZoMBIHop:
             return None
 
         # Median Y of all raw observations within the paring spatial distance
-        thresh_ilr = dh.paring_spatial_halfnoise * dh.input_noise_ilr
-        needle_ilr = composition_to_ilr(needle_X.unsqueeze(0).to(dtype=torch.float64)).to(dtype=self.dtype)
-        all_ilr   = composition_to_ilr(dh.X_all_actual.to(dtype=torch.float64)).to(dtype=self.dtype)
-        nearby    = torch.norm(all_ilr - needle_ilr, dim=1) <= thresh_ilr
+        thresh = dh.paring_spatial_halfnoise * dh.input_noise
+        nearby = torch.norm(dh.X_all_actual - needle_X.unsqueeze(0), dim=1) <= thresh
         needle_median = dh.Y_all[nearby].reshape(-1).median().item() if nearby.any() else float('nan')
 
         self._log(

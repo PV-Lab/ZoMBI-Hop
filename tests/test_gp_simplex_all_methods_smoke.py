@@ -122,7 +122,7 @@ def test_gp_simplex_all_methods_smoke(torch, monkeypatch):
     assert B.shape == (3, 2)
     M, B2 = gp.determine_penalty_ellipsoid(X[0], drop_fraction=0.25, eigenvalue_floor=1e-6)
     assert M.shape == (2, 2)
-    assert B2 is None  # ILR mode: no tangent basis needed
+    assert B2 is not None and B2.shape == (3, 2)
 
     # get_candidate exercises _optimize_acquisition internally
     cand = gp.get_candidate(bounds=dh.bounds, best_f=float(Y.max().item()), max_attempts=1)

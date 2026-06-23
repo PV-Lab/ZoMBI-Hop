@@ -15,35 +15,32 @@ from botorch.fit import fit_gpytorch_mll
 from botorch.acquisition import LogExpectedImprovement, UpperConfidenceBound
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.utils.errors import NotPSDError
-from torch.autograd import grad
 from typing import Literal, Optional, Tuple, Callable, List
 
-from .simplex import proj_simplex, random_simplex, Ellipsoid, composition_to_ilr, ilr_to_composition
+from .simplex import proj_simplex, random_simplex, Ellipsoid
 from .datahandler import DataHandler
 
 
-class ILRWrappedAcquisition(nn.Module):
+class CompWrappedAcquisition(nn.Module):
     """
-    Wraps a BoTorch acquisition trained in ILR space.
+    Wraps a BoTorch acquisition trained on normalized composition coordinates.
 
-    Accepts simplex inputs (..., d), transforms to ILR (..., d-1) before
-    calling the underlying BoTorch acquisition.  All outer code (RepulsiveAcquisition,
-    nat-grad, seeding) continues to pass d-dimensional simplex coordinates.
+    Accepts simplex inputs (..., d), divides by per-dimension training std before
+    calling the underlying BoTorch acquisition.
     """
 
-    def __init__(self, base: nn.Module, ilr_std: Optional[torch.Tensor] = None):
+    def __init__(self, base: nn.Module, comp_std: Optional[torch.Tensor] = None):
         super().__init__()
         self.base = base
-        self.ilr_std = ilr_std  # (d-1,) or None; divides raw ILR before passing to BoTorch
+        self.comp_std = comp_std  # (d,) or None
 
     def forward(self, Xq: torch.Tensor) -> torch.Tensor:
         shape = Xq.shape
         d = shape[-1]
         x_flat = Xq.reshape(-1, d)
-        x_ilr = composition_to_ilr(x_flat)          # (N, d-1)
-        if self.ilr_std is not None:
-            x_ilr = x_ilr / self.ilr_std
-        return self.base(x_ilr.reshape(*shape[:-1], d - 1))
+        if self.comp_std is not None:
+            x_flat = x_flat / self.comp_std
+        return self.base(x_flat.reshape(*shape))
 
 
 class RepulsiveAcquisition(nn.Module):
@@ -69,8 +66,8 @@ class RepulsiveAcquisition(nn.Module):
     repulsion_lambda : float
         Strength of repulsion penalty. Default: 1000.0.
     needle_M_list : list of (torch.Tensor or None), optional
-        Per-needle (d-1, d-1) Mahalanobis matrix. None entries fall back to
-        Euclidean sphere repulsion.
+        Per-needle (d-1, d-1) Mahalanobis matrix in tangent space. None entries
+        fall back to Euclidean sphere repulsion.
     needle_B : torch.Tensor or None, optional
         Shared (d, d-1) tangent basis for all ellipsoid needles.
     boundary_epsilon : float
@@ -132,29 +129,16 @@ class RepulsiveAcquisition(nn.Module):
 
         # Needle repulsion
         if has_needles:
-            # ILR mode: needle_B is None, M matrices live in ILR space.
-            use_ilr = self.needle_B is None and any(M is not None for M in self.needle_M_list)
-            X_ilr = composition_to_ilr(X_flat) if use_ilr else None  # (B, d-1)
-
             for idx in range(self.needles.shape[0]):
                 needle = self.needles[idx]  # (d,)
+                diff = X_flat - needle.unsqueeze(0)  # (B, d)
                 M = self.needle_M_list[idx] if idx < len(self.needle_M_list) else None
 
-                if M is not None and use_ilr:
-                    # ILR-space ellipsoid: delta_z = ilr(x) - ilr(needle)
-                    needle_ilr = composition_to_ilr(needle.unsqueeze(0))  # (1, d-1)
-                    delta_z = X_ilr - needle_ilr                          # (B, d-1)
-                    quad = (delta_z @ M * delta_z).sum(dim=-1)            # (B,)
-                    violation = torch.clamp(1.0 - quad, min=0.0)
-                elif M is not None and self.needle_B is not None:
-                    # Legacy tangent-space ellipsoid
-                    diff = X_flat - needle.unsqueeze(0)
+                if M is not None and self.needle_B is not None:
                     u = diff @ self.needle_B
                     quad = (u @ M * u).sum(dim=-1)
                     violation = torch.clamp(1.0 - quad, min=0.0)
                 else:
-                    # Fallback: Euclidean sphere
-                    diff = X_flat - needle.unsqueeze(0)
                     r = self.penalty_radii[idx]
                     dist = torch.norm(diff, dim=-1)
                     violation = torch.clamp(r - dist, min=0.0)
@@ -162,7 +146,6 @@ class RepulsiveAcquisition(nn.Module):
                 total_violation = total_violation + violation ** 2
 
         # Boundary repulsion: exp-decay from each simplex face (x_i = 0)
-        # Uses the same repulsion_lambda; epsilon derived from input_noise_ilr.
         if has_boundary:
             boundary_terms = torch.exp(-X_flat / self.boundary_epsilon).sum(dim=-1)  # (B,)
             total_violation = total_violation + boundary_terms
@@ -247,7 +230,7 @@ class GPSimplex:
         self.acq_fn = None
         self._last_computed_lambda = None  # Track auto-computed lambda for logging
         self._tangent_basis: Optional[torch.Tensor] = None  # cached (d, d-1)
-        self.ilr_std: Optional[torch.Tensor] = None  # per-dimension ILR std from last fit
+        self.comp_std: Optional[torch.Tensor] = None  # per-dimension composition std from last fit
 
     _JITTER_SCHEDULE = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2]
 
@@ -258,21 +241,16 @@ class GPSimplex:
         Parameters
         ----------
         X : torch.Tensor
-            Training inputs (n, d).
+            Training inputs (n, d) on the simplex.
         Y : torch.Tensor
             Training outputs (n, 1).
         """
         X = X.to(device=self.device, dtype=self.dtype)
         Y = Y.to(device=self.device, dtype=self.dtype)
 
-        X_ilr = composition_to_ilr(X)
-        # std(dim=0) is NaN for a single training point (unbiased std divides by
-        # n-1 = 0), and clamp() does NOT rescue NaN — normalising by it would
-        # poison the GP with NaNs. Fall back to unit scale when there is no spread
-        # (single pared point), so the GP still fits instead of erroring.
-        ilr_std = torch.nan_to_num(X_ilr.std(dim=0), nan=1.0).clamp(min=1e-3)
-        self.ilr_std = ilr_std
-        X_norm = X_ilr / ilr_std
+        comp_std = torch.nan_to_num(X.std(dim=0), nan=1.0).clamp(min=1e-3)
+        self.comp_std = comp_std
+        X_norm = X / comp_std
 
         _t0 = time.time()
         last_exc: Exception | None = None
@@ -305,6 +283,12 @@ class GPSimplex:
         X, Y = self.data_handler.get_gp_data()
         self.fit(X, Y)
 
+    def _gp_inputs(self, X: torch.Tensor) -> torch.Tensor:
+        """Normalize compositions for GP / BoTorch acquisition evaluation."""
+        if self.comp_std is not None:
+            return X / self.comp_std
+        return X
+
     def predict(self, X: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Make predictions with the GP.
@@ -323,11 +307,9 @@ class GPSimplex:
             raise RuntimeError("GP not fitted. Call fit() first.")
 
         X = X.to(device=self.device, dtype=self.dtype)
-        x_ilr = composition_to_ilr(X)
-        if self.ilr_std is not None:
-            x_ilr = x_ilr / self.ilr_std
+        x_norm = self._gp_inputs(X)
         try:
-            posterior = self.gp.posterior(x_ilr)
+            posterior = self.gp.posterior(x_norm)
         except (NotPSDError, RuntimeError):
             mean = torch.zeros(X.shape[0], 1, device=self.device, dtype=self.dtype)
             var = torch.ones(X.shape[0], 1, device=self.device, dtype=self.dtype)
@@ -360,11 +342,9 @@ class GPSimplex:
             return 0.0
         x_2d = x.unsqueeze(0) if x.dim() == 1 else x
         with torch.no_grad():
-            x_ilr = composition_to_ilr(x_2d)
-            if self.ilr_std is not None:
-                x_ilr = x_ilr / self.ilr_std
+            x_norm = self._gp_inputs(x_2d)
             try:
-                posterior = self.gp.posterior(x_ilr)
+                posterior = self.gp.posterior(x_norm)
             except (NotPSDError, RuntimeError):
                 return 0.0
             mu = posterior.mean.squeeze().item()
@@ -392,20 +372,18 @@ class GPSimplex:
         if self.gp is None:
             return float('-inf')
         x_1d = x.reshape(-1)
-        x_ilr = composition_to_ilr(x_1d.unsqueeze(0))  # (1, d-1)
-        if self.ilr_std is not None:
-            x_ilr = x_ilr / self.ilr_std
-        x_ilr_3d = x_ilr.unsqueeze(0)  # (1, 1, d-1)
+        x_norm = self._gp_inputs(x_1d.unsqueeze(0))  # (1, d)
+        x_norm_3d = x_norm.unsqueeze(0)  # (1, 1, d)
         try:
             if self.acquisition_type == "ei":
                 base_acq = LogExpectedImprovement(self.gp, best_f=best_f)
                 with torch.no_grad():
-                    val = base_acq(x_ilr_3d).squeeze().item()
+                    val = base_acq(x_norm_3d).squeeze().item()
                 return val
             else:
                 base_acq = UpperConfidenceBound(self.gp, beta=self.ucb_beta)
                 with torch.no_grad():
-                    val = base_acq(x_ilr_3d).squeeze().item()
+                    val = base_acq(x_norm_3d).squeeze().item()
                 return val
         except (NotPSDError, RuntimeError):
             return float('-inf')
@@ -441,8 +419,7 @@ class GPSimplex:
                 best_f = Y.max().item()
             base_botorch = LogExpectedImprovement(self.gp, best_f=best_f)
 
-        # Wrap BoTorch acq (trained in ILR space) so outer code passes simplex coords
-        base_acq = ILRWrappedAcquisition(base_botorch, ilr_std=self.ilr_std)
+        base_acq = CompWrappedAcquisition(base_botorch, comp_std=self.comp_std)
 
         # Auto-compute repulsion_lambda if not provided
         if self.repulsion_lambda is None:
@@ -464,7 +441,7 @@ class GPSimplex:
             repulsion_lambda=computed_lambda,
             needle_M_list=needle_M_list,
             needle_B=needle_B,
-            boundary_epsilon=self.data_handler.input_noise_ilr,
+            boundary_epsilon=self.data_handler.input_noise,
         )
 
         return self.acq_fn
@@ -818,45 +795,37 @@ class GPSimplex:
         eigenvalue_floor: float = 1e-6,
         max_radius: float = 1.0,
         acq_fn: Optional[nn.Module] = None,
-    ) -> Tuple[torch.Tensor, None]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute the ellipsoidal penalty region via the ILR-space Hessian of the
-        base (unpenalized) acquisition function.
+        Compute the ellipsoidal penalty region via the tangent-space Hessian of the
+        base (unpenalized) acquisition function at the needle.
 
-        Returns (M, None) where a point x is inside the basin iff
-            delta_z = ilr(x) - ilr(needle),  delta_z^T M delta_z <= 1.
+        Returns (M, B) where a point x is inside the basin iff
+            u = B^T (x - needle),  u^T M u <= 1.
 
-        M is (d-1, d-1) in ILR space.  B is no longer used (the ILR
-        transformation replaces the linear tangent-space approximation).
-
-        The Hessian is evaluated at ilr(needle) in ILR space, which is the
-        native training space of the GP, giving curvature estimates that are
-        directly proportional to the GP kernel's lengthscale.
+        M is (d-1, d-1) in tangent space; B is the shared (d, d-1) basis.
         """
         d = needle.shape[0]
         needle = needle.detach().to(device=self.device, dtype=self.dtype)
+        B = self._get_tangent_basis(d)
 
         # Base (unpenalized) acquisition — avoids repulsion contaminating curvature.
         if acq_fn is not None:
-            base_acq = acq_fn  # caller-supplied clean ILRWrappedAcquisition
+            base_acq = acq_fn
         else:
             if self.acq_fn is None:
                 self.create_acquisition()
             base_acq = getattr(self.acq_fn, "base", self.acq_fn)
 
-        # ILR coordinates of the needle (the point at which we evaluate the Hessian).
-        needle_ilr = composition_to_ilr(needle.unsqueeze(0)).squeeze(0).detach()  # (d-1,)
+        u0 = torch.zeros(d - 1, device=self.device, dtype=self.dtype)
 
-        # f(z) = base_acq(ilr_to_composition(z))
-        # Since base_acq = ILRWrappedAcquisition(botorch_acq) internally does
-        # composition_to_ilr, the composition cancels and we obtain the BoTorch
-        # acquisition's Hessian directly in ILR space — the space it was trained in.
-        def tilde_alpha_ilr(z: torch.Tensor) -> torch.Tensor:
-            x = ilr_to_composition(z.unsqueeze(0), d).squeeze(0)
+        def tilde_alpha_u(u: torch.Tensor) -> torch.Tensor:
+            x = needle + u @ B.T
+            x = self.proj_fn(x.unsqueeze(0)).squeeze(0)
             return base_acq(x.view(1, 1, d)).squeeze()
 
         _t0 = time.time()
-        H = torch.autograd.functional.hessian(tilde_alpha_ilr, needle_ilr)  # (d-1, d-1)
+        H = torch.autograd.functional.hessian(tilde_alpha_u, u0)  # (d-1, d-1)
         if self.verbose:
             print(f"  [GP.ellipsoid] Hessian: {time.time()-_t0:.2f}s")
         neg_H = -0.5 * (H + H.T)
@@ -865,7 +834,7 @@ class GPSimplex:
         eigvals = eigvals.clamp(min=eigenvalue_floor)
 
         alpha_peak = abs(base_acq(needle.view(1, 1, d)).squeeze().item())
-        sigma = self.data_handler.get_input_noise()  # already in ILR-space units
+        sigma = self.data_handler.get_input_noise()
         lambda_max = eigvals.max().item()
 
         Delta_acq = drop_fraction * alpha_peak
@@ -885,7 +854,7 @@ class GPSimplex:
                   f"after: {[f'{r:.3f}' for r in radii_after]}")
         M = M_eigvecs @ torch.diag(M_eigvals_clamped) @ M_eigvecs.T
 
-        return M, None
+        return M, B
 
     def fit_with_locality(
         self,
@@ -898,7 +867,7 @@ class GPSimplex:
         """
         Fit GP to a local subset of data centered on needle.
 
-        Ranks all points by ILR-space distance from needle, takes all within
+        Ranks all points by composition L2 distance from needle, takes all within
         max_radius (padded to max_gp_points with nearest outside points if the
         inside set is too small).  Operates on the raw X_all/Y_all arrays —
         no penalisation filter — to avoid bias near the needle.
@@ -907,9 +876,7 @@ class GPSimplex:
         X_all = X_all.to(device=self.device, dtype=self.dtype)
         Y_all = Y_all.to(device=self.device, dtype=self.dtype)
 
-        needle_ilr = composition_to_ilr(needle.unsqueeze(0)).squeeze(0)  # (d-1,)
-        X_ilr = composition_to_ilr(X_all)                                 # (n, d-1)
-        dists = torch.norm(X_ilr - needle_ilr.unsqueeze(0), dim=1)        # (n,)
+        dists = torch.norm(X_all - needle.unsqueeze(0), dim=1)  # (n,)
 
         order = torch.argsort(dists)
         n_inside = int((dists <= max_radius).sum().item())
@@ -923,7 +890,7 @@ class GPSimplex:
 
     def create_clean_acquisition(self, best_f: Optional[float] = None) -> nn.Module:
         """
-        Return an ILRWrappedAcquisition with no RepulsiveAcquisition wrapper.
+        Return a CompWrappedAcquisition with no RepulsiveAcquisition wrapper.
 
         Suitable as the acq_fn argument to determine_penalty_ellipsoid so that
         curvature estimates are not contaminated by the repulsion penalty.
@@ -939,7 +906,7 @@ class GPSimplex:
                 best_f = Y.max().item()
             base_botorch = LogExpectedImprovement(self.gp, best_f=best_f)
 
-        return ILRWrappedAcquisition(base_botorch, ilr_std=self.ilr_std)
+        return CompWrappedAcquisition(base_botorch, comp_std=self.comp_std)
 
     def recompute_all_ellipsoids(
         self,
@@ -964,15 +931,16 @@ class GPSimplex:
         saved_gp = self.gp
         saved_mll = self.mll
         saved_acq = self.acq_fn
-        saved_ilr_std = self.ilr_std
+        saved_comp_std = self.comp_std
 
         M_list = []
+        B_shared = None
         try:
             for i in range(needles.shape[0]):
                 needle = needles[i]
                 self.fit_with_locality(needle, X_all, Y_all, max_radius, max_gp_points)
                 clean_acq = self.create_clean_acquisition()
-                M, _ = self.determine_penalty_ellipsoid(
+                M, B = self.determine_penalty_ellipsoid(
                     needle,
                     drop_fraction=drop_fraction,
                     eigenvalue_floor=eigenvalue_floor,
@@ -980,10 +948,14 @@ class GPSimplex:
                     acq_fn=clean_acq,
                 )
                 M_list.append(M)
+                B_shared = B
         finally:
             self.gp = saved_gp
             self.mll = saved_mll
             self.acq_fn = saved_acq
-            self.ilr_std = saved_ilr_std
+            self.comp_std = saved_comp_std
+
+        if B_shared is not None:
+            self.data_handler.needle_B = B_shared
 
         return M_list

@@ -82,7 +82,7 @@ _VALID_HPARAM_KEYS = {
     "repulsion_lambda", "acquisition_type", "ucb_beta", "nat_grad_step",
     "nat_grad_max_steps", "ellipsoid_drop_fraction", "ellipsoid_eigenvalue_floor",
     "max_penalty_radius", "paring_spatial_halfnoise", "paring_y_noise_multiplier",
-    "input_noise_ilr", "needle_shrink_factor", "needle_stop_noise_multiplier",
+    "input_noise", "needle_shrink_factor", "needle_stop_noise_multiplier",
     "zoom_jaccard_threshold", "bounds_shrink_factor", "min_axis_noise_mult",
     "jaccard_window", "jaccard_threshold",
 }

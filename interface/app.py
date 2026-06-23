@@ -58,14 +58,13 @@ except ImportError:
 
 from src import ZoMBIHop, LineBO
 from src.core.linebo import line_simplex_segment, zero_sum_dirs
-from src.utils.simplex import composition_to_ilr, ilr_to_composition, proj_simplex
+from src.utils.simplex import add_composition_noise, proj_simplex, get_tangent_basis
 from src.utils.datahandler import reconstruct_snapshot_tensors
 
 # ── constants ─────────────────────────────────────────────────────────────────
 DEVICE          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE           = torch.float64
-NOISE_LEVEL     = 0.01
-NOISE_LEVEL_ILR = 0.03
+NOISE_LEVEL = 0.01
 NUM_EXPERIMENTS = 24
 NUM_LINES       = 10
 N_INIT_LINES    = 2
@@ -145,9 +144,9 @@ HPARAM_CATEGORIES: dict[str, list[tuple]] = {
         ("ucb_beta",         "float", 0.1,  "UCB β",
          "Exploration–exploitation trade-off for UCB: higher β = more exploration. "
          "Ignored when acquisition_type is 'ei' or 'pi'."),
-        ("input_noise_ilr",  "float", 0.03, "Input noise (ILR)",
-         "Std dev of isotropic Gaussian noise added to inputs in ILR space at every "
-         "evaluation. Controls how spread-out the sampled line is around the suggested point."),
+        ("input_noise",  "float", 0.01, "Input noise (composition)",
+         "Std dev of isotropic Gaussian noise added to each composition component "
+         "before simplex reprojection at every evaluation."),
     ],
     "Zoom / Convergence": [
         ("max_zooms",                   "int",   3,    "Max zooms",
@@ -205,7 +204,7 @@ HPARAM_CATEGORIES: dict[str, list[tuple]] = {
     ],
     "Point Paring": [
         ("paring_spatial_halfnoise",  "float", 0.5, "Spatial halfnoise",
-         "Half-bandwidth (in units of input_noise_ilr) for spatial clustering when "
+         "Half-bandwidth (in units of input_noise) for spatial clustering when "
          "deduplicating repeated nearby measurements. Points within this radius "
          "are candidates for merging."),
         ("paring_y_noise_multiplier", "float", 1.0, "Y-noise mult",
@@ -275,9 +274,7 @@ def _make_sim_obj(fn_callable, device, dtype, *, maximize: bool):
         t     = torch.linspace(0.0, 1.0, NUM_EXPERIMENTS,
                                dtype=torch.float64, device=left.device)
         pts   = left.unsqueeze(0) + t.unsqueeze(1) * (right - left).unsqueeze(0)
-        z     = composition_to_ilr(pts)
-        z     = z + torch.randn_like(z) * NOISE_LEVEL_ILR
-        pts   = ilr_to_composition(z, d=pts.shape[1])
+        pts   = add_composition_noise(pts, NOISE_LEVEL)
         raw   = np.array([fn_callable(x) for x in pts.detach().cpu().numpy()], float)
         y     = torch.tensor(raw if maximize else -raw, dtype=dtype, device=device)
         y     = y + torch.randn_like(y) * NOISE_LEVEL
@@ -330,9 +327,7 @@ def _gen_init_data(fn_callable, d: int, maximize: bool):
         _, _, xl, xr = seg
         t    = torch.linspace(0.0, 1.0, NUM_EXPERIMENTS, dtype=torch.float64, device=DEVICE)
         pts  = xl.to(torch.float64).unsqueeze(0) + t.unsqueeze(1) * (xr - xl).to(torch.float64).unsqueeze(0)
-        z    = composition_to_ilr(pts)
-        z    = z + torch.randn_like(z) * NOISE_LEVEL_ILR
-        pts  = ilr_to_composition(z, d=pts.shape[1])
+        pts  = add_composition_noise(pts, NOISE_LEVEL)
         raw  = np.array([fn_callable(x) for x in pts.detach().cpu().numpy()], float)
         yt   = torch.tensor(raw if maximize else -raw, dtype=DTYPE, device=DEVICE)
         yt   = yt + torch.randn_like(yt) * NOISE_LEVEL
@@ -1226,14 +1221,15 @@ class GPQueryFrame(ttk.Frame):
 
         def _work():
             try:
-                X_ilr = composition_to_ilr(
-                    torch.tensor(_X, dtype=torch.float64)
-                ).to(dtype=DTYPE, device=DEVICE)
+                X_t = torch.tensor(_X, dtype=torch.float64).to(dtype=DTYPE, device=DEVICE)
+                comp_std = torch.nan_to_num(X_t.std(dim=0), nan=1.0).clamp(min=1e-3)
+                X_norm = X_t / comp_std
                 Y_t = torch.tensor(_Y, dtype=DTYPE, device=DEVICE).unsqueeze(-1)
-                gp  = SingleTaskGP(X_ilr, Y_t, outcome_transform=Standardize(m=1))
+                gp  = SingleTaskGP(X_norm, Y_t, outcome_transform=Standardize(m=1))
                 mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
                 fit_gpytorch_mll(mll)
                 gp.eval()
+                gp._comp_std = comp_std
                 with self._gp_lock:
                     self._gp = gp
                 self._gp_rid = _rid
@@ -1269,11 +1265,12 @@ class GPQueryFrame(ttk.Frame):
         elif abs(s - 1.0) > 1e-6:
             v /= s
         try:
-            x_ilr = composition_to_ilr(
-                torch.tensor(v, dtype=torch.float64).unsqueeze(0)
-            ).to(dtype=DTYPE, device=DEVICE)
+            x_norm = (
+                torch.tensor(v, dtype=torch.float64).unsqueeze(0).to(dtype=DTYPE, device=DEVICE)
+                / gp._comp_std
+            )
             with torch.no_grad():
-                post = gp.posterior(x_ilr)
+                post = gp.posterior(x_norm)
                 mean = post.mean.item()
                 std  = post.variance.sqrt().item()
             self._result_var.set(f"mean = {mean:.5f}    std = {std:.5f}")
@@ -1315,7 +1312,6 @@ def _needle_ellipsoid_comp(needle_comp, M, B, n: int = 200):
     ``_draw_needle_ellipsoid`` in interactive_test_zombi.py:
 
       tangent-space mode (B given): x = x* + B @ u,  u^T M u = 1
-      ILR mode      (B is None):    x = ilr⁻¹(ilr(x*) + u),  u^T M u = 1
 
     Returns None if ``M`` is None or on any failure.
     """
@@ -1330,16 +1326,10 @@ def _needle_ellipsoid_comp(needle_comp, M, B, n: int = 200):
         angles = np.linspace(0, 2 * np.pi, n)
         circle = np.column_stack([np.cos(angles), np.sin(angles)])
         u_ell = (eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ circle.T).T   # (n, d-1)
-        if B is not None:
-            B_np = np.asarray(B, dtype=float)               # (d, d-1)
-            ell = needle_comp.reshape(1, d) + (B_np @ u_ell.T).T
-        else:
-            needle_ilr = composition_to_ilr(
-                torch.tensor(needle_comp, dtype=torch.float64).unsqueeze(0)
-            ).squeeze(0).cpu().numpy()                       # (d-1,)
-            z_ell = needle_ilr + u_ell                       # (n, d-1)
-            ell = ilr_to_composition(
-                torch.tensor(z_ell, dtype=torch.float64), d).cpu().numpy()
+        if B is None:
+            B = get_tangent_basis(d, torch.device("cpu"), torch.float64).cpu().numpy()
+        B_np = np.asarray(B, dtype=float)               # (d, d-1)
+        ell = needle_comp.reshape(1, d) + (B_np @ u_ell.T).T
         ell = np.clip(ell, 0, 1)
         s = ell.sum(axis=1, keepdims=True)
         return ell / np.where(s < 1e-9, 1.0, s)

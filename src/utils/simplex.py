@@ -304,6 +304,14 @@ def random_simplex(
 # Simplex Projection
 # =============================================================================
 
+def add_composition_noise(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Add isotropic Gaussian noise in R^d and project back onto the simplex."""
+    if sigma <= 0.0:
+        return x
+    noisy = x + torch.randn_like(x) * sigma
+    return proj_simplex(noisy)
+
+
 def proj_simplex(X: torch.Tensor) -> torch.Tensor:
     """
     Project points onto the simplex (differentiable).
