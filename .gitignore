@@ -4,6 +4,7 @@
 
 hyperparameters/*
 htem/datasets/*
+ela/*
 
 # UV artifacts
 .python-version
