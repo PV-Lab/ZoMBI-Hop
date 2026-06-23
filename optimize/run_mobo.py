@@ -22,13 +22,13 @@ Multi-Ackley benchmark (layout/b configurable); ``--dataset ackley*`` uses the
 feature counts/widths/amplitudes + a fresh master seed; the number of true optima
 is drawn from a dimension-specific range — 5–30 at dim 3, 20–50 at dim 4, 50–150
 at dim 10). To keep the MOBO model from chasing that landscape noise, each
-hyperparameter set is evaluated on ``ENSEMBLE_N_REPEATS`` (5) independently
-randomized landscapes per trial and the three metrics are AVERAGED before the next
-MOBO iteration. Every landscape is saved for reproducibility: each repeat writes
-``trial_<n>/run_<k>/ensemble_config.json`` and the full ``ensemble_configs`` list
-(plus per-repeat metrics) is recorded in ``trial_<n>/trial.json``. ``--ensemble-seed``
-makes the per-trial landscape sequence reproducible; ``--ensemble-margin`` sets the
-optima/background gap.
+hyperparameter set is evaluated on ``ENSEMBLE_N_REPEATS`` (5 by default, override
+with ``--ensemble-repeats``) independently randomized landscapes per trial and the
+three metrics are AVERAGED before the next MOBO iteration. Every landscape is saved
+for reproducibility: each repeat writes ``trial_<n>/run_<k>/ensemble_config.json``
+and the full ``ensemble_configs`` list (plus per-repeat metrics) is recorded in
+``trial_<n>/trial.json``. ``--ensemble-seed`` makes the per-trial landscape sequence
+reproducible; ``--ensemble-margin`` sets the optima/background gap.
 
 Three objectives (all minimised):
   1. dist_to_needles    – symmetric greedy matching distance between needles and
@@ -612,6 +612,7 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
         cfg["ensemble_random_per_run"] = True
         cfg["ensemble_seed"] = ensemble_spec["seed"]
         cfg["ensemble_optima_margin"] = ensemble_spec["optima_margin"]
+        cfg["ensemble_repeats"] = ensemble_spec.get("n_repeats", ENSEMBLE_N_REPEATS)
     if batch_name:
         cfg["batch_name"] = batch_name
     if batch_config_path:
@@ -2133,34 +2134,47 @@ def run_single_trial(
     sim_obj = make_sim_obj(fn_callable, DEVICE, DTYPE, maximize=maximize)
     inner   = make_linebo_wrapper(sim_obj, dim, NUM_LINES, DEVICE, DTYPE, plot_state)
 
+    # The per-iteration "heavy" payload fields (pared point cloud, per-needle
+    # penalisation matrices, bounds) are consumed ONLY by render_frame, i.e. the
+    # 3D per-iteration ternary frames. At dim ≥ 4 no frames are drawn (the 4D
+    # point cloud reads final state straight from the data handler, not payloads),
+    # so storing them every iteration just grows host RAM without bound — on a
+    # long high-dim trial that exhausts the cgroup limit and triggers an OOM kill.
+    # Keep them only when ternary frames will actually be rendered.
+    keep_heavy = landscape.render_ternary
+
     def obj_wrapper(x_tell, bounds, acq_fn):
         x_req, x_act, y = inner(x_tell, bounds, acq_fn)
         call_counter[0] += 1
         dh = dh_ref[0]
-        xp, yp = dh.X_pared, dh.Y_pared
-        if xp is not None and xp.shape[0] > 0:
-            pared_X = xp.detach().cpu().numpy()
-            pared_Y = yp.detach().cpu().numpy().ravel()
-            if not maximize:
-                pared_Y = -pared_Y
-        else:
-            pared_X = pared_Y = None
         needles = dh.needles
-        payloads.append(dict(
+        payload = dict(
             iter_num=call_counter[0],
-            pared_X=pared_X, pared_Y=pared_Y,
             needles=(as_numpy(needles)
                      if needles is not None and needles.shape[0] > 0 else None),
             needle_vals=(as_numpy(dh.needle_vals).ravel()
                          if dh.needle_vals is not None and dh.needle_vals.shape[0] > 0 else None),
-            needle_M_list=[as_numpy(m) if m is not None else None
-                           for m in dh.needle_M_list],
-            needle_B=(as_numpy(dh.needle_B) if dh.needle_B is not None else None),
-            bounds=(as_numpy(dh.bounds) if dh.bounds is not None else None),
             line_0=plot_state.get("line_0"),
             line_1=plot_state.get("line_1"),
             n_points_before=(dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0),
-        ))
+        )
+        if keep_heavy:
+            xp, yp = dh.X_pared, dh.Y_pared
+            if xp is not None and xp.shape[0] > 0:
+                pared_X = xp.detach().cpu().numpy()
+                pared_Y = yp.detach().cpu().numpy().ravel()
+                if not maximize:
+                    pared_Y = -pared_Y
+            else:
+                pared_X = pared_Y = None
+            payload.update(
+                pared_X=pared_X, pared_Y=pared_Y,
+                needle_M_list=[as_numpy(m) if m is not None else None
+                               for m in dh.needle_M_list],
+                needle_B=(as_numpy(dh.needle_B) if dh.needle_B is not None else None),
+                bounds=(as_numpy(dh.bounds) if dh.bounds is not None else None),
+            )
+        payloads.append(payload)
         return x_req, x_act, y
 
     try:
@@ -2231,7 +2245,7 @@ def run_single_trial(
     dup  = metric_dup_fraction(X_all_np, dim=dim)
     print(f"    [trial]  iters={n_iters}  dist={dist:.4f}  dup={dup:.4f}"
           f"  t/iter={avg_time_per_iter:.3f}s  (total {runtime:.1f}s)"
-          f"  needles={len(discovered)}/{len(true_optima)}")
+          f"  needles={len(discovered)}/{len(true_optima)}", flush=True)
 
     try:
         write_points_csv(os.path.join(trial_dir, "points.csv"), dh, snap_records, dim=dim)
@@ -2320,15 +2334,16 @@ def evaluate_hparams(
         shutil.rmtree(trial_dir, ignore_errors=True)
     os.makedirs(trial_dir, exist_ok=True)
 
+    n_repeats = int(ensemble_spec.get("n_repeats", ENSEMBLE_N_REPEATS))
     configs: list[dict] = []
     repeats: list[dict] = []
-    for k in range(1, ENSEMBLE_N_REPEATS + 1):
+    for k in range(1, n_repeats + 1):
         rng = random.Random(f"{ensemble_spec['seed']}-{trial_num}-{k}")
         cfg = random_ensemble_config(
             ensemble_spec["dim"], rng, optima_margin=ensemble_spec["optima_margin"])
         configs.append(cfg)
         run_dir = os.path.join(trial_dir, f"run_{k}")
-        print(f"    [ensemble repeat {k}/{ENSEMBLE_N_REPEATS}]", flush=True)
+        print(f"    [ensemble repeat {k}/{n_repeats}]", flush=True)
         r = run_single_trial(hparams, landscape, run_dir, ensemble_config=cfg)
         repeats.append({
             "run": k,
@@ -2344,7 +2359,7 @@ def evaluate_hparams(
     avg_t = float(np.mean([r["avg_time_per_iter"] for r in repeats]))
     runtime = float(np.sum([r["runtime"] for r in repeats]))
     n_iters = int(np.sum([r["n_iters"] for r in repeats]))
-    print(f"    [trial] ensemble avg over {ENSEMBLE_N_REPEATS} landscapes — "
+    print(f"    [trial] ensemble avg over {n_repeats} landscapes — "
           f"dist={dist:.4f}  dup={dup:.4f}  t/iter={avg_t:.3f}s")
     return {
         "dist": dist, "dup": dup, "runtime": runtime,
@@ -2494,7 +2509,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                 hparams = norm_to_hparams(x_new)
                 hp_str = "  ".join(f"{k}={round(v,4) if isinstance(v,float) else v}"
                                    for k, v in hparams.items())
-                print(f"\n[trial {trial_num} | {phase}]  {hp_str}")
+                print(f"\n[trial {trial_num} | {phase}]  {hp_str}", flush=True)
 
                 res = evaluate_hparams(
                     hparams, landscape, trial_dir, trial_num,
@@ -2639,6 +2654,7 @@ def _ensemble_spec_from_cfg(cfg: dict) -> dict | None:
             "dim": int(cfg.get("dim", ENSEMBLE_DEFAULT_DIM)),
             "optima_margin": float(cfg.get("ensemble_optima_margin", 0.2)),
             "seed": int(cfg.get("ensemble_seed", cfg.get("seed", 0))),
+            "n_repeats": int(cfg.get("ensemble_repeats", ENSEMBLE_N_REPEATS)),
         }
     return None
 
@@ -2791,6 +2807,12 @@ def main() -> None:
     parser.add_argument("--ensemble-margin", type=float, default=0.2,
                         help="optima_margin for --dataset ensemble — normalized gap the "
                              "background stays below the optima (default: 0.2).")
+    parser.add_argument("--ensemble-repeats", type=int, default=ENSEMBLE_N_REPEATS,
+                        help="number of independently randomized landscapes each "
+                             "hyperparameter set is evaluated on per trial for "
+                             f"--dataset ensemble; the three metrics are averaged "
+                             f"across them to reduce landscape noise (default: "
+                             f"{ENSEMBLE_N_REPEATS}).")
     parser.add_argument("--resume-from", metavar="RUN_DIR", default=None,
                         help="Resume from a SPECIFIC run: trust its stored metrics "
                              "as prior history (no re-evaluation), reuse its config.")
@@ -3291,11 +3313,13 @@ def main() -> None:
             time_limit_hours=TIME_LIMIT_HOURS)
         ensemble_spec = {
             "dim": dim, "optima_margin": args.ensemble_margin, "seed": args.ensemble_seed,
+            "n_repeats": args.ensemble_repeats,
         }
         lo, hi = optima_count_range(dim)
         resolutions = [
             f"dataset: CLI --dataset ensemble (re-randomized per trial, n_optima in [{lo}, {hi}])",
-            f"ensemble_seed: {args.ensemble_seed}   ensemble_margin: {args.ensemble_margin}",
+            f"ensemble_seed: {args.ensemble_seed}   ensemble_margin: {args.ensemble_margin}"
+            f"   ensemble_repeats: {args.ensemble_repeats}",
             f"time_limit_hours: {'CLI' if time_limit_override is not None else 'default'} "
             f"({TIME_LIMIT_HOURS})",
         ]

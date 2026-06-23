@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=mobo_4d
-#SBATCH --output=optimize/scripts/mobo_4d_%j.out
-#SBATCH --error=optimize/scripts/mobo_4d_%j.err
+#SBATCH --output=optimize/scripts/logs/mobo_4d_%j.out
+#SBATCH --error=optimize/scripts/logs/mobo_4d_%j.err
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1

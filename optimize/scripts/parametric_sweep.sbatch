@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=param_sweep
-#SBATCH --output=optimize/scripts/param_sweep_%j.out
-#SBATCH --error=optimize/scripts/param_sweep_%j.err
+#SBATCH --output=optimize/scripts/logs/param_sweep_%j.out
+#SBATCH --error=optimize/scripts/logs/param_sweep_%j.err
 #SBATCH --time=06:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
