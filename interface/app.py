@@ -943,10 +943,11 @@ class ConvergencePlotFrame(PlotFrame):
                        label="penalized", zorder=2)
             ax.scatter(idx[pm],  Y[pm],  s=10, alpha=0.65, color="steelblue",
                        label="valid", zorder=3)
-            running_best = np.maximum.accumulate(np.where(pm, Y, -np.inf))
         else:
             ax.scatter(idx, Y, s=10, alpha=0.65, color="steelblue", label="obs", zorder=2)
-            running_best = np.maximum.accumulate(Y)
+
+        # Running best spans every observation, penalized or not.
+        running_best = np.maximum.accumulate(Y)
 
         ax.plot(idx, running_best, color="darkorange", lw=1.8,
                 label="running best", zorder=4)
@@ -1347,6 +1348,129 @@ def _needle_ellipsoid_comp(needle_comp, M, B, n: int = 200):
         return None
 
 
+def _needle_penalty_bands(needle_comp, M, B, *, n_bands: int = 18, n_ang: int = 160):
+    """Non-overlapping annular rings coloured by the smooth repulsion penalty.
+
+    The acquisition repulsion is ``violation**2 = clamp(1 - quad, 0)**2`` with
+    ``quad = delta_z^T M delta_z``: strongest (1.0) at the needle centre, fading
+    smoothly to 0 at the boundary (``quad = 1``).  Each ring between contours
+    ``quad = s_out**2`` and ``quad = s_in**2`` carries penalty ``(1 - s_mid**2)**2``
+    at its mid-radius.  Because the rings don't overlap, filling each with
+    ``alpha = base * penalty`` makes the rendered opacity *exactly proportional* to
+    the true penalty at every radius.  Returns ``[(ring_comp, penalty), ...]`` or
+    ``None`` on failure.
+    """
+    if M is None:
+        return None
+    try:
+        needle_comp = np.asarray(needle_comp, dtype=float).ravel()
+        d = needle_comp.shape[0]
+        M_np = np.asarray(M, dtype=float)
+        eigvals, eigvecs = np.linalg.eigh(M_np)
+        eigvals = np.maximum(eigvals, 1e-12)
+        angles = np.linspace(0, 2 * np.pi, n_ang)
+        circle = np.column_stack([np.cos(angles), np.sin(angles)])
+        u_unit = (eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ circle.T).T   # quad == 1
+        needle_ilr = (composition_to_ilr(
+            torch.tensor(needle_comp, dtype=torch.float64).unsqueeze(0)).squeeze(0).cpu().numpy()
+            if B is None else None)
+
+        def _contour(s):
+            u = s * u_unit
+            if B is not None:
+                ell = needle_comp.reshape(1, d) + (np.asarray(B, dtype=float) @ u.T).T
+            else:
+                ell = ilr_to_composition(
+                    torch.tensor(needle_ilr + u, dtype=torch.float64), d).cpu().numpy()
+            ell = np.clip(ell, 0, 1)
+            ssum = ell.sum(axis=1, keepdims=True)
+            return ell / np.where(ssum < 1e-9, 1.0, ssum)
+
+        scales = np.linspace(1.0, 0.0, n_bands + 1)     # edge (1) → centre (0)
+        contours = [_contour(s) for s in scales]
+        bands = []
+        for k in range(n_bands):
+            s_mid = 0.5 * (scales[k] + scales[k + 1])
+            penalty = float((1.0 - s_mid ** 2) ** 2)
+            if scales[k + 1] <= 1e-9:
+                ring = contours[k]                      # innermost: filled centre disk
+            else:
+                ring = np.vstack([contours[k], contours[k + 1][::-1]])  # annulus
+            bands.append((ring, penalty))
+        return bands
+    except Exception:
+        return None
+
+
+def _draw_penalty_gradient(ax, bands, proj) -> None:
+    """Draw non-overlapping red rings; opacity is proportional to the penalty
+    (transparent at the edge → opaque at the centre)."""
+    for ring, penalty in bands:
+        ax.add_patch(matplotlib.patches.Polygon(
+            proj(ring), closed=True, facecolor="red", edgecolor="none",
+            alpha=0.5 * penalty, linewidth=0, zorder=2))
+
+
+def _ternary_grid_comp(n: int = 72) -> np.ndarray:
+    """Uniform ``(N, 3)`` grid on the 3-simplex (compositions sum to 1)."""
+    pts = []
+    for i in range(n + 1):
+        for j in range(n + 1 - i):
+            pts.append([i / n, j / n, (n - i - j) / n])
+    return np.asarray(pts, dtype=float)
+
+
+_GP_LANDSCAPE_CACHE: dict = {}
+
+
+def _gp_landscape_grid(rd, n: int = 72, max_train: int = 500):
+    """GP posterior mean over a ternary grid — the landscape ZoMBI-Hop's GP
+    currently believes in, for use as the ternary background.
+
+    Refits a GP from the snapshot's *unpenalized* points (what ZoMBI's GP
+    trains on) in ILR space with output standardisation, matching the live
+    ``GPSimplex`` setup, then predicts over the grid.  Only defined for d == 3.
+    Returns ``(grid_comp (N, 3), mean (N,))`` or None.  Cached per snapshot so
+    re-renders (e.g. changing the vertex-dim selection) don't refit.
+    """
+    if not _BOTORCH_OK or rd is None or rd.d != 3:
+        return None
+    if rd.X_all is None or rd.Y_all is None or len(rd.X_all) < 3:
+        return None
+    key = (rd.run_id, rd.snapshot_name, rd.n_points, n)
+    if key in _GP_LANDSCAPE_CACHE:
+        return _GP_LANDSCAPE_CACHE[key]
+    try:
+        X = np.asarray(rd.X_all, dtype=float)
+        Y = np.asarray(rd.Y_all, dtype=float).ravel()
+        # Train on the points the GP actually uses (unpenalized), as ZoMBI does.
+        if (rd.penalty_mask is not None and len(rd.penalty_mask) == len(X)
+                and rd.penalty_mask.any()):
+            X, Y = X[rd.penalty_mask], Y[rd.penalty_mask]
+        if len(X) < 3:
+            return None
+        if len(X) > max_train:   # subsample for a fast, visualisation-only fit
+            idx = np.random.default_rng(0).choice(len(X), max_train, replace=False)
+            X, Y = X[idx], Y[idx]
+        X_ilr = composition_to_ilr(
+            torch.tensor(X, dtype=torch.float64)).to(dtype=DTYPE, device=DEVICE)
+        Y_t = torch.tensor(Y, dtype=DTYPE, device=DEVICE).unsqueeze(-1)
+        gp = SingleTaskGP(X_ilr, Y_t, outcome_transform=Standardize(m=1))
+        mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
+        fit_gpytorch_mll(mll)
+        gp.eval()
+        grid = _ternary_grid_comp(n)
+        g_ilr = composition_to_ilr(
+            torch.tensor(grid, dtype=torch.float64)).to(dtype=DTYPE, device=DEVICE)
+        with torch.no_grad():
+            mean = gp.posterior(g_ilr).mean.detach().cpu().numpy().ravel()
+        out = (grid, mean)
+        _GP_LANDSCAPE_CACHE[key] = out
+        return out
+    except Exception:
+        return None
+
+
 class TernaryPlotFrame(ttk.Frame):
     """
     Ternary-plot tab.
@@ -1382,6 +1506,27 @@ class TernaryPlotFrame(ttk.Frame):
 
         ttk.Button(ctrl, text="Update", command=self._on_update).pack(side="left", padx=(4, 0))
         self._ctrl = ctrl
+
+        # ── layer-toggle row: show/hide each overlay, re-render on change ──
+        toggles = ttk.Frame(self)
+        toggles.pack(fill="x", padx=4, pady=(0, 2))
+        ttk.Label(toggles, text="Show:").pack(side="left", padx=(4, 6))
+        self._show_bg      = tk.BooleanVar(value=True)
+        self._show_points  = tk.BooleanVar(value=True)
+        self._show_penalty = tk.BooleanVar(value=True)
+        self._show_zoom    = tk.BooleanVar(value=True)
+        self._show_lines   = tk.BooleanVar(value=True)
+        self._show_needles = tk.BooleanVar(value=True)
+        for text, var in (
+            ("GP background", self._show_bg),
+            ("Sample points", self._show_points),
+            ("Penalty zones", self._show_penalty),
+            ("Zoom region",   self._show_zoom),
+            ("LineBO lines",  self._show_lines),
+            ("Needles",       self._show_needles),
+        ):
+            ttk.Checkbutton(toggles, text=text, variable=var,
+                            command=self._on_update).pack(side="left", padx=(0, 8))
 
         # ── matplotlib figure ─────────────────────────────────────────────
         self.fig    = Figure(figsize=(8, 6), dpi=96, tight_layout=True)
@@ -1691,6 +1836,18 @@ class TernaryPlotFrame(ttk.Frame):
             x, y = _ternary_xy(comp[:, da], comp[:, db], comp[:, dc])
             return np.column_stack([x, y])
 
+        # ── GP landscape background: what ZoMBI-Hop's GP currently believes ──
+        # the objective looks like (posterior mean over the ternary grid). d == 3 only.
+        if n_cols == 3 and rd is not None and rd.d == 3 and self._show_bg.get():
+            land = _gp_landscape_grid(rd)
+            if land is not None:
+                grid_comp, grid_mean = land
+                gxy = _proj(grid_comp)
+                sc_bg = ax.scatter(gxy[:, 0], gxy[:, 1], c=grid_mean, cmap="viridis",
+                                   s=8, alpha=0.70, zorder=1, rasterized=True)
+                cb_bg = self.fig.colorbar(sc_bg, ax=ax, shrink=0.60, pad=0.02)
+                cb_bg.set_label("GP posterior mean", fontsize=8)
+
         # ── trust / zoom region: sample composition bounds → convex hull ──
         # Matches _draw_bounds_region in interactive_test_zombi.py. Source the
         # bounds from the snapshot (works for synthetic runs) or live state.
@@ -1701,7 +1858,7 @@ class TernaryPlotFrame(ttk.Frame):
         elif rd is not None and rd.zoom_bounds is not None \
                 and rd.zoom_bounds.shape == (2, 3):
             lo, hi = rd.zoom_bounds[0], rd.zoom_bounds[1]
-        if lo is not None and n_cols == 3:
+        if lo is not None and n_cols == 3 and self._show_zoom.get():
             comp = _sample_bounds_comp(lo, hi)
             if comp is not None:
                 bxy = _proj(comp)
@@ -1723,18 +1880,18 @@ class TernaryPlotFrame(ttk.Frame):
         # snapshot's true ellipsoid (needle M + B); fall back to live isotropic
         # spheres (radius_ilr) when no snapshot ellipsoid is available.
         penalty_drawn = False
-        if n_cols == 3 and rd is not None and rd.needles is not None \
+        if self._show_penalty.get() and n_cols == 3 and rd is not None \
+                and rd.needles is not None \
                 and rd.needles.shape[0] > 0 and rd.needle_M_list:
             for i, ncomp in enumerate(rd.needles):
                 M = rd.needle_M_list[i] if i < len(rd.needle_M_list) else None
-                ell = _needle_ellipsoid_comp(ncomp, M, rd.needle_B)
-                if ell is None:
+                bands = _needle_penalty_bands(ncomp, M, rd.needle_B)
+                if bands is None:
                     continue
-                ax.add_patch(matplotlib.patches.Polygon(
-                    _proj(ell), closed=True, facecolor="#80008022",
-                    edgecolor="purple", lw=0.9, zorder=2))
+                _draw_penalty_gradient(ax, bands, _proj)
                 penalty_drawn = True
-        if not penalty_drawn and live is not None and n_cols == 3:
+        if self._show_penalty.get() and not penalty_drawn \
+                and live is not None and n_cols == 3:
             for pr in live.get("penalty_regions", []):
                 try:
                     cpt = np.asarray(pr["center"], float)
@@ -1742,22 +1899,20 @@ class TernaryPlotFrame(ttk.Frame):
                     if cpt.shape[0] != 3 or rad <= 0:
                         continue
                     # isotropic ILR sphere of radius rad ⇒ M = I / rad²
-                    ell = _needle_ellipsoid_comp(cpt, np.eye(2) / (rad ** 2), None)
-                    if ell is None:
+                    bands = _needle_penalty_bands(cpt, np.eye(2) / (rad ** 2), None)
+                    if bands is None:
                         continue
-                    ax.add_patch(matplotlib.patches.Polygon(
-                        _proj(ell), closed=True, facecolor="#80008022",
-                        edgecolor="purple", lw=0.9, zorder=2))
+                    _draw_penalty_gradient(ax, bands, _proj)
                     penalty_drawn = True
                 except Exception:
                     pass
         if penalty_drawn:
             legend_handles.append(matplotlib.patches.Patch(
-                facecolor="#80008033", edgecolor="purple",
+                facecolor="#ff000033", edgecolor="red",
                 label="Penalty region"))
 
         # ── scatter points ────────────────────────────────────────────────
-        if X.shape[0] > 0 and X.shape[1] > max_col:
+        if self._show_points.get() and X.shape[0] > 0 and X.shape[1] > max_col:
             A, B, C = X[:, da], X[:, db], X[:, dc]
             xp, yp  = _ternary_xy(A, B, C)
 
@@ -1770,17 +1925,20 @@ class TernaryPlotFrame(ttk.Frame):
                 Y = rd.Y_all
 
             if Y is not None:
-                sc = ax.scatter(xp, yp, c=Y, cmap="viridis", s=22, alpha=0.80, zorder=3)
+                sc = ax.scatter(xp, yp, c=Y, cmap="viridis", s=22, alpha=0.80,
+                                zorder=3, edgecolors="black", linewidths=0.9)
                 cb_bar = self.fig.colorbar(sc, ax=ax, shrink=0.60, pad=0.02)
                 cb_bar.set_label("Objective Y", fontsize=8)
             else:
-                ax.scatter(xp, yp, s=22, alpha=0.80, color="steelblue", zorder=3)
+                ax.scatter(xp, yp, s=22, alpha=0.80, color="steelblue",
+                           zorder=3, edgecolors="black", linewidths=0.9)
             legend_handles.append(matplotlib.lines.Line2D(
                 [], [], linestyle="none", marker="o", markersize=6,
                 color="steelblue", label=f"Samples ({len(xp)})"))
 
         # ── prior LineBO lines (dashed, faded) ────────────────────────────
-        prior_eps    = live.get("prior_line_endpoints", []) if live else []
+        prior_eps    = (live.get("prior_line_endpoints", [])
+                        if live and self._show_lines.get() else [])
         prior_colors = ["#7799ee", "#77cc77"]
         prior_drawn  = False
         for i, ep in enumerate(prior_eps[:2]):
@@ -1800,7 +1958,8 @@ class TernaryPlotFrame(ttk.Frame):
                 pass
 
         # ── current LineBO lines (solid, prominent) ───────────────────────
-        curr_eps    = live.get("line_endpoints", []) if live else []
+        curr_eps    = (live.get("line_endpoints", [])
+                       if live and self._show_lines.get() else [])
         curr_colors = ["#0044dd", "#007700"]
         curr_drawn  = False
         for i, ep in enumerate(curr_eps[:2]):
@@ -1820,8 +1979,10 @@ class TernaryPlotFrame(ttk.Frame):
                 pass
 
         # ── needles ───────────────────────────────────────────────────────
-        needles_data: list = live.get("needles", []) if live else []
-        if not needles_data and rd is not None and rd.needles is not None and rd.needles.shape[0] > 0:
+        needles_data: list = (live.get("needles", [])
+                              if live and self._show_needles.get() else [])
+        if self._show_needles.get() and not needles_data and rd is not None \
+                and rd.needles is not None and rd.needles.shape[0] > 0:
             nv = rd.needle_vals
             for i, npt in enumerate(rd.needles):
                 val = float(nv[i]) if nv is not None and i < len(nv) else 0.0

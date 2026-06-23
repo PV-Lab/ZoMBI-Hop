@@ -568,6 +568,26 @@ def make_linebo_wrapper(
     return wrapper
 
 
+def _gp_landscape_vals(gp_handler, grid_pts, maximize: bool):
+    """GP posterior mean over the ternary grid (display orientation), or None.
+
+    Captures what ZoMBI-Hop's GP currently believes the objective landscape
+    looks like, for use as the exploration-panel background.  Un-negated for
+    minimize runs to match the ``pared_Y`` display convention.
+    """
+    if (gp_handler is None or getattr(gp_handler, "gp", None) is None
+            or grid_pts is None):
+        return None
+    try:
+        gt = torch.as_tensor(grid_pts, dtype=DTYPE, device=DEVICE)
+        with torch.no_grad():
+            mean, _ = gp_handler.predict(gt)
+        m = mean.detach().cpu().numpy().ravel()
+        return m if maximize else -m
+    except Exception:
+        return None
+
+
 def make_plotting_wrapper(
     inner_wrapper,
     dh_ref: list,
@@ -580,6 +600,7 @@ def make_plotting_wrapper(
     *,
     maximize: bool,
     show_sampling: bool = False,
+    gp_ref: list | None = None,
 ):
     """
     Wrap ``inner_wrapper`` so that after every objective call a snapshot of
@@ -639,6 +660,8 @@ def make_plotting_wrapper(
             sampling_lines=plot_state.get("sampling_lines") if show_sampling else None,
             iteration_num=plot_state["iter"],
             save_dir=save_dir,
+            gp_grid_vals=_gp_landscape_vals(
+                gp_ref[0] if gp_ref else None, grid_pts, maximize),
         )
         plot_queue.put(payload)
         return x_requested, x_actual, y
@@ -683,6 +706,65 @@ def _draw_bounds_region(ax, bounds, n_sample: int = 5000) -> None:
         pass
 
 
+def _needle_penalty_bands(
+    needle_x: np.ndarray,
+    M: torch.Tensor,
+    B: torch.Tensor | None,
+    *,
+    n_bands: int = 18,
+    n_ang: int = 160,
+) -> list[tuple[np.ndarray, float]]:
+    """Non-overlapping annular rings coloured by the smooth repulsion penalty.
+
+    The acquisition repulsion is ``violation**2 = clamp(1 - quad, 0)**2`` with
+    ``quad = delta_z^T M delta_z``: strongest (1.0) at the needle centre, fading
+    smoothly to 0 at the boundary (``quad = 1``).  Each ring between contours
+    ``quad = s_out**2`` and ``quad = s_in**2`` carries penalty ``(1 - s_mid**2)**2``
+    at its mid-radius.  Because the rings don't overlap, filling each with
+    ``alpha = base * penalty`` yields a rendered opacity *exactly proportional* to
+    the true penalty at every radius.
+
+    Tangent-space mode (B is not None):  boundary {x* + B @ u : u^T M u = 1}
+    ILR mode (B is None):                boundary {ilr⁻¹(ilr(x*) + u) : u^T M u = 1}
+    """
+    d = needle_x.shape[0]
+    M_np = M.cpu().numpy()
+    eigvals, eigvecs = np.linalg.eigh(M_np)
+    eigvals = np.maximum(eigvals, 1e-12)
+    angles = np.linspace(0, 2 * np.pi, n_ang)
+    circle = np.column_stack([np.cos(angles), np.sin(angles)])
+    # Unit ellipse boundary: u = V diag(1/√λ) [cos,sin]^T  → u^T M u = 1
+    u_unit = (eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ circle.T).T   # (n_ang, d-1)
+    needle_x = np.asarray(needle_x, dtype=float).ravel()
+    needle_ilr = (composition_to_ilr(
+        torch.tensor(needle_x, dtype=torch.float64).unsqueeze(0)).squeeze(0).cpu().numpy()
+        if B is None else None)
+
+    def _contour(s: float) -> np.ndarray:
+        u_ell = s * u_unit
+        if B is not None:
+            ell = needle_x.reshape(1, d) + (B.cpu().numpy() @ u_ell.T).T
+        else:
+            ell = ilr_to_composition(
+                torch.tensor(needle_ilr + u_ell, dtype=torch.float64), d).cpu().numpy()
+        ell = np.clip(ell, 0, 1)
+        ssum = ell.sum(axis=1, keepdims=True)
+        return ell / np.where(ssum < 1e-9, 1.0, ssum)
+
+    scales = np.linspace(1.0, 0.0, n_bands + 1)         # edge (1) → centre (0)
+    contours = [_contour(s) for s in scales]
+    bands: list[tuple[np.ndarray, float]] = []
+    for k in range(n_bands):
+        s_mid = 0.5 * (scales[k] + scales[k + 1])
+        penalty = float((1.0 - s_mid ** 2) ** 2)
+        if scales[k + 1] <= 1e-9:
+            ring = contours[k]                          # innermost: filled centre disk
+        else:
+            ring = np.vstack([contours[k], contours[k + 1][::-1]])  # annulus
+        bands.append((ring, penalty))
+    return bands
+
+
 def _draw_needle_ellipsoid(
     ax,
     needle_x: np.ndarray,
@@ -690,13 +772,10 @@ def _draw_needle_ellipsoid(
     B: torch.Tensor | None,
 ) -> None:
     """
-    Plot a red star for the needle and, if ellipsoid parameters are available,
-    a faded purple polygon tracing the penalization ellipsoid in ternary space.
-
-    Tangent-space mode (B is not None):
-        Boundary: {x* + B @ u : u^T M u = 1}
-    ILR mode (B is None):
-        Boundary: {ilr_to_composition(ilr(x*) + u) : u^T M u = 1}
+    Plot a red star for the needle and, if ellipsoid parameters are available, a
+    red penalty gradient over the penalization ellipsoid: opaque red at the needle
+    centre (where the repulsion is strongest) fading to fully transparent at the
+    boundary (where the penalty vanishes).  Opacity is proportional to the penalty.
     """
     xy = comp_to_xy(needle_x.reshape(1, 3))
     ax.scatter(
@@ -707,39 +786,12 @@ def _draw_needle_ellipsoid(
     if M is None:
         return
     try:
-        d = needle_x.shape[0]
-        M_np = M.cpu().numpy()
-        eigvals, eigvecs = np.linalg.eigh(M_np)
-        eigvals = np.maximum(eigvals, 1e-12)
-        angles = np.linspace(0, 2 * np.pi, 200)
-        circle = np.column_stack([np.cos(angles), np.sin(angles)])
-        # Ellipse boundary: u = V diag(1/√λ) [cos,sin]^T  → u^T M u = 1
-        u_ell = (eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ circle.T).T   # (200, d-1)
-
-        if B is not None:
-            # Legacy tangent-space mode: x = x* + B @ u, project back to simplex
-            B_np = B.cpu().numpy()   # (d, d-1)
-            delta_x = (B_np @ u_ell.T).T   # (200, d)
-            ell_pts = needle_x.reshape(1, d) + delta_x
-        else:
-            # ILR mode: boundary in ILR space → map back to composition
-            needle_t = torch.tensor(needle_x, dtype=torch.float64)
-            needle_ilr = composition_to_ilr(needle_t.unsqueeze(0)).squeeze(0).cpu().numpy()  # (d-1,)
-            z_ell = needle_ilr + u_ell   # (200, d-1)
-            z_t = torch.tensor(z_ell, dtype=torch.float64)
-            ell_pts = ilr_to_composition(z_t, d).cpu().numpy()   # (200, d)
-
-        ell_pts = np.clip(ell_pts, 0, 1)
-        s = ell_pts.sum(axis=1, keepdims=True)
-        ell_pts = ell_pts / np.where(s < 1e-9, 1.0, s)
-        ell_xy = comp_to_xy(ell_pts)
-        poly = MplPolygon(
-            ell_xy, closed=True,
-            alpha=0.15, facecolor="purple", edgecolor="purple",
-            linewidth=0.9, zorder=6,
-        )
-        ax.add_patch(poly)
-        ax.plot(ell_xy[:, 0], ell_xy[:, 1], c="purple", lw=0.7, alpha=0.45, zorder=6)
+        for ring, penalty in _needle_penalty_bands(needle_x, M, B):
+            ax.add_patch(MplPolygon(
+                comp_to_xy(ring), closed=True,
+                facecolor="red", edgecolor="none",
+                alpha=0.5 * penalty, linewidth=0, zorder=6,
+            ))
     except Exception as exc:
         print(f"  [ellipse warn] {exc}")
 
@@ -760,6 +812,7 @@ def _plot_iteration(
     iteration_num: int,
     save_dir: str | None = None,
     sampling_lines: list | None = None,
+    gp_grid_vals: np.ndarray | None = None,
 ) -> plt.Figure:
     """
     Generate the two-panel ternary figure for one iteration and optionally save it.
@@ -814,6 +867,17 @@ def _plot_iteration(
     ax_exp.set_title("ZoMBI-Hop exploration", fontsize=11)
     legend_handles = []
 
+    # Background = the GP's current belief about the objective landscape (its
+    # posterior mean over the ternary grid).
+    if gp_grid_vals is not None and len(gp_grid_vals) == len(grid_pts):
+        sc_gp = ax_exp.scatter(
+            gxy[:, 0], gxy[:, 1],
+            c=gp_grid_vals, cmap="viridis",
+            s=6, alpha=0.72, zorder=1, rasterized=True,
+        )
+        fig.colorbar(sc_gp, ax=ax_exp, label="GP posterior mean",
+                     fraction=0.046, pad=0.04)
+
     # Pared (noise-deduplicated) dataset — matches what the GP trains on.
     # Older points are more transparent; colour encodes true RF objective value.
     if pared_X is not None and len(pared_X) > 0:
@@ -830,7 +894,7 @@ def _plot_iteration(
                 c=[[pared_Y[i]]], cmap="viridis",
                 vmin=y_lo, vmax=y_hi,
                 s=22, alpha=float(alphas[i]), zorder=3,
-                edgecolors="gray", linewidths=0.2,
+                edgecolors="black", linewidths=0.9,
             )
         ax_exp.set_title(
             f"ZoMBI-Hop exploration  ({n} pared pts)", fontsize=11
@@ -1163,6 +1227,7 @@ def main(
 
     plot_state: dict = {"line_0": None, "line_1": None, "fig": None, "iter": 0}
     dh_ref: list = [None]   # filled with optimizer.data_handler after construction
+    gp_ref: list = [None]   # filled with optimizer.gp_handler after construction
     plot_queue: queue.Queue = queue.Queue()
 
     print("    Building sim objective …")
@@ -1179,6 +1244,7 @@ def main(
         plot_queue=plot_queue,
         maximize=maximize,
         show_sampling=show_sampling,
+        gp_ref=gp_ref,
     )
 
     print(f"    Generating initial data ({N_INIT_LINES} lines × {NUM_EXPERIMENTS} pts) …")
@@ -1203,6 +1269,7 @@ def main(
         num_iterations_saved=50,
     )
     dh_ref[0] = optimizer.data_handler  # connect plotting wrapper to live DataHandler
+    gp_ref[0] = optimizer.gp_handler    # GP belief landscape for the panel background
     print("    ZoMBIHop ready.")
 
     # ── Step 4: run ZoMBI in background; main thread owns all Tk/matplotlib ───
