@@ -2,6 +2,8 @@
 *.err
 *.out
 
+htem/datasets/*
+
 # UV artifacts
 .python-version
 pyproject.toml
