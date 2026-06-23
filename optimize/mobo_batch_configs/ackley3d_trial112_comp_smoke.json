@@ -1,0 +1,9 @@
+{
+  "name": "ackley3d_trial112_comp_smoke",
+  "landscape": "synthetic",
+  "oracle": "ackley",
+  "dim": 3,
+  "variant": "realistic",
+  "seed": 42,
+  "time_limit_hours": 0.05
+}

@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 
-from synthetic_data.oracles import ORACLE_CHOICES, build_oracle, normalize_rows
+from synthetic_data.oracles import ORACLE_CHOICES, ORACLE_EXPRESSIONS, build_oracle, normalize_rows
 
 OBJECTIVE_COL = "Objective"
 TARGET_DATASET_SIZE = 700
@@ -194,6 +194,7 @@ def build_metadata(
     comp_cols = composition_column_names(dim)
     return {
         "oracle": oracle,
+        "expression": ORACLE_EXPRESSIONS.get(oracle, ""),
         "dim": dim,
         "layout": layout,
         "seed": seed,
@@ -282,11 +283,21 @@ def generate_campaign_files(
     return df, meta
 
 
-# Presets for 3D MOBO benchmarking (same layout/oracle mix as team meeting notes).
+# Presets for 3D MOBO benchmarking — one CSV per expression family.
 SYNTHETIC_3D_PRESETS: dict[str, dict[str, Any]] = {
+    # Layered / campaign-like
     "messy": {"oracle": "messy", "maximize": True},
+    "planted_bumps": {"oracle": "planted_bumps", "maximize": True},
+    "bumps": {"oracle": "bumps", "maximize": True},
+    # Smooth multi-peak
     "ackley": {"oracle": "ackley", "maximize": True},
     "gaussian": {"oracle": "gaussian", "maximize": True},
-    "planted_bumps": {"oracle": "planted_bumps", "maximize": True},
+    "aitchison_gaussian": {"oracle": "aitchison_gaussian", "maximize": True},
+    # ILR-native
+    "quadratic_ilr": {"oracle": "quadratic_ilr", "maximize": True},
     "rastrigin_ilr": {"oracle": "rastrigin_ilr", "maximize": True},
+    # Facet / linear / rational
+    "simplex_linear": {"oracle": "simplex_linear", "maximize": True},
+    "vertex_max": {"oracle": "vertex_max", "maximize": True},
+    "rastrigin_direct": {"oracle": "rastrigin_direct", "maximize": True},
 }

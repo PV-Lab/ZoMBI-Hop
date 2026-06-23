@@ -83,6 +83,19 @@ mobo trial CSVs) and ``x1..xd`` otherwise.
 
 Usage
 -----
+
+    COMPOSITIONAL TRIAL 112 HPARAMS
+    python optimize/evaluate.py \
+        --hparams-json optimize/hparams/trial_112_composition.json \
+        --dataset RF \
+        --num-runs 1 \
+        --time-limit-min 3 \
+        --device cpu \
+        --no-video \
+        --out-dir optimize/runs/rerun_trial112_comp \
+        --runs-path optimize/runs/mobo_05_06_15_32
+
+
   python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
       --trials 112 --dataset gaussian --num-runs 3 --time-limit-min 3
 
@@ -403,11 +416,23 @@ def build_ensemble_ds(config: dict, dataset: str, *, time_limit_hours: float | N
 
 # ─── Hyperparameter loading ─────────────────────────────────────────────────────
 
+# Keys allowed in hparams JSON beyond the MOBO search space (override ZOMBI_FIXED).
+_ZOMBI_OVERRIDE_KEYS = frozenset({"input_noise", "max_gp_points", "acquisition_type", "verbose"})
+
+
+def _split_hparams(hp: dict) -> tuple[dict, dict]:
+    """Return (mobo_hparams, zombi_fixed_overrides)."""
+    mobo = {k: hp[k] for k in rm.HPARAM_NAMES if k in hp}
+    overrides = {k: hp[k] for k in _ZOMBI_OVERRIDE_KEYS if k in hp}
+    return mobo, overrides
+
+
 def _normalize_hparams(hp: dict, *, source: str) -> dict:
     missing = [k for k in rm.HPARAM_NAMES if k not in hp]
     if missing:
         sys.exit(f"{source}: missing hparams {missing} (stale hyperparameter set?).")
-    return {k: hp[k] for k in rm.HPARAM_NAMES}
+    mobo, overrides = _split_hparams(hp)
+    return {**mobo, **overrides}
 
 
 def _trial_num_from_path(path: str) -> int | None:
@@ -486,7 +511,8 @@ def load_hparams_from_json(json_path: str) -> dict[int, dict]:
     if missing:
         sys.exit(f"--hparams-json: missing hparams {missing} "
                  f"(stale hyperparameter set?).")
-    hp = {k: hp[k] for k in rm.HPARAM_NAMES}
+    mobo, overrides = _split_hparams(hp)
+    hp = {**mobo, **overrides}
     print(f"  [hparams-json] loaded {len(hp)} hyperparameters from {json_path}")
     return {0: hp}
 
@@ -797,10 +823,15 @@ def run_single_eval(
     if dim > 3 and (hp.get("top_m_points") is None or hp.get("top_m_points", 0) < dim + 1):
         hp["top_m_points"] = max(dim + 1, 4)
 
+    zombi_fixed = dict(rm.ZOMBI_FIXED)
+    for k in _ZOMBI_OVERRIDE_KEYS:
+        if k in hp:
+            zombi_fixed[k] = hp.pop(k)
+
     optimizer = rm.ZoMBIHop(
         objective=obj_wrapper,
         X_init_actual=X_a, X_init_expected=X_e, Y_init=Y,
-        **rm.ZOMBI_FIXED, **hp,
+        **zombi_fixed, **hp,
         device=str(rm.DEVICE), dtype=rm.DTYPE,
         run_uuid=None, checkpoint_dir=None,
     )

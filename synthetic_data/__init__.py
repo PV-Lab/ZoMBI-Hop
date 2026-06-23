@@ -9,7 +9,7 @@ from .ackley import (
 )
 from .bumps import Bumps
 from .ensemble import Ensemble
-from .oracles import ORACLE_CHOICES, build_oracle
+from .oracles import ORACLE_CHOICES, ORACLE_EXPRESSIONS, build_oracle
 from .campaign_datasets import (
     SYNTHETIC_3D_PRESETS,
     generate_campaign_files,
@@ -21,6 +21,6 @@ __all__ = [
     "load_config", "save_config",
     "Bumps",
     "Ensemble",
-    "ORACLE_CHOICES", "build_oracle",
+    "ORACLE_CHOICES", "ORACLE_EXPRESSIONS", "build_oracle",
     "SYNTHETIC_3D_PRESETS", "generate_campaign_files", "load_metadata",
 ]

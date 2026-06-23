@@ -1,0 +1,28 @@
+{
+  "description": "Trial 112 MOBO hparams adjusted for the composition-space pipeline (d=3).",
+  "notes": {
+    "input_noise": "0.01 replaces fixed MOBO input_noise_ilr=0.03 (÷3)",
+    "max_penalty_radius": "4.56 ILR semi-axes → ~1.9 tangent/comp (÷2.4 heuristic at d=3)",
+    "needle_stop_noise_multiplier": "tuned so stop threshold ≈ old 2.82×0.03 ILR"
+  },
+  "hparams": {
+    "nat_grad_step": 0.00100187,
+    "nat_grad_max_steps": 54,
+    "n_restarts": 285,
+    "raw": 200,
+    "ucb_beta": 1.45791911,
+    "max_zooms": 3,
+    "max_iterations": 8,
+    "top_m_points": 8,
+    "n_consecutive_converged": 1,
+    "convergence_pi_threshold": 0.05,
+    "input_noise_threshold_mult": 3.98353261,
+    "output_noise_threshold_mult": 0.52251166,
+    "max_penalty_radius": 1.9,
+    "needle_shrink_factor": 0.637987,
+    "needle_stop_noise_multiplier": 3.5,
+    "paring_spatial_halfnoise": 1.21375814,
+    "paring_y_noise_multiplier": 4.19507699,
+    "input_noise": 0.01
+  }
+}

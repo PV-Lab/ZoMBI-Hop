@@ -22,7 +22,28 @@ ORACLE_CHOICES = (
     "gaussian",
     "rastrigin_ilr",
     "planted_bumps",
+    "aitchison_gaussian",
+    "quadratic_ilr",
+    "simplex_linear",
+    "vertex_max",
+    "rastrigin_direct",
+    "bumps",
 )
+
+# Short mathematical description for metadata / dashboards.
+ORACLE_EXPRESSIONS: dict[str, str] = {
+    "messy": "Σ exp(-||x-c||²/2σ²) major + signed micro + Σ A·sin(ω·ilr(x)+φ)",
+    "ackley": "negated Ackley basins at Dirichlet peaks + Perlin noise",
+    "gaussian": "Σ exp(-||x-p||²/2σ²)  (Euclidean composition distance)",
+    "rastrigin_ilr": "-[An + Σ(zᵢ² - A cos(2πzᵢ))],  z = ilr(x)",
+    "planted_bumps": "Σ exp(-||x-c||²/2σ²) major + unsigned micro bumps",
+    "aitchison_gaussian": "Σ exp(-d_A(x,p)²/2σ²)  (Aitchison / CLR distance)",
+    "quadratic_ilr": "-||ilr(x) - ilr(c*)||²  (single ILR bowl)",
+    "simplex_linear": "w·x  (dot product; peak at one vertex)",
+    "vertex_max": "maxᵢ xᵢ  (facet expression; peaks at all vertices)",
+    "rastrigin_direct": "-[An + Σ((fxᵢ)² - A cos(2πfxᵢ))],  f·x ∈ ℤ₊",
+    "bumps": "Σ exp(-||x-c||²/2σ²) random Dirichlet majors + micro ([0.5,1])",
+}
 
 _RASTRIGIN_CONFIGS_DIR = Path(__file__).resolve().parent / "rastrigin_ilr"
 _RASTRIGIN_DEFAULTS_PATH = _RASTRIGIN_CONFIGS_DIR / "defaults.json"
@@ -154,6 +175,20 @@ def normalize_rows(X: np.ndarray) -> np.ndarray:
     return X / np.where(s == 0, 1.0, s)
 
 
+_EPS = 1e-10
+
+
+def aitchison_distance_np(x: np.ndarray, y: np.ndarray) -> float:
+    """Aitchison distance between two compositions (CLR Euclidean norm)."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    log_x = np.log(x + _EPS)
+    log_y = np.log(y + _EPS)
+    clr_x = log_x - log_x.mean()
+    clr_y = log_y - log_y.mean()
+    return float(np.linalg.norm(clr_x - clr_y))
+
+
 class GaussianMixtureOracle:
     maximize = True
 
@@ -241,6 +276,122 @@ class PlantedBumpField:
     @property
     def true_optima(self) -> list[np.ndarray]:
         return [c.copy() for c in self.major_centers]
+
+
+class AitchisonGaussianOracle:
+    """Gaussian mixture on Aitchison distance — compositional-native smooth peaks."""
+
+    maximize = True
+
+    def __init__(self, peaks: list[np.ndarray], *, sigma: float = 0.35):
+        self.peaks = [normalize_rows(np.asarray(p, dtype=float).reshape(1, -1))[0] for p in peaks]
+        self.sigma = float(sigma)
+
+    def __call__(self, x: np.ndarray) -> float:
+        x = np.asarray(x, dtype=float)
+        return float(sum(
+            math.exp(-(aitchison_distance_np(x, p) / self.sigma) ** 2 / 2.0)
+            for p in self.peaks
+        ))
+
+    @property
+    def true_optima(self) -> list[np.ndarray]:
+        return [p.copy() for p in self.peaks]
+
+
+class QuadraticILROracle:
+    """Single smooth bowl: negative squared ILR distance from a target composition."""
+
+    maximize = True
+
+    def __init__(self, center: np.ndarray, *, scale: float = 1.0):
+        self.center = normalize_rows(np.asarray(center, dtype=float).reshape(1, -1))[0]
+        self.z_star = composition_to_ilr_np(self.center)
+        self.scale = float(scale)
+
+    def __call__(self, x: np.ndarray) -> float:
+        z = composition_to_ilr_np(np.asarray(x, dtype=float))
+        return -self.scale * float(np.sum((z - self.z_star) ** 2))
+
+    @property
+    def true_optima(self) -> list[np.ndarray]:
+        return [self.center.copy()]
+
+
+class SimplexLinearOracle:
+    """Linear expression on composition coordinates; optimum at one vertex."""
+
+    maximize = True
+
+    def __init__(self, d: int, *, seed: int = 42):
+        rng = np.random.default_rng(seed)
+        self.weights = rng.uniform(0.5, 2.0, d)
+        self._optimum_vertex = simplex_vertex(d, int(np.argmax(self.weights)))
+
+    def __call__(self, x: np.ndarray) -> float:
+        return float(np.dot(self.weights, np.asarray(x, dtype=float)))
+
+    @property
+    def true_optima(self) -> list[np.ndarray]:
+        return [self._optimum_vertex.copy()]
+
+
+class VertexMaxOracle:
+    """Facet / vertex expression: max component (all pure compositions tie)."""
+
+    maximize = True
+
+    def __init__(self, d: int) -> None:
+        if d < 2:
+            raise ValueError("vertex_max requires d >= 2")
+        self.d = d
+
+    def __call__(self, x: np.ndarray) -> float:
+        return float(np.max(np.asarray(x, dtype=float)))
+
+    @property
+    def true_optima(self) -> list[np.ndarray]:
+        return [simplex_vertex(self.d, i) for i in range(self.d)]
+
+
+class RastriginDirectOracle:
+    """Rastrigin on raw composition coordinates (rational lattice optima)."""
+
+    maximize = True
+
+    def __init__(self, d: int = 3, *, amplitude: float = 10.0, frequency: int = 5):
+        self.d = d
+        self.amplitude = float(amplitude)
+        self.frequency = int(frequency)
+
+    def __call__(self, x: np.ndarray) -> float:
+        x = np.asarray(x, dtype=float)
+        z = self.frequency * x
+        n = z.shape[0]
+        rastrigin = self.amplitude * n + float(
+            np.sum(z ** 2 - self.amplitude * np.cos(2.0 * math.pi * z))
+        )
+        return -rastrigin
+
+    @property
+    def local_optima(self) -> list[np.ndarray]:
+        """Compositions where frequency * x_i is a non-negative integer summing to frequency."""
+        optima: list[np.ndarray] = []
+        freq = self.frequency
+
+        def _enumerate(dims_left: int, total: int, prefix: list[int]) -> None:
+            if dims_left == 1:
+                optima.append(np.array(prefix + [total], dtype=float) / freq)
+                return
+            for k in range(total + 1):
+                _enumerate(dims_left - 1, total - k, prefix + [k])
+
+        _enumerate(self.d, freq, [])
+        return optima
+
+    @property
+    def true_optima(self) -> list[np.ndarray]:
+        return self.local_optima
 
 
 class MessyCampaignOracle:
@@ -342,4 +493,31 @@ def build_oracle(
         obj = PlantedBumpField(centers, n_micro=40, seed=seed)
         label = f"Planted bumps ({len(centers)} major + 40 micro)"
         return obj, obj.true_optima, label
+    if name == "aitchison_gaussian":
+        obj = AitchisonGaussianOracle(centers, sigma=0.35)
+        label = f"Aitchison Gaussian ({len(centers)} peaks, σ=0.35)"
+        return obj, obj.true_optima, label
+    if name == "quadratic_ilr":
+        obj = QuadraticILROracle(centers[0], scale=1.0)
+        label = f"Quadratic ILR bowl (center=layout peak 0)"
+        return obj, obj.true_optima, label
+    if name == "simplex_linear":
+        obj = SimplexLinearOracle(d, seed=seed)
+        label = f"Simplex linear w·x (seed={seed})"
+        return obj, obj.true_optima, label
+    if name == "vertex_max":
+        obj = VertexMaxOracle(d)
+        label = f"Vertex max max(x) ({d} global optima at vertices)"
+        return obj, obj.true_optima, label
+    if name == "rastrigin_direct":
+        obj = RastriginDirectOracle(d, amplitude=10.0, frequency=5)
+        label = f"Rastrigin direct ({len(obj.true_optima)} rational lattice optima)"
+        return obj, obj.true_optima, label
+    if name == "bumps":
+        from synthetic_data.bumps import Bumps
+
+        obj = Bumps(dim=d, seed=seed)
+        optima = [c.copy() for c in obj.major_centers]
+        label = f"Random bumps ({len(optima)} major + micro, seed={seed})"
+        return obj, optima, label
     raise ValueError(f"Unknown oracle {name!r}; choose from {ORACLE_CHOICES}")

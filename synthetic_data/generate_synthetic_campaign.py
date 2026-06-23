@@ -272,7 +272,7 @@ def main() -> None:
     parser.add_argument(
         "--all-3d",
         action="store_true",
-        help="Generate all standard 3D synthetic presets (messy, ackley, gaussian, …).",
+        help="Generate all standard 3D synthetic presets (11 expression families).",
     )
     args = parser.parse_args()
 
