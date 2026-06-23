@@ -292,7 +292,7 @@ def resolve_dataset(
         with open(cfg_path) as f:
             cfg = json.load(f)
         try:
-            csv_path = resolve_surrogate_csv_path(cfg["csv_path"])
+            csv_path = resolve_surrogate_csv_path(cfg.get("csv_path"))
         except FileNotFoundError as exc:
             sys.exit(str(exc))
         maximize = bool(cfg["maximize"])

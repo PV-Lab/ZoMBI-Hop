@@ -391,7 +391,7 @@ def _prepare_coverage(trial_dir: str) -> dict:
             raise ValueError(f"RF surrogate ground truth is only available for dim=3 "
                              f"(got dim={dim})")
         try:
-            csv_path = resolve_surrogate_csv_path(cfg["csv_path"])
+            csv_path = resolve_surrogate_csv_path(cfg.get("csv_path"))
         except FileNotFoundError as exc:
             raise FileNotFoundError(str(exc)) from exc
         grid_pts, grid_vals = _build_rf_ground_truth(csv_path)
