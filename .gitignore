@@ -2,6 +2,10 @@
 *.err
 *.out
 
+hyperparameters/*
+htem/datasets/*
+ela/*
+
 # UV artifacts
 .python-version
 pyproject.toml
