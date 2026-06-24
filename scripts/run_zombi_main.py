@@ -219,6 +219,7 @@ def _write_live_plot_state(
             "prior_line_endpoints": _endpoints_to_list(prior_endpoints_ref) if prior_endpoints_ref else [],
             "needles": [],
             "penalty_regions": [],   # [{center: [...], radius_ilr: float}]
+            "penalty_mask": None,    # per-point bool aligned with x_actual (True = active)
             "zoom_bounds_lo": None,
             "zoom_bounds_hi": None,
         }
@@ -248,7 +249,7 @@ def _write_live_plot_state(
                 state["zoom_bounds_hi"] = zoom_bounds[1].cpu().numpy().tolist()
             except Exception:
                 pass
-        # Penalty regions directly from the optimizer's data handler
+        # Penalty regions + per-point penalty mask from the optimizer's handler
         if optimizer_ref is not None and optimizer_ref[0] is not None:
             try:
                 dh = optimizer_ref[0].data_handler
@@ -259,6 +260,19 @@ def _write_live_plot_state(
                         "center": n_comp[i].tolist(),
                         "radius_ilr": float(n_rads[i]),
                     })
+            except Exception:
+                pass
+            # Per-point pruned/pared flag, for the ternary's white/black outlines.
+            # get_penalty_mask() aligns with dh.X_all_actual (which *includes* the
+            # initial data); all_x_actual does not, so take the tail that lines up.
+            try:
+                dh = optimizer_ref[0].data_handler
+                full_mask = dh.get_penalty_mask()
+                if full_mask is not None:
+                    fm = full_mask.detach().cpu().numpy().ravel().astype(bool)
+                    n_live = len(all_x_actual)
+                    if len(fm) >= n_live:
+                        state["penalty_mask"] = fm[len(fm) - n_live:].tolist()
             except Exception:
                 pass
         (run_dir / "live_plot_state.json").write_text(json.dumps(state))
