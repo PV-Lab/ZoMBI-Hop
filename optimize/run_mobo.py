@@ -2663,8 +2663,11 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
         xs, ys, n_runs = collect_shared_observations(
             share_dirs, shared_sig, shared_seen, exclude_run_dir=run_dir)
         if xs:
-            X_prior.extend(xs)
-            Y_prior.extend(ys)
+            # Normalise to CPU to match X_prior/Y_prior and X_obs/Y_obs (line ~2644
+            # and ~2768): hparams_to_norm yields DEVICE tensors, and stacking those
+            # with the CPU observation tensors trips a cross-device torch.cat.
+            X_prior.extend(x.detach().cpu() for x in xs)
+            Y_prior.extend(y.detach().cpu() for y in ys)
             print(f"  [share] +{len(xs)} trial(s) from {n_runs} matching sibling run(s) "
                   f"— shared history now {len(Y_prior)} pair(s)", flush=True)
 
