@@ -34,7 +34,9 @@ Usage
   conda activate zombi-hop
   python optimize/pareto.py                 # crawl optimize/runs, write there
   python optimize/pareto.py <runs_dir>      # crawl a specific runs directory
-  python optimize/pareto.py <run_dir>       # a single run dir (holds mobo_progress.json)
+  python optimize/pareto.py <run_dir>       # a single run dir: pools its config-
+                                            #   matching siblings (shared history)
+  python optimize/pareto.py <run_dir> --no-shared-history  # that one run only
   python optimize/pareto.py --out <dir>     # write pareto.json / .png elsewhere
   python optimize/pareto.py --no-interactive # save static PNG instead of live window
   python optimize/pareto.py --with-old       # include mobo_old_jackson (excluded by default)
@@ -91,6 +93,55 @@ HPARAM_SPACE: dict[str, tuple] = {
     "paring_y_noise_multiplier":   (0.1,    5.0,   "linear"),
 }
 HPARAM_NAMES = list(HPARAM_SPACE.keys())
+
+
+# ─── Run-config signatures (shared history) ──────────────────────────────────────
+# Mirror of run_mobo.py's --share-history matching: a single run dir's trials are
+# only comparable to a sibling's when the objective they were scored against is the
+# same, which is pinned down by these run_config.json fields.
+
+def _run_signature(cfg: dict) -> dict:
+    """Config fields that must match for another run's stored trials to be pooled.
+
+    These pin down the *objective* a trial was scored against — the same
+    hyperparameters yield comparable (dist, dup, avg_time_per_iter) only when the
+    dataset, dimension, per-trial time budget, search direction, and (for the
+    ensemble objective) the landscape difficulty/averaging all agree. Fields absent
+    in older configs come back as ``None`` and simply have to match ``None`` on both
+    sides. Kept in sync with ``run_mobo._run_signature``.
+    """
+    return {
+        "dataset": cfg.get("dataset") or cfg.get("oracle") or cfg.get("landscape"),
+        "dim": int(cfg["dim"]) if cfg.get("dim") is not None else None,
+        "time_limit_hours": cfg.get("time_limit_hours"),
+        "maximize": bool(cfg.get("maximize", False)),
+        "ensemble_optima_margin": cfg.get("ensemble_optima_margin"),
+        "ensemble_repeats": cfg.get("ensemble_repeats"),
+    }
+
+
+def _signatures_match(a: dict, b: dict) -> bool:
+    """Equality over signature fields, with float tolerance for the numeric ones."""
+    def eq(x, y) -> bool:
+        if isinstance(x, bool) or isinstance(y, bool):
+            return x == y
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            return abs(float(x) - float(y)) < 1e-9
+        return x == y
+    return all(eq(v, b.get(k)) for k, v in a.items())
+
+
+def _load_run_signature(run_dir: str) -> dict | None:
+    """Read ``run_dir/run_config.json`` and return its signature, or None if absent."""
+    cfg_path = os.path.join(run_dir, "run_config.json")
+    if not os.path.isfile(cfg_path):
+        return None
+    try:
+        with open(cfg_path) as f:
+            return _run_signature(json.load(f))
+    except Exception as exc:
+        print(f"  [shared-history] {run_dir}: run_config.json unreadable ({exc}).")
+        return None
 
 
 # ─── Collection ────────────────────────────────────────────────────────────────
@@ -159,6 +210,7 @@ def collect_trials(
     only_runs: set[str] | None = None,
     only_trials: dict[str, set[int]] | None = None,
     only_prefixes: set[str] | None = None,
+    only_signature: dict | None = None,
 ) -> list[dict]:
     """Crawl ``runs_dir/mobo_*/mobo_progress.json`` → list of trial records.
 
@@ -170,6 +222,8 @@ def collect_trials(
     *only_trials*: if set, maps run names to specific trial numbers to include.
     *only_prefixes*: if set, include every run whose name starts with any of
     these prefixes (e.g. ``mobo_4d_`` from the ``--only 4d`` shorthand).
+    *only_signature*: if set, include only runs whose ``run_config.json`` matches
+    this signature (the shared-history pooling used when a single run dir is given).
     """
     has_filter = only_runs or only_trials or only_prefixes
     records: list[dict] = []
@@ -188,6 +242,10 @@ def collect_trials(
                 continue
         if exclude_old and run_name == "mobo_old_jackson":
             continue
+        if only_signature is not None:
+            sig = _load_run_signature(os.path.dirname(path))
+            if sig is None or not _signatures_match(only_signature, sig):
+                continue
         try:
             with open(path) as f:
                 data = json.load(f)
@@ -276,6 +334,18 @@ def plot_pareto(M: np.ndarray, mask: np.ndarray, obj_labels: list[str],
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
     print(f"  Pareto plot -> {out_path}")
+
+
+def _has_display() -> bool:
+    """True if an interactive GUI window can plausibly be shown.
+
+    On Linux a window needs an X11/Wayland display, so a missing ``DISPLAY`` /
+    ``WAYLAND_DISPLAY`` (e.g. an SSH session or batch node) means headless. macOS
+    and Windows always have a native display server.
+    """
+    if platform.system() in ("Darwin", "Windows"):
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
 def _open_file(path: str) -> None:
@@ -538,6 +608,9 @@ def main() -> None:
                         help="Include trials from mobo_old_jackson (excluded by default).")
     parser.add_argument("--show-numberline", action="store_true",
                         help="Show hyperparameter number-line figure in interactive mode.")
+    parser.add_argument("--no-shared-history", action="store_true",
+                        help="When a single run dir is given, do NOT pool sibling runs "
+                             "with a matching run_config; use only that one run's trials.")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -553,6 +626,21 @@ def main() -> None:
     )
     plot_runs_dir = os.path.dirname(runs_dir) if single_run else runs_dir
 
+    # Shared-history pooling: when a single run dir is given, default to pooling its
+    # config-matching siblings (same dataset/dim/time-budget/direction/ensemble
+    # settings), mirroring run_mobo's --share-history. This crawls the parent runs
+    # dir, filtered to the target run's signature. --no-shared-history opts out.
+    only_signature = None
+    if single_run and not args.no_shared_history:
+        only_signature = _load_run_signature(runs_dir)
+        if only_signature is None:
+            print(f"  [shared-history] {os.path.basename(runs_dir)} has no run_config.json; "
+                  "using this run's trials only.")
+        else:
+            print(f"  [shared-history] pooling sibling runs matching "
+                  f"{os.path.basename(runs_dir)}'s config: {only_signature}")
+            runs_dir = plot_runs_dir  # crawl the parent, filtered by signature below
+
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 70)
@@ -564,7 +652,8 @@ def main() -> None:
     records = collect_trials(runs_dir, exclude_old=not args.with_old,
                              only_runs=only_runs or None,
                              only_trials=only_trials or None,
-                             only_prefixes=only_prefixes or None)
+                             only_prefixes=only_prefixes or None,
+                             only_signature=only_signature)
     if not records:
         sys.exit(f"No usable trials found under {runs_dir}/mobo_*/mobo_progress.json.")
 
@@ -606,6 +695,13 @@ def main() -> None:
 
     if args.no_interactive:
         plot_pareto(M, mask, obj_labels, os.path.join(out_dir, "pareto_front.png"))
+    elif not _has_display():
+        # Headless system (e.g. SSH / batch node): an interactive window can't be
+        # shown, so save a static PNG into optimize/ instead of failing.
+        png_path = os.path.join(script_dir, "pareto_front.png")
+        print("  No display detected (headless); saving static PNG instead of "
+              "opening an interactive window.")
+        plot_pareto(M, mask, obj_labels, png_path)
     else:
         plot_pareto_interactive(M, mask, records, plot_runs_dir, obj_labels,
                                 show_numberline=args.show_numberline)

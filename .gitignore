@@ -2,6 +2,7 @@
 *.err
 *.out
 
+optimize/pareto_front.png
 hyperparameters/*
 htem/datasets/*
 ela/*
