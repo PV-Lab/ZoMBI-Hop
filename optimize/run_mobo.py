@@ -2019,8 +2019,8 @@ def build_ensemble_landscape(
     spec a valid ``true_optima`` and (for dim 3) a render grid. ``oracle`` is
     tagged ``"ensemble"`` so resume can recognise and rebuild it.
     """
-    rng = random.Random(f"{seed}-base")
-    cfg = random_ensemble_config(dim, rng, optima_margin=optima_margin)
+    cfg = random_ensemble_config(dim, index=0, total=1, seed=int(seed),
+                                 optima_margin=optima_margin)
     fn = Ensemble(**cfg)
     true_optima = [np.asarray(c, dtype=float) for c in fn.centers]
     grid_pts = grid_vals = None
@@ -2316,9 +2316,12 @@ def evaluate_hparams(
     configs: list[dict] = []
     repeats: list[dict] = []
     for k in range(1, n_repeats + 1):
-        rng = random.Random(f"{ensemble_spec['seed']}-{trial_num}-{k}")
+        # Stable per (trial, k) Sobol' index so the same ensemble seed regenerates
+        # the identical landscape sequence (k < 1024 per trial).
+        idx = int(trial_num) * 1024 + int(k)
         cfg = random_ensemble_config(
-            ensemble_spec["dim"], rng, optima_margin=ensemble_spec["optima_margin"])
+            ensemble_spec["dim"], idx, seed=int(ensemble_spec["seed"]),
+            optima_margin=ensemble_spec["optima_margin"])
         configs.append(cfg)
         run_dir = os.path.join(trial_dir, f"run_{k}")
         print(f"    [ensemble repeat {k}/{n_repeats}]", flush=True)

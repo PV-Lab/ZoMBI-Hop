@@ -1129,9 +1129,10 @@ def evaluate_dataset(
             if is_ensemble:
                 # Reproducible per (trial, run): same --ensemble-seed regenerates
                 # the identical landscape sequence; ensemble_config.json records it.
-                rng = random.Random(f"{args.ensemble_seed}-{trial_num}-{k}")
+                idx = int(trial_num) * 1024 + int(k)
                 ens_cfg = random_ensemble_config(
-                    ens_dim, rng, optima_margin=args.ensemble_margin)
+                    ens_dim, idx, seed=int(args.ensemble_seed),
+                    optima_margin=args.ensemble_margin)
                 run_ds = build_ensemble_ds(
                     ens_cfg, dataset, time_limit_hours=time_limit_min / 60.0)
                 os.makedirs(run_dir, exist_ok=True)

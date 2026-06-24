@@ -9,45 +9,64 @@ single objective so the benchmark looks more like a real materials-composition
 response surface:
 
     * **Optima**          — strong negated-Ackley basins; the *true* maxima.
+                            Their placement can be uniform ("scatter") or
+                            **clustered** around a chosen simplex region.
     * **Roughness**       — coherent Perlin-style simplex noise (fine ripple).
     * **Weak optima**     — extra, shorter negated-Ackley basins acting as
                             distractors / fake local optima.
-    * **Ridges**          — high-value tubes around random line segments.
+    * **Ridges**          — high-value tubes around line segments of an
+                            **adjustable length**.
+    * **Edge bias**       — a smooth structural trend that raises (or lowers)
+                            the whole surface toward a chosen simplex region
+                            (corners / edges / faces / middle).
     * **Anisotropy**      — per-axis stretching of the distance metric, so
                             basins/ridges are elongated along some axes.
-    * **Plateaus**        — regions flattened to a constant mesa height.
+    * **Plateaus**        — regions flattened to a constant mesa (or basin) height.
+
+Signed features (centered output)
+---------------------------------
+Unlike the earlier additive-only design, the background is built around a
+**neutral level of 0** (raw units), and every background feature can add *or*
+subtract mass: weak optima can be bumps or pits, ridges can be ridges or
+trenches, plateaus can be mesas or basins, and the edge bias can push the
+chosen region up or down.  The per-instance sign is drawn randomly (a fraction
+``neg_frac`` of instances subtract).  This lets the final surface centre around
+the middle of its output range and span roughly ``[0, 1]`` rather than only the
+upper half.
 
 Unlike ``ackley.py`` this module deliberately avoids any hardcoded
 "parameter-by-dimension" tables: every knob is a plain scalar (or a count) that
-means the same thing at any ``dim``.  Random placement of every feature is
+means the same thing at any ``dim`` (the only exception is the *count* of true
+optima, which scales with simplex room).  Random placement of every feature is
 driven by a single ``seed``.
 
-Guaranteed dominance of the true optima
----------------------------------------
-The defining contract of this objective is that **the true optima are always
-the strict global maxima**, by a tunable margin, *no matter* how the other
-features are configured.  Concretely, let ``T(x)`` be the clean true-optima
-field (value 0 at each optimum, negative elsewhere) and ``G(x)`` the combined
-*background* (weak optima + ridges + roughness + plateaus).  The raw objective is
+Dominance of the true optima
+----------------------------
+The true optima are always the global maxima: let ``T(x)`` be the clean
+true-optima field (peaking at ``_PEAK`` at each optimum) and ``G(x)`` the
+combined signed *background* (weak optima + ridges + edge bias + roughness +
+plateaus).  The raw objective is
 
-    F(x) = max( T(x),  min( G(x), cap_raw ) )
+    F(x) = max( T(x),  min( G(x), cap_high ) )
 
-The background is capped *before* the true-optima field is laid on top, so no
-amount of stretching, plateau insertion or noise can push a distractor up to or
-past a real optimum.
+The background's *upward* excursions are capped at
+``cap_high = _PEAK * (1 - 2 * optima_margin)`` *before* the true-optima field is
+laid on top, so no amount of stretching, ridging or noise can push a distractor
+up to a real optimum.  (Downward excursions — valleys/pits — are never capped;
+they are what let the surface dip toward 0 and "float" the optima below 1.)
 
-``optima_margin`` is expressed in the **normalized output units** (the same
-``[0.5, 1]`` scale ``predict`` returns), in ``[0, 0.5]``: the optima sit at 1.0
-and the entire background is guaranteed to sit at or below ``1 - optima_margin``.
-Because the ``[0.5, 1]`` map is monotonic in the raw signal with the peak pinned
-at raw 0, that normalized cap corresponds to the raw cap
-``cap_raw = 2 * optima_margin * raw_min`` (and ``raw_min`` is unaffected by the
-cap, since capping only lowers the *top* of the background, never the landscape
-floor — so there is no circularity).
+Output normalization ("optima float")
+--------------------------------------
+The raw field is mapped to output with a single symmetric scale centred on the
+neutral level:
 
-(The guarantee is about the background / distractor field.  The true optima's
-*own* basins of course rise continuously to the peak, so points inside a real
-basin are legitimately close to it — those are the optimum, not competitors.)
+    y = clip( 0.5 + 0.5 * F / scale,  0, 1 ),   scale = max(|raw_min|, |raw_max|)
+
+so the neutral level (raw 0) always maps to 0.5.  The true optima are still the
+maxima, but they are **not pinned to exactly 1.0**: if the deepest valley is
+deeper than the optima are tall, ``scale`` is set by the valley and the optima
+land below 1.0.  This keeps the distribution centred on the middle and ranging
+across (roughly) the whole ``[0, 1]`` interval.
 
 The ``Ensemble`` class exposes ``predict(X)`` with the scikit-learn-style
 ``(N, d) -> (N,)`` signature, plus ``known_maxima`` and ``centers`` like
@@ -58,8 +77,8 @@ Example
     from synthetic_data.ensemble import Ensemble
 
     fn = Ensemble(dim=4, n_optima=4, n_weak=8, n_ridges=2, n_plateaus=2)
-    y = fn.predict(X)                       # (N,) in [0.5, 1]
-    for c, v in fn.known_maxima:            # each v == 1.0 (the global max)
+    y = fn.predict(X)                       # (N,) in [0, 1]
+    for c, v in fn.known_maxima:            # each v is the global max
         ...
 """
 
@@ -74,25 +93,42 @@ from synthetic_data.ackley import (
     simplex_noise,
 )
 
-# Raw "far-field floor": the value a negated-Ackley basin asymptotes to far from
-# its center (``-scale * a``).  Background features are expressed as a fraction
-# of the span between this floor and the peak value of 0.
+# Raw amplitude unit: the span of a single negated-Ackley basin (``scale * a``).
+# The background is centred on a neutral level of 0; the true optima rise one
+# full span (``_PEAK``) above that level.
 _BASE = -ACKLEY_SCALE * ACKLEY_A
 _SPAN = 0.0 - _BASE  # == ACKLEY_SCALE * ACKLEY_A
-_RANGE_SAMPLES = 100_000  # simplex samples used to estimate raw min/max for the [0.5, 1] map
+_PEAK = _SPAN        # raw value at a true optimum (one span above neutral 0)
+_RANGE_SAMPLES = 100_000  # simplex samples used to estimate raw min/max for the output map
 
-# Per-feature seed offsets so one master ``seed`` deterministically drives every
-# random placement without the features sharing a stream.
 # Anisotropy: max log-stretch grows as ``log1p(ANISO_RATE * strength)`` so the
 # stretched axes widen by ~4x at strength 10 and ~16x at strength 50.
 ANISO_RATE = 0.3
 
+# Per-feature seed offsets so one master ``seed`` deterministically drives every
+# random placement without the features sharing a stream.
 _SEED_OPTIMA = 0
 _SEED_WEAK = 101
 _SEED_RIDGES = 202
 _SEED_PLATEAUS = 303
 _SEED_ANISO = 404
 _SEED_NOISE = 505
+_SEED_SIGNS = 606
+_SEED_EDGE = 707
+_SEED_CLUSTERS = 808
+
+# Region targets selectable by the location-based features (clustering of optima
+# and the edge bias).  ``"scatter"`` (optima only) means uniform placement / no
+# region preference.  ``"faces"`` only differs from ``"edges"`` for dim >= 4.
+REGION_MODES = ("corners", "edges", "faces", "middle")
+
+
+def region_modes(dim: int) -> tuple[str, ...]:
+    """Region targets meaningful at simplex ``dim`` (drops ``"faces"`` for dim 3,
+    where a facet coincides with an edge)."""
+    if dim <= 3:
+        return tuple(m for m in REGION_MODES if m != "faces")
+    return REGION_MODES
 
 
 # ── Per-run randomization ─────────────────────────────────────────────────────
@@ -120,45 +156,154 @@ def optima_count_range(dim: int) -> tuple[int, int]:
     return (5 * dim, 15 * dim)
 
 
-def random_ensemble_config(dim: int, rng, *, optima_margin: float = 0.2) -> dict:
-    """Draw a random :class:`Ensemble` configuration for one run.
+# Hardcoded range of basin sharpness ``b`` to draw per dimension.  ``b`` is the
+# *inverse* width: larger ``b`` -> sharper/narrower basins, smaller ``b`` ->
+# wider basins.  The envelope is ``exp(-b * rms)`` with ``rms = ||delta|| /
+# sqrt(dim)`` (see :func:`_negated_ackley_env01`), so a basin's 1/e radius in
+# rms-units is ``1/b`` while the *largest* distance across the dim-simplex is
+# ``rms_max = sqrt(2/dim)``.  The widest basin that still localizes (i.e. whose
+# 1/e radius just equals the simplex extent) therefore sits at
+# ``b = sqrt(dim/2)``; below that even the farthest simplex point stays above the
+# basin's half-height and the "basin" is an almost-flat bump.  For dim 10 that
+# floor is ``sqrt(5) ~= 2.2`` — the low end of the 10-simplex range below.
+BASIN_WIDTH_RANGES: dict[int, tuple[float, float]] = {
+    3: (2.2, 90.0),
+    4: (2.2, 50.0),
+    10: (2.2, 20.0),
+}
 
-    Mirrors the "Randomize" button in ``synthetic_data/plot_ensemble.py`` — the
-    same per-feature ranges and the same on/off toggles (a disabled feature passes
-    its count/amplitude as 0) — and additionally draws a random master ``seed`` so
-    each call also relocates every feature.  ``n_optima`` is drawn from the
-    dimension-specific :func:`optima_count_range`; ``optima_margin`` is held fixed
-    (the viewer does not randomize it either).  Returns a kwargs dict accepted
-    directly by ``Ensemble(**config)``, so a saved config exactly recreates the
-    landscape.
 
-    ``rng`` is any object with the ``random.Random`` interface; seed it
-    deterministically (e.g. ``random.Random(f"{master_seed}-{trial}")``) for a
-    reproducible per-trial landscape sequence.
+def basin_width_range(dim: int) -> tuple[float, float]:
+    """``(lo, hi)`` range of basin sharpness ``b`` to draw at simplex ``dim``.
+
+    Uses the hardcoded :data:`BASIN_WIDTH_RANGES` table for the benchmarked
+    dimensions (3/4/10); other dimensions fall back to ``(sqrt(dim/2), 90.0)`` —
+    the "widest basin that still localizes" floor up to a sharp basin.
     """
-    opt_lo, opt_hi = optima_count_range(int(dim))
-    toggle = lambda: rng.random() > 0.5  # noqa: E731
-    weak_on, ridges_on, rough_on, aniso_on, plateaus_on = (
-        toggle(), toggle(), toggle(), toggle(), toggle())
+    if dim in BASIN_WIDTH_RANGES:
+        return BASIN_WIDTH_RANGES[dim]
+    return (round(float(np.sqrt(dim / 2.0)), 1), 90.0)
+
+
+def _sobol_point(d: int, index: int, seed: int) -> np.ndarray:
+    """The ``index``-th point of a scrambled ``d``-dimensional Sobol' sequence.
+
+    Quasi-random (low-discrepancy) sampling spreads the drawn configurations far
+    more evenly across the parameter hypercube than independent uniform draws, so
+    a sweep of trials covers the feature space with fewer gaps/clusters.  The
+    ``seed`` selects the scramble; any two calls with the same ``(d, index, seed)``
+    return the same point, so a landscape is reproducible from ``(seed, index)``.
+    """
+    from scipy.stats import qmc
+
+    sob = qmc.Sobol(d=d, scramble=True, seed=int(seed) & 0xFFFFFFFF)
+    if index > 0:
+        sob.fast_forward(int(index))
+    return sob.random(1)[0]
+
+
+def random_ensemble_config(
+    dim: int,
+    index: int = 0,
+    total: int | None = None,
+    *,
+    seed: int = 0,
+    optima_margin: float = 0.2,
+) -> dict:
+    """Draw the ``index``-th :class:`Ensemble` configuration from a Sobol' sweep.
+
+    Every continuous knob, on/off toggle and categorical choice (region modes,
+    optima layout) is mapped from one coordinate of a scrambled Sobol' point, so
+    a run of ``index = 0, 1, 2, …`` walks a low-discrepancy path through the whole
+    configuration space (mirrors the "Randomize" button in
+    ``synthetic_data/plot_ensemble.py``).  A disabled feature passes its
+    count/amplitude as 0.  ``n_optima`` is drawn from the dimension-specific
+    :func:`optima_count_range`; ``optima_margin`` is held fixed.  Returns a kwargs
+    dict accepted directly by ``Ensemble(**config)``, so a saved config exactly
+    recreates the landscape.
+
+    Parameters
+    ----------
+    dim : simplex dimensionality.
+    index : position in the Sobol' sequence (stable, reproducible per landscape).
+    total : advisory total number of configs in the sweep (unused by the Sobol'
+        sequence itself; accepted for API symmetry / future LHS batching).
+    seed : selects the Sobol' scramble *and* the per-landscape feature placement
+        seed; same ``(seed, index)`` -> identical landscape.
+    """
+    dim = int(dim)
+    opt_lo, opt_hi = optima_count_range(dim)
+    bw_lo, bw_hi = basin_width_range(dim)
+    regions = region_modes(dim)
+    layout_opts = ("scatter",) + regions
+
+    # One Sobol' coordinate per knob, consumed in order.
+    n_coords = 29
+    pt = _sobol_point(n_coords, int(index), int(seed))
+    _i = 0
+
+    def u() -> float:
+        nonlocal _i
+        v = float(pt[_i])
+        _i += 1
+        return v
+
+    def f_range(lo: float, hi: float) -> float:
+        return lo + u() * (hi - lo)
+
+    def i_range(lo: int, hi: int) -> int:
+        return int(round(lo + u() * (hi - lo)))
+
+    def on(p: float = 0.5) -> bool:
+        return u() < p
+
+    def pick(opts):
+        return opts[min(len(opts) - 1, int(u() * len(opts)))]
+
+    # Feature on/off toggles.
+    weak_on, ridges_on, rough_on, aniso_on, plateaus_on, edge_on = (
+        on(), on(), on(), on(), on(), on())
+
+    # Per-landscape placement seed, deterministic in (seed, index).
+    feature_seed = (int(seed) * 100_003 + int(index)) % 1_000_000
+
     return {
-        "dim": int(dim),
-        "n_optima": rng.randint(opt_lo, opt_hi),
-        "basin_width": float(rng.randint(40, 90)),
+        "dim": dim,
+        # true optima
+        "n_optima": i_range(opt_lo, opt_hi),
+        "basin_width": round(f_range(bw_lo, bw_hi), 1),
         "optima_margin": float(optima_margin),
-        "n_weak": rng.randint(0, 30) if weak_on else 0,
-        "weak_width": float(rng.randint(5, 300)),
-        "weak_amp": round(rng.uniform(0.0, 1.0), 2),
-        "n_ridges": rng.randint(0, 8) if ridges_on else 0,
-        "ridge_width": round(rng.uniform(0.01, 0.25), 3),
-        "ridge_amp": round(rng.uniform(0.0, 1.0), 2),
-        "noise_freq": round(rng.uniform(0.0, 40.0), 1),
-        "noise_amp": float(rng.randint(0, 2000)) if rough_on else 0.0,
-        "noise_octaves": rng.randint(1, 6),
-        "aniso_strength": round(rng.uniform(0.0, 50.0), 1) if aniso_on else 0.0,
-        "n_plateaus": rng.randint(0, 8) if plateaus_on else 0,
-        "plateau_radius": round(rng.uniform(0.02, 0.40), 2),
-        "plateau_amp": round(rng.uniform(0.0, 1.0), 2),
-        "seed": rng.randint(0, 10_000),
+        # optima placement / clustering
+        "optima_layout": pick(layout_opts),
+        "n_optima_clusters": i_range(1, 6),
+        "optima_cluster_conc": round(f_range(20.0, 250.0), 1),
+        # weak optima (distractors)
+        "n_weak": i_range(0, 30) if weak_on else 0,
+        "weak_width": float(i_range(5, 300)),
+        "weak_amp": round(f_range(0.0, 1.0), 2),
+        # ridges
+        "n_ridges": i_range(0, 8) if ridges_on else 0,
+        "ridge_width": round(f_range(0.01, 0.25), 3),
+        "ridge_amp": round(f_range(0.0, 1.0), 2),
+        "ridge_length": round(f_range(0.1, 1.0), 2),
+        # roughness
+        "noise_freq": round(f_range(0.0, 40.0), 1),
+        "noise_amp": float(i_range(0, 2000)) if rough_on else 0.0,
+        "noise_octaves": i_range(1, 6),
+        # anisotropy
+        "aniso_strength": round(f_range(0.0, 50.0), 1) if aniso_on else 0.0,
+        # plateaus
+        "n_plateaus": i_range(0, 8) if plateaus_on else 0,
+        "plateau_radius": round(f_range(0.02, 0.40), 2),
+        "plateau_amp": round(f_range(0.0, 1.0), 2),
+        # edge / structural bias
+        "edge_region": pick(regions) if edge_on else None,
+        "edge_amp": round(f_range(0.0, 1.0), 2),
+        "edge_reach": round(f_range(0.10, 0.80), 2),
+        # signed-feature mix (fraction of instances that subtract mass)
+        "neg_frac": round(f_range(0.3, 0.6), 2),
+        # global
+        "seed": int(feature_seed),
     }
 
 
@@ -196,15 +341,15 @@ def _anisotropy_scale(dim: int, strength: float, seed: int) -> np.ndarray:
     return np.exp(-max_log * w)
 
 
-def _negated_ackley_env(X: np.ndarray, center: np.ndarray, b: float,
-                        axis_scale: np.ndarray) -> np.ndarray:
-    """Anisotropic negated-Ackley envelope in ``[_BASE, 0]`` (0 at ``center``)."""
+def _negated_ackley_env01(X: np.ndarray, center: np.ndarray, b: float,
+                          axis_scale: np.ndarray) -> np.ndarray:
+    """Anisotropic negated-Ackley envelope rescaled to ``[0, 1]`` (1 at ``center``)."""
     X = np.atleast_2d(np.asarray(X, dtype=float))
     center = np.asarray(center, dtype=float).reshape(1, -1)
     delta = (X - center) * axis_scale.reshape(1, -1)
     d_eff = delta.shape[1]
-    t1 = -ACKLEY_A * np.exp(-b * np.sqrt(np.sum(delta ** 2, axis=1) / d_eff))
-    return -ACKLEY_SCALE * (t1 + ACKLEY_A)
+    # ``exp(-b * rms_delta)`` is 1 at the center and decays to 0 far away.
+    return np.exp(-b * np.sqrt(np.sum(delta ** 2, axis=1) / d_eff))
 
 
 def _point_segment_dist(X: np.ndarray, p: np.ndarray, q: np.ndarray) -> np.ndarray:
@@ -226,6 +371,16 @@ def _smoothstep(t: np.ndarray) -> np.ndarray:
     return t * t * (3.0 - 2.0 * t)
 
 
+def _project_simplex(x: np.ndarray) -> np.ndarray:
+    """Cheap projection of a point onto the probability simplex: clip the
+    negatives and renormalize to sum 1 (used to place ridge endpoints)."""
+    x = np.clip(np.asarray(x, dtype=float), 0.0, None)
+    s = x.sum()
+    if s < 1e-12:
+        return np.full_like(x, 1.0 / x.size)
+    return x / s
+
+
 # ── Ensemble objective ───────────────────────────────────────────────────────
 
 class Ensemble:
@@ -237,18 +392,34 @@ class Ensemble:
         Simplex dimensionality (>= 2).
     n_optima, basin_width : true (strong) optima count and Ackley sharpness ``b``.
     optima_margin : float
-        Normalized gap in ``[0, 0.5]`` guaranteeing the whole background stays at
-        or below ``1 - optima_margin`` while the optima sit at 1.0 (see module
-        docstring).
+        Normalized gap in ``[0, 0.5]`` guaranteeing the background's upward
+        excursions stay at or below ``_PEAK * (1 - 2*optima_margin)`` while the
+        optima sit at ``_PEAK`` (see module docstring).
+    optima_layout : str
+        ``"scatter"`` (uniform Dirichlet placement) or one of
+        :data:`REGION_MODES` (``"corners"``/``"edges"``/``"faces"``/``"middle"``)
+        to **cluster** the optima around that simplex region.
+    n_optima_clusters, optima_cluster_conc : number of clusters and Dirichlet
+        concentration (higher = tighter clusters) used when clustering.
     n_weak, weak_width, weak_amp : weak-optima (distractor) count, sharpness, and
-        prominence in ``[0, 1]`` (fraction of the full basin height).
-    n_ridges, ridge_width, ridge_amp : ridge count, tube width (simplex units),
-        and prominence in ``[0, 1]``.
+        prominence in ``[0, 1]`` (fraction of the full basin height).  Each weak
+        optimum is randomly a bump or a pit (see ``neg_frac``).
+    n_ridges, ridge_width, ridge_amp, ridge_length : ridge count, tube width
+        (simplex units), prominence in ``[0, 1]``, and segment length as a
+        fraction of the simplex extent.  Each ridge is randomly raised or sunk.
     noise_freq, noise_amp, noise_octaves : background Perlin-noise controls.
     aniso_strength : per-axis stretching of the distance metric (0 = isotropic).
     n_plateaus, plateau_radius, plateau_amp : plateau count, radius (simplex
-        units) and mesa height in ``[0, 1]``.
-    seed : single master seed driving every random placement.
+        units) and mesa height in ``[0, 1]``.  Each plateau is randomly a mesa or
+        a basin.
+    edge_region, edge_amp, edge_reach : structural-bias target region (one of
+        :data:`REGION_MODES`, or ``None`` to disable), prominence in ``[0, 1]``,
+        and reach (simplex units) over which the bias falls off.  The bias is
+        randomly positive or negative.
+    neg_frac : float
+        Fraction of signed-feature instances that *subtract* mass instead of
+        adding it (in ``[0, 1]``; ~0.5 keeps the surface centred).
+    seed : single master seed driving every random placement and sign.
     """
 
     def __init__(
@@ -259,6 +430,10 @@ class Ensemble:
         n_optima: int = 4,
         basin_width: float = 65.0,
         optima_margin: float = 0.1,
+        # optima placement / clustering
+        optima_layout: str = "scatter",
+        n_optima_clusters: int = 3,
+        optima_cluster_conc: float = 80.0,
         # weak optima (distractors)
         n_weak: int = 6,
         weak_width: float = 120.0,
@@ -267,6 +442,7 @@ class Ensemble:
         n_ridges: int = 2,
         ridge_width: float = 0.06,
         ridge_amp: float = 0.6,
+        ridge_length: float = 1.0,
         # roughness
         noise_freq: float = 8.0,
         noise_amp: float = 120.0,
@@ -277,6 +453,12 @@ class Ensemble:
         n_plateaus: int = 2,
         plateau_radius: float = 0.12,
         plateau_amp: float = 0.7,
+        # edge / structural bias
+        edge_region: str | None = None,
+        edge_amp: float = 0.0,
+        edge_reach: float = 0.3,
+        # signed-feature mix
+        neg_frac: float = 0.5,
         # global
         seed: int = 0,
     ) -> None:
@@ -287,44 +469,62 @@ class Ensemble:
 
         self.optima_margin = float(np.clip(optima_margin, 0.0, 0.5))
         self.basin_width = float(basin_width)
+        self.optima_layout = str(optima_layout)
+        self.n_optima_clusters = max(1, int(n_optima_clusters))
+        self.optima_cluster_conc = max(1e-3, float(optima_cluster_conc))
         self.weak_width = float(weak_width)
         self.weak_amp = float(np.clip(weak_amp, 0.0, 1.0))
         self.ridge_width = max(1e-4, float(ridge_width))
         self.ridge_amp = float(np.clip(ridge_amp, 0.0, 1.0))
+        self.ridge_length = float(np.clip(ridge_length, 1e-3, 2.0))
         self.noise_freq = float(noise_freq)
         self.noise_amp = max(0.0, float(noise_amp))
         self.noise_octaves = int(noise_octaves)
         self.plateau_radius = max(1e-4, float(plateau_radius))
         self.plateau_amp = float(np.clip(plateau_amp, 0.0, 1.0))
+        self.edge_region = edge_region if edge_region in REGION_MODES else None
+        self.edge_amp = float(np.clip(edge_amp, 0.0, 1.0))
+        self.edge_reach = max(1e-4, float(edge_reach))
+        self.neg_frac = float(np.clip(neg_frac, 0.0, 1.0))
 
         # Per-axis stretch shared by every distance-based feature.
         self.axis_scale = _anisotropy_scale(dim, float(aniso_strength), self.seed + _SEED_ANISO)
 
-        # Random placement of every feature (Dirichlet on the simplex).
-        self.centers = self._sample_simplex(int(n_optima), _SEED_OPTIMA)
+        # Random placement of every feature.
+        self.centers = self._sample_optima(int(n_optima))
         self.weak_centers = self._sample_simplex(int(n_weak), _SEED_WEAK)
         self.plateau_centers = self._sample_simplex(int(n_plateaus), _SEED_PLATEAUS)
-        # Ridges: each is a segment between two distinct random simplex points.
-        ridge_pts = self._sample_simplex(2 * int(n_ridges), _SEED_RIDGES)
-        self.ridges = [(ridge_pts[2 * i], ridge_pts[2 * i + 1]) for i in range(int(n_ridges))]
+        self.ridges = self._sample_ridges(int(n_ridges))
 
-        # Estimate the raw range for the [0.5, 1] map.  Include the true centers
-        # so the analytic peak (raw 0) anchors the top of the range exactly.
+        # Per-instance signs (+1 raises, -1 lowers) for the signed features.
+        sign_rng = np.random.default_rng(self.seed + _SEED_SIGNS)
+
+        def _signs(n: int) -> np.ndarray:
+            if n <= 0:
+                return np.empty(0)
+            return np.where(sign_rng.random(n) < self.neg_frac, -1.0, 1.0)
+
+        self.weak_signs = _signs(int(n_weak))
+        self.ridge_signs = _signs(int(n_ridges))
+        self.plateau_signs = _signs(int(n_plateaus))
+        self.edge_sign = -1.0 if sign_rng.random() < self.neg_frac else 1.0
+
+        # Upward background excursions are capped this far below the optima peak.
+        self._cap_high = _PEAK * (1.0 - 2.0 * self.optima_margin)
+
+        # Estimate the raw range for the symmetric [0, 1] map.  Include the true
+        # centers so the analytic peak anchors the top of the range.
         rng = np.random.default_rng(12345)
         samples = rng.dirichlet(np.ones(dim), size=_RANGE_SAMPLES)
         if len(self.centers):
             samples = np.vstack([samples, self.centers])
-        true = self._true_field(samples)
-        bg = self._background_field(samples)
-        # raw_min comes from the *uncapped* landscape (the cap only lowers the top
-        # of the background, never the floor), so it is consistent to derive the
-        # raw cap from it.  ``optima_margin`` is normalized: a value m means the
-        # background top maps to (1 - m) on the final [0.5, 1] scale, i.e. the raw
-        # cap is ``2 * m * raw_min`` (raw peak is pinned at 0).
-        self._raw_min = float(np.maximum(true, bg).min())
-        self._cap_raw = 2.0 * self.optima_margin * self._raw_min
-        final = np.maximum(true, np.minimum(bg, self._cap_raw))
+        final = self._predict_raw(samples)
+        self._raw_min = float(final.min())
         self._raw_max = float(final.max())
+        # Symmetric scale around the neutral level (raw 0 -> output 0.5).
+        self._scale = max(abs(self._raw_min), abs(self._raw_max), 1e-12)
+
+    # ── Placement helpers ───────────────────────────────────────────────────
 
     def _sample_simplex(self, n: int, seed_offset: int) -> np.ndarray:
         if n <= 0:
@@ -332,50 +532,168 @@ class Ensemble:
         rng = np.random.default_rng(self.seed + seed_offset)
         return rng.dirichlet(np.ones(self.dim), size=n)
 
+    def _region_targets(self, n: int, region: str, rng) -> np.ndarray:
+        """``n`` points on/near ``region`` of the simplex (used as cluster seeds)."""
+        d = self.dim
+        eps = 1e-3
+        out = np.empty((n, d), dtype=float)
+        for i in range(n):
+            if region == "middle":
+                t = np.full(d, 1.0 / d)
+            elif region == "corners":
+                t = np.zeros(d)
+                t[rng.integers(d)] = 1.0
+            elif region == "edges":
+                a, b = rng.choice(d, size=2, replace=False)
+                w = rng.random()
+                t = np.zeros(d)
+                t[a], t[b] = w, 1.0 - w
+            elif region == "faces":
+                # A point on a random facet {x_j = 0}: Dirichlet on the rest.
+                j = rng.integers(d)
+                t = rng.dirichlet(np.ones(d))
+                t[j] = 0.0
+                s = t.sum()
+                t = t / s if s > 1e-12 else np.full(d, 1.0 / d)
+            else:  # scatter / unknown
+                t = rng.dirichlet(np.ones(d))
+            out[i] = t + eps
+        return out
+
+    def _sample_optima(self, n: int) -> np.ndarray:
+        """True-optima centers: uniform ("scatter") or clustered around a region."""
+        if n <= 0:
+            return np.empty((0, self.dim), dtype=float)
+        rng = np.random.default_rng(self.seed + _SEED_OPTIMA)
+        if self.optima_layout not in REGION_MODES:
+            return rng.dirichlet(np.ones(self.dim), size=n)
+        # Clustered placement: seed a few cluster centers in the chosen region,
+        # then draw each optimum tightly around a randomly assigned cluster.
+        crng = np.random.default_rng(self.seed + _SEED_CLUSTERS)
+        n_clusters = min(self.n_optima_clusters, n)
+        seeds = self._region_targets(n_clusters, self.optima_layout, crng)
+        assign = rng.integers(n_clusters, size=n)
+        centers = np.empty((n, self.dim), dtype=float)
+        for k in range(n):
+            alpha = self.optima_cluster_conc * seeds[assign[k]]
+            centers[k] = rng.dirichlet(alpha)
+        return centers
+
+    def _sample_ridges(self, n: int) -> list[tuple[np.ndarray, np.ndarray]]:
+        """``n`` segments of controlled length: a random midpoint plus a random
+        tangent direction, endpoints offset by ``ridge_length`` and reprojected
+        onto the simplex."""
+        if n <= 0:
+            return []
+        rng = np.random.default_rng(self.seed + _SEED_RIDGES)
+        half = 0.5 * self.ridge_length
+        ridges = []
+        for _ in range(n):
+            m = rng.dirichlet(np.ones(self.dim))
+            d = rng.standard_normal(self.dim)
+            d -= d.mean()  # tangent to the simplex (sum-zero)
+            nrm = float(np.linalg.norm(d))
+            if nrm < 1e-9:
+                p = q = m
+            else:
+                d /= nrm
+                p = _project_simplex(m - half * d)
+                q = _project_simplex(m + half * d)
+            ridges.append((p, q))
+        return ridges
+
     # ── Field components (raw units) ────────────────────────────────────────
 
     def _true_field(self, X: np.ndarray) -> np.ndarray:
-        """Clean true-optima field: 0 at each optimum, ``_BASE`` far away."""
+        """Clean true-optima field: ``_PEAK`` at each optimum, ``_BASE`` far away."""
         X = np.atleast_2d(np.asarray(X, dtype=float))
         if not len(self.centers):
             return np.full(X.shape[0], _BASE)
-        terms = np.stack(
-            [_negated_ackley_env(X, c, self.basin_width, self.axis_scale)
+        env = np.stack(
+            [_negated_ackley_env01(X, c, self.basin_width, self.axis_scale)
              for c in self.centers],
             axis=0,
-        )
-        return terms.max(axis=0)
+        ).max(axis=0)
+        return _BASE + (_PEAK - _BASE) * env
+
+    def _region_proximity(self, X: np.ndarray, region: str, reach: float) -> np.ndarray:
+        """Smooth ``[0, 1]`` proximity to ``region`` (1 at the region, 0 beyond
+        ``reach``)."""
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+        if region == "faces":
+            # Distance to the simplex boundary = smallest coordinate.
+            d = X.min(axis=1)
+            return _smoothstep(1.0 - d / reach)
+        Xs = X * self.axis_scale.reshape(1, -1)
+        if region == "middle":
+            c = (np.full(self.dim, 1.0 / self.dim) * self.axis_scale).reshape(1, -1)
+            d = np.linalg.norm(Xs - c, axis=1)
+        elif region == "corners":
+            V = np.eye(self.dim) * self.axis_scale.reshape(1, -1)
+            d = np.min([np.linalg.norm(Xs - v.reshape(1, -1), axis=1) for v in V], axis=0)
+        elif region == "edges":
+            verts = np.eye(self.dim) * self.axis_scale.reshape(1, -1)
+            dists = []
+            for a in range(self.dim):
+                for b in range(a + 1, self.dim):
+                    dists.append(_point_segment_dist(Xs, verts[a], verts[b]))
+            d = np.min(dists, axis=0)
+        else:
+            return np.zeros(X.shape[0])
+        return _smoothstep(1.0 - d / reach)
 
     def _background_field(self, X: np.ndarray) -> np.ndarray:
-        """Combined distractor field (weak optima, ridges, roughness, plateaus)."""
+        """Combined *signed* distractor field, centred on the neutral level 0
+        (weak optima, ridges, edge bias, roughness, plateaus)."""
         X = np.atleast_2d(np.asarray(X, dtype=float))
-        g = np.full(X.shape[0], _BASE)
+        g = np.zeros(X.shape[0])
 
-        # Weak optima — shorter negated-Ackley basins, max-combined.
-        for c in self.weak_centers:
-            env = (_negated_ackley_env(X, c, self.weak_width, self.axis_scale) - _BASE) / _SPAN
-            g = np.maximum(g, _BASE + self.weak_amp * _SPAN * env)
+        # Weak optima — shorter negated-Ackley bumps/pits.  Combine the raises by
+        # max and the digs by min, then add, so each stays bounded by its amp.
+        if self.weak_amp > 0 and len(self.weak_centers):
+            up = np.zeros(X.shape[0])
+            down = np.zeros(X.shape[0])
+            for c, s in zip(self.weak_centers, self.weak_signs):
+                env = _negated_ackley_env01(X, c, self.weak_width, self.axis_scale)
+                contrib = self.weak_amp * _SPAN * env
+                if s > 0:
+                    up = np.maximum(up, contrib)
+                else:
+                    down = np.minimum(down, -contrib)
+            g = g + up + down
 
-        # Ridges — Gaussian tubes around segments, max-combined.
-        if self.ridge_amp > 0:
+        # Ridges — Gaussian tubes/trenches around segments.
+        if self.ridge_amp > 0 and self.ridges:
             Xs = X * self.axis_scale.reshape(1, -1)
-            for p, q in self.ridges:
-                d = _point_segment_dist(Xs, p * self.axis_scale, q * self.axis_scale)
-                gauss = np.exp(-(d / self.ridge_width) ** 2)
-                g = np.maximum(g, _BASE + self.ridge_amp * _SPAN * gauss)
+            up = np.zeros(X.shape[0])
+            down = np.zeros(X.shape[0])
+            for (p, q), s in zip(self.ridges, self.ridge_signs):
+                dseg = _point_segment_dist(Xs, p * self.axis_scale, q * self.axis_scale)
+                gauss = np.exp(-(dseg / self.ridge_width) ** 2)
+                contrib = self.ridge_amp * _SPAN * gauss
+                if s > 0:
+                    up = np.maximum(up, contrib)
+                else:
+                    down = np.minimum(down, -contrib)
+            g = g + up + down
 
-        # Roughness — coherent simplex noise added on top.
+        # Edge / structural bias — smooth signed trend toward a region.
+        if self.edge_region is not None and self.edge_amp > 0:
+            prox = self._region_proximity(X, self.edge_region, self.edge_reach)
+            g = g + self.edge_sign * self.edge_amp * _SPAN * prox
+
+        # Roughness — coherent simplex noise (already ~zero-mean) added on top.
         if self.noise_amp > 0:
             g = g + simplex_noise(
                 X, frequency=self.noise_freq, amplitude=self.noise_amp,
                 octaves=self.noise_octaves, seed=self.seed + _SEED_NOISE,
             )
 
-        # Plateaus — flatten regions toward a constant mesa level.
+        # Plateaus — flatten regions toward a constant (signed) mesa/basin level.
         if len(self.plateau_centers):
             Xs = X * self.axis_scale.reshape(1, -1)
-            level = _BASE + self.plateau_amp * _SPAN
-            for c in self.plateau_centers:
+            for c, s in zip(self.plateau_centers, self.plateau_signs):
+                level = s * self.plateau_amp * _SPAN
                 d = np.linalg.norm(Xs - (c * self.axis_scale).reshape(1, -1), axis=1)
                 w = _smoothstep(1.0 - d / self.plateau_radius)
                 g = (1.0 - w) * g + w * level
@@ -383,17 +701,17 @@ class Ensemble:
         return g
 
     def _predict_raw(self, X: np.ndarray) -> np.ndarray:
-        """Raw objective: background capped ``optima_margin`` (normalized) below
-        the peak, then the clean true-optima field laid on top."""
+        """Raw objective: background's upward excursions capped below the optima
+        peak, then the clean true-optima field laid on top."""
         true = self._true_field(X)
-        bg = np.minimum(self._background_field(X), self._cap_raw)
+        bg = np.minimum(self._background_field(X), self._cap_high)
         return np.maximum(true, bg)
 
     def components(self, X: np.ndarray) -> dict:
         """Raw field pieces, for inspection/plotting (not used by ``predict``)."""
         return {
             "true_optima": self._true_field(X),
-            "background": np.minimum(self._background_field(X), self._cap_raw),
+            "background": np.minimum(self._background_field(X), self._cap_high),
             "combined": self._predict_raw(X),
         }
 
@@ -401,11 +719,8 @@ class Ensemble:
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         raw = self._predict_raw(X)
-        span = self._raw_max - self._raw_min
-        if span < 1e-12:
-            return np.full(raw.shape, 0.75)
-        y = 0.5 + 0.5 * (raw - self._raw_min) / span
-        return np.clip(y, 0.5, 1.0)
+        y = 0.5 + 0.5 * raw / self._scale
+        return np.clip(y, 0.0, 1.0)
 
     def __call__(self, x: np.ndarray) -> float:
         return float(self.predict(np.asarray(x, dtype=float).reshape(1, -1))[0])
@@ -416,5 +731,6 @@ class Ensemble:
 
     def __repr__(self) -> str:  # pragma: no cover
         return (f"Ensemble(dim={self.dim}, n_optima={len(self.centers)}, "
-                f"n_weak={len(self.weak_centers)}, n_ridges={len(self.ridges)}, "
-                f"n_plateaus={len(self.plateau_centers)}, seed={self.seed})")
+                f"layout={self.optima_layout!r}, n_weak={len(self.weak_centers)}, "
+                f"n_ridges={len(self.ridges)}, n_plateaus={len(self.plateau_centers)}, "
+                f"edge_region={self.edge_region!r}, seed={self.seed})")

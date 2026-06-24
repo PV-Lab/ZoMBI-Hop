@@ -6,10 +6,12 @@ A single Dash app shows **one plot at a time**:
   * **dimensionality** dropdown — "3D" draws the 3-simplex as a ternary heatmap;
     "4D" draws the 4-simplex as a tetrahedron point cloud (objective -> colour).
 
-Every parameter of every feature (true optima, weak optima, ridges, roughness,
-anisotropy, plateaus) has its own slider, plus a master **random seed** slider,
-**grid resolution** slider, and a **basin threshold**.  Each optional feature has
-an on/off checkbox; unchecking it passes the disabling value (count/amplitude 0)
+Every parameter of every feature (true optima + their placement/clustering, weak
+optima, ridges incl. length, roughness, anisotropy, plateaus, and the edge /
+structural bias) has its own control, plus a **negative-fraction** slider (share
+of features that subtract mass), a master **random seed** slider, **grid
+resolution** slider, and a **basin threshold**.  Each optional feature has an
+on/off checkbox; unchecking it passes the disabling value (count/amplitude 0)
 without losing the slider position.  There is intentionally no save/load of
 defaults.
 
@@ -101,6 +103,19 @@ def build_app():
             _slider("Optima Margin (normalized gap above background)",
                     "optima-margin", 0.0, 0.5, 0.01, 0.2, 0.1,
                     lambda v: f"{v:.2f}"),
+            html.Div([
+                html.Label("Placement / Clustering"),
+                dcc.Dropdown(id="optima-layout", clearable=False,
+                             options=[{"label": "Scatter (uniform)", "value": "scatter"},
+                                      {"label": "Cluster @ corners", "value": "corners"},
+                                      {"label": "Cluster @ edges", "value": "edges"},
+                                      {"label": "Cluster @ faces", "value": "faces"},
+                                      {"label": "Cluster @ middle", "value": "middle"}],
+                             value="scatter"),
+            ], style={"padding": "8px"}),
+            _slider("Cluster Count", "n-clusters", 1, 6, 1, 3, 1, str),
+            _slider("Cluster Concentration (higher = tighter)",
+                    "cluster-conc", 20, 250, 5, 80, 50, str),
         ], style={"borderTop": "2px solid #999", "padding": "4px 0"}),
 
         _feature_block("Weak Optima (distractors)", "tog-weak", [
@@ -115,6 +130,8 @@ def build_app():
             _slider("Tube Width", "ridge-width", 0.01, 0.25, 0.005, 0.06, 0.06,
                     lambda v: f"{v:.2f}"),
             _slider("Prominence", "ridge-amp", 0.0, 1.0, 0.02, 0.6, 0.25,
+                    lambda v: f"{v:.2f}"),
+            _slider("Length", "ridge-length", 0.1, 1.0, 0.05, 1.0, 0.3,
                     lambda v: f"{v:.2f}"),
         ]),
 
@@ -137,10 +154,28 @@ def build_app():
                     lambda v: f"{v:.2f}"),
         ]),
 
+        _feature_block("Edge / Structural Bias", "tog-edge", [
+            html.Div([
+                html.Label("Target Region"),
+                dcc.Dropdown(id="edge-region", clearable=False,
+                             options=[{"label": "Corners", "value": "corners"},
+                                      {"label": "Edges", "value": "edges"},
+                                      {"label": "Faces", "value": "faces"},
+                                      {"label": "Middle", "value": "middle"}],
+                             value="corners"),
+            ], style={"padding": "8px"}),
+            _slider("Prominence", "edge-amp", 0.0, 1.0, 0.02, 0.4, 0.25,
+                    lambda v: f"{v:.2f}"),
+            _slider("Reach", "edge-reach", 0.05, 0.80, 0.05, 0.3, 0.25,
+                    lambda v: f"{v:.2f}"),
+        ], enabled=False),
+
         # Global controls.
         html.Div([
             html.Label("Global", style={"fontWeight": "bold"}),
             _slider("Random Seed", "seed", 0, 100, 1, 0, 20, str),
+            _slider("Negative Fraction (share of features that subtract mass)",
+                    "neg-frac", 0.0, 1.0, 0.02, 0.5, 0.25, lambda v: f"{v:.2f}"),
             html.Div(_slider("Grid Resolution", "grid-res-3d", 30, 180, 10,
                              160, 30, str), id="grid-3d-wrap"),
             html.Div(_slider("Grid Resolution", "grid-res-4d", 15, 50, 5,
@@ -177,12 +212,16 @@ def build_app():
     @callback(
         Output("n-optima", "value"),
         Output("basin-width", "value"),
+        Output("optima-layout", "value"),
+        Output("n-clusters", "value"),
+        Output("cluster-conc", "value"),
         Output("n-weak", "value"),
         Output("weak-width", "value"),
         Output("weak-amp", "value"),
         Output("n-ridges", "value"),
         Output("ridge-width", "value"),
         Output("ridge-amp", "value"),
+        Output("ridge-length", "value"),
         Output("noise-freq", "value"),
         Output("noise-amp", "value"),
         Output("noise-oct", "value"),
@@ -190,11 +229,16 @@ def build_app():
         Output("n-plateaus", "value"),
         Output("plateau-radius", "value"),
         Output("plateau-amp", "value"),
+        Output("edge-region", "value"),
+        Output("edge-amp", "value"),
+        Output("edge-reach", "value"),
+        Output("neg-frac", "value"),
         Output("tog-weak", "value"),
         Output("tog-ridges", "value"),
         Output("tog-rough", "value"),
         Output("tog-aniso", "value"),
         Output("tog-plateaus", "value"),
+        Output("tog-edge", "value"),
         Input("randomize-btn", "n_clicks"),
         State("dim-select", "value"),
         prevent_initial_call=True,
@@ -202,19 +246,24 @@ def build_app():
     def randomize(_n_clicks, dim_sel):
         # Draw exactly what optimize/run_mobo.py and optimize/evaluate.py generate
         # per run, so the viewer's "Randomize" matches the benchmark landscapes.
-        # n_optima is drawn from the dimension-specific optima_count_range.
+        # A random Sobol' index + scramble seed gives a fresh landscape per click.
         dim = 3 if dim_sel == "3d" else 4
-        cfg = random_ensemble_config(dim, random.Random())
+        cfg = random_ensemble_config(dim, index=random.randrange(1 << 20),
+                                     seed=random.randrange(1 << 16))
         on = lambda v: ["on"] if v else []  # noqa: E731
         return (
             cfg["n_optima"],                             # n-optima
             cfg["basin_width"],                          # basin-width
+            cfg["optima_layout"],                        # optima-layout
+            cfg["n_optima_clusters"],                    # n-clusters
+            cfg["optima_cluster_conc"],                  # cluster-conc
             cfg["n_weak"],                               # n-weak
             cfg["weak_width"],                           # weak-width
             cfg["weak_amp"],                             # weak-amp
             cfg["n_ridges"],                             # n-ridges
             cfg["ridge_width"],                          # ridge-width
             cfg["ridge_amp"],                            # ridge-amp
+            cfg["ridge_length"],                         # ridge-length
             cfg["noise_freq"],                           # noise-freq
             cfg["noise_amp"],                            # noise-amp
             cfg["noise_octaves"],                        # noise-oct
@@ -222,11 +271,16 @@ def build_app():
             cfg["n_plateaus"],                           # n-plateaus
             cfg["plateau_radius"],                       # plateau-radius
             cfg["plateau_amp"],                          # plateau-amp
+            cfg["edge_region"] or "corners",             # edge-region
+            cfg["edge_amp"],                             # edge-amp
+            cfg["edge_reach"],                           # edge-reach
+            cfg["neg_frac"],                             # neg-frac
             on(cfg["n_weak"] > 0),                       # tog-weak
             on(cfg["n_ridges"] > 0),                     # tog-ridges
             on(cfg["noise_amp"] > 0),                    # tog-rough
             on(cfg["aniso_strength"] > 0),               # tog-aniso
             on(cfg["n_plateaus"] > 0),                   # tog-plateaus
+            on(cfg["edge_region"] is not None),          # tog-edge
         )
 
     @callback(
@@ -235,6 +289,9 @@ def build_app():
         Input("n-optima", "value"),
         Input("basin-width", "value"),
         Input("optima-margin", "value"),
+        Input("optima-layout", "value"),
+        Input("n-clusters", "value"),
+        Input("cluster-conc", "value"),
         Input("tog-weak", "value"),
         Input("n-weak", "value"),
         Input("weak-width", "value"),
@@ -243,6 +300,7 @@ def build_app():
         Input("n-ridges", "value"),
         Input("ridge-width", "value"),
         Input("ridge-amp", "value"),
+        Input("ridge-length", "value"),
         Input("tog-rough", "value"),
         Input("noise-freq", "value"),
         Input("noise-amp", "value"),
@@ -253,17 +311,24 @@ def build_app():
         Input("n-plateaus", "value"),
         Input("plateau-radius", "value"),
         Input("plateau-amp", "value"),
+        Input("tog-edge", "value"),
+        Input("edge-region", "value"),
+        Input("edge-amp", "value"),
+        Input("edge-reach", "value"),
+        Input("neg-frac", "value"),
         Input("seed", "value"),
         Input("grid-res-3d", "value"),
         Input("grid-res-4d", "value"),
         Input("basin-threshold", "value"),
     )
     def update_plot(dim_sel, n_optima, basin_width, optima_margin,
+                    optima_layout, n_clusters, cluster_conc,
                     tog_weak, n_weak, weak_width, weak_amp,
-                    tog_ridges, n_ridges, ridge_width, ridge_amp,
+                    tog_ridges, n_ridges, ridge_width, ridge_amp, ridge_length,
                     tog_rough, noise_freq, noise_amp, noise_oct,
                     tog_aniso, aniso_strength,
                     tog_plateaus, n_plateaus, plateau_radius, plateau_amp,
+                    tog_edge, edge_region, edge_amp, edge_reach, neg_frac,
                     seed, grid_res_3d, grid_res_4d, basin_threshold):
         dim = 3 if dim_sel == "3d" else 4
         on = lambda t: bool(t)  # noqa: E731
@@ -273,12 +338,16 @@ def build_app():
             n_optima=int(n_optima),
             basin_width=float(basin_width),
             optima_margin=float(optima_margin),
+            optima_layout=str(optima_layout),
+            n_optima_clusters=int(n_clusters),
+            optima_cluster_conc=float(cluster_conc),
             n_weak=int(n_weak) if on(tog_weak) else 0,
             weak_width=float(weak_width),
             weak_amp=float(weak_amp),
             n_ridges=int(n_ridges) if on(tog_ridges) else 0,
             ridge_width=float(ridge_width),
             ridge_amp=float(ridge_amp),
+            ridge_length=float(ridge_length),
             noise_freq=float(noise_freq),
             noise_amp=float(noise_amp) if on(tog_rough) else 0.0,
             noise_octaves=int(noise_oct),
@@ -286,6 +355,10 @@ def build_app():
             n_plateaus=int(n_plateaus) if on(tog_plateaus) else 0,
             plateau_radius=float(plateau_radius),
             plateau_amp=float(plateau_amp),
+            edge_region=str(edge_region) if on(tog_edge) else None,
+            edge_amp=float(edge_amp),
+            edge_reach=float(edge_reach),
+            neg_frac=float(neg_frac),
             seed=int(seed),
         )
         peaks = np.asarray(fn.centers)
