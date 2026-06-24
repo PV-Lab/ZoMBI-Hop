@@ -262,6 +262,24 @@ N_INIT_TRIALS    = 8       # Sobol initial designs before BO begins
 N_MOBO_RESTARTS  = 10
 N_MOBO_SAMPLES   = 512
 
+# Shared-history seeding (--share-history): when enabled, each MOBO run repeatedly
+# ingests (X,Y) trials from OTHER runs whose run_config matches its own, so several
+# concurrent jobs (possibly different users) pool their progress into one GP. These
+# are the runs directories scanned by default — keep both so the feature is
+# symmetric whether the job runs from Brianna's or Evelyn's checkout.
+SHARED_RUNS_DIRS_DEFAULT = [
+    "/home/adewinmb/ZoMBI-Hop/optimize/runs",
+    "/home/eve_lal/ZoMBI-Hop/optimize/runs",
+]
+# Set by main() from --share-history; None disables sharing.
+SHARE_HISTORY_DIRS: list[str] | None = None
+
+
+def _enable_share_history(dirs: list[str] | None) -> None:
+    """Turn on cross-run history sharing, scanning *dirs* (None disables)."""
+    global SHARE_HISTORY_DIRS
+    SHARE_HISTORY_DIRS = dirs
+
 # For the re-randomized 'ensemble' dataset only: evaluate each hyperparameter set
 # on this many independently randomized landscapes per MOBO trial and average the
 # three metrics, to reduce the run-to-run landscape noise the MOBO model sees.
@@ -1226,6 +1244,106 @@ def collect_observations_for_dim(runs_dir: str, dim: int):
             n_runs += 1
             print(f"  [collect] {os.path.basename(os.path.dirname(cfg_path))}: {used} trial(s)")
     return X_obs, Y_obs, n_runs
+
+
+# ─── Shared-history seeding across concurrent runs (--share-history) ─────────────
+
+def _run_signature(cfg: dict) -> dict:
+    """Config fields that must match for another run's stored Y to be trusted here.
+
+    These pin down the *objective* a trial was scored against — the same
+    hyperparameters yield comparable (dist, dup, avg_time_per_iter) only when the
+    dataset, dimension, per-trial time budget, search direction, and (for the
+    ensemble objective) the landscape difficulty/averaging all agree. Fields
+    absent in older configs come back as ``None`` and simply have to match
+    ``None`` on both sides.
+    """
+    return {
+        "dataset": cfg.get("dataset") or cfg.get("oracle") or cfg.get("landscape"),
+        "dim": int(cfg["dim"]) if cfg.get("dim") is not None else None,
+        "time_limit_hours": cfg.get("time_limit_hours"),
+        "maximize": bool(cfg.get("maximize", False)),
+        "ensemble_optima_margin": cfg.get("ensemble_optima_margin"),
+        "ensemble_repeats": cfg.get("ensemble_repeats"),
+    }
+
+
+def _signatures_match(a: dict, b: dict) -> bool:
+    """Equality over signature fields, with float tolerance for the numeric ones."""
+    def eq(x, y) -> bool:
+        if isinstance(x, bool) or isinstance(y, bool):
+            return x == y
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            return abs(float(x) - float(y)) < 1e-9
+        return x == y
+    return all(eq(v, b.get(k)) for k, v in a.items())
+
+
+def collect_shared_observations(
+    dirs: list[str],
+    signature: dict,
+    seen: set,
+    *,
+    exclude_run_dir: str | None = None,
+):
+    """Scan *dirs* for runs whose config matches *signature*; return their not-yet
+    -seen (X_norm, Y) trials so concurrent jobs can pool history.
+
+    ``seen`` is a set of ``(abs_run_dir, trial_num)`` keys, mutated in place, so
+    repeated calls during a run only ever return trials produced since last time
+    (this is what lets a long run keep absorbing a sibling's new results live).
+    The caller's own ``exclude_run_dir`` is skipped — its trials are already in
+    ``X_obs`` — and each physical run dir is visited once even if *dirs* overlap.
+    Returns ``(X_new, Y_new, n_runs_contributing)``.
+    """
+    X_new, Y_new = [], []
+    runs_contributing: set = set()
+    exclude = os.path.realpath(exclude_run_dir) if exclude_run_dir else None
+    visited_dirs: set = set()
+    for d in dirs:
+        try:
+            cfg_paths = sorted(glob.glob(os.path.join(d, "mobo_*", "run_config.json")))
+        except Exception:
+            continue
+        for cfg_path in cfg_paths:
+            run_dir = os.path.realpath(os.path.dirname(cfg_path))
+            if run_dir == exclude or run_dir in visited_dirs:
+                continue
+            visited_dirs.add(run_dir)
+            try:
+                with open(cfg_path) as f:
+                    cfg = json.load(f)
+            except Exception:
+                continue
+            if not _signatures_match(signature, _run_signature(cfg)):
+                continue
+            prog = os.path.join(run_dir, "mobo_progress.json")
+            if not os.path.exists(prog):
+                continue
+            try:
+                with open(prog) as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            for t in data.get("trials", []):
+                key = (run_dir, int(t.get("trial", -1)))
+                if key in seen:
+                    continue
+                hp, m = t.get("hparams", {}), t.get("metrics", {})
+                if not all(name in hp for name in HPARAM_NAMES):
+                    continue
+                try:
+                    x = hparams_to_norm(hp)
+                    y = torch.tensor([-float(m["dist_to_needles"]),
+                                      -float(m["dup_fraction"]),
+                                      -_time_objective(m)], dtype=DTYPE)
+                except (KeyError, ValueError, TypeError):
+                    continue
+                seen.add(key)
+                X_new.append(x)
+                Y_new.append(y)
+                runs_contributing.add(run_dir)
+    return X_new, Y_new, len(runs_contributing)
 
 
 def load_or_make_sobol(run_dir: str, bounds: torch.Tensor, n: int) -> torch.Tensor:
@@ -2512,6 +2630,35 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
 
     X_prior = [x.detach().cpu() for x in X_prior] if X_prior else []
     Y_prior = [y.detach().cpu() for y in Y_prior] if Y_prior else []
+
+    # ── Shared-history seeding: continuously pool matching trials from sibling runs.
+    share_dirs = SHARE_HISTORY_DIRS
+    shared_seen: set = set()
+    shared_sig: dict | None = None
+    if share_dirs:
+        try:
+            with open(os.path.join(run_dir, "run_config.json")) as f:
+                shared_sig = _run_signature(json.load(f))
+        except Exception as exc:
+            print(f"  [share] could not read own run_config ({exc}); sharing disabled.")
+            share_dirs = None
+
+    def _refresh_shared_history() -> None:
+        """Pull any new matching trials from sibling runs into X_prior/Y_prior."""
+        if not share_dirs:
+            return
+        xs, ys, n_runs = collect_shared_observations(
+            share_dirs, shared_sig, shared_seen, exclude_run_dir=run_dir)
+        if xs:
+            X_prior.extend(xs)
+            Y_prior.extend(ys)
+            print(f"  [share] +{len(xs)} trial(s) from {n_runs} matching sibling run(s) "
+                  f"— shared history now {len(Y_prior)} pair(s)", flush=True)
+
+    if share_dirs:
+        print(f"  [share] history sharing ON — scanning: {', '.join(share_dirs)}")
+        _refresh_shared_history()
+
     n_prior = len(Y_prior)
     seed_X  = [x.detach().cpu() for x in seed_X] if seed_X else []
     X_obs: list[torch.Tensor] = []
@@ -2542,6 +2689,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
     consec_fail = 0
     try:
         while max_trials is None or len(Y_obs) < max_trials:
+            _refresh_shared_history()  # absorb siblings' trials produced since last loop
             n_done    = len(Y_obs)
             use_init  = n_done < n_init
             phase     = init_design[n_done][1] if use_init else "mobo"
@@ -2923,7 +3071,21 @@ def main() -> None:
                              "is a run dir or a run_config.json file. Non-interactive; runs a "
                              "normal Sobol-init + BO run. Cannot combine with "
                              "--resume / --resume-scratch / --resume-from.")
+    parser.add_argument("--share-history", action="store_true",
+                        help="Continuously pool (X,Y) trials from OTHER runs (this user's and "
+                             "collaborators') whose run_config matches this run's "
+                             "dataset/dim/time-limit/direction/ensemble-margin, trusting their "
+                             "metrics as prior history (no re-evaluation). Lets concurrent jobs "
+                             f"share progress live. Scans {', '.join(SHARED_RUNS_DIRS_DEFAULT)} "
+                             "unless --share-dirs is given.")
+    parser.add_argument("--share-dirs", nargs="+", metavar="RUNS_DIR", default=None,
+                        help="Override the runs directories scanned by --share-history.")
     args = parser.parse_args()
+
+    if args.share_history:
+        _enable_share_history(args.share_dirs or list(SHARED_RUNS_DIRS_DEFAULT))
+    elif args.share_dirs:
+        print("  [warning] --share-dirs has no effect without --share-history.")
 
     if args.batch and not args.config:
         sys.exit("--batch requires --config PATH.")
