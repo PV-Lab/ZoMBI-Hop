@@ -35,7 +35,6 @@ Usage:
 """
 
 import argparse
-import random
 import sys
 from pathlib import Path
 
@@ -111,7 +110,9 @@ def ensemble_combined_panel(rng: np.random.Generator) -> tuple:
     """Pool ``ENSEMBLE_N_RUNS`` random 3-D Ensemble landscapes into one panel.
 
     Each run draws a fresh random Ensemble config (same recipe the benchmark and
-    the plot_ensemble.py "Randomize" button use), samples it uniformly on the
+    the plot_ensemble.py "Randomize" button use): walking the Sobol' sweep
+    ``index = 0, 1, ..., ENSEMBLE_N_RUNS - 1`` at ``seed=ENSEMBLE_SEED`` gives a
+    low-discrepancy spread of landscapes.  Each is sampled uniformly on the
     simplex, and the objective values from every run are concatenated so they all
     fall into one shared set of bins in :func:`plot_panels`.
 
@@ -119,10 +120,9 @@ def ensemble_combined_panel(rng: np.random.Generator) -> tuple:
     *average* per-run count -- the same magnitude as the single-run RF panel, so
     both panels read on the same scale.
     """
-    cfg_rng = random.Random(ENSEMBLE_SEED)
     ys = []
-    for _ in range(ENSEMBLE_N_RUNS):
-        cfg = random_ensemble_config(ENSEMBLE_DIM, cfg_rng)
+    for i in range(ENSEMBLE_N_RUNS):
+        cfg = random_ensemble_config(ENSEMBLE_DIM, index=i, seed=ENSEMBLE_SEED)
         fn = Ensemble(**cfg)
         ys.append(fn.predict(sample_simplex(ENSEMBLE_DIM, N_SAMPLES, rng)))
     y = np.concatenate(ys)
