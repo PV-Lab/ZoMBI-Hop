@@ -106,6 +106,9 @@ Modifiers (combinable with any mode above):
                     (X,Y) pairs, no re-evaluation). Non-interactive (ackley only).
   --start-from-best DIR [DIR ...]  RE-EVALUATE hparams from trial dir(s) as
                     initial trials (metrics ignored; Sobol init is NOT skipped).
+                    A seed already present in the loaded prior history (e.g. under
+                    --resume) is skipped — its (X,Y) already seeds the GP, so it is
+                    not re-run.
   --max-trials N    cap total trials (default: unbounded, Ctrl+C to stop).
 
 Usage
@@ -1010,6 +1013,16 @@ def _time_objective(metrics: dict) -> float:
     if "avg_time_per_iter_s" in metrics:
         return float(metrics["avg_time_per_iter_s"])
     return float(metrics["runtime_s"])
+
+
+def _norm_x_key(x: torch.Tensor) -> tuple[int, ...]:
+    """Hashable key for a normalised hparam vector (rounded to 1e-6) for dedup.
+
+    Identical stored hparams map to identical vectors via ``hparams_to_norm``, so
+    rounded keys compare equal for the same config across runs.
+    """
+    return tuple(torch.round(x.detach().to(dtype=DTYPE).reshape(-1) * 1e6)
+                 .to(torch.int64).tolist())
 
 
 def _collect_from_progress(path: str, X_obs: list, Y_obs: list) -> int:
@@ -2661,6 +2674,26 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
 
     n_prior = len(Y_prior)
     seed_X  = [x.detach().cpu() for x in seed_X] if seed_X else []
+
+    # ── Skip "start from best" seeds already present in the prior history, so a
+    #    config an earlier run already evaluated isn't re-run: its (X,Y) is already
+    #    seeding the GP via X_prior (which only holds trials valid under THIS run's
+    #    config). Matching is on the normalised hparam vector — identical hparams
+    #    map to identical vectors through hparams_to_norm. In a fresh run X_prior is
+    #    empty, so every seed is (correctly) re-evaluated.
+    if seed_X and X_prior:
+        prior_keys = {_norm_x_key(x) for x in X_prior}
+        kept_seed, n_dropped = [], 0
+        for x in seed_X:
+            if _norm_x_key(x) in prior_keys:
+                n_dropped += 1
+            else:
+                kept_seed.append(x)
+        if n_dropped:
+            print(f"  [seed] {n_dropped} 'start from best' seed(s) already evaluated in "
+                  f"prior history — skipping re-evaluation; {len(kept_seed)} seed(s) remain.")
+        seed_X = kept_seed
+
     X_obs: list[torch.Tensor] = []
     Y_obs: list[torch.Tensor] = []
 
