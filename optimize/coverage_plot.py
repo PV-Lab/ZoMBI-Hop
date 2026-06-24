@@ -28,6 +28,13 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from sklearn.ensemble import RandomForestRegressor
 
+# Allow running as a plain script (``python optimize/coverage_plot.py``), which
+# puts ``optimize/`` on sys.path instead of the project root and breaks the
+# ``optimize.*`` package imports below.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 from optimize.mobo_landscapes import resolve_surrogate_csv_path
 
 VIDEO_TARGET_DURATION_S = 60.0

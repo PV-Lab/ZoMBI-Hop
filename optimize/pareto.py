@@ -327,7 +327,15 @@ def plot_pareto_interactive(
     *,
     show_numberline: bool = False,
 ) -> None:
-    """Interactive Pareto plot: hover highlights across all subplots, click opens trial image."""
+    """Interactive Pareto plot: hover highlights across all subplots, click opens trial image.
+
+    Hovering and clicking work on *every* trial — Pareto stars and dominated
+    points alike. The hovered point is ringed in red across all three subplots,
+    its metrics shown in the tooltip, and a click opens its landscape view (if
+    any). The hyperparameter number-line (``--show-numberline``) only lists
+    Pareto points, so it highlights when a Pareto point is hovered and clears
+    when a dominated one is.
+    """
     pairs = _obj_pairs(obj_labels)
     pareto_idx = np.where(mask)[0]
     pareto_M = M[pareto_idx]
@@ -350,7 +358,7 @@ def plot_pareto_interactive(
     fig, axes = plt.subplots(1, 3, figsize=(15, 6.5))
     fig.suptitle(
         f"MOBO Pareto front across all runs  "
-        f"(★ = Pareto-optimal, {n_pareto}/{len(mask)})  —  hover/click stars",
+        f"(★ = Pareto-optimal, {n_pareto}/{len(mask)})  —  hover/click any point",
         fontsize=12,
     )
 
@@ -368,11 +376,13 @@ def plot_pareto_interactive(
         ax.set_ylabel(yl)
         ax.legend(fontsize=8)
 
+    # A red ring marks the hovered point, whether it is a gold Pareto star or a
+    # steelblue dominated dot — an open circle reads clearly over either marker.
     highlight_artists = []
     for ax, (ix, iy, _, _) in zip(axes, pairs):
         hl = ax.scatter(
-            [], [], marker="*", s=400, c="red", zorder=10,
-            edgecolors="k", linewidths=1.0,
+            [], [], marker="o", s=320, facecolors="none",
+            edgecolors="red", linewidths=2.0, zorder=10,
         )
         highlight_artists.append(hl)
 
@@ -424,7 +434,12 @@ def plot_pareto_interactive(
     # --- Shared interaction state ---
     active_idx = [None]
 
-    def _nearest_pareto(event) -> int | None:
+    def _nearest_point(event) -> int | None:
+        """Global record index of the point nearest the cursor, or None.
+
+        Searches *all* trials (Pareto and dominated) so both are interactive.
+        Returns an index into ``records`` / ``M``.
+        """
         if event.inaxes is None:
             return None
         ax = event.inaxes
@@ -433,8 +448,8 @@ def plot_pareto_interactive(
         except ValueError:
             return None
         ix, iy = pairs[panel][0], pairs[panel][1]
-        dx = pareto_M[:, ix] - event.xdata
-        dy = pareto_M[:, iy] - event.ydata
+        dx = M[:, ix] - event.xdata
+        dy = M[:, iy] - event.ydata
         sx = ax.get_xlim()
         sy = ax.get_ylim()
         x_range = sx[1] - sx[0]
@@ -448,17 +463,28 @@ def plot_pareto_interactive(
         return None
 
     def _update_hp_highlight(idx: int | None) -> None:
+        """Highlight the hovered point on the Pareto-only number-line.
+
+        *idx* is a global record index. Dominated points are absent from the
+        number-line, so they clear it; Pareto points map to their row in
+        ``pareto_idx`` / ``hp_norm``.
+        """
         if fig_hp is None:
             return
-        if idx is None:
+        pareto_pos = None
+        if idx is not None:
+            where = np.where(pareto_idx == idx)[0]
+            if len(where):
+                pareto_pos = int(where[0])
+        if pareto_pos is None:
             for hl in hp_highlight:
                 hl.set_offsets(np.empty((0, 2)))
             for lbl in hp_val_labels:
                 lbl.set_text("")
         else:
-            rec = records[pareto_idx[idx]]
+            rec = records[idx]
             for j, name in enumerate(available_hparams):
-                val_norm = hp_norm[idx, j]
+                val_norm = hp_norm[pareto_pos, j]
                 hp_highlight[j].set_offsets([[val_norm, j]])
                 raw_val = rec["hparams"].get(name)
                 if raw_val is not None:
@@ -470,7 +496,7 @@ def plot_pareto_interactive(
         fig_hp.canvas.draw_idle()
 
     def _on_motion(event):
-        idx = _nearest_pareto(event)
+        idx = _nearest_point(event)
         if idx == active_idx[0]:
             return
         active_idx[0] = idx
@@ -480,11 +506,12 @@ def plot_pareto_interactive(
             tooltip.set_text("")
         else:
             for hl, (ix, iy, _, _) in zip(highlight_artists, pairs):
-                hl.set_offsets([[pareto_M[idx, ix], pareto_M[idx, iy]]])
-            rec = records[pareto_idx[idx]]
+                hl.set_offsets([[M[idx, ix], M[idx, iy]]])
+            rec = records[idx]
             m = rec["metrics"]
+            kind = "Pareto" if mask[idx] else "dominated"
             tooltip.set_text(
-                f"{rec['source_run']} trial {rec['trial']}  |  "
+                f"{rec['source_run']} trial {rec['trial']} ({kind})  |  "
                 f"dist={m[DIST_KEY]:.4f}  dup={m[DUP_KEY]:.4f}  "
                 f"{rec['time_key']}={rec['time_value']:.4g}"
             )
@@ -492,10 +519,10 @@ def plot_pareto_interactive(
         _update_hp_highlight(idx)
 
     def _on_click(event):
-        idx = _nearest_pareto(event)
+        idx = _nearest_point(event)
         if idx is None:
             return
-        rec = records[pareto_idx[idx]]
+        rec = records[idx]
         img = _final_plot_for_trial(runs_dir, rec["source_run"], rec["trial"])
         # Higher-dimensional trials have no landscape image: silently do nothing
         # (no error, no popup) — hover highlighting still works for them.
@@ -512,7 +539,8 @@ def plot_pareto_interactive(
 
     fig.tight_layout()
     fig.subplots_adjust(bottom=0.12)
-    print("  Interactive Pareto plot open. Hover stars to highlight, click to open trial image.")
+    print("  Interactive Pareto plot open. Hover any point (Pareto or dominated) to "
+          "highlight, click to open its trial image.")
     if show_numberline:
         print("  Hyperparameter figure shows values for the hovered Pareto point.")
     plt.show()
