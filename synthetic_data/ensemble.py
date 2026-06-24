@@ -156,16 +156,6 @@ def optima_count_range(dim: int) -> tuple[int, int]:
     return (5 * dim, 15 * dim)
 
 
-# Hardcoded range of basin sharpness ``b`` to draw per dimension.  ``b`` is the
-# *inverse* width: larger ``b`` -> sharper/narrower basins, smaller ``b`` ->
-# wider basins.  The envelope is ``exp(-b * rms)`` with ``rms = ||delta|| /
-# sqrt(dim)`` (see :func:`_negated_ackley_env01`), so a basin's 1/e radius in
-# rms-units is ``1/b`` while the *largest* distance across the dim-simplex is
-# ``rms_max = sqrt(2/dim)``.  The widest basin that still localizes (i.e. whose
-# 1/e radius just equals the simplex extent) therefore sits at
-# ``b = sqrt(dim/2)``; below that even the farthest simplex point stays above the
-# basin's half-height and the "basin" is an almost-flat bump.  For dim 10 that
-# floor is ``sqrt(5) ~= 2.2`` — the low end of the 10-simplex range below.
 BASIN_WIDTH_RANGES: dict[int, tuple[float, float]] = {
     3: (2.2, 90.0),
     4: (2.2, 50.0),

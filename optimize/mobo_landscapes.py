@@ -9,6 +9,7 @@ Supports:
 
 from __future__ import annotations
 
+import glob
 import os
 import sys
 from dataclasses import dataclass
@@ -21,16 +22,39 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 
-def resolve_surrogate_csv_path(csv_path: str, repo_root: str | None = None) -> str:
+def resolve_surrogate_csv_path(csv_path: str | None, repo_root: str | None = None) -> str:
     """Resolve a surrogate CSV path, tolerating stale absolute paths from other machines.
 
-    If ``csv_path`` is missing, looks for the same basename under ``data/``,
+    If ``csv_path`` is a stale path, looks for the same basename under ``data/``,
     ``interactive_testing/``, and the repo root (relative to ``repo_root``).
+    If ``csv_path`` is missing entirely (None/empty), scans ``data/`` (then
+    ``interactive_testing/``) for a CSV and uses it when the choice is unambiguous.
     """
+    root = os.path.abspath(repo_root or _REPO)
+
+    if not csv_path:
+        for rel in ("data", "interactive_testing"):
+            search_dir = os.path.join(root, rel)
+            if not os.path.isdir(search_dir):
+                continue
+            csvs = sorted(glob.glob(os.path.join(search_dir, "*.csv")))
+            if len(csvs) == 1:
+                print(f"  [csv] no csv_path in config; using {csvs[0]}")
+                return os.path.abspath(csvs[0])
+            if len(csvs) > 1:
+                raise FileNotFoundError(
+                    f"No csv_path in config and multiple CSVs found in {rel}/: "
+                    f"{[os.path.basename(c) for c in csvs]}. "
+                    f"Set 'csv_path' in the source run config to disambiguate."
+                )
+        raise FileNotFoundError(
+            "No csv_path in config and no CSV found under data/ or "
+            "interactive_testing/. Set 'csv_path' in the source run config."
+        )
+
     if os.path.isfile(csv_path):
         return os.path.abspath(csv_path)
 
-    root = os.path.abspath(repo_root or _REPO)
     basename = os.path.basename(csv_path.replace("\\", "/"))
     for rel in (os.path.join("data", basename),
                 os.path.join("interactive_testing", basename),
@@ -302,7 +326,7 @@ def landscape_from_run_config(cfg: dict, *, build_rf_and_grid) -> LandscapeSpec:
             time_limit_hours=time_limit,
         )
 
-    csv_path = resolve_surrogate_csv_path(cfg["csv_path"])
+    csv_path = resolve_surrogate_csv_path(cfg.get("csv_path"))
     obj_col = cfg.get("objective_column", "Objective")
     comp_cols = cfg.get("composition_columns")
     maximize = bool(cfg.get("maximize", False))
