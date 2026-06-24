@@ -5,8 +5,8 @@
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=64G
+#SBATCH --mem=128G
 #SBATCH --partition=sched_mit_sloan_gpu_r8
 #SBATCH --gres=gpu:1
 
-uv run python optimize/run_mobo.py --dataset ensemble --dim 10 --time-limit 1 --ensemble-repeats 3 --start-from-best optimize/runs/mobo_05_06_15_32/trial_112
+uv run python optimize/run_mobo.py --dataset ensemble --dim 10 --time-limit 0.7 --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112

@@ -159,6 +159,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import gc
 import glob
 import json
 import math
@@ -405,6 +406,72 @@ def _log_error(run_dir: str, trial_num: int, exc: Exception) -> None:
             f.write(f"[{datetime.datetime.now().isoformat(timespec='seconds')}] "
                     f"trial {trial_num}: {exc}\n")
             f.write(traceback.format_exc() + "\n")
+    except Exception:
+        pass
+
+
+# ─── Resource (RAM / VRAM) usage logging ────────────────────────────────────────
+
+def _gib(n_bytes: float) -> str:
+    return f"{n_bytes / 2**30:.2f}GiB"
+
+
+def _host_rss() -> tuple[int, int]:
+    """(current_rss, peak_rss) for this process in bytes (Linux). Best-effort.
+
+    Peak comes from getrusage(ru_maxrss) — a process-wide high-water mark that
+    never decreases, so it is exactly what catches the slow RAM ratchet that
+    triggers Slurm OOM kills. Current comes from /proc/self/statm.
+    """
+    peak = cur = 0
+    try:
+        import resource
+        peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024  # KiB → B
+    except Exception:
+        pass
+    try:
+        with open("/proc/self/statm") as f:
+            cur = int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except Exception:
+        pass
+    return cur, peak
+
+
+def log_resource_usage(tag: str) -> None:
+    """Print host RAM (current + process-peak) and, on CUDA, GPU VRAM for *tag*.
+
+    Called at every ZoMBI run / trial boundary so each run's .out shows whether
+    memory is climbing (RAM peak) and how much VRAM the GP/acquisition needs.
+    Per-run VRAM peak is meaningful only if reset_peak_memory_stats was called at
+    the start of the run (see run_single_trial).
+    """
+    cur, peak = _host_rss()
+    msg = f"  [mem] {tag}  RAM cur={_gib(cur)} peak={_gib(peak)}"
+    if torch.cuda.is_available():
+        msg += (f"  | VRAM cur={_gib(torch.cuda.memory_allocated())} "
+                f"reserved={_gib(torch.cuda.memory_reserved())} "
+                f"peak={_gib(torch.cuda.max_memory_allocated())} "
+                f"peak_reserved={_gib(torch.cuda.max_memory_reserved())}")
+    print(msg, flush=True)
+
+
+def _reclaim_memory() -> None:
+    """Force a GC sweep and return freed host/GPU memory to the OS.
+
+    Each ZoMBI run leaves large transient allocations behind (GP caches, the
+    penalty-mask / cdist temporaries built over the full needle set). CPython
+    frees them, but glibc keeps the freed arenas and the CUDA caching allocator
+    keeps its blocks, so process RSS only ever climbs. Across the many runs of an
+    ensemble trial that ratchets past the Slurm --mem cap and the job is
+    OOM-killed. Calling this at every ZoMBI run boundary keeps the baseline flat.
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    try:
+        # glibc holds freed small/medium arenas; malloc_trim hands them back.
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
 
@@ -2191,6 +2258,9 @@ def run_single_trial(
                                  dh.current_activation, dh.current_zoom))
     dh.take_snapshot = snap_wrap
 
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()  # per-run VRAM high-water mark
+
     t0 = time.time()
     try:
         if landscape.time_limit_hours is not None:
@@ -2224,6 +2294,8 @@ def run_single_trial(
     print(f"    [trial]  iters={n_iters}  dist={dist:.4f}  dup={dup:.4f}"
           f"  t/iter={avg_time_per_iter:.3f}s  (total {runtime:.1f}s)"
           f"  needles={len(discovered)}/{len(true_optima)}", flush=True)
+    log_resource_usage(f"after {os.path.basename(trial_dir)} "
+                       f"(n_iters={n_iters}, needles={len(discovered)})")
 
     try:
         write_points_csv(os.path.join(trial_dir, "points.csv"), dh, snap_records, dim=dim)
@@ -2272,10 +2344,21 @@ def run_single_trial(
 
     _auto_generate_plots(trial_dir, dim)
 
-    return {"dist": dist, "dup": dup, "runtime": runtime,
-            "avg_time_per_iter": avg_time_per_iter, "n_iters": n_iters,
-            "payloads": payloads, "ackley_seed": ackley_seed,
-            "ensemble_config": ensemble_config}
+    result = {"dist": dist, "dup": dup, "runtime": runtime,
+              "avg_time_per_iter": avg_time_per_iter, "n_iters": n_iters,
+              "payloads": payloads, "ackley_seed": ackley_seed,
+              "ensemble_config": ensemble_config}
+
+    # Drop the ZoMBI run's heavy objects (GP, data handler with all sampled
+    # points + needle penalty structures) and hand the freed memory back to the
+    # OS before the next ensemble repeat starts — otherwise RSS ratchets up run
+    # over run until Slurm OOM-kills the job (see _reclaim_memory).
+    dh.take_snapshot = orig_snap        # break the snap_wrap closure over dh
+    dh_ref[0] = None
+    del optimizer, dh, sim_obj, inner, snap_records
+    _reclaim_memory()
+
+    return result
 
 
 # ─── One MOBO trial: single eval, or averaged ensemble repeats ──────────────────
@@ -2506,6 +2589,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                     [-res["dist"], -res["dup"], -res["avg_time_per_iter"]],
                     dtype=DTYPE, device="cpu"))
                 save_running_summary(X_obs, Y_obs, run_dir, n_seed=n_seed, n_sobol=n_sobol)
+                log_resource_usage(f"end of trial {trial_num} ({phase})")
                 write_trial_json(
                     os.path.join(trial_dir, "trial.json"),
                     trial_num, phase,
@@ -2699,6 +2783,19 @@ def _interactive_run_config(script_dir: str):
     )
 
 
+def _run_dir_prefix(dataset: str | None, dim: int) -> str:
+    """Run-folder prefix tagged with dataset + dimension, e.g. ``mobo_ensemble_4d``.
+
+    Ackley datasets already encode the dimension in their name (``ackley10d``), so
+    they are used as-is to avoid a redundant ``ackley10d_10d``; everything else
+    (``ensemble``, ``rf``) gets ``_<dim>d`` appended.
+    """
+    ds = (dataset or "rf").lower()
+    if ds.startswith("ackley"):
+        return f"mobo_{ds}"
+    return f"mobo_{ds}_{dim}d"
+
+
 def _launch_run(runs_dir, landscape: LandscapeSpec, max_trials,
                 seed_X=None, X_prior=None, Y_prior=None, *,
                 batch_name: str | None = None,
@@ -2711,7 +2808,7 @@ def _launch_run(runs_dir, landscape: LandscapeSpec, max_trials,
                 invocation: dict | None = None) -> None:
     """Create a fresh runs/mobo_* folder, persist its config, and run MOBO."""
     if run_dir is None:
-        run_dir = unique_run_dir(runs_dir, "mobo")
+        run_dir = unique_run_dir(runs_dir, _run_dir_prefix(dataset, landscape.dim))
     else:
         os.makedirs(run_dir, exist_ok=True)
     if invocation is not None:
