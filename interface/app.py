@@ -338,6 +338,88 @@ def _gen_init_data(fn_callable, d: int, maximize: bool):
     return (torch.cat(xa), torch.cat(xe), torch.cat(yl).reshape(-1, 1))
 
 
+def _write_synth_live_state(run_dir, dh, cur_lines, prior_lines) -> None:
+    """
+    Write ``<run_dir>/live_plot_state.json`` for a synthetic GUI run, mirroring
+    ``scripts/run_zombi_main._write_live_plot_state`` so the ternary tab shows the
+    same live overlays it does for hardware runs: all points, the current and
+    prior LineBO lines, needles, penalty zones and zoom bounds — plus a per-point
+    ``penalty_mask`` so pruned/pared points keep their white outline live.
+
+    ``cur_lines`` / ``prior_lines`` are lists of ``(L, R)`` endpoint pairs (full-d
+    composition arrays) or None, as recorded in the LineBO plot_state.
+    """
+    try:
+        if run_dir is None or dh is None or dh.X_all_actual is None:
+            return
+        X = dh.X_all_actual.detach().cpu().numpy()
+        Y = (dh.Y_all.detach().cpu().numpy().ravel()
+             if dh.Y_all is not None else np.zeros(len(X)))
+        d = X.shape[1]
+        mask = dh.get_penalty_mask()
+        pen_mask = (mask.detach().cpu().numpy().ravel().astype(bool).tolist()
+                    if mask is not None else None)
+
+        def _eps(lines):
+            out = []
+            for ln in (lines or []):
+                if ln is None:
+                    continue
+                try:
+                    L, R = ln
+                    out.append([np.asarray(L, float).ravel().tolist(),
+                                np.asarray(R, float).ravel().tolist()])
+                except Exception:
+                    pass
+            return out
+
+        state = {
+            "optimizing_dims":      list(range(d)),
+            "x_actual":             X.tolist(),
+            "y_values":             Y.tolist(),
+            "penalty_mask":         pen_mask,
+            "line_endpoints":       _eps(cur_lines),
+            "prior_line_endpoints": _eps(prior_lines),
+            "needles":              [],
+            "penalty_regions":      [],
+            "zoom_bounds_lo":       None,
+            "zoom_bounds_hi":       None,
+        }
+
+        nds = dh.needles
+        if nds is not None and nds.shape[0] > 0:
+            ncomp = nds.detach().cpu().numpy()
+            nval  = (dh.needle_vals.detach().cpu().numpy().ravel()
+                     if dh.needle_vals is not None else np.zeros(len(ncomp)))
+            for i in range(len(ncomp)):
+                state["needles"].append({
+                    "point": ncomp[i].tolist(),
+                    "y": float(nval[i]) if i < len(nval) else 0.0,
+                })
+            try:
+                rads = dh.needle_penalty_radii.detach().cpu().numpy().ravel()
+                for i in range(min(len(rads), len(ncomp))):
+                    state["penalty_regions"].append({
+                        "center": ncomp[i].tolist(),
+                        "radius_ilr": float(rads[i]),
+                    })
+            except Exception:
+                pass
+
+        zb = getattr(dh, "current_zoom_bounds", None)
+        if zb is not None:
+            try:
+                zbn = zb.detach().cpu().numpy()
+                state["zoom_bounds_lo"] = zbn[0].tolist()
+                state["zoom_bounds_hi"] = zbn[1].tolist()
+            except Exception:
+                pass
+
+        (Path(run_dir) / "live_plot_state.json").write_text(json.dumps(state))
+    except Exception:
+        pass
+
+
 # ── run analytics (mirrors optimize/run_mobo.py metrics + plots) ─────────────
 
 def _metric_dup_fraction(X_all: np.ndarray, threshold: float) -> float:
@@ -938,10 +1020,11 @@ class ConvergencePlotFrame(PlotFrame):
                        label="penalized", zorder=2)
             ax.scatter(idx[pm],  Y[pm],  s=10, alpha=0.65, color="steelblue",
                        label="valid", zorder=3)
-            running_best = np.maximum.accumulate(np.where(pm, Y, -np.inf))
         else:
             ax.scatter(idx, Y, s=10, alpha=0.65, color="steelblue", label="obs", zorder=2)
-            running_best = np.maximum.accumulate(Y)
+
+        # Running best spans every observation, penalized or not.
+        running_best = np.maximum.accumulate(Y)
 
         ax.plot(idx, running_best, color="darkorange", lw=1.8,
                 label="running best", zorder=4)
@@ -1337,6 +1420,122 @@ def _needle_ellipsoid_comp(needle_comp, M, B, n: int = 200):
         return None
 
 
+def _needle_penalty_bands(needle_comp, M, B, *, n_bands: int = 18, n_ang: int = 160):
+    """Non-overlapping annular rings coloured by the smooth repulsion penalty.
+
+    The acquisition repulsion is ``violation**2 = clamp(1 - quad, 0)**2`` with
+    ``quad = delta_z^T M delta_z``: strongest (1.0) at the needle centre, fading
+    smoothly to 0 at the boundary (``quad = 1``).  Each ring between contours
+    ``quad = s_out**2`` and ``quad = s_in**2`` carries penalty ``(1 - s_mid**2)**2``
+    at its mid-radius.  Because the rings don't overlap, filling each with
+    ``alpha = base * penalty`` makes the rendered opacity *exactly proportional* to
+    the true penalty at every radius.  Returns ``[(ring_comp, penalty), ...]`` or
+    ``None`` on failure.
+    """
+    if M is None:
+        return None
+    try:
+        needle_comp = np.asarray(needle_comp, dtype=float).ravel()
+        d = needle_comp.shape[0]
+        M_np = np.asarray(M, dtype=float)
+        eigvals, eigvecs = np.linalg.eigh(M_np)
+        eigvals = np.maximum(eigvals, 1e-12)
+        angles = np.linspace(0, 2 * np.pi, n_ang)
+        circle = np.column_stack([np.cos(angles), np.sin(angles)])
+        u_unit = (eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ circle.T).T   # quad == 1
+        needle_ilr = (composition_to_ilr(
+            torch.tensor(needle_comp, dtype=torch.float64).unsqueeze(0)).squeeze(0).cpu().numpy()
+            if B is None else None)
+
+        def _contour(s):
+            u = s * u_unit
+            if B is not None:
+                ell = needle_comp.reshape(1, d) + (np.asarray(B, dtype=float) @ u.T).T
+            else:
+                ell = ilr_to_composition(
+                    torch.tensor(needle_ilr + u, dtype=torch.float64), d).cpu().numpy()
+            ell = np.clip(ell, 0, 1)
+            ssum = ell.sum(axis=1, keepdims=True)
+            return ell / np.where(ssum < 1e-9, 1.0, ssum)
+
+        scales = np.linspace(1.0, 0.0, n_bands + 1)     # edge (1) → centre (0)
+        contours = [_contour(s) for s in scales]
+        bands = []
+        for k in range(n_bands):
+            s_mid = 0.5 * (scales[k] + scales[k + 1])
+            penalty = float((1.0 - s_mid ** 2) ** 2)
+            if scales[k + 1] <= 1e-9:
+                ring = contours[k]                      # innermost: filled centre disk
+            else:
+                ring = np.vstack([contours[k], contours[k + 1][::-1]])  # annulus
+            bands.append((ring, penalty))
+        return bands
+    except Exception:
+        return None
+
+
+def _draw_penalty_gradient(ax, bands, proj) -> None:
+    """Draw non-overlapping red rings; opacity is proportional to the penalty
+    (transparent at the edge → opaque at the centre)."""
+    for ring, penalty in bands:
+        ax.add_patch(matplotlib.patches.Polygon(
+            proj(ring), closed=True, facecolor="red", edgecolor="none",
+            alpha=0.5 * penalty, linewidth=0, zorder=2))
+
+
+def _ternary_grid_comp(n: int = 72) -> np.ndarray:
+    """Uniform ``(N, 3)`` grid on the 3-simplex (compositions sum to 1)."""
+    pts = []
+    for i in range(n + 1):
+        for j in range(n + 1 - i):
+            pts.append([i / n, j / n, (n - i - j) / n])
+    return np.asarray(pts, dtype=float)
+
+
+# Cache and in-flight guard for the ternary GP-background landscape. The fit is
+# done on a daemon thread (see TernaryPlotFrame._get_gp_landscape_async) so it
+# never blocks the GUI; for hardware runs the optimizer lives in a separate
+# subprocess and is wholly unaffected regardless.
+_GP_LANDSCAPE_CACHE: dict   = {}
+_GP_LANDSCAPE_PENDING: set  = set()
+
+
+def _compute_gp_landscape(X: np.ndarray, Y: np.ndarray,
+                          n: int = 72, max_train: int = 500):
+    """GP posterior mean over a ternary grid, fit on **all** supplied points
+    (active + pruned/pared), for use as the d == 3 ternary background.
+
+    Fits a throwaway visualisation GP in ILR space with output standardisation,
+    then predicts over the grid. Returns ``(grid_comp (N, 3), mean (N,))`` or
+    None. Pure/synchronous: caching and threading live in the caller.
+    """
+    if not _BOTORCH_OK:
+        return None
+    try:
+        X = np.asarray(X, dtype=float)
+        Y = np.asarray(Y, dtype=float).ravel()
+        if len(X) < 3:
+            return None
+        if len(X) > max_train:   # subsample for a fast, visualisation-only fit
+            idx = np.random.default_rng(0).choice(len(X), max_train, replace=False)
+            X, Y = X[idx], Y[idx]
+        X_ilr = composition_to_ilr(
+            torch.tensor(X, dtype=torch.float64)).to(dtype=DTYPE, device=DEVICE)
+        Y_t = torch.tensor(Y, dtype=DTYPE, device=DEVICE).unsqueeze(-1)
+        gp = SingleTaskGP(X_ilr, Y_t, outcome_transform=Standardize(m=1))
+        mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
+        fit_gpytorch_mll(mll)
+        gp.eval()
+        grid = _ternary_grid_comp(n)
+        g_ilr = composition_to_ilr(
+            torch.tensor(grid, dtype=torch.float64)).to(dtype=DTYPE, device=DEVICE)
+        with torch.no_grad():
+            mean = gp.posterior(g_ilr).mean.detach().cpu().numpy().ravel()
+        return (grid, mean)
+    except Exception:
+        return None
+
+
 class TernaryPlotFrame(ttk.Frame):
     """
     Ternary-plot tab.
@@ -1373,6 +1572,27 @@ class TernaryPlotFrame(ttk.Frame):
         ttk.Button(ctrl, text="Update", command=self._on_update).pack(side="left", padx=(4, 0))
         self._ctrl = ctrl
 
+        # ── layer-toggle row: show/hide each overlay, re-render on change ──
+        toggles = ttk.Frame(self)
+        toggles.pack(fill="x", padx=4, pady=(0, 2))
+        ttk.Label(toggles, text="Show:").pack(side="left", padx=(4, 6))
+        self._show_bg      = tk.BooleanVar(value=True)
+        self._show_points  = tk.BooleanVar(value=True)
+        self._show_penalty = tk.BooleanVar(value=True)
+        self._show_zoom    = tk.BooleanVar(value=True)
+        self._show_lines   = tk.BooleanVar(value=True)
+        self._show_needles = tk.BooleanVar(value=True)
+        for text, var in (
+            ("GP background", self._show_bg),
+            ("Sample points", self._show_points),
+            ("Penalty zones", self._show_penalty),
+            ("Zoom region",   self._show_zoom),
+            ("LineBO lines",  self._show_lines),
+            ("Needles",       self._show_needles),
+        ):
+            ttk.Checkbutton(toggles, text=text, variable=var,
+                            command=self._on_update).pack(side="left", padx=(0, 8))
+
         # ── matplotlib figure ─────────────────────────────────────────────
         self.fig    = Figure(figsize=(8, 6), dpi=96, tight_layout=True)
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
@@ -1384,8 +1604,25 @@ class TernaryPlotFrame(ttk.Frame):
         self._last_rd: Optional[RunData]       = None
         self._live_state: Optional[dict]       = None
         self._live_state_mtime: float          = 0.0
+        self._last_replot_args: Optional[tuple] = None  # for async GP-bg redraw
         self._saved_dims: dict[str, list[str]] = {}   # run_id → [labelA, labelB, labelC]
         self._current_labels: list[str]        = []   # labels for the current data set
+
+        # Per-run point accumulator: every sampled point seen for the current
+        # run is remembered so the scatter persists for the whole lifetime of
+        # the run, even if a momentary read of live_plot_state.json / a snapshot
+        # reports fewer points (e.g. mid zoom/activation, or a live↔snapshot
+        # source switch). Reset when the viewed run changes.
+        self._accum_run_id: str                 = ""
+        self._accum_pts: Optional[np.ndarray]   = None   # (n, n_cols)
+        self._accum_y: Optional[np.ndarray]     = None   # (n,)
+        self._accum_penalized: np.ndarray       = np.empty((0,), dtype=bool)  # (n,) pruned/pared
+        self._accum_keys: set                   = set()
+        self._accum_index: dict                 = {}     # composition key → row index
+        # Discovered needles seen so far for the current run (full-d points),
+        # accumulated for the same persistence reason as the sample points.
+        self._accum_needles: list               = []     # list of np.ndarray (d,)
+        self._accum_needle_keys: set            = set()
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -1519,6 +1756,170 @@ class TernaryPlotFrame(ttk.Frame):
             return None
         return da, db, dc
 
+    # ── point accumulation ─────────────────────────────────────────────────
+
+    def _resolve_batch_Y(self, X: np.ndarray) -> Optional[np.ndarray]:
+        """Objective values aligned with the current X batch, or None."""
+        rd, live = self._last_rd, self._live_state
+        n = X.shape[0] if X.ndim == 2 else 0
+        if live is not None:
+            yraw = live.get("y_values", [])
+            if len(yraw) == n:
+                return np.array(yraw, dtype=float)
+        elif rd is not None and rd.Y_all is not None and len(rd.Y_all) == n:
+            return np.asarray(rd.Y_all, dtype=float)
+        return None
+
+    def _resolve_batch_penalized(self, X: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Per-point pruned/pared (penalized) flag aligned with X, or None if unknown.
+
+        ``penalty_mask`` is True for the points the GP keeps (active); the pruned/
+        pared points are its complement.  Read it from live state when present
+        (synthetic runs and any hardware run that writes it), else fall back to
+        the snapshot's mask.  Returns None (all treated as active) when no source
+        carries a per-point mask — e.g. a hardware ``live_plot_state.json`` that
+        only records penalty *regions*.
+        """
+        rd, live = self._last_rd, self._live_state
+        n = X.shape[0] if X.ndim == 2 else 0
+        if live is not None:
+            pm = live.get("penalty_mask")
+            if pm is not None and len(pm) == n:
+                return ~np.asarray(pm, dtype=bool)
+            return None
+        if rd is not None and rd.penalty_mask is not None \
+                and len(rd.penalty_mask) == n:
+            return ~np.asarray(rd.penalty_mask, dtype=bool)
+        return None
+
+    # ── GP background (d == 3, all points, off-thread) ─────────────────────
+
+    def _get_gp_landscape_async(self, rd: "RunData"):
+        """
+        Return the cached (grid, mean) all-points GP background, or None while a
+        fit is in flight.
+
+        Never blocks: the GP is fit on a daemon thread and a redraw is scheduled
+        on the Tk main thread when it lands. The optimizer that computes the next
+        composition runs in a separate process (hardware) or is untouched by this
+        cache lookup (synthetic), so visualisation never delays sending points.
+        """
+        if not _BOTORCH_OK or rd is None or rd.d != 3:
+            return None
+        if rd.X_all is None or rd.Y_all is None or len(rd.X_all) < 3:
+            return None
+        key = (rd.run_id, rd.snapshot_name, rd.n_points)
+        if key in _GP_LANDSCAPE_CACHE:
+            return _GP_LANDSCAPE_CACHE[key]
+        if key in _GP_LANDSCAPE_PENDING:
+            return None
+        _GP_LANDSCAPE_PENDING.add(key)
+        X = np.asarray(rd.X_all, dtype=float).copy()
+        Y = np.asarray(rd.Y_all, dtype=float).ravel().copy()
+
+        def _work():
+            out = None
+            try:
+                out = _compute_gp_landscape(X, Y)
+                if out is not None:
+                    _GP_LANDSCAPE_CACHE[key] = out
+            finally:
+                _GP_LANDSCAPE_PENDING.discard(key)
+                try:
+                    self.after(0, self._on_landscape_ready, key)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_work, daemon=True).start()
+        return None
+
+    def _on_landscape_ready(self, key):
+        """Redraw once a background GP fit completes, if it's still relevant."""
+        rd = self._last_rd
+        if rd is None or not self._show_bg.get():
+            return
+        if (rd.run_id, rd.snapshot_name, rd.n_points) != key:
+            return
+        if self._last_replot_args is not None:
+            self._replot(*self._last_replot_args)
+
+    def _accumulate_points(self, X: np.ndarray, n_cols: int,
+                           Y: Optional[np.ndarray],
+                           penalized: Optional[np.ndarray] = None):
+        """
+        Merge the current (X, Y) batch into the per-run accumulator and return
+        the full (pts, y) seen so far for this run. New points are de-duplicated
+        by composition so re-reading the same source doesn't grow the set; points
+        already accumulated are never dropped, so the scatter persists across
+        zoom/activation changes and live↔snapshot source switches.
+        """
+        rd = self._last_rd
+        run_id = rd.run_id if rd else ""
+
+        # Reset on run change or a change in column count.
+        if (run_id != self._accum_run_id or self._accum_pts is None
+                or self._accum_pts.shape[1] != n_cols):
+            self._accum_run_id      = run_id
+            self._accum_pts         = np.empty((0, n_cols), dtype=float)
+            self._accum_y           = np.empty((0,), dtype=float)
+            self._accum_penalized   = np.empty((0,), dtype=bool)
+            self._accum_keys        = set()
+            self._accum_index       = {}    # composition key → row in _accum_pts
+            self._accum_needles     = []
+            self._accum_needle_keys = set()
+
+        if (X is None or X.ndim != 2 or X.shape[0] == 0
+                or n_cols == 0 or X.shape[1] < n_cols):
+            return self._accum_pts, self._accum_y, self._accum_penalized
+
+        has_y = Y is not None and len(Y) == X.shape[0]
+        has_p = penalized is not None and len(penalized) == X.shape[0]
+        new_pts, new_y, new_p = [], [], []
+        for i in range(X.shape[0]):
+            row = X[i, :n_cols]
+            key = tuple(np.round(row, 9))
+            if key in self._accum_keys:
+                # Penalty status can flip over a run's life (e.g. once a needle is
+                # declared nearby), so refresh the flag whenever the source knows it.
+                if has_p:
+                    self._accum_penalized[self._accum_index[key]] = bool(penalized[i])
+                continue
+            self._accum_keys.add(key)
+            self._accum_index[key] = self._accum_pts.shape[0] + len(new_pts)
+            new_pts.append(row)
+            new_y.append(float(Y[i]) if has_y else np.nan)
+            new_p.append(bool(penalized[i]) if has_p else False)
+        if new_pts:
+            self._accum_pts       = np.vstack([self._accum_pts, np.asarray(new_pts, float)])
+            self._accum_y         = np.concatenate([self._accum_y, np.asarray(new_y, float)])
+            self._accum_penalized = np.concatenate(
+                [self._accum_penalized, np.asarray(new_p, bool)])
+        return self._accum_pts, self._accum_y, self._accum_penalized
+
+    def _accumulate_needles(self, needles_data: list) -> list:
+        """
+        Merge the current needle batch into the per-run needle accumulator and
+        return the full list of needle points (full-d ndarrays) seen so far.
+        New needles are de-duplicated by composition; accumulated needles are
+        never dropped, so declared needles persist for the run's lifetime.
+
+        Relies on _accumulate_points having already reset state on run change.
+        """
+        for nd in needles_data:
+            try:
+                pt = np.asarray(nd["point"], float)
+            except Exception:
+                continue
+            if pt.ndim != 1 or pt.shape[0] == 0:
+                continue
+            key = tuple(np.round(pt, 9))
+            if key in self._accum_needle_keys:
+                continue
+            self._accum_needle_keys.add(key)
+            self._accum_needles.append(pt)
+        return self._accum_needles
+
     # ── rendering ─────────────────────────────────────────────────────────
 
     def _replot_tetra(self, X: np.ndarray, labels: list[str]):
@@ -1554,15 +1955,13 @@ class TernaryPlotFrame(ttk.Frame):
         legend_handles: list = []
 
         # ── sampled points (no ground-truth background cloud) ─────────────
-        if X.shape[0] > 0 and X.shape[1] >= 4:
-            P = X[:, :4] @ V
-            Y = None
-            if live is not None:
-                yraw = live.get("y_values", [])
-                if len(yraw) == P.shape[0]:
-                    Y = np.array(yraw, dtype=float)
-            elif rd is not None and rd.Y_all is not None and len(rd.Y_all) == P.shape[0]:
-                Y = rd.Y_all
+        # Accumulate every point seen for this run so the cloud persists for the
+        # whole lifetime of the run (see _accumulate_points).
+        acc_pts, acc_y, _ = self._accumulate_points(X, 4, self._resolve_batch_Y(X))
+        if acc_pts.shape[0] > 0 and acc_pts.shape[1] >= 4:
+            P = acc_pts[:, :4] @ V
+            Y = (acc_y if acc_y is not None and len(acc_y) == P.shape[0]
+                 and np.isfinite(acc_y).all() else None)
             if Y is not None:
                 sc = ax.scatter(P[:, 0], P[:, 1], P[:, 2], c=Y, cmap="viridis",
                                 s=18, depthshade=True, zorder=3)
@@ -1596,18 +1995,13 @@ class TernaryPlotFrame(ttk.Frame):
         _draw_lines("line_endpoints",       "-",  "#0044dd", "Current LineBO lines")
 
         # ── needles ───────────────────────────────────────────────────────
-        needles_data: list = live.get("needles", []) if live else []
+        # Accumulate so declared needles persist for the run's lifetime.
+        needles_data: list = list(live.get("needles", [])) if live else []
         if not needles_data and rd is not None and rd.needles is not None \
                 and rd.needles.shape[0] > 0:
             needles_data = [{"point": npt.tolist()} for npt in rd.needles]
-        nd_pts = []
-        for nd in needles_data:
-            try:
-                pt = np.asarray(nd["point"], float)
-                if pt.shape[0] >= 4:
-                    nd_pts.append(pt[:4])
-            except Exception:
-                pass
+        nd_pts = [pt[:4] for pt in self._accumulate_needles(needles_data)
+                  if pt.shape[0] >= 4]
         if nd_pts:
             NP = np.asarray(nd_pts) @ V
             ax.scatter(NP[:, 0], NP[:, 1], NP[:, 2], marker="X", s=160,
@@ -1623,7 +2017,7 @@ class TernaryPlotFrame(ttk.Frame):
             pass
         ax.set_axis_off()
         run_lbl = rd.run_id if rd else ""
-        n_pts   = X.shape[0] if X.ndim == 2 else 0
+        n_pts   = acc_pts.shape[0]
         src_tag = (" [live]" if live else
                    (f" [snap: {rd.snapshot_name}]" if rd and rd.snapshot_name else ""))
         ax.set_title(f"{run_lbl}  —  4-simplex point cloud  ·  {n_pts} pts{src_tag}",
@@ -1634,6 +2028,9 @@ class TernaryPlotFrame(ttk.Frame):
         self.draw()
 
     def _replot(self, X: np.ndarray, n_cols: int, labels: list[str]):
+        # Remember args so an async GP-background fit can trigger a redraw.
+        self._last_replot_args = (X, n_cols, labels)
+
         # d == 4 → tetrahedron point-cloud view instead of a 3-of-d ternary.
         if n_cols == 4:
             self._replot_tetra(X, labels)
@@ -1681,6 +2078,19 @@ class TernaryPlotFrame(ttk.Frame):
             x, y = _ternary_xy(comp[:, da], comp[:, db], comp[:, dc])
             return np.column_stack([x, y])
 
+        # ── GP landscape background: posterior mean of a visualisation GP fit ──
+        # on ALL points (active + pruned/pared) over the ternary grid. d == 3 only.
+        # Fit happens off-thread; this returns the cached grid or None meanwhile.
+        if n_cols == 3 and rd is not None and rd.d == 3 and self._show_bg.get():
+            land = self._get_gp_landscape_async(rd)
+            if land is not None:
+                grid_comp, grid_mean = land
+                gxy = _proj(grid_comp)
+                sc_bg = ax.scatter(gxy[:, 0], gxy[:, 1], c=grid_mean, cmap="viridis",
+                                   s=8, alpha=0.70, zorder=1, rasterized=True)
+                cb_bg = self.fig.colorbar(sc_bg, ax=ax, shrink=0.60, pad=0.02)
+                cb_bg.set_label("GP posterior mean (all pts)", fontsize=8)
+
         # ── trust / zoom region: sample composition bounds → convex hull ──
         # Matches _draw_bounds_region in interactive_test_zombi.py. Source the
         # bounds from the snapshot (works for synthetic runs) or live state.
@@ -1691,7 +2101,7 @@ class TernaryPlotFrame(ttk.Frame):
         elif rd is not None and rd.zoom_bounds is not None \
                 and rd.zoom_bounds.shape == (2, 3):
             lo, hi = rd.zoom_bounds[0], rd.zoom_bounds[1]
-        if lo is not None and n_cols == 3:
+        if lo is not None and n_cols == 3 and self._show_zoom.get():
             comp = _sample_bounds_comp(lo, hi)
             if comp is not None:
                 bxy = _proj(comp)
@@ -1713,18 +2123,18 @@ class TernaryPlotFrame(ttk.Frame):
         # snapshot's true ellipsoid (needle M + B); fall back to live isotropic
         # spheres (radius_ilr) when no snapshot ellipsoid is available.
         penalty_drawn = False
-        if n_cols == 3 and rd is not None and rd.needles is not None \
+        if self._show_penalty.get() and n_cols == 3 and rd is not None \
+                and rd.needles is not None \
                 and rd.needles.shape[0] > 0 and rd.needle_M_list:
             for i, ncomp in enumerate(rd.needles):
                 M = rd.needle_M_list[i] if i < len(rd.needle_M_list) else None
-                ell = _needle_ellipsoid_comp(ncomp, M, rd.needle_B)
-                if ell is None:
+                bands = _needle_penalty_bands(ncomp, M, rd.needle_B)
+                if bands is None:
                     continue
-                ax.add_patch(matplotlib.patches.Polygon(
-                    _proj(ell), closed=True, facecolor="#80008022",
-                    edgecolor="purple", lw=0.9, zorder=2))
+                _draw_penalty_gradient(ax, bands, _proj)
                 penalty_drawn = True
-        if not penalty_drawn and live is not None and n_cols == 3:
+        if self._show_penalty.get() and not penalty_drawn \
+                and live is not None and n_cols == 3:
             for pr in live.get("penalty_regions", []):
                 try:
                     cpt = np.asarray(pr["center"], float)
@@ -1732,45 +2142,66 @@ class TernaryPlotFrame(ttk.Frame):
                     if cpt.shape[0] != 3 or rad <= 0:
                         continue
                     # isotropic ILR sphere of radius rad ⇒ M = I / rad²
-                    ell = _needle_ellipsoid_comp(cpt, np.eye(2) / (rad ** 2), None)
-                    if ell is None:
+                    bands = _needle_penalty_bands(cpt, np.eye(2) / (rad ** 2), None)
+                    if bands is None:
                         continue
-                    ax.add_patch(matplotlib.patches.Polygon(
-                        _proj(ell), closed=True, facecolor="#80008022",
-                        edgecolor="purple", lw=0.9, zorder=2))
+                    _draw_penalty_gradient(ax, bands, _proj)
                     penalty_drawn = True
                 except Exception:
                     pass
         if penalty_drawn:
             legend_handles.append(matplotlib.patches.Patch(
-                facecolor="#80008033", edgecolor="purple",
+                facecolor="#ff000033", edgecolor="red",
                 label="Penalty region"))
 
         # ── scatter points ────────────────────────────────────────────────
-        if X.shape[0] > 0 and X.shape[1] > max_col:
-            A, B, C = X[:, da], X[:, db], X[:, dc]
+        # Accumulate every point seen for this run so the scatter persists for
+        # the whole lifetime of the run, regardless of what the current source
+        # momentarily reports.
+        acc_pts, acc_y, acc_pen = self._accumulate_points(
+            X, n_cols, self._resolve_batch_Y(X), self._resolve_batch_penalized(X))
+        if self._show_points.get() and acc_pts.shape[0] > 0 and acc_pts.shape[1] > max_col:
+            A, B, C = acc_pts[:, da], acc_pts[:, db], acc_pts[:, dc]
             xp, yp  = _ternary_xy(A, B, C)
 
-            Y = None
-            if live is not None:
-                yraw = live.get("y_values", [])
-                if len(yraw) == len(xp):
-                    Y = np.array(yraw, dtype=float)
-            elif rd is not None and rd.Y_all is not None and len(rd.Y_all) == len(xp):
-                Y = rd.Y_all
-
-            if Y is not None:
-                sc = ax.scatter(xp, yp, c=Y, cmap="viridis", s=22, alpha=0.80, zorder=3)
+            Y = (acc_y if acc_y is not None and len(acc_y) == len(xp)
+                 and np.isfinite(acc_y).all() else None)
+            # Pruned / pared points (penalized) get a white outline; the points
+            # ZoMBI-Hop's GP still cares about (active) get a black outline.
+            pen   = (acc_pen if acc_pen is not None and len(acc_pen) == len(xp)
+                     else np.zeros(len(xp), dtype=bool))
+            active = ~pen
+            # Share one colour scale across both groups so equal Y ⇒ equal colour.
+            vmin, vmax = ((float(np.min(Y)), float(np.max(Y)))
+                          if Y is not None and len(Y) else (None, None))
+            sc = None
+            for grp, edge in ((active, "black"), (pen, "white")):
+                if not grp.any():
+                    continue
+                if Y is not None:
+                    s = ax.scatter(xp[grp], yp[grp], c=Y[grp], cmap="viridis",
+                                   vmin=vmin, vmax=vmax, s=22, alpha=0.80, zorder=3,
+                                   edgecolors=edge, linewidths=0.9)
+                    sc = sc if sc is not None else s
+                else:
+                    ax.scatter(xp[grp], yp[grp], s=22, alpha=0.80, color="steelblue",
+                               zorder=3, edgecolors=edge, linewidths=0.9)
+            if Y is not None and sc is not None:
                 cb_bar = self.fig.colorbar(sc, ax=ax, shrink=0.60, pad=0.02)
                 cb_bar.set_label("Objective Y", fontsize=8)
-            else:
-                ax.scatter(xp, yp, s=22, alpha=0.80, color="steelblue", zorder=3)
             legend_handles.append(matplotlib.lines.Line2D(
-                [], [], linestyle="none", marker="o", markersize=6,
-                color="steelblue", label=f"Samples ({len(xp)})"))
+                [], [], linestyle="none", marker="o", markersize=7,
+                markerfacecolor="steelblue", markeredgecolor="black",
+                label=f"Active pts ({int(active.sum())})"))
+            if pen.any():
+                legend_handles.append(matplotlib.lines.Line2D(
+                    [], [], linestyle="none", marker="o", markersize=7,
+                    markerfacecolor="steelblue", markeredgecolor="white",
+                    markeredgewidth=1.4, label=f"Pruned/pared ({int(pen.sum())})"))
 
         # ── prior LineBO lines (dashed, faded) ────────────────────────────
-        prior_eps    = live.get("prior_line_endpoints", []) if live else []
+        prior_eps    = (live.get("prior_line_endpoints", [])
+                        if live and self._show_lines.get() else [])
         prior_colors = ["#7799ee", "#77cc77"]
         prior_drawn  = False
         for i, ep in enumerate(prior_eps[:2]):
@@ -1790,7 +2221,8 @@ class TernaryPlotFrame(ttk.Frame):
                 pass
 
         # ── current LineBO lines (solid, prominent) ───────────────────────
-        curr_eps    = live.get("line_endpoints", []) if live else []
+        curr_eps    = (live.get("line_endpoints", [])
+                       if live and self._show_lines.get() else [])
         curr_colors = ["#0044dd", "#007700"]
         curr_drawn  = False
         for i, ep in enumerate(curr_eps[:2]):
@@ -1810,29 +2242,31 @@ class TernaryPlotFrame(ttk.Frame):
                 pass
 
         # ── needles ───────────────────────────────────────────────────────
-        needles_data: list = live.get("needles", []) if live else []
-        if not needles_data and rd is not None and rd.needles is not None and rd.needles.shape[0] > 0:
-            nv = rd.needle_vals
-            for i, npt in enumerate(rd.needles):
-                val = float(nv[i]) if nv is not None and i < len(nv) else 0.0
-                needles_data.append({"point": npt.tolist(), "y": val})
+        # Source the current needles from live state, falling back to the
+        # snapshot, then accumulate so declared needles persist for the whole
+        # run (see _accumulate_needles).
+        needles_data: list = list(live.get("needles", [])) if live else []
+        if not needles_data and rd is not None \
+                and rd.needles is not None and rd.needles.shape[0] > 0:
+            needles_data = [{"point": npt.tolist()} for npt in rd.needles]
+        acc_needles = self._accumulate_needles(needles_data)
 
         needle_drawn = False
-        for nd in needles_data:
-            try:
-                pt = np.asarray(nd["point"], float)
-                if pt.shape[0] > max_col:
-                    xn, yn = _ternary_xy(pt[[da]], pt[[db]], pt[[dc]])
-                    ax.scatter(xn, yn, marker="*", s=260, color="#ff4400",
-                               edgecolors="#880000", lw=0.8, zorder=7)
-                    if not needle_drawn:
-                        legend_handles.append(matplotlib.lines.Line2D(
-                            [], [], linestyle="none", marker="*", markersize=12,
-                            color="#ff4400", markeredgecolor="#880000",
-                            label="Needle (optimum)"))
-                        needle_drawn = True
-            except Exception:
-                pass
+        if self._show_needles.get():
+            for pt in acc_needles:
+                try:
+                    if pt.shape[0] > max_col:
+                        xn, yn = _ternary_xy(pt[[da]], pt[[db]], pt[[dc]])
+                        ax.scatter(xn, yn, marker="*", s=260, color="#ff4400",
+                                   edgecolors="#880000", lw=0.8, zorder=7)
+                        if not needle_drawn:
+                            legend_handles.append(matplotlib.lines.Line2D(
+                                [], [], linestyle="none", marker="*", markersize=12,
+                                color="#ff4400", markeredgecolor="#880000",
+                                label="Needle (optimum)"))
+                            needle_drawn = True
+                except Exception:
+                    pass
 
         # ── legend ────────────────────────────────────────────────────────
         if legend_handles:
@@ -1841,7 +2275,7 @@ class TernaryPlotFrame(ttk.Frame):
 
         # ── title ─────────────────────────────────────────────────────────
         run_lbl = rd.run_id if rd else ""
-        n_pts   = X.shape[0] if X.ndim == 2 else 0
+        n_pts   = acc_pts.shape[0]
         src_tag = (" [live]" if live else
                    (f" [snap: {rd.snapshot_name}]" if rd and rd.snapshot_name else ""))
         ax.set_title(
@@ -2740,6 +3174,8 @@ class NewRunDialog(tk.Toplevel):
                 analytics_payloads: list[dict] = []
                 analytics_counter = [0]
                 analytics_dh_ref = [None]
+                live_run_dir_ref = [None]      # set once the run dir is known
+                prior_lines_ref  = [None]      # previous iter's LineBO endpoints
 
                 def _analytics_obj(x_tell, bounds, acq_fn):
                     if stop_event.is_set():
@@ -2762,6 +3198,13 @@ class NewRunDialog(tk.Toplevel):
                             "line_0": plot_state.get("line_0"),
                             "line_1": plot_state.get("line_1"),
                         })
+                    # Publish live_plot_state.json so the ternary tab shows live
+                    # points, LineBO lines (current + prior), needles, penalty
+                    # zones and the per-point penalty mask — same as hardware runs.
+                    cur_lines = [plot_state.get("line_0"), plot_state.get("line_1")]
+                    _write_synth_live_state(
+                        live_run_dir_ref[0], _dh, cur_lines, prior_lines_ref[0])
+                    prior_lines_ref[0] = cur_lines
                     return x_req, x_act, y
 
                 zombi = ZoMBIHop(
@@ -2780,6 +3223,7 @@ class NewRunDialog(tk.Toplevel):
                 )
                 actual_run_dir = zombi.data_handler.run_dir
                 analytics_dh_ref[0] = zombi.data_handler
+                live_run_dir_ref[0] = actual_run_dir
                 _log(f"  run_uuid: {zombi.data_handler.run_uuid}", tag="info")
 
                 snap_records: list[tuple] = []

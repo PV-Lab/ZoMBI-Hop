@@ -764,6 +764,8 @@ def run_single_eval(
     snap_records: list[tuple] = []
     call_counter = [0]
     dh_ref = [None]
+    gp_ref = [None]
+    grid_pts = ds.get("grid_pts")
 
     sim_obj = rm.make_sim_obj(fn, rm.DEVICE, rm.DTYPE, maximize=maximize)
     inner = rm.make_linebo_wrapper(sim_obj, dim, rm.NUM_LINES, rm.DEVICE, rm.DTYPE, plot_state)
@@ -795,6 +797,8 @@ def run_single_eval(
             line_0=plot_state.get("line_0"),
             line_1=plot_state.get("line_1"),
             n_points_before=(dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0),
+            gp_grid_vals=(rm.gp_landscape_vals(gp_ref[0], grid_pts, maximize)
+                          if dim == 3 else None),
         ))
         if top_k is not None:
             n_needles = needles.shape[0] if needles is not None else 0
@@ -826,6 +830,7 @@ def run_single_eval(
     )
     dh = optimizer.data_handler
     dh_ref[0] = dh
+    gp_ref[0] = optimizer.gp_handler
 
     orig_snap = dh.take_snapshot
     def snap_wrap(*a, **k):

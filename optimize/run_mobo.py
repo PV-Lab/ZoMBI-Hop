@@ -1686,36 +1686,90 @@ def _draw_bounds_region(ax, bounds, n_sample: int = 5000) -> None:
         pass
 
 
+def _needle_penalty_bands(needle_x, M, B, *, n_bands: int = 18, n_ang: int = 160):
+    """Non-overlapping annular rings coloured by the smooth repulsion penalty.
+
+    The acquisition repulsion is ``violation**2 = clamp(1 - quad, 0)**2`` with
+    ``quad = delta_z^T M delta_z``: strongest (1.0) at the needle centre, fading
+    smoothly to 0 at the ellipsoid boundary (``quad = 1``).  Each ring between the
+    contours ``quad = s_out**2`` and ``quad = s_in**2`` carries penalty
+    ``(1 - s_mid**2)**2`` evaluated at its mid-radius.  Because the rings do not
+    overlap, a caller that fills each ring with ``alpha = base * penalty`` gets a
+    rendered opacity that is *exactly proportional* to the true penalty at every
+    radius (transparent at the edge → opaque at the centre).
+    """
+    d = needle_x.shape[0]
+    M_np = as_numpy(M, dtype=float)
+    eigvals, eigvecs = np.linalg.eigh(M_np)
+    eigvals = np.maximum(eigvals, 1e-12)
+    angles = np.linspace(0, 2 * np.pi, n_ang)
+    circle = np.column_stack([np.cos(angles), np.sin(angles)])
+    u_unit = (eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ circle.T).T  # quad == 1
+    needle_x = np.asarray(needle_x, dtype=float).ravel()
+    needle_ilr = (composition_to_ilr(
+        torch.tensor(needle_x, dtype=torch.float64).unsqueeze(0)).squeeze(0).cpu().numpy()
+        if B is None else None)
+
+    def _contour(s):
+        u = s * u_unit
+        if B is not None:
+            ell = needle_x.reshape(1, d) + (as_numpy(B, dtype=float) @ u.T).T
+        else:
+            ell = ilr_to_composition(
+                torch.tensor(needle_ilr + u, dtype=torch.float64), d).cpu().numpy()
+        ell = np.clip(ell, 0, 1)
+        ssum = ell.sum(axis=1, keepdims=True)
+        return ell / np.where(ssum < 1e-9, 1.0, ssum)
+
+    scales = np.linspace(1.0, 0.0, n_bands + 1)         # edge (1) → centre (0)
+    contours = [_contour(s) for s in scales]
+    bands = []
+    for k in range(n_bands):
+        s_mid = 0.5 * (scales[k] + scales[k + 1])
+        penalty = float((1.0 - s_mid ** 2) ** 2)
+        if scales[k + 1] <= 1e-9:
+            ring = contours[k]                          # innermost: filled centre disk
+        else:
+            ring = np.vstack([contours[k], contours[k + 1][::-1]])  # annulus
+        bands.append((ring, penalty))
+    return bands
+
+
 def _draw_needle_ellipsoid(ax, needle_x, M, B) -> None:
-    """Red star for the needle + faded purple penalisation ellipsoid."""
+    """Red star for the needle + red penalty gradient (centre → transparent edge)."""
     xy = comp_to_xy(needle_x.reshape(1, 3))
     ax.scatter(xy[0, 0], xy[0, 1], marker="*", s=280, c="red",
                zorder=9, edgecolors="darkred", linewidths=1.0)
     if M is None:
         return
     try:
-        d = needle_x.shape[0]
-        M_np = as_numpy(M, dtype=float)
-        eigvals, eigvecs = np.linalg.eigh(M_np)
-        eigvals = np.maximum(eigvals, 1e-12)
-        angles = np.linspace(0, 2 * np.pi, 200)
-        circle = np.column_stack([np.cos(angles), np.sin(angles)])
-        u_ell = (eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ circle.T).T
-        if B is not None:
-            B_np = as_numpy(B, dtype=float)
-            ell_pts = needle_x.reshape(1, d) + (B_np @ u_ell.T).T
-        else:
-            return
-        ell_pts = np.clip(ell_pts, 0, 1)
-        s = ell_pts.sum(axis=1, keepdims=True)
-        ell_pts = ell_pts / np.where(s < 1e-9, 1.0, s)
-        ell_xy = comp_to_xy(ell_pts)
-        poly = MplPolygon(ell_xy, closed=True, alpha=0.15, facecolor="purple",
-                          edgecolor="purple", linewidth=0.9, zorder=6)
-        ax.add_patch(poly)
-        ax.plot(ell_xy[:, 0], ell_xy[:, 1], c="purple", lw=0.7, alpha=0.45, zorder=6)
+        for ring, penalty in _needle_penalty_bands(needle_x, M, B):
+            ax.add_patch(MplPolygon(comp_to_xy(ring), closed=True,
+                                    facecolor="red", edgecolor="none",
+                                    alpha=0.5 * penalty, linewidth=0, zorder=6))
     except Exception:
         pass
+
+
+def gp_landscape_vals(gp_handler, grid_pts, maximize: bool):
+    """GP posterior mean over the ternary grid, in display orientation.
+
+    Returns a ``(len(grid_pts),)`` array of the GP's current belief about the
+    objective (what ZoMBI-Hop "thinks" the landscape looks like at this step),
+    or ``None`` if the GP is not yet fitted / prediction fails.  Mirrors the
+    display convention of ``pared_Y`` (un-negated for minimize runs).
+    """
+    if (gp_handler is None or getattr(gp_handler, "gp", None) is None
+            or grid_pts is None):
+        return None
+    try:
+        gt = torch.as_tensor(grid_pts, dtype=DTYPE, device=DEVICE)
+        with torch.no_grad():
+            mean, _ = gp_handler.predict(gt)
+        m = as_numpy(mean).ravel()
+        return m if maximize else -m
+    except Exception:
+        return None
 
 
 def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool,
@@ -1744,6 +1798,16 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
     draw_ternary_frame(ax_exp)
     legend_handles = []
     pared_X, pared_Y = payload.get("pared_X"), payload.get("pared_Y")
+
+    # Background = the GP's current belief about the objective landscape (its
+    # posterior mean over the ternary grid).
+    gp_vals = payload.get("gp_grid_vals")
+    if gp_vals is not None and grid_pts is not None and len(gp_vals) == len(grid_pts):
+        gxy_e = comp_to_xy(grid_pts)
+        sc_gp = ax_exp.scatter(gxy_e[:, 0], gxy_e[:, 1], c=gp_vals, cmap="viridis",
+                               s=6, alpha=0.72, zorder=1, rasterized=True)
+        fig.colorbar(sc_gp, ax=ax_exp, label="GP posterior mean", fraction=0.046, pad=0.04)
+
     if pared_X is not None and len(pared_X) > 0:
         n = len(pared_Y)
         alphas = np.linspace(0.15, 0.92, n) if n > 1 else np.array([0.92])
@@ -1754,7 +1818,7 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
         for i in range(n):
             ax_exp.scatter(xy_pts[i, 0], xy_pts[i, 1], c=[[pared_Y[i]]], cmap="viridis",
                            vmin=y_lo, vmax=y_hi, s=22, alpha=float(alphas[i]),
-                           zorder=3, edgecolors="gray", linewidths=0.2)
+                           zorder=3, edgecolors="black", linewidths=0.9)
         ax_exp.set_title(f"ZoMBI-Hop exploration  ({n} pared pts)", fontsize=11)
     else:
         ax_exp.set_title("ZoMBI-Hop exploration", fontsize=11)
@@ -2306,6 +2370,7 @@ def run_single_trial(
     snap_records: list[tuple] = []
     call_counter = [0]
     dh_ref = [None]
+    gp_ref = [None]
 
     sim_obj = make_sim_obj(fn_callable, DEVICE, DTYPE, maximize=maximize)
     inner   = make_linebo_wrapper(sim_obj, dim, NUM_LINES, DEVICE, DTYPE, plot_state)
@@ -2349,6 +2414,8 @@ def run_single_trial(
                                for m in dh.needle_M_list],
                 needle_B=(as_numpy(dh.needle_B) if dh.needle_B is not None else None),
                 bounds=(as_numpy(dh.bounds) if dh.bounds is not None else None),
+                gp_grid_vals=(gp_landscape_vals(gp_ref[0], grid_pts, maximize)
+                              if dim == 3 else None),
             )
         payloads.append(payload)
         return x_req, x_act, y
@@ -2380,6 +2447,7 @@ def run_single_trial(
                 "ackley_seed": ackley_seed}
     dh = optimizer.data_handler
     dh_ref[0] = dh
+    gp_ref[0] = optimizer.gp_handler
 
     orig_snap = dh.take_snapshot
     def snap_wrap(*a, **k):
