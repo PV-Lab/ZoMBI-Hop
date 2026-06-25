@@ -51,6 +51,124 @@ OPTIMIZING_DIMS = [0, 8, 9]
 # to minimize (we negate for the GP; plots/logs show measured y).
 MINIMIZE_OBJECTIVE = False
 
+
+# ── composition logging ─────────────────────────────────────────────────────────
+# Records, per objective call, the SENT (requested) and REAL (measured)
+# compositions for BOTH hardware rails (main + cache), so expected-vs-actual can
+# be reconstructed exactly later (see visualization/discrepancy.py). The optimizer
+# itself only keeps the main rail's measurements; this log is the only recoverable
+# record of the requested lines and of the cache rail. Written as newline-delimited
+# JSON to <run_dir>/composition_log.jsonl, one record per objective call.
+#
+# Resume-safe: opened in append mode, with the call counter continued past records
+# from before the resume. Records produced before the run directory is known (the
+# initial seed-line sampling of a brand-new run) are buffered and flushed once
+# set_composition_log_dir() is called.
+COMPOSITION_LOG_NAME = "composition_log.jsonl"
+_COMP_LOG: Dict[str, Any] = {"path": None, "buffer": [], "call": 0}
+
+
+def set_composition_log_dir(run_dir: "Path | None") -> None:
+    """Point the composition log at a run directory and flush buffered records.
+
+    Safe to call more than once. On resume (file already present) the call counter
+    continues from the number of records already logged so indices stay unique.
+    """
+    if run_dir is None:
+        return
+    path = Path(run_dir) / COMPOSITION_LOG_NAME
+    _COMP_LOG["path"] = path
+    if _COMP_LOG["call"] == 0 and path.exists():
+        try:
+            with open(path, "r") as fh:
+                _COMP_LOG["call"] = sum(1 for _ in fh)
+        except Exception:
+            pass
+    if _COMP_LOG["buffer"]:
+        buffered, _COMP_LOG["buffer"] = _COMP_LOG["buffer"], []
+        for rec in buffered:
+            _write_composition_record(rec)
+
+
+def _write_composition_record(record: Dict[str, Any]) -> None:
+    path = _COMP_LOG["path"]
+    if path is None:
+        _COMP_LOG["buffer"].append(record)
+        return
+    try:
+        with open(path, "a") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except Exception as exc:
+        print(f"[comp-log] WARNING: could not write composition record: {exc}")
+
+
+def log_compositions(
+    sent_main: np.ndarray,
+    sent_cache: np.ndarray,
+    endpoints_log_ref: "Dict[str, Any] | None",
+    measured: np.ndarray,
+    y_measured: np.ndarray,
+    valid_indices: np.ndarray,
+    num_experiments: int,
+) -> None:
+    """Append one record describing both rails of a single objective call.
+
+    All compositions are in the apparatus/optimizer space (``OPTIMIZING_DIMS``).
+    ``measured`` / ``y_measured`` are only the rows the apparatus returned (NaN
+    rows already dropped); ``valid_indices`` maps each returned row back to its
+    position in the concatenated send order ``[main(0..N-1), cache(N..2N-1)]`` so
+    the two rails are separated exactly even when some points are missing.
+    """
+    try:
+        sent = {0: np.asarray(sent_main, float), 1: np.asarray(sent_cache, float)}
+        rails: Dict[int, Dict[str, list]] = {
+            0: {"sent": [], "measured": [], "y": []},
+            1: {"sent": [], "measured": [], "y": []},
+        }
+        meas = np.atleast_2d(np.asarray(measured, float))
+        yv = np.asarray(y_measured, float).ravel()
+        for j, idx in enumerate(np.asarray(valid_indices).ravel().astype(int)):
+            rail = 0 if idx < num_experiments else 1
+            within = int(idx) - (0 if rail == 0 else num_experiments)
+            src = sent[rail]
+            if 0 <= within < len(src):
+                rails[rail]["sent"].append(src[within].tolist())
+                rails[rail]["measured"].append(meas[j].tolist() if j < len(meas) else [])
+                rails[rail]["y"].append(float(yv[j]) if j < len(yv) else float("nan"))
+
+        ep = endpoints_log_ref or {}
+
+        def _ep(key: str):
+            v = ep.get(key)
+            return np.asarray(v, float).tolist() if v is not None else None
+
+        record = {
+            "ts": time.time(),
+            "call": _COMP_LOG["call"],
+            "optimizing_dims": list(OPTIMIZING_DIMS),
+            "num_experiments": int(num_experiments),
+            "rails": [
+                {
+                    "name": "main",
+                    "sent_endpoints": [_ep("line_0_left"), _ep("line_0_right")],
+                    "sent": rails[0]["sent"],
+                    "measured": rails[0]["measured"],
+                    "y": rails[0]["y"],
+                },
+                {
+                    "name": "cache",
+                    "sent_endpoints": [_ep("line_1_left"), _ep("line_1_right")],
+                    "sent": rails[1]["sent"],
+                    "measured": rails[1]["measured"],
+                    "y": rails[1]["y"],
+                },
+            ],
+        }
+        _COMP_LOG["call"] += 1
+        _write_composition_record(record)
+    except Exception as exc:
+        print(f"[comp-log] WARNING: failed to build composition record: {exc}")
+
 # Built-in (arbitrary) ZoMBI-Hop hyperparameters used when no --hparams JSON file
 # is supplied. Copied verbatim from optimize/runs/mobo_05_06_15_32/trial_112.
 # Keep in sync with DEFAULT_HPARAMS in interface/app.py.
@@ -468,6 +586,7 @@ def get_y_measurements(
     db: str = "./sql/objective.db",
     verbose: bool = False,
     ready_for_objectives: bool = False,
+    return_indices: bool = False,
 ):
     """
     Read objective values (and compositions → x_meas) from the objective DB.
@@ -477,6 +596,11 @@ def get_y_measurements(
     - We wait until flag == 1, then read the objective table, then set flag = 0 (consumed).
     - This avoids reading stale data. On resume, reset_objective() clears the table and
       sets flag = 0 so the first read waits for fresh data from the apparatus.
+
+    When ``return_indices`` is True the return is ``(y, x_meas, valid_indices)``
+    where ``valid_indices`` maps each returned (non-NaN) row back to its row in the
+    input ``x`` send order, so callers can attribute rows to the correct rail even
+    when some points were dropped.
     """
     import os as _os
     import sqlite3
@@ -581,6 +705,8 @@ def get_y_measurements(
             conn.close()
         except Exception as e:
             print(f"[get_y_measurements] Error clearing handshake flag: {e}")
+    if return_indices:
+        return y, x_meas, valid_indices
     return y, x_meas
 
 
@@ -671,11 +797,19 @@ def objective(
     # Always reset (not just when ready_for_objectives) so stale rows from a previous
     # call never bleed into the next one.
     communication.reset_objective()
-    y_all, x_meas_all = get_y_measurements(
-        np.vstack([x_main, x_cache]), verbose=True, ready_for_objectives=ready_for_objectives
+    y_all, x_meas_all, valid_indices = get_y_measurements(
+        np.vstack([x_main, x_cache]), verbose=True,
+        ready_for_objectives=ready_for_objectives, return_indices=True,
     )
     # Clear after reading so objective_receiver sees obj_empty=True for the next call.
     communication.reset_objective()
+    # Record the sent vs. measured compositions for BOTH rails before the optimizer
+    # discards the cache rail — the only recoverable record of the requested lines.
+    log_compositions(
+        sent_main=x_main, sent_cache=x_cache, endpoints_log_ref=endpoints_log_ref,
+        measured=x_meas_all, y_measured=y_all, valid_indices=valid_indices,
+        num_experiments=num_experiments,
+    )
     x_meas_main = x_meas_all[:num_experiments].astype(np.float64)
     y_main = np.asarray(y_all[:num_experiments]).ravel().astype(np.float64)
     y_for_gp = y_measured_to_optimizer(y_main)
@@ -1104,6 +1238,7 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
 
         run_dir_ref[0] = ckpt_path / f"run_{optimizer.run_uuid}"
         optimizer_ref[0] = optimizer
+        set_composition_log_dir(run_dir_ref[0])  # flush any buffered seed-line records
         print(f"✅ Starting new trial with UUID: {optimizer.run_uuid}")
     else:
         run_dir = ckpt_path / f"run_{resume_uuid}"
@@ -1128,6 +1263,7 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
         )
         run_dir_ref[0] = run_dir
         optimizer_ref[0] = optimizer
+        set_composition_log_dir(run_dir_ref[0])  # append to existing log across resume
         _flush_initial_state()  # write historical data to GUI immediately
         print(
             f"✅ Resumed from activation={optimizer.current_activation}, "

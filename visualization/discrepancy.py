@@ -2,34 +2,48 @@
 visualization/discrepancy.py
 =============================
 Interactive Dash web app for inspecting the *discrepancy* between the line
-ZoMBI-Hop **asked** the hardware to sample (the "expected" line) and the line
-the hardware actually **returned** (the "actual" line).
+ZoMBI-Hop **asked** the hardware to print (the "expected"/sent line) and the
+line the hardware actually **returned** (the "actual"/measured line), on a
+ternary diagram.
 
-Each LineBO line is a sequence of ``NUM_EXPERIMENTS`` (24) composition points.
-For a chosen line the ternary shows:
+Two data sources, picked automatically per run
+----------------------------------------------
+1. ``composition_log.jsonl``  (preferred — written by scripts/run_zombi_main.py)
+   Records, per objective call, the sent and measured compositions for **both
+   hardware rails** (the hardware prints two lines at a time: a *main* rail and
+   a *cache* rail). When present, each call is shown as two ternaries labelled
+   e.g. ``5a`` (main) and ``5b`` (cache):
+     * expected/sent line  — grey points + line;
+     * actual/measured line — points coloured by objective value (viridis,
+                               mirroring interface/app.py).
+   The closeness metric is the mean per-point ‖measured − sent‖₂.
 
-  * the expected line  — 24 points drawn in **grey**;
-  * the actual line     — 24 points coloured by their **objective value**
-                          (viridis), mirroring how points are rendered in
-                          ``interface/app.py``;
-  * thin grey segments connecting each actual point to its expected twin.
+2. Legacy fallback (older runs with no composition log)
+   Older runs only stored the *main* rail's measured points, and the saved
+   "expected" array is a degenerate single PCA fit through the batch — the true
+   requested line was never logged. So for these runs we segment the saved
+   points into one line per optimizer iteration (using the per-snapshot point
+   counts, NOT a fixed chunk of 24 — dedup makes lines variable-length) and draw
+   each iteration's measured points against a **best-fit reference line** (grey).
+   The metric is then the RMS perpendicular distance to that fit (how straight /
+   noisy the rail was), and a banner makes clear the true requested line and the
+   second rail are unavailable for these runs.
 
-A "Random line" button picks a random line.  The scrollable list on the right
-shows every line, labelled by the order in which it was placed and ranked
-*worst-first* by closeness (mean per-point Euclidean distance between the
-actual and expected points).  That same metric is shown beneath the ternary.
+A "Random line" button jumps to a random iteration. The scrollable list on the
+right shows every rail, labelled by placement order and **ranked worst-first**
+by the closeness metric; the same metric is shown beneath the ternaries.
 
-Only d=3 (true ternary) runs are supported; loading a higher-d run raises a
-clear error.
+Only d=3 (true ternary) runs are supported.
 
 Usage
 -----
   conda activate zombi-hop
   python visualization/discrepancy.py
-  # then open the printed http://127.0.0.1:8050 in a browser
+  # open the printed http://127.0.0.1:8050 in a browser
 """
 from __future__ import annotations
 
+import json
 import random
 import sys
 from pathlib import Path
@@ -43,23 +57,21 @@ sys.path.insert(0, str(_HERE.parent))
 from src.utils.datahandler import reconstruct_snapshot_tensors  # noqa: E402
 
 import dash  # noqa: E402
-from dash import Input, Output, State, ctx, dcc, html  # noqa: E402
+from dash import Input, Output, State, dcc, html  # noqa: E402
 import plotly.graph_objects as go  # noqa: E402
 
 # ── constants ──────────────────────────────────────────────────────────────────
-NUM_EXPERIMENTS = 24                       # points per LineBO line
-RUNS_DIR        = _HERE.parent / "runs"
-DEFAULT_RUN     = "run_63b5"               # preferred default if present
+RUNS_DIR    = _HERE.parent / "runs"
+DEFAULT_RUN = "run_7eb9"
+COMP_LOG    = "composition_log.jsonl"
 
-# Cache of loaded line data, keyed by (run, snapshot), to avoid re-reading
-# snapshots on every callback. The dev server is single-process so this is safe.
-_CACHE: dict[tuple[str, str], list[dict]] = {}
+# Cache of loaded groups, keyed by (run, snapshot). Single-process dev server.
+_CACHE: dict[tuple[str, str], tuple] = {}
 
 
 # ── run / snapshot discovery ────────────────────────────────────────────────────
 
 def list_runs() -> list[str]:
-    """Run directories under runs/ that have a config and at least one snapshot."""
     if not RUNS_DIR.exists():
         return []
     return [
@@ -88,135 +100,210 @@ def latest_snapshot(run: str) -> str | None:
     return snaps[-1]
 
 
-# ── line loading ─────────────────────────────────────────────────────────────────
+def has_comp_log(run: str) -> bool:
+    return (RUNS_DIR / run / COMP_LOG).exists()
 
-def load_lines(run: str, snapshot: str) -> list[dict]:
+
+# ── geometry helpers ────────────────────────────────────────────────────────────
+
+def _avg_dist(a: np.ndarray, b: np.ndarray) -> float:
+    if len(a) == 0:
+        return 0.0
+    return float(np.linalg.norm(a - b, axis=1).mean())
+
+
+def fit_line_feet(P: np.ndarray) -> np.ndarray:
+    """Return, for each point, the foot of its perpendicular on the best-fit line."""
+    if len(P) < 2:
+        return P.copy()
+    mean = P.mean(axis=0)
+    c = P - mean
+    _, _, Vt = np.linalg.svd(c, full_matrices=False)
+    direction = Vt[0]
+    t = c @ direction
+    return mean + np.outer(t, direction)
+
+
+# ── group / rail construction ────────────────────────────────────────────────────
+# A "group" is one optimizer iteration (one objective call). It holds 1–2 rails.
+# A "rail" dict: {label, expected (N,3), actual (N,3), y (N,), avg_dist, kind}.
+
+def _rail(label, expected, actual, y, kind):
+    return {
+        "label":    label,
+        "expected": np.asarray(expected, float),
+        "actual":   np.asarray(actual, float),
+        "y":        np.asarray(y, float).ravel(),
+        "avg_dist": _avg_dist(np.asarray(actual, float), np.asarray(expected, float)),
+        "kind":     kind,
+    }
+
+
+def load_from_comp_log(run: str) -> list[dict]:
+    """Build groups (with both rails) from composition_log.jsonl."""
+    groups: list[dict] = []
+    path = RUNS_DIR / run / COMP_LOG
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        idx = int(rec.get("call", len(groups)))
+        rails = []
+        for ri, rail in enumerate(rec.get("rails", [])):
+            sent = np.asarray(rail.get("sent", []), float)
+            meas = np.asarray(rail.get("measured", []), float)
+            yv   = np.asarray(rail.get("y", []), float).ravel()
+            if sent.ndim != 2 or sent.shape[0] == 0 or sent.shape != meas.shape:
+                continue
+            if sent.shape[1] != 3:
+                raise ValueError(
+                    f"discrepancy.py supports only d=3; run '{run}' has d={sent.shape[1]}.")
+            suffix = "ab"[ri] if ri < 2 else str(ri)
+            rails.append(_rail(f"{idx}{suffix}", sent, meas, yv, kind="sent"))
+        if rails:
+            groups.append({"index": idx, "label": f"call {idx}", "rails": rails})
+    return groups
+
+
+def _snapshot_boundaries(run: str, snapshot: str) -> list[int]:
+    """Cumulative point counts at each snapshot up to `snapshot`, from summary.json."""
+    counts: list[int] = []
+    for sn in list_snapshots(run):
+        summ = RUNS_DIR / run / "snapshots" / sn / "summary.json"
+        try:
+            n = int(json.loads(summ.read_text()).get("n_points", 0))
+        except Exception:
+            n = 0
+        counts.append(n)
+        if sn == snapshot:
+            break
+    return counts
+
+
+def load_legacy(run: str, snapshot: str) -> list[dict]:
     """
-    Reconstruct a snapshot and split its paired expected/actual point clouds into
-    LineBO lines of ``NUM_EXPERIMENTS`` points each.
-
-    Returns a list (in placement order) of dicts with keys:
-      placed   – int placement index (0 = first line sampled)
-      expected – (24, 3) expected composition points
-      actual   – (24, 3) actual composition points returned by hardware
-      y        – (24,)   objective value per actual point
-      avg_dist – mean per-point ‖actual − expected‖₂ over the 24 points
+    Fallback for runs without a composition log: one rail per optimizer iteration,
+    segmented by per-snapshot point counts, compared against a best-fit reference.
     """
     s  = reconstruct_snapshot_tensors(RUNS_DIR / run, snapshot, device="cpu")
     xa = s["X_all_actual"].float().numpy()
-    xe = s["X_all_expected"].float().numpy()
     y  = s["Y_all"].float().numpy().ravel()
-
     if xa.ndim != 2 or xa.shape[1] != 3:
         d = xa.shape[1] if xa.ndim == 2 else "?"
-        raise ValueError(
-            f"discrepancy.py supports only d=3 (ternary) runs; "
-            f"'{run}/{snapshot}' has d={d}."
-        )
+        raise ValueError(f"discrepancy.py supports only d=3; run '{run}' has d={d}.")
 
-    n_lines = xa.shape[0] // NUM_EXPERIMENTS
-    lines: list[dict] = []
-    for i in range(n_lines):
-        sl   = slice(i * NUM_EXPERIMENTS, (i + 1) * NUM_EXPERIMENTS)
-        a, e = xa[sl], xe[sl]
-        dist = np.linalg.norm(a - e, axis=1)
-        lines.append({
-            "placed":   i,
-            "expected": e,
-            "actual":   a,
-            "y":        y[sl],
-            "avg_dist": float(dist.mean()),
+    # Iteration boundaries = the distinct increasing cumulative counts.
+    bounds = sorted({c for c in _snapshot_boundaries(run, snapshot) if c > 0})
+    groups: list[dict] = []
+    prev, gi = 0, 0
+    for b in bounds:
+        b = min(b, len(xa))
+        if b <= prev:
+            continue
+        actual = xa[prev:b]
+        feet   = fit_line_feet(actual)            # grey best-fit reference points
+        groups.append({
+            "index": gi, "label": f"iter {gi}",
+            "rails": [_rail(str(gi), feet, actual, y[prev:b], kind="fit")],
         })
-    return lines
+        prev, gi = b, gi + 1
+    return groups
 
 
-def get_lines(run: str, snapshot: str) -> list[dict]:
-    key = (run, snapshot)
+def get_groups(run: str, snapshot: str) -> tuple[list[dict], str]:
+    """Return (groups, mode) where mode is 'log' or 'legacy'."""
+    key = (run, snapshot if not has_comp_log(run) else "__log__")
     if key not in _CACHE:
-        _CACHE[key] = load_lines(run, snapshot)
+        if has_comp_log(run):
+            _CACHE[key] = (load_from_comp_log(run), "log")
+        else:
+            _CACHE[key] = (load_legacy(run, snapshot), "legacy")
     return _CACHE[key]
 
 
-def ranked(lines: list[dict]) -> list[dict]:
-    """Lines sorted worst-first (largest mean discrepancy first)."""
-    return sorted(lines, key=lambda ln: ln["avg_dist"], reverse=True)
+def all_rails(groups: list[dict]) -> list[tuple[dict, dict]]:
+    """Flat list of (group, rail) pairs, worst-first by avg_dist."""
+    pairs = [(g, r) for g in groups for r in g["rails"]]
+    return sorted(pairs, key=lambda gr: gr[1]["avg_dist"], reverse=True)
 
 
-# ── figure ───────────────────────────────────────────────────────────────────────
+# ── figures ──────────────────────────────────────────────────────────────────────
 
-def make_figure(line: dict) -> go.Figure:
-    e, a, y = line["expected"], line["actual"], line["y"]
-
-    # Connector segments (expected → actual) for each of the 24 points.
-    ca, cb, cc = [], [], []
-    for i in range(len(a)):
-        ca += [e[i, 0], a[i, 0], None]
-        cb += [e[i, 1], a[i, 1], None]
-        cc += [e[i, 2], a[i, 2], None]
+def make_figure(rail: dict) -> go.Figure:
+    e, a, y = rail["expected"], rail["actual"], rail["y"]
 
     fig = go.Figure()
-    fig.add_trace(go.Scatterternary(
-        a=ca, b=cb, c=cc, mode="lines",
-        line=dict(color="rgba(150,150,150,0.4)", width=1),
-        hoverinfo="skip", showlegend=False,
-    ))
-    fig.add_trace(go.Scatterternary(
-        a=e[:, 0], b=e[:, 1], c=e[:, 2], mode="lines+markers",
-        line=dict(color="lightgrey", width=1),
-        marker=dict(size=8, color="lightgrey",
-                    line=dict(color="grey", width=1)),
-        name="Expected", hovertemplate="expected<extra></extra>",
-    ))
+    # The grey "expected/sent" line + connectors are only meaningful when we have a
+    # real sent line to compare against (log mode). For legacy runs (kind="fit")
+    # there is no true expected line, so just show the measured points.
+    if rail["kind"] != "fit":
+        ca, cb, cc = [], [], []
+        for i in range(len(a)):
+            ca += [e[i, 0], a[i, 0], None]
+            cb += [e[i, 1], a[i, 1], None]
+            cc += [e[i, 2], a[i, 2], None]
+        fig.add_trace(go.Scatterternary(
+            a=ca, b=cb, c=cc, mode="lines",
+            line=dict(color="rgba(150,150,150,0.45)", width=1),
+            hoverinfo="skip", showlegend=False))
+        fig.add_trace(go.Scatterternary(
+            a=e[:, 0], b=e[:, 1], c=e[:, 2], mode="lines+markers",
+            line=dict(color="lightgrey", width=1),
+            marker=dict(size=7, color="lightgrey", line=dict(color="grey", width=1)),
+            name="Expected (sent)", hovertemplate="Expected (sent)<extra></extra>"))
+    has_y = y.size == len(a) and np.isfinite(y).any()
     fig.add_trace(go.Scatterternary(
         a=a[:, 0], b=a[:, 1], c=a[:, 2], mode="lines+markers",
         line=dict(color="rgba(0,0,0,0.2)", width=1),
         marker=dict(
-            size=11, color=y, colorscale="Viridis",
-            colorbar=dict(title="Objective Y", len=0.6),
-            line=dict(color="black", width=1),
-        ),
-        name="Actual",
-        customdata=y,
-        hovertemplate="actual<br>Y = %{customdata:.5f}<extra></extra>",
-    ))
+            size=10,
+            color=(y if has_y else "steelblue"),
+            colorscale="Viridis" if has_y else None,
+            colorbar=(dict(title="Objective Y", len=0.7) if has_y else None),
+            line=dict(color="black", width=1)),
+        name="Actual (measured)",
+        customdata=(y if has_y else None),
+        hovertemplate=("actual<br>Y = %{customdata:.5f}<extra></extra>"
+                       if has_y else "actual<extra></extra>")))
     fig.update_layout(
-        ternary=dict(
-            sum=1,
-            aaxis=dict(title="x0", min=0),
-            baxis=dict(title="x1", min=0),
-            caxis=dict(title="x2", min=0),
-        ),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-        margin=dict(l=40, r=40, t=60, b=40),
-        height=620,
-    )
+        title=dict(text=f"Line {rail['label']}   ·   avg dist {rail['avg_dist']:.4f}",
+                   x=0.5, font=dict(size=14)),
+        ternary=dict(sum=1, aaxis=dict(title="x0", min=0),
+                     baxis=dict(title="x1", min=0), caxis=dict(title="x2", min=0)),
+        showlegend=False, margin=dict(l=30, r=30, t=50, b=30), height=520)
     return fig
 
 
-def line_list_options(lines: list[dict]) -> list[dict]:
-    """Radio options for the right-hand list: worst-first, labelled by placement."""
+def list_options(groups: list[dict]) -> list[dict]:
     opts = []
-    for rank, ln in enumerate(ranked(lines), start=1):
+    for rank, (g, r) in enumerate(all_rails(groups), start=1):
         opts.append({
             "label": html.Span(
-                f"#{rank}  ·  placed {ln['placed']}  ·  avg dist {ln['avg_dist']:.4f}",
-                style={"fontFamily": "monospace", "fontSize": "13px"},
-            ),
-            "value": ln["placed"],
+                f"#{rank}  ·  {r['label']}  ·  avg dist {r['avg_dist']:.4f}",
+                style={"fontFamily": "monospace", "fontSize": "13px"}),
+            "value": g["index"],
         })
     return opts
 
 
-def metric_text(lines: list[dict], placed: int) -> str:
-    by_placed = {ln["placed"]: ln for ln in lines}
-    ln = by_placed.get(placed)
-    if ln is None:
+def metric_children(groups: list[dict], group_index: int):
+    order = all_rails(groups)
+    rank_of = {id(r): i for i, (_, r) in enumerate(order, start=1)}
+    grp = next((g for g in groups if g["index"] == group_index), None)
+    if grp is None:
         return "No line selected."
-    order = ranked(lines)
-    rank  = next(i for i, x in enumerate(order, start=1) if x["placed"] == placed)
-    return (f"Line placed #{placed}  —  mean expected↔actual distance "
-            f"= {ln['avg_dist']:.5f}   (closeness rank {rank} of {len(lines)}, "
-            f"worst = rank 1)")
+    parts = []
+    for r in grp["rails"]:
+        label = ("mean perpendicular distance to best-fit"
+                 if r["kind"] == "fit" else "mean sent↔measured distance")
+        parts.append(html.Div(
+            f"Line {r['label']}  —  {label} = {r['avg_dist']:.5f}   "
+            f"(closeness rank {rank_of[id(r)]} of {len(order)}, worst = rank 1)"))
+    return parts
 
 
 # ── app ────────────────────────────────────────────────────────────────────────
@@ -230,10 +317,10 @@ _default_run = DEFAULT_RUN if DEFAULT_RUN in _runs else (_runs[0] if _runs else 
 app.layout = html.Div(
     style={"fontFamily": "system-ui, sans-serif", "padding": "12px"},
     children=[
-        html.H2("Expected vs. actual LineBO lines"),
+        html.H2("Expected (sent) vs. actual (measured) hardware lines"),
         html.Div(
             style={"display": "flex", "gap": "16px", "alignItems": "flex-end",
-                   "flexWrap": "wrap", "marginBottom": "8px"},
+                   "flexWrap": "wrap", "marginBottom": "6px"},
             children=[
                 html.Div([
                     html.Label("Run"),
@@ -241,25 +328,28 @@ app.layout = html.Div(
                         id="run-dd",
                         options=[{"label": r, "value": r} for r in _runs],
                         value=_default_run, clearable=False,
-                        style={"width": "240px"},
-                    ),
+                        style={"width": "240px"}),
                 ]),
                 html.Div([
-                    html.Label("Snapshot"),
-                    dcc.Dropdown(id="snap-dd", clearable=False,
-                                 style={"width": "320px"}),
+                    html.Label("Snapshot (legacy runs only)"),
+                    dcc.Dropdown(id="snap-dd", clearable=False, style={"width": "320px"}),
                 ]),
                 html.Button("🎲 Random line", id="random-btn", n_clicks=0,
                             style={"height": "38px", "cursor": "pointer"}),
             ],
         ),
+        html.Div(id="mode-banner", style={
+            "fontSize": "13px", "padding": "6px 10px", "borderRadius": "6px",
+            "marginBottom": "8px"}),
         html.Div(
             style={"display": "flex", "gap": "16px", "alignItems": "stretch"},
             children=[
                 html.Div(
-                    style={"flex": "1 1 640px", "minWidth": "480px"},
+                    style={"flex": "1 1 700px", "minWidth": "480px"},
                     children=[
-                        dcc.Graph(id="ternary"),
+                        html.Div(id="ternaries",
+                                 style={"display": "flex", "gap": "12px",
+                                        "flexWrap": "wrap"}),
                         html.Div(id="metric", style={
                             "fontFamily": "monospace", "fontSize": "14px",
                             "padding": "8px 10px", "background": "#f3f3f3",
@@ -269,18 +359,16 @@ app.layout = html.Div(
                 html.Div(
                     style={"flex": "0 0 320px"},
                     children=[
-                        html.Label("Lines — ranked worst → best",
+                        html.Label("Rails — ranked worst → best",
                                    style={"fontWeight": "bold"}),
                         html.Div(
                             dcc.RadioItems(
                                 id="line-list", options=[], value=None,
-                                labelStyle={"display": "block",
-                                            "padding": "3px 4px", "cursor": "pointer"},
-                            ),
+                                labelStyle={"display": "block", "padding": "3px 4px",
+                                            "cursor": "pointer"}),
                             style={"height": "560px", "overflowY": "auto",
                                    "border": "1px solid #ccc", "borderRadius": "6px",
-                                   "padding": "6px", "marginTop": "4px"},
-                        ),
+                                   "padding": "6px", "marginTop": "4px"}),
                     ],
                 ),
             ],
@@ -294,64 +382,76 @@ app.layout = html.Div(
 @app.callback(
     Output("snap-dd", "options"),
     Output("snap-dd", "value"),
+    Output("snap-dd", "disabled"),
     Input("run-dd", "value"),
 )
 def _update_snapshots(run):
     if not run:
-        return [], None
+        return [], None, True
     snaps = list_snapshots(run)
-    return ([{"label": s, "value": s} for s in snaps], latest_snapshot(run))
+    # In log mode the snapshot axis is irrelevant (the log spans the whole run).
+    return ([{"label": s, "value": s} for s in snaps],
+            latest_snapshot(run), has_comp_log(run))
 
 
 @app.callback(
     Output("line-list", "options"),
     Output("line-list", "value"),
+    Output("mode-banner", "children"),
+    Output("mode-banner", "style"),
     Input("snap-dd", "value"),
-    State("run-dd", "value"),
-)
-def _populate_lines(snapshot, run):
-    if not run or not snapshot:
-        return [], None
-    lines = get_lines(run, snapshot)
-    if not lines:
-        return [], None
-    options = line_list_options(lines)
-    chosen  = random.choice(lines)["placed"]
-    return options, chosen
-
-
-@app.callback(
-    Output("line-list", "value", allow_duplicate=True),
     Input("random-btn", "n_clicks"),
     State("run-dd", "value"),
-    State("snap-dd", "value"),
-    prevent_initial_call=True,
+    State("line-list", "value"),
 )
-def _random_line(_n, run, snapshot):
+def _populate(snapshot, _n_clicks, run, current_value):
+    base_style = {"fontSize": "13px", "padding": "6px 10px", "borderRadius": "6px",
+                  "marginBottom": "8px"}
     if not run or not snapshot:
-        return dash.no_update
-    lines = get_lines(run, snapshot)
-    if not lines:
-        return dash.no_update
-    return random.choice(lines)["placed"]
+        return [], None, "", base_style
+    groups, mode = get_groups(run, snapshot)
+    if not groups:
+        return [], None, "No lines found for this run.", base_style
+
+    trigger = dash.callback_context.triggered_id
+    if trigger == "random-btn":
+        value = random.choice(groups)["index"]
+    elif current_value is not None and any(g["index"] == current_value for g in groups):
+        value = current_value
+    else:
+        value = random.choice(groups)["index"]
+
+    if mode == "log":
+        banner = ("✓ Using composition_log.jsonl — true sent vs. measured "
+                  "compositions, both rails (a = main, b = cache). "
+                  "Snapshot selector is ignored in this mode.")
+        style = {**base_style, "background": "#e6f5e6", "border": "1px solid #9c9"}
+    else:
+        banner = ""
+        style = {**base_style, "display": "none"}
+    return list_options(groups), value, banner, style
 
 
 @app.callback(
-    Output("ternary", "figure"),
+    Output("ternaries", "children"),
     Output("metric", "children"),
     Input("line-list", "value"),
     State("run-dd", "value"),
     State("snap-dd", "value"),
 )
-def _render(placed, run, snapshot):
-    if placed is None or not run or not snapshot:
-        return go.Figure(), "Select a run and line."
-    lines    = get_lines(run, snapshot)
-    by_placed = {ln["placed"]: ln for ln in lines}
-    line = by_placed.get(placed)
-    if line is None:
-        return go.Figure(), "Line not found."
-    return make_figure(line), metric_text(lines, placed)
+def _render(group_index, run, snapshot):
+    if group_index is None or not run or not snapshot:
+        return [], "Select a run and line."
+    groups, _ = get_groups(run, snapshot)
+    grp = next((g for g in groups if g["index"] == group_index), None)
+    if grp is None:
+        return [], "Line not found."
+    graphs = [
+        dcc.Graph(figure=make_figure(r),
+                  style={"flex": "1 1 460px", "minWidth": "360px"})
+        for r in grp["rails"]
+    ]
+    return graphs, metric_children(groups, group_index)
 
 
 if __name__ == "__main__":
