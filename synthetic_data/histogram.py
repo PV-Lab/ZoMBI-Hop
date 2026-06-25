@@ -51,7 +51,7 @@ from synthetic_data.ensemble import Ensemble, random_ensemble_config  # noqa: E4
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 DIMENSIONS = [3, 4, 10]   # simplex dimensionalities to examine (--ackley, one panel each)
-N_SAMPLES = 500_000       # uniform simplex samples used to estimate the distribution
+N_SAMPLES = 50_000       # uniform simplex samples used to estimate the distribution
 N_BINS = 80               # histogram bins per panel
 SEED = 0                  # RNG seed for reproducible sampling
 

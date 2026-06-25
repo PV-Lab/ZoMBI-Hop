@@ -30,9 +30,10 @@ Unlike the earlier additive-only design, the background is built around a
 subtract mass: weak optima can be bumps or pits, ridges can be ridges or
 trenches, plateaus can be mesas or basins, and the edge bias can push the
 chosen region up or down.  The per-instance sign is drawn randomly (a fraction
-``neg_frac`` of instances subtract).  This lets the final surface centre around
-the middle of its output range and span roughly ``[0, 1]`` rather than only the
-upper half.
+``neg_frac`` of instances subtract).  This lets the *raw* surface centre around
+its neutral level and span symmetrically in both directions; the final output
+map (see "Output normalization" below) then squishes that symmetric span into
+the upper half ``[0.5, 1]``.
 
 Unlike ``ackley.py`` this module deliberately avoids any hardcoded
 "parameter-by-dimension" tables: every knob is a plain scalar (or a count) that
@@ -58,15 +59,18 @@ they are what let the surface dip toward 0 and "float" the optima below 1.)
 Output normalization ("optima float")
 --------------------------------------
 The raw field is mapped to output with a single symmetric scale centred on the
-neutral level:
+neutral level, then the result is squished into the **upper half** ``[0.5, 1]``:
 
-    y = clip( 0.5 + 0.5 * F / scale,  0, 1 ),   scale = max(|raw_min|, |raw_max|)
+    u = clip( 0.5 + 0.5 * F / scale,  0, 1 ),   scale = max(|raw_min|, |raw_max|)
+    y = 0.5 + 0.5 * u
 
-so the neutral level (raw 0) always maps to 0.5.  The true optima are still the
-maxima, but they are **not pinned to exactly 1.0**: if the deepest valley is
-deeper than the optima are tall, ``scale`` is set by the valley and the optima
-land below 1.0.  This keeps the distribution centred on the middle and ranging
-across (roughly) the whole ``[0, 1]`` interval.
+so a symmetric ``[0, 1]`` span (neutral at 0.5) becomes a ``[0.5, 1]`` span with
+the neutral level at 0.75.  The true optima are still the maxima, but they are
+**not pinned to exactly 1.0**: if the deepest valley is deeper than the optima
+are tall, ``scale`` is set by the valley and the optima land below 1.0.  The
+final squish halves every distance from the neutral level, so it **deliberately
+deflates the optima margin** in exchange for keeping the whole surface in the
+top half of the output range.
 
 The ``Ensemble`` class exposes ``predict(X)`` with the scikit-learn-style
 ``(N, d) -> (N,)`` signature, plus ``known_maxima`` and ``centers`` like
@@ -77,7 +81,7 @@ Example
     from synthetic_data.ensemble import Ensemble
 
     fn = Ensemble(dim=4, n_optima=4, n_weak=8, n_ridges=2, n_plateaus=2)
-    y = fn.predict(X)                       # (N,) in [0, 1]
+    y = fn.predict(X)                       # (N,) in [0.5, 1]
     for c, v in fn.known_maxima:            # each v is the global max
         ...
 """
@@ -709,8 +713,12 @@ class Ensemble:
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         raw = self._predict_raw(X)
-        y = 0.5 + 0.5 * raw / self._scale
-        return np.clip(y, 0.0, 1.0)
+        # Symmetric map to [0, 1] centred on the neutral level (raw 0 -> 0.5).
+        y = np.clip(0.5 + 0.5 * raw / self._scale, 0.0, 1.0)
+        # Squish the full [0, 1] span into the upper half [0.5, 1].  This
+        # deliberately deflates the optima margin (everything is compressed by
+        # 2x) so the surface only ever ranges across the top half of the output.
+        return 0.5 + 0.5 * y
 
     def __call__(self, x: np.ndarray) -> float:
         return float(self.predict(np.asarray(x, dtype=float).reshape(1, -1))[0])
