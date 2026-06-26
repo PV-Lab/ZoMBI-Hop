@@ -116,6 +116,8 @@ def build_app():
             _slider("Cluster Count", "n-clusters", 1, 6, 1, 3, 1, str),
             _slider("Cluster Concentration (higher = tighter)",
                     "cluster-conc", 20, 250, 5, 80, 50, str),
+            _slider("Cluster Spread (higher = looser hug of region)",
+                    "cluster-spread", 0.0, 1.0, 0.05, 0.0, 0.25, str),
         ], style={"borderTop": "2px solid #999", "padding": "4px 0"}),
 
         _feature_block("Weak Optima (distractors)", "tog-weak", [
@@ -215,6 +217,7 @@ def build_app():
         Output("optima-layout", "value"),
         Output("n-clusters", "value"),
         Output("cluster-conc", "value"),
+        Output("cluster-spread", "value"),
         Output("n-weak", "value"),
         Output("weak-width", "value"),
         Output("weak-amp", "value"),
@@ -257,6 +260,7 @@ def build_app():
             cfg["optima_layout"],                        # optima-layout
             cfg["n_optima_clusters"],                    # n-clusters
             cfg["optima_cluster_conc"],                  # cluster-conc
+            cfg["optima_cluster_spread"],                # cluster-spread
             cfg["n_weak"],                               # n-weak
             cfg["weak_width"],                           # weak-width
             cfg["weak_amp"],                             # weak-amp
@@ -292,6 +296,7 @@ def build_app():
         Input("optima-layout", "value"),
         Input("n-clusters", "value"),
         Input("cluster-conc", "value"),
+        Input("cluster-spread", "value"),
         Input("tog-weak", "value"),
         Input("n-weak", "value"),
         Input("weak-width", "value"),
@@ -322,7 +327,7 @@ def build_app():
         Input("basin-threshold", "value"),
     )
     def update_plot(dim_sel, n_optima, basin_width, optima_margin,
-                    optima_layout, n_clusters, cluster_conc,
+                    optima_layout, n_clusters, cluster_conc, cluster_spread,
                     tog_weak, n_weak, weak_width, weak_amp,
                     tog_ridges, n_ridges, ridge_width, ridge_amp, ridge_length,
                     tog_rough, noise_freq, noise_amp, noise_oct,
@@ -341,6 +346,7 @@ def build_app():
             optima_layout=str(optima_layout),
             n_optima_clusters=int(n_clusters),
             optima_cluster_conc=float(cluster_conc),
+            optima_cluster_spread=float(cluster_spread),
             n_weak=int(n_weak) if on(tog_weak) else 0,
             weak_width=float(weak_width),
             weak_amp=float(weak_amp),

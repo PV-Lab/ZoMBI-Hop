@@ -10,7 +10,9 @@ response surface:
 
     * **Optima**          — strong negated-Ackley basins; the *true* maxima.
                             Their placement can be uniform ("scatter") or
-                            **clustered** around a chosen simplex region.
+                            **clustered** around a chosen simplex region, with an
+                            adjustable *spread* controlling how loosely each
+                            cluster hugs that corner / edge / face / centroid.
     * **Roughness**       — coherent Perlin-style simplex noise (fine ripple).
     * **Weak optima**     — extra, shorter negated-Ackley basins acting as
                             distractors / fake local optima.
@@ -232,7 +234,7 @@ def random_ensemble_config(
     layout_opts = ("scatter",) + regions
 
     # One Sobol' coordinate per knob, consumed in order.
-    n_coords = 29
+    n_coords = 30
     pt = _sobol_point(n_coords, int(index), int(seed))
     _i = 0
 
@@ -271,6 +273,7 @@ def random_ensemble_config(
         "optima_layout": pick(layout_opts),
         "n_optima_clusters": i_range(1, 6),
         "optima_cluster_conc": round(f_range(20.0, 250.0), 1),
+        "optima_cluster_spread": round(f_range(0.0, 1.0), 2),
         # weak optima (distractors)
         "n_weak": i_range(0, 30) if weak_on else 0,
         "weak_width": float(i_range(5, 300)),
@@ -395,6 +398,12 @@ class Ensemble:
         to **cluster** the optima around that simplex region.
     n_optima_clusters, optima_cluster_conc : number of clusters and Dirichlet
         concentration (higher = tighter clusters) used when clustering.
+    optima_cluster_spread : float
+        How loosely the clusters hug the target region, in ``[0, 1]``.  Each
+        cluster seed is pulled toward the simplex centroid by a random fraction
+        in ``[0, optima_cluster_spread]`` before optima are drawn around it, so
+        ``0`` reproduces the tight on-feature hug and higher values let optima
+        sit progressively further off the corner/edge/face toward the interior.
     n_weak, weak_width, weak_amp : weak-optima (distractor) count, sharpness, and
         prominence in ``[0, 1]`` (fraction of the full basin height).  Each weak
         optimum is randomly a bump or a pit (see ``neg_frac``).
@@ -428,6 +437,7 @@ class Ensemble:
         optima_layout: str = "scatter",
         n_optima_clusters: int = 3,
         optima_cluster_conc: float = 80.0,
+        optima_cluster_spread: float = 0.0,
         # weak optima (distractors)
         n_weak: int = 6,
         weak_width: float = 120.0,
@@ -466,6 +476,7 @@ class Ensemble:
         self.optima_layout = str(optima_layout)
         self.n_optima_clusters = max(1, int(n_optima_clusters))
         self.optima_cluster_conc = max(1e-3, float(optima_cluster_conc))
+        self.optima_cluster_spread = float(np.clip(optima_cluster_spread, 0.0, 1.0))
         self.weak_width = float(weak_width)
         self.weak_amp = float(np.clip(weak_amp, 0.0, 1.0))
         self.ridge_width = max(1e-4, float(ridge_width))
@@ -526,10 +537,19 @@ class Ensemble:
         rng = np.random.default_rng(self.seed + seed_offset)
         return rng.dirichlet(np.ones(self.dim), size=n)
 
-    def _region_targets(self, n: int, region: str, rng) -> np.ndarray:
-        """``n`` points on/near ``region`` of the simplex (used as cluster seeds)."""
+    def _region_targets(self, n: int, region: str, rng, spread: float = 0.0) -> np.ndarray:
+        """``n`` points on/near ``region`` of the simplex (used as cluster seeds).
+
+        ``spread`` in ``[0, 1]`` controls how tightly each seed hugs the region:
+        every seed is pulled toward the simplex centroid by a random fraction drawn
+        in ``[0, spread]`` (0 = sit exactly on the corner/edge/face; 1 = may drift
+        all the way in to the centroid).  Each seed draws its own pull, so within
+        one cluster layout some optima can hug the feature while others sit looser.
+        """
         d = self.dim
         eps = 1e-3
+        centroid = np.full(d, 1.0 / d)
+        spread = float(np.clip(spread, 0.0, 1.0))
         out = np.empty((n, d), dtype=float)
         for i in range(n):
             if region == "middle":
@@ -551,6 +571,9 @@ class Ensemble:
                 t = t / s if s > 1e-12 else np.full(d, 1.0 / d)
             else:  # scatter / unknown
                 t = rng.dirichlet(np.ones(d))
+            if spread > 0.0:
+                pull = float(rng.random()) * spread
+                t = (1.0 - pull) * t + pull * centroid
             out[i] = t + eps
         return out
 
@@ -565,7 +588,8 @@ class Ensemble:
         # then draw each optimum tightly around a randomly assigned cluster.
         crng = np.random.default_rng(self.seed + _SEED_CLUSTERS)
         n_clusters = min(self.n_optima_clusters, n)
-        seeds = self._region_targets(n_clusters, self.optima_layout, crng)
+        seeds = self._region_targets(
+            n_clusters, self.optima_layout, crng, self.optima_cluster_spread)
         assign = rng.integers(n_clusters, size=n)
         centers = np.empty((n, self.dim), dtype=float)
         for k in range(n):
