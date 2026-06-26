@@ -458,6 +458,12 @@ def _host_rss() -> tuple[int, int]:
     return cur, peak
 
 
+# How often (in ZoMBI iterations) to emit an in-run [mem] line. The per-run
+# summary printed after optimizer.run() returns cannot catch a transient RAM
+# spike that OOM-kills the job mid-run, so we also sample inside the timed loop.
+MEM_LOG_EVERY = 50
+
+
 def log_resource_usage(tag: str) -> None:
     """Print host RAM (current + process-peak) and, on CUDA, GPU VRAM for *tag*.
 
@@ -2418,6 +2424,13 @@ def run_single_trial(
                               if dim == 3 else None),
             )
         payloads.append(payload)
+        # Sample memory inside the timed loop so a mid-run RAM spike (which can
+        # OOM-kill the job before the post-run summary prints) is visible.
+        if call_counter[0] % MEM_LOG_EVERY == 0:
+            log_resource_usage(
+                f"in-run {os.path.basename(trial_dir)} "
+                f"(iter={call_counter[0]}, "
+                f"n_points={payload['n_points_before']})")
         return x_req, x_act, y
 
     try:
