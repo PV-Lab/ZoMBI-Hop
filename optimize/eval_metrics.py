@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.spatial import cKDTree
 
 UNMATCHED_PENALTY = 10.0
 MATCH_RADIUS = 0.05
@@ -116,10 +117,11 @@ def metric_dup_fraction(
         return 0.0
     d = infer_metric_dim(dim, X_all)
     thr = float(threshold if threshold is not None else dup_threshold_comp(d))
-    diff = X_all[:, None, :] - X_all[None, :, :]
-    dists = np.sqrt((diff ** 2).sum(axis=-1))
-    np.fill_diagonal(dists, np.inf)
-    return float((dists < thr).any(axis=1).mean())
+    # A KD-tree nearest-neighbour query is O(N log N) time / O(N) memory; the
+    # naive N×N×D difference array would peak at tens of GiB for N~20k samples.
+    tree = cKDTree(X_all)
+    nn_dist, _ = tree.query(X_all, k=2)  # k=2: self (dist 0) + nearest other
+    return float((nn_dist[:, 1] < thr).mean())
 
 
 def metric_pct_matched_comp(
