@@ -378,15 +378,33 @@ def _final_plot_for_trial(runs_dir: str, source_run: str, trial: int) -> str | N
     4D trials render an interactive (rotatable) ``point_cloud.html`` (falling back
     to a legacy static ``coverage.png`` for older runs). Higher-dimensional trials
     have no landscape view, so this returns None and clicking is a silent no-op.
+
+    Ensemble trials are nested one level deeper: instead of writing landscape
+    plots directly under ``trial_N``, they hold one sub-run per ensemble repeat
+    (``trial_N/run_1`` ... ``trial_N/run_5``), each with its own ``plots``. For
+    those we open the first sub-run's final plot.
     """
     trial_dir = os.path.join(runs_dir, source_run, f"trial_{trial}")
-    pngs = sorted(glob.glob(os.path.join(trial_dir, "plots", "iter_*.png")))
-    if pngs:
-        return pngs[-1]
-    for name in ("point_cloud.html", "coverage.png"):
-        candidate = os.path.join(trial_dir, name)
-        if os.path.isfile(candidate):
-            return candidate
+
+    def _landscape_in(d: str) -> str | None:
+        pngs = sorted(glob.glob(os.path.join(d, "plots", "iter_*.png")))
+        if pngs:
+            return pngs[-1]
+        for name in ("point_cloud.html", "coverage.png"):
+            candidate = os.path.join(d, name)
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    found = _landscape_in(trial_dir)
+    if found:
+        return found
+    # Ensemble trial: fall back to the first sub-run (trial_N/run_1, run_2, ...).
+    run_dirs = sorted(glob.glob(os.path.join(trial_dir, "run_*")))
+    for run_dir in run_dirs:
+        found = _landscape_in(run_dir)
+        if found:
+            return found
     return None
 
 

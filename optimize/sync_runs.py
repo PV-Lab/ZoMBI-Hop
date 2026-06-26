@@ -129,10 +129,16 @@ def sync(pattern: str, dry_run: bool = False):
             with tarfile.open(fileobj=stream, mode="r|gz") as tar:
                 for member in tar:
                     try:
-                        tar.extract(member, LOCAL_DIR, filter="data")
-                    except TypeError:
-                        # `filter=` added in Python 3.12; fall back for older.
-                        tar.extract(member, LOCAL_DIR)
+                        try:
+                            tar.extract(member, LOCAL_DIR, filter="data")
+                        except TypeError:
+                            # `filter=` added in Python 3.12; fall back for older.
+                            tar.extract(member, LOCAL_DIR)
+                    except (OSError, KeyError) as e:
+                        # A file that changed/vanished on the remote mid-read can
+                        # produce a truncated or unreadable member. Skip it
+                        # rather than aborting the whole sync.
+                        print(f"Skipping {member.name}: {e}", file=sys.stderr)
                     bar.update(member.size)
     except tarfile.ReadError:
         proc.wait()
@@ -143,7 +149,13 @@ def sync(pattern: str, dry_run: bool = False):
             stream.close()
 
     ret = proc.wait()
-    if ret != 0:
+    if ret == 1:
+        # tar returns 1 for non-fatal warnings (e.g. "file changed as we read
+        # it" when a run is still being written). The archive is complete, so
+        # treat this as a warning and finish normally.
+        print("Some files changed during transfer (warning); archive is "
+              "otherwise complete.", file=sys.stderr)
+    elif ret != 0:
         print(f"ssh exited with status {ret}.", file=sys.stderr)
         sys.exit(ret)
 
