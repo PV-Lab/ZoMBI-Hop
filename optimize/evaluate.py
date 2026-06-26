@@ -20,6 +20,13 @@ Built-in names:
 
   RF           3-simplex Random-Forest surrogate from the source run's
                ``run_config.json`` (requires ``--runs-path``).
+  newRF        3-simplex Random-Forest surrogate trained on live measurements
+               pulled straight from a ``results`` SQLite DB (same source as
+               ``visualization/plot_run.py``; ``--db``/``--db-value``).  The first
+               time, reference optima are picked interactively (click them on the
+               RF map, like ``interactive_test_zombi.py``) and cached to
+               ``newRF_optima.json`` in the output dir; later runs can pass
+               ``--runs-path THAT_DIR`` (or ``--optima-json``) to skip the picker.
   ackley3d     negated analytic Ackley on the 3-simplex (``--ackley-variant``).
   ackley4d     negated analytic Ackley on the 4-simplex.
   ackley10d    negated analytic Ackley on the 10-simplex.
@@ -112,6 +119,17 @@ Usage
   python optimize/evaluate.py --runs-path optimize/runs/mobo_05_06_15_32 \
       --trials 12 --dataset ackley10d --num-runs 3
 
+  # newRF: pull data from the DB, pick optima interactively (cached for reuse):
+  python optimize/evaluate.py \
+      --hparams-json optimize/runs/mobo_.../trial_1/trial.json \
+      --dataset newRF --num-runs 3 --time-limit-min 5
+  # later, reuse the cached optima (no clicking) by pointing --runs-path at the
+  # previous output dir (which holds newRF_optima.json):
+  python optimize/evaluate.py \
+      --hparams-json optimize/runs/mobo_.../trial_1/trial.json \
+      --dataset newRF --num-runs 3 --time-limit-min 5 \
+      --runs-path optimize/runs/rerun_DD_MM_HH_MM
+
 Instead of ``--trials``, you can pass ``--hparams`` (trial dir / trial.json /
 mobo_* dir) or ``--hparams-json`` with a path to a JSON file containing the
 hyperparameters directly (either a trial.json-style dict with an ``"hparams"``
@@ -175,8 +193,22 @@ ACKLEY_BENCHMARKS = {"ackley3d": 3, "ackley4d": 4, "ackley10d": 10}
 GAUSSIAN_BENCHMARKS = {"gaussian3d": 3, "gaussian4d": 4, "gaussian10d": 10}
 # Layered ``Ensemble`` objective: re-randomized per run (see random_ensemble_config).
 ENSEMBLE_DATASETS = {"ensemble"}
+# ``newRF``: RF surrogate trained on live measurements pulled straight from a
+# ``results`` SQLite DB (same source as visualization/plot_run.py).  Its reference
+# optima are picked interactively (interactive_test_zombi.ExtremaPicker) the first
+# time and cached to ``newRF_optima.json`` so later runs can supply ``--runs-path``.
+NEWRF_DATASETS = {"newRF"}
 BUILTIN_DATASETS = {"RF", *ACKLEY_BENCHMARKS.keys(), *GAUSSIAN_BENCHMARKS.keys(),
-                    *ORACLE_CHOICES, *ENSEMBLE_DATASETS}
+                    *ORACLE_CHOICES, *ENSEMBLE_DATASETS, *NEWRF_DATASETS}
+
+# ─── newRF database source (mirrors visualization/plot_run.py) ──────────────────
+DEFAULT_DB = "2nd_real_run.db"
+DB_COMP_COLS = ["FAPbI3", "MAPbI3", "MAPbBr3"]
+DEFAULT_DB_VALUE = "Objective"
+# Cached picker selections, written into the rerun output dir; ``--runs-path`` can
+# point back at that dir (or any dir / JSON holding a ``true_optima`` list) to skip
+# the interactive picker on later runs.
+NEWRF_OPTIMA_FILENAME = "newRF_optima.json"
 
 # Canonical campaign1a RF reference optima from mobo_05_06_15_32 (interactive picker).
 TRIAL112_REFERENCE_OPTIMA = os.path.join(
@@ -206,6 +238,112 @@ def load_true_optima_json(path: str) -> list[np.ndarray]:
     if not raw:
         sys.exit(f"reference optima file {cfg_path} has no 'true_optima' list.")
     return [np.asarray(t, dtype=float) for t in raw]
+
+
+# ─── newRF: database source + interactive / cached optima ───────────────────────
+
+def _newrf_load_db(db_arg: str, value_col: str):
+    """Read ``(X (N,3), Y (N,))`` from a results DB, reusing plot_run's loader.
+
+    Returns ``(db_abspath, X, Y, value_col)``.
+    """
+    repo_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    try:
+        from visualization.plot_run import _resolve_db_path, load_db_dataset
+    except Exception as exc:  # pragma: no cover
+        sys.exit(f"--dataset newRF: could not import visualization.plot_run ({exc}).")
+    try:
+        db_path = _resolve_db_path(db_arg)
+    except FileNotFoundError as exc:
+        sys.exit(str(exc))
+    X, Y, _labels, title = load_db_dataset(db_path, value_col)
+    print(f"  [newRF] {title}")
+    return str(db_path), X, Y, value_col
+
+
+def _newrf_optima_candidate(optima_json: str | None, runs_path: str | None) -> str | None:
+    """Resolve a saved-optima file from ``--optima-json`` / ``--runs-path``, or None.
+
+    ``--optima-json`` wins; otherwise ``--runs-path`` is searched for (in order) a
+    cached ``newRF_optima.json``, a prior ``rerun_config.json``, or a source
+    ``run_config.json`` — any JSON exposing a ``true_optima`` list works.
+    """
+    if optima_json:
+        p = os.path.abspath(optima_json)
+        if not os.path.isfile(p):
+            sys.exit(f"--optima-json not found: {p}")
+        return p
+    if runs_path:
+        for name in (NEWRF_OPTIMA_FILENAME, "rerun_config.json", "run_config.json"):
+            cand = os.path.join(runs_path, name)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def _load_newrf_optima(path: str) -> tuple[list[np.ndarray], bool | None]:
+    """Load ``true_optima`` (and an optional ``maximize`` flag) from ``path``."""
+    optima = load_true_optima_json(path)
+    maximize = None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if isinstance(data.get("maximize"), bool):
+            maximize = data["maximize"]
+    except Exception:
+        pass
+    return optima, maximize
+
+
+def _save_newrf_optima(path: str, optima: list[np.ndarray], *, maximize: bool,
+                       db_path: str, value_col: str) -> None:
+    payload = {
+        "generated": datetime.datetime.now().isoformat(timespec="seconds"),
+        "dataset": "newRF",
+        "db": db_path,
+        "value_col": value_col,
+        "maximize": maximize,
+        "true_optima": [list(map(float, np.asarray(o, dtype=float).ravel())) for o in optima],
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _newrf_pick_optima(rf, grid_pts: np.ndarray, grid_vals: np.ndarray,
+                       *, maximize: bool) -> list[np.ndarray]:
+    """Open the ExtremaPicker so the user can click reference optima on the RF map.
+
+    Switches matplotlib to an interactive backend for the click session, then
+    restores the headless backend so per-iteration landscape frames still render.
+    Returns the picked simplex compositions (possibly empty if nothing was clicked).
+    """
+    import matplotlib
+    it_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "interactive_testing")
+    if it_dir not in sys.path:
+        sys.path.insert(0, it_dir)
+    try:
+        matplotlib.use("TkAgg", force=True)
+        import interactive_test_zombi as it  # module sets TkAgg + imports the picker
+    except Exception as exc:
+        sys.exit(
+            f"--dataset newRF needs a GUI (TkAgg) backend to pick optima but it "
+            f"failed to start ({exc}). Re-run with --optima-json PATH or "
+            f"--runs-path DIR pointing at a saved newRF_optima.json instead."
+        )
+    import matplotlib.pyplot as plt
+    plt.ion()
+    try:
+        picker = it.ExtremaPicker(rf, grid_pts, grid_vals, maximize=maximize)
+        extrema = picker.run()
+    finally:
+        # Restore the headless backend for the subsequent landscape rendering.
+        try:
+            rm._configure_mpl_backend(headless=True)
+        except Exception:
+            matplotlib.use("Agg", force=True)
+    return [np.asarray(c, dtype=float) for c, _v in extrema]
 
 
 # ─── Dataset resolution ─────────────────────────────────────────────────────────
@@ -279,8 +417,62 @@ def resolve_dataset(
     oracle_variant: str = "layout",
     config: dict | None = None,
     time_limit_hours: float | None = None,
+    db_path: str | None = None,
+    db_value: str = DEFAULT_DB_VALUE,
+    db_minimize: bool = False,
+    optima_json: str | None = None,
+    out_dir: str | None = None,
 ) -> dict:
     """Build the objective + reference optima for ``dataset``."""
+    if dataset == "newRF":
+        from sklearn.ensemble import RandomForestRegressor
+
+        db_resolved, X, Y, value_col = _newrf_load_db(db_path or DEFAULT_DB, db_value)
+        rf = RandomForestRegressor(n_estimators=rm.RF_N_ESTIMATORS, n_jobs=-1, random_state=42)
+        rf.fit(X, Y)
+        rf_fn = lambda x, _rf=rf: float(_rf.predict(x.reshape(1, -1))[0])
+        grid_pts = rm.ternary_grid(rm.TERNARY_GRID_N)
+        grid_vals = rf.predict(grid_pts)
+
+        # Reference optima: load a cached/provided set, else pick interactively and
+        # cache the result so a later run can just pass --runs-path.
+        maximize = not db_minimize
+        saved = _newrf_optima_candidate(optima_json, runs_path)
+        if saved is not None:
+            true_optima, saved_max = _load_newrf_optima(saved)
+            if saved_max is not None:
+                maximize = saved_max
+            print(f"  [newRF] loaded {len(true_optima)} reference optima from {saved} "
+                  f"({'maximize' if maximize else 'minimize'})")
+        else:
+            print(f"  [newRF] no saved optima — opening interactive picker "
+                  f"({'maximize' if maximize else 'minimize'}). Click near each optimum, "
+                  f"then press Enter / Q.")
+            true_optima = _newrf_pick_optima(rf, grid_pts, grid_vals, maximize=maximize)
+            if true_optima:
+                save_dir = out_dir or os.getcwd()
+                os.makedirs(save_dir, exist_ok=True)
+                save_path = os.path.join(save_dir, NEWRF_OPTIMA_FILENAME)
+                _save_newrf_optima(save_path, true_optima, maximize=maximize,
+                                   db_path=db_resolved, value_col=value_col)
+                print(f"  [newRF] cached {len(true_optima)} optima -> {save_path}\n"
+                      f"          reuse next time with: --runs-path {save_dir}")
+            else:
+                print("  [newRF] WARNING: no optima selected — metrics will use an "
+                      "empty reference set (distance/pct will be penalized).")
+
+        print(f"  [newRF] RF surrogate from {db_resolved} "
+              f"({'maximize' if maximize else 'minimize'}, "
+              f"{len(true_optima)} reference optima, value='{value_col}')")
+        spec = rm.LandscapeSpec(
+            landscape="rf", dim=3, maximize=maximize, true_optima=true_optima,
+            fn_callable=rf_fn, grid_pts=grid_pts, grid_vals=grid_vals,
+            csv_path=db_resolved, objective_column=value_col,
+            composition_columns=list(DB_COMP_COLS),
+            time_limit_hours=time_limit_hours,
+        )
+        return _landscape_to_ds(spec, "newRF")
+
     if dataset == "RF":
         if not runs_path:
             sys.exit("--dataset RF requires --runs-path (source mobo run).")
@@ -569,6 +761,8 @@ def gen_init_data(fn_callable, maximize: bool, dim: int):
 def coord_cols(dim: int, dataset: str) -> list[str]:
     if dataset == "RF" and dim == 3:
         return ["FA", "MA", "Br"]
+    if dataset == "newRF" and dim == 3:
+        return list(DB_COMP_COLS)
     return [f"x{i + 1}" for i in range(dim)]
 
 
@@ -1088,6 +1282,11 @@ def evaluate_dataset(
             oracle_variant=syn_defaults.get("variant", args.oracle_variant),
             config=synthetic_defaults,
             time_limit_hours=time_limit_min / 60.0,
+            db_path=args.db,
+            db_value=args.db_value,
+            db_minimize=args.db_minimize,
+            optima_json=args.optima_json,
+            out_dir=out_dir,
         )
         rerun_cfg = _build_rerun_config(
             dataset, ds, runs_path=runs_path, trial_nums=trial_nums,
@@ -1170,7 +1369,7 @@ def main() -> None:
 
     ds_grp = parser.add_mutually_exclusive_group(required=False)
     ds_grp.add_argument("--dataset", default=None, metavar="DS[,DS...]",
-                        help="Objective(s): RF, ackley3d/4d/10d, or synthetic oracle names.")
+                        help="Objective(s): RF, newRF, ackley3d/4d/10d, or synthetic oracle names.")
     ds_grp.add_argument("--config", default=None, metavar="PATH",
                         help="Synthetic batch JSON (implies --dataset from oracle field).")
 
@@ -1188,6 +1387,17 @@ def main() -> None:
     parser.add_argument("--oracle-variant", default="layout",
                         choices=["layout", "realistic"],
                         help="Synthetic oracle variant; realistic = random peaks for gaussian.")
+    parser.add_argument("--db", default=DEFAULT_DB, metavar="DB",
+                        help=f"newRF results DB (path or bare name under data/; "
+                             f"default: {DEFAULT_DB}).")
+    parser.add_argument("--db-value", default=DEFAULT_DB_VALUE, metavar="COL",
+                        help=f"newRF DB value column for the objective "
+                             f"(default: {DEFAULT_DB_VALUE}).")
+    parser.add_argument("--db-minimize", action="store_true",
+                        help="newRF: minimize the DB objective instead of maximizing.")
+    parser.add_argument("--optima-json", default=None, metavar="PATH",
+                        help="newRF: JSON with a 'true_optima' list to use as the "
+                             "reference set (skips the interactive picker).")
     parser.add_argument("--dim", type=int, default=3,
                         help="Simplex dimension for synthetic oracles (default: 3).")
     parser.add_argument("--layout", default="2", choices=["1", "2", "3"],

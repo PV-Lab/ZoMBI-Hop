@@ -45,6 +45,8 @@ Usage
   python optimize/pareto.py --only mobo_00_01/trial_3,mobo_00_02  # specific trials
   python optimize/pareto.py --only 4d        # all runs with _4d_ (mobo_4d_*, mobo_ensemble_4d_*, ...)
   python optimize/pareto.py --only 10d       # all runs with _10d_ (mobo_10d_*, mobo_ensemble_10d_*, ...)
+  python optimize/pareto.py --only 4d,ensemble   # only the mobo_ensemble_4d_* runs (variant AND)
+  python optimize/pareto.py --only 4d,-ensemble  # only the plain mobo_4d_* runs (exclude ensemble)
 """
 
 from __future__ import annotations
@@ -160,23 +162,34 @@ def _time_metric(m: dict) -> tuple[float, str] | None:
     return None
 
 
-def _parse_only(only_str: str) -> tuple[set[str], dict[str, set[int]], set[str]]:
-    """Parse ``--only`` into (run_names, {run_name: {trial_nums}}, dim_tokens).
+def _parse_only(
+    only_str: str,
+) -> tuple[set[str], dict[str, set[int]], set[str], set[str], set[str]]:
+    """Parse ``--only`` into (run_names, {run_name: {trials}}, dim_tokens,
+    require_subs, exclude_subs).
 
     Entries like ``mobo_00_01`` add the full run. Entries like
     ``mobo_00_01/trial_3`` add only that trial from that run. Full paths
     (e.g. ``optimize/runs/mobo_00_01/trial_3``) and backslashes are handled.
 
-    A bare dimension token such as ``4d`` or ``10d`` is a shorthand that adds
+    A bare dimension token such as ``4d`` or ``10d`` is a shorthand that selects
     every run directory whose name contains that dimension as an
     underscore-delimited segment — e.g. ``10d`` matches both ``mobo_10d_*`` and
     ``mobo_ensemble_10d_*`` (matched as the substring ``_10d_`` in
-    ``collect_trials`` against each run name).
+    ``collect_trials``). Several dim tokens union (``4d,10d`` -> both dims).
+
+    Any other bare word is a substring *variant* filter that further narrows the
+    shorthand selection (logical AND with the dim tokens): ``ensemble`` keeps only
+    runs whose name contains ``ensemble``; a leading ``-``/``!`` excludes instead
+    (``-ensemble`` drops the ensemble runs). So ``4d,ensemble`` selects only
+    ``mobo_ensemble_4d_*`` while ``4d`` alone still catches the plain runs too.
     """
     import re
     run_names: set[str] = set()
     run_trials: dict[str, set[int]] = {}
     dim_tokens: set[str] = set()
+    require_subs: set[str] = set()
+    exclude_subs: set[str] = set()
     for part in only_str.split(","):
         part = part.strip().replace("\\", "/").rstrip("/")
         if not part:
@@ -195,15 +208,19 @@ def _parse_only(only_str: str) -> tuple[set[str], dict[str, set[int]], set[str]]
             # catches plain (mobo_10d_*) and variant (mobo_ensemble_10d_*) runs.
             if re.fullmatch(r"\d+d", part):
                 dim_tokens.add(f"_{part}_")
+            elif part[0] in "-!^" and len(part) > 1:
+                # Variant exclusion, e.g. "-ensemble" drops ensemble runs.
+                exclude_subs.add(part[1:])
             else:
-                print(f"  [--only] skipping unrecognised entry: {part}")
+                # Variant requirement, e.g. "ensemble" keeps only ensemble runs.
+                require_subs.add(part)
             continue
         if trial_seg is not None:
             num = int(trial_seg.replace("trial_", ""))
             run_trials.setdefault(mobo_seg, set()).add(num)
         else:
             run_names.add(mobo_seg)
-    return run_names, run_trials, dim_tokens
+    return run_names, run_trials, dim_tokens, require_subs, exclude_subs
 
 
 def collect_trials(
@@ -213,6 +230,8 @@ def collect_trials(
     only_runs: set[str] | None = None,
     only_trials: dict[str, set[int]] | None = None,
     only_prefixes: set[str] | None = None,
+    require_subs: set[str] | None = None,
+    exclude_subs: set[str] | None = None,
     only_signature: dict | None = None,
 ) -> list[dict]:
     """Crawl ``runs_dir/mobo_*/mobo_progress.json`` → list of trial records.
@@ -223,10 +242,14 @@ def collect_trials(
 
     *only_runs*: if set, include only these run directories (all trials).
     *only_trials*: if set, maps run names to specific trial numbers to include.
-    *only_prefixes*: if set, include every run whose name starts with any of
-    these prefixes (e.g. ``mobo_4d_`` from the ``--only 4d`` shorthand).
+    *only_prefixes*: dim-token substrings (e.g. ``_4d_`` from ``--only 4d``);
+    a run matches if its name contains *any* of them.
+    *require_subs* / *exclude_subs*: variant substrings that further narrow the
+    shorthand selection — a run must contain *every* required substring and
+    *none* of the excluded ones (e.g. ``ensemble`` / ``-ensemble``).
     """
-    has_filter = only_runs or only_trials or only_prefixes
+    has_filter = (only_runs or only_trials or only_prefixes
+                  or require_subs or exclude_subs)
     records: list[dict] = []
     # Accept either a runs *parent* directory (containing mobo_*/mobo_progress.json)
     # or a single run directory (containing mobo_progress.json directly).
@@ -236,10 +259,17 @@ def collect_trials(
     for path in progress_paths:
         run_name = os.path.basename(os.path.dirname(path))
         if has_filter:
-            matches_dim = any(tok in run_name for tok in (only_prefixes or set()))
+            # Shorthand selection: dim tokens union, then variant subs AND-narrow.
+            shorthand_active = bool(only_prefixes or require_subs or exclude_subs)
+            dim_ok = (not only_prefixes
+                      or any(tok in run_name for tok in only_prefixes))
+            require_ok = all(sub in run_name for sub in (require_subs or set()))
+            exclude_ok = not any(sub in run_name for sub in (exclude_subs or set()))
+            matches_shorthand = (shorthand_active
+                                 and dim_ok and require_ok and exclude_ok)
             if (run_name not in (only_runs or set())
                     and run_name not in (only_trials or {})
-                    and not matches_dim):
+                    and not matches_shorthand):
                 continue
         if exclude_old and run_name == "mobo_old_jackson":
             continue
@@ -662,7 +692,9 @@ def main() -> None:
                         help="Comma-separated list of runs or specific trials to include "
                              "(e.g. mobo_00_01,mobo_00_02/trial_3). A bare dimension "
                              "token like 4d or 10d includes every run whose name contains "
-                             "that dimension, e.g. both mobo_10d_* and mobo_ensemble_10d_*.")
+                             "that dimension, e.g. both mobo_10d_* and mobo_ensemble_10d_*. "
+                             "Add a variant word to narrow it: '4d,ensemble' keeps only "
+                             "mobo_ensemble_4d_*, '4d,-ensemble' keeps only plain mobo_4d_*.")
     parser.add_argument("--with-old", action="store_true",
                         help="Include trials from mobo_old_jackson (excluded by default).")
     parser.add_argument("--show-numberline", action="store_true",
@@ -706,12 +738,14 @@ def main() -> None:
     print(f"MOBO Pareto collection  |  runs: {runs_dir}")
     print("=" * 70)
 
-    only_runs, only_trials, only_prefixes = (
-        _parse_only(args.only) if args.only else (None, None, None))
+    only_runs, only_trials, only_prefixes, require_subs, exclude_subs = (
+        _parse_only(args.only) if args.only else (None, None, None, None, None))
     records = collect_trials(runs_dir, exclude_old=not args.with_old,
                              only_runs=only_runs or None,
                              only_trials=only_trials or None,
                              only_prefixes=only_prefixes or None,
+                             require_subs=require_subs or None,
+                             exclude_subs=exclude_subs or None,
                              only_signature=only_signature)
     if not records:
         sys.exit(f"No usable trials found under {runs_dir}/mobo_*/mobo_progress.json.")
