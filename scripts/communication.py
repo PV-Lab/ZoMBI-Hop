@@ -681,6 +681,7 @@ def composition_sender(ser, hz, comp_db_path, chaos=False, verbose=True, super_v
     next_send = time.monotonic()
     consecutive_errors = 0
     max_consecutive_errors = 10
+    last_sent_ts = None  # only transmit when the composition actually changes
 
     def read_all():
         try:
@@ -742,6 +743,17 @@ def composition_sender(ser, hz, comp_db_path, chaos=False, verbose=True, super_v
             if chaos:
                 ts = np.random.randint(1,10)
 
+            # Skip if this composition was already sent. Re-transmitting the
+            # same multi-KB packet every cycle overruns the serial link (at
+            # 9600 baud a single packet can take seconds to drain), which fills
+            # the OS write buffer and triggers SerialTimeoutException('Write
+            # timeout'). A new ts is written by the GUI on every "Update", so
+            # this still sends immediately whenever the composition changes.
+            if ts == last_sent_ts:
+                if super_verbose:
+                    print(f"[composition_sender] ts={ts} unchanged, skipping send.")
+                continue
+
             pkt = {
                 "type":               "composition",
                 "ts":                  ts,
@@ -759,6 +771,7 @@ def composition_sender(ser, hz, comp_db_path, chaos=False, verbose=True, super_v
                 with _serial_lock:
                     ser.write(raw)
                     ser.flush()  # Ensure data is sent immediately
+                last_sent_ts = ts  # mark sent only after a successful write
                 if super_verbose:
                     print(f"[composition_sender] Packet sent successfully. Queue size: {_read_queue.qsize()}")
                     print(f"[composition_sender] sent ts={ts}")

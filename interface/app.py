@@ -1893,7 +1893,16 @@ class TernaryPlotFrame(ttk.Frame):
                 # Penalty status can flip over a run's life (e.g. once a needle is
                 # declared nearby), so refresh the flag whenever the source knows it.
                 if has_p:
-                    self._accum_penalized[self._accum_index[key]] = bool(penalized[i])
+                    idx = self._accum_index[key]
+                    base = self._accum_penalized.shape[0]
+                    if idx < base:
+                        # Already materialised in the accumulator array.
+                        self._accum_penalized[idx] = bool(penalized[i])
+                    else:
+                        # Duplicate composition earlier in *this* batch: the row is
+                        # still pending in new_p and hasn't been vstacked yet, so
+                        # writing into _accum_penalized would be out of bounds.
+                        new_p[idx - base] = bool(penalized[i])
                 continue
             self._accum_keys.add(key)
             self._accum_index[key] = self._accum_pts.shape[0] + len(new_pts)
