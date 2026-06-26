@@ -43,8 +43,8 @@ Usage
   python optimize/pareto.py --show-numberline # show hyperparameter number-line figure
   python optimize/pareto.py --only mobo_00_01,mobo_00_02          # only these runs
   python optimize/pareto.py --only mobo_00_01/trial_3,mobo_00_02  # specific trials
-  python optimize/pareto.py --only 4d        # all runs prefixed mobo_4d_*
-  python optimize/pareto.py --only 10d       # all runs prefixed mobo_10d_*
+  python optimize/pareto.py --only 4d        # all runs with _4d_ (mobo_4d_*, mobo_ensemble_4d_*, ...)
+  python optimize/pareto.py --only 10d       # all runs with _10d_ (mobo_10d_*, mobo_ensemble_10d_*, ...)
 """
 
 from __future__ import annotations
@@ -161,20 +161,22 @@ def _time_metric(m: dict) -> tuple[float, str] | None:
 
 
 def _parse_only(only_str: str) -> tuple[set[str], dict[str, set[int]], set[str]]:
-    """Parse ``--only`` into (run_names, {run_name: {trial_nums}}, run_prefixes).
+    """Parse ``--only`` into (run_names, {run_name: {trial_nums}}, dim_tokens).
 
     Entries like ``mobo_00_01`` add the full run. Entries like
     ``mobo_00_01/trial_3`` add only that trial from that run. Full paths
     (e.g. ``optimize/runs/mobo_00_01/trial_3``) and backslashes are handled.
 
     A bare dimension token such as ``4d`` or ``10d`` is a shorthand that adds
-    every run directory prefixed with ``mobo_4d_`` / ``mobo_10d_`` respectively
-    (matched in ``collect_trials`` against each run name).
+    every run directory whose name contains that dimension as an
+    underscore-delimited segment — e.g. ``10d`` matches both ``mobo_10d_*`` and
+    ``mobo_ensemble_10d_*`` (matched as the substring ``_10d_`` in
+    ``collect_trials`` against each run name).
     """
     import re
     run_names: set[str] = set()
     run_trials: dict[str, set[int]] = {}
-    run_prefixes: set[str] = set()
+    dim_tokens: set[str] = set()
     for part in only_str.split(","):
         part = part.strip().replace("\\", "/").rstrip("/")
         if not part:
@@ -189,9 +191,10 @@ def _parse_only(only_str: str) -> tuple[set[str], dict[str, set[int]], set[str]]
                 trial_seg = seg
         if mobo_seg is None:
             # Shorthand: a bare dimension token (e.g. "4d", "10d") expands to a
-            # prefix match over all mobo_<dim>_* run directories.
+            # substring match over every mobo_*_<dim>_* run directory, so it
+            # catches plain (mobo_10d_*) and variant (mobo_ensemble_10d_*) runs.
             if re.fullmatch(r"\d+d", part):
-                run_prefixes.add(f"mobo_{part}_")
+                dim_tokens.add(f"_{part}_")
             else:
                 print(f"  [--only] skipping unrecognised entry: {part}")
             continue
@@ -200,7 +203,7 @@ def _parse_only(only_str: str) -> tuple[set[str], dict[str, set[int]], set[str]]
             run_trials.setdefault(mobo_seg, set()).add(num)
         else:
             run_names.add(mobo_seg)
-    return run_names, run_trials, run_prefixes
+    return run_names, run_trials, dim_tokens
 
 
 def collect_trials(
@@ -222,8 +225,6 @@ def collect_trials(
     *only_trials*: if set, maps run names to specific trial numbers to include.
     *only_prefixes*: if set, include every run whose name starts with any of
     these prefixes (e.g. ``mobo_4d_`` from the ``--only 4d`` shorthand).
-    *only_signature*: if set, include only runs whose ``run_config.json`` matches
-    this signature (the shared-history pooling used when a single run dir is given).
     """
     has_filter = only_runs or only_trials or only_prefixes
     records: list[dict] = []
@@ -235,10 +236,10 @@ def collect_trials(
     for path in progress_paths:
         run_name = os.path.basename(os.path.dirname(path))
         if has_filter:
-            matches_prefix = any(run_name.startswith(p) for p in (only_prefixes or set()))
+            matches_dim = any(tok in run_name for tok in (only_prefixes or set()))
             if (run_name not in (only_runs or set())
                     and run_name not in (only_trials or {})
-                    and not matches_prefix):
+                    and not matches_dim):
                 continue
         if exclude_old and run_name == "mobo_old_jackson":
             continue
@@ -254,6 +255,7 @@ def collect_trials(
             continue
         trial_filter = (only_trials or {}).get(run_name)
         used = 0
+        skipped_failed = 0
         for t in data.get("trials", []):
             if trial_filter is not None and t.get("trial") not in trial_filter:
                 continue
@@ -264,6 +266,14 @@ def collect_trials(
             if tm is None:
                 continue
             time_value, time_key = tm
+            # A non-positive time metric marks a failed trial: it completed zero
+            # ZoMBI iterations (avg_time_per_iter_s = runtime/0 -> 0.0) and so
+            # carries only failure sentinels (the unmatched-needle penalty
+            # distance, time=0). Those aren't real measurements; on the minimised
+            # objectives they masquerade as Pareto-optimal, so exclude them.
+            if time_value <= 0:
+                skipped_failed += 1
+                continue
             try:
                 metrics = {DIST_KEY: float(m[DIST_KEY]), DUP_KEY: float(m[DUP_KEY]),
                            time_key: time_value}
@@ -278,8 +288,10 @@ def collect_trials(
                 "hparams":    t.get("hparams", {}),
             })
             used += 1
-        if used:
-            print(f"  [collect] {run_name}: {used} trial(s)")
+        if used or skipped_failed:
+            note = (f"  ({skipped_failed} failed trial(s) skipped)"
+                    if skipped_failed else "")
+            print(f"  [collect] {run_name}: {used} trial(s){note}")
     return records
 
 
@@ -397,7 +409,15 @@ def plot_pareto_interactive(
     *,
     show_numberline: bool = False,
 ) -> None:
-    """Interactive Pareto plot: hover highlights across all subplots, click opens trial image."""
+    """Interactive Pareto plot: hover highlights across all subplots, click opens trial image.
+
+    Hovering and clicking work on *every* trial — Pareto stars and dominated
+    points alike. The hovered point is ringed in red across all three subplots,
+    its metrics shown in the tooltip, and a click opens its landscape view (if
+    any). The hyperparameter number-line (``--show-numberline``) only lists
+    Pareto points, so it highlights when a Pareto point is hovered and clears
+    when a dominated one is.
+    """
     pairs = _obj_pairs(obj_labels)
     pareto_idx = np.where(mask)[0]
     pareto_M = M[pareto_idx]
@@ -420,7 +440,7 @@ def plot_pareto_interactive(
     fig, axes = plt.subplots(1, 3, figsize=(15, 6.5))
     fig.suptitle(
         f"MOBO Pareto front across all runs  "
-        f"(★ = Pareto-optimal, {n_pareto}/{len(mask)})  —  hover/click stars",
+        f"(★ = Pareto-optimal, {n_pareto}/{len(mask)})  —  hover/click any point",
         fontsize=12,
     )
 
@@ -438,11 +458,13 @@ def plot_pareto_interactive(
         ax.set_ylabel(yl)
         ax.legend(fontsize=8)
 
+    # A red ring marks the hovered point, whether it is a gold Pareto star or a
+    # steelblue dominated dot — an open circle reads clearly over either marker.
     highlight_artists = []
     for ax, (ix, iy, _, _) in zip(axes, pairs):
         hl = ax.scatter(
-            [], [], marker="*", s=400, c="red", zorder=10,
-            edgecolors="k", linewidths=1.0,
+            [], [], marker="o", s=320, facecolors="none",
+            edgecolors="red", linewidths=2.0, zorder=10,
         )
         highlight_artists.append(hl)
 
@@ -494,7 +516,12 @@ def plot_pareto_interactive(
     # --- Shared interaction state ---
     active_idx = [None]
 
-    def _nearest_pareto(event) -> int | None:
+    def _nearest_point(event) -> int | None:
+        """Global record index of the point nearest the cursor, or None.
+
+        Searches *all* trials (Pareto and dominated) so both are interactive.
+        Returns an index into ``records`` / ``M``.
+        """
         if event.inaxes is None:
             return None
         ax = event.inaxes
@@ -503,8 +530,8 @@ def plot_pareto_interactive(
         except ValueError:
             return None
         ix, iy = pairs[panel][0], pairs[panel][1]
-        dx = pareto_M[:, ix] - event.xdata
-        dy = pareto_M[:, iy] - event.ydata
+        dx = M[:, ix] - event.xdata
+        dy = M[:, iy] - event.ydata
         sx = ax.get_xlim()
         sy = ax.get_ylim()
         x_range = sx[1] - sx[0]
@@ -518,17 +545,28 @@ def plot_pareto_interactive(
         return None
 
     def _update_hp_highlight(idx: int | None) -> None:
+        """Highlight the hovered point on the Pareto-only number-line.
+
+        *idx* is a global record index. Dominated points are absent from the
+        number-line, so they clear it; Pareto points map to their row in
+        ``pareto_idx`` / ``hp_norm``.
+        """
         if fig_hp is None:
             return
-        if idx is None:
+        pareto_pos = None
+        if idx is not None:
+            where = np.where(pareto_idx == idx)[0]
+            if len(where):
+                pareto_pos = int(where[0])
+        if pareto_pos is None:
             for hl in hp_highlight:
                 hl.set_offsets(np.empty((0, 2)))
             for lbl in hp_val_labels:
                 lbl.set_text("")
         else:
-            rec = records[pareto_idx[idx]]
+            rec = records[idx]
             for j, name in enumerate(available_hparams):
-                val_norm = hp_norm[idx, j]
+                val_norm = hp_norm[pareto_pos, j]
                 hp_highlight[j].set_offsets([[val_norm, j]])
                 raw_val = rec["hparams"].get(name)
                 if raw_val is not None:
@@ -540,7 +578,7 @@ def plot_pareto_interactive(
         fig_hp.canvas.draw_idle()
 
     def _on_motion(event):
-        idx = _nearest_pareto(event)
+        idx = _nearest_point(event)
         if idx == active_idx[0]:
             return
         active_idx[0] = idx
@@ -550,11 +588,12 @@ def plot_pareto_interactive(
             tooltip.set_text("")
         else:
             for hl, (ix, iy, _, _) in zip(highlight_artists, pairs):
-                hl.set_offsets([[pareto_M[idx, ix], pareto_M[idx, iy]]])
-            rec = records[pareto_idx[idx]]
+                hl.set_offsets([[M[idx, ix], M[idx, iy]]])
+            rec = records[idx]
             m = rec["metrics"]
+            kind = "Pareto" if mask[idx] else "dominated"
             tooltip.set_text(
-                f"{rec['source_run']} trial {rec['trial']}  |  "
+                f"{rec['source_run']} trial {rec['trial']} ({kind})  |  "
                 f"dist={m[DIST_KEY]:.4f}  dup={m[DUP_KEY]:.4f}  "
                 f"{rec['time_key']}={rec['time_value']:.4g}"
             )
@@ -562,10 +601,10 @@ def plot_pareto_interactive(
         _update_hp_highlight(idx)
 
     def _on_click(event):
-        idx = _nearest_pareto(event)
+        idx = _nearest_point(event)
         if idx is None:
             return
-        rec = records[pareto_idx[idx]]
+        rec = records[idx]
         img = _final_plot_for_trial(runs_dir, rec["source_run"], rec["trial"])
         # Higher-dimensional trials have no landscape image: silently do nothing
         # (no error, no popup) — hover highlighting still works for them.
@@ -582,7 +621,8 @@ def plot_pareto_interactive(
 
     fig.tight_layout()
     fig.subplots_adjust(bottom=0.12)
-    print("  Interactive Pareto plot open. Hover stars to highlight, click to open trial image.")
+    print("  Interactive Pareto plot open. Hover any point (Pareto or dominated) to "
+          "highlight, click to open its trial image.")
     if show_numberline:
         print("  Hyperparameter figure shows values for the hovered Pareto point.")
     plt.show()
@@ -603,7 +643,8 @@ def main() -> None:
     parser.add_argument("--only", default=None,
                         help="Comma-separated list of runs or specific trials to include "
                              "(e.g. mobo_00_01,mobo_00_02/trial_3). A bare dimension "
-                             "token like 4d or 10d includes all mobo_4d_* / mobo_10d_* runs.")
+                             "token like 4d or 10d includes every run whose name contains "
+                             "that dimension, e.g. both mobo_10d_* and mobo_ensemble_10d_*.")
     parser.add_argument("--with-old", action="store_true",
                         help="Include trials from mobo_old_jackson (excluded by default).")
     parser.add_argument("--show-numberline", action="store_true",
