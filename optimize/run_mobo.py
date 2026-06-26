@@ -2579,6 +2579,21 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                 res = evaluate_hparams(
                     hparams, landscape, trial_dir, trial_num,
                     ackley_variant=ackley_variant, ensemble_spec=ensemble_spec)
+
+                # A trial that completed zero ZoMBI iterations (e.g. ZoMBI
+                # crashed before the first iteration; the crash is swallowed in
+                # run_single_trial) carries only failure sentinels — the
+                # unmatched-needle penalty distance and avg_time_per_iter=0.0,
+                # not a real measurement. Feeding that to the GP would reward
+                # instant crashes on the minimised-time objective and poison the
+                # surrogate, so treat it as a hard failure: raise before the
+                # X_obs/Y_obs append so it never enters the optimization (the
+                # handler below logs it and retries).
+                if res["n_iters"] <= 0 or res["avg_time_per_iter"] <= 0:
+                    raise RuntimeError(
+                        "trial completed 0 ZoMBI iterations "
+                        "(avg_time_per_iter=0); excluded from MOBO so its "
+                        "failure sentinels never enter the GP")
                 try:
                     plot_hparam_edge_proximity(
                         os.path.join(trial_dir, "hparam_edge_proximity.png"), x_new)
