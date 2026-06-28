@@ -10,9 +10,11 @@ Two data sources are supported, selectable in the app:
   * **Run directory** (e.g. ``runs/run_7eb9``) — the full measured dataset
     ``(X, Y)`` is reconstructed from the run's delta snapshots
     (``reconstruct_snapshot_tensors``).
-  * **Database** (e.g. ``data/2nd_real_run.db``) — the ``results`` table is read
+  * **Data file** (e.g. ``data/2nd_real_run.db`` or ``data/campaign1a.csv``) —
+    the ``results`` table (``.db``) or the campaign table (``.csv``) is read
     directly; the three composition columns (FAPbI3, MAPbI3, MAPbBr3) form ``X``
-    and a chosen value column (default ``Objective``) forms ``Y``.
+    and a chosen value column (default ``Objective``) forms ``Y``. The format is
+    detected automatically from the file extension.
 
 For whichever source, the app:
   1. Trains a Random-Forest surrogate on ``(X, Y)`` and evaluates it over a
@@ -32,13 +34,14 @@ Usage
   # Static PNG export (legacy behaviour), no server:
   python visualization/plot_run.py --export --run runs/run_7eb9
   python visualization/plot_run.py --export --db data/2nd_real_run.db --out db.png
+  python visualization/plot_run.py --export --db data/campaign1a.csv --out csv.png
 
 Flags
 -----
   --port N          Port for the Dash app (default: 8050).
   --export          Render a static PNG instead of launching the app.
   --run PATH        Run directory for --export (default: runs/run_7eb9).
-  --db PATH         Database file for --export (overrides --run if given).
+  --db PATH         Data file (.db or .csv) for --export (overrides --run).
   --value COL       DB value column to plot as the objective (default: Objective).
   --snapshot NAME   Snapshot to reconstruct up to (default: latest.txt).
   --out PATH        Output PNG path for --export.
@@ -246,21 +249,33 @@ def load_run_source(
     return X, Y, labels, title
 
 
-# ── data loading: database ────────────────────────────────────────────────────
+# ── data loading: database / csv ──────────────────────────────────────────────
+
+def _is_csv(path: Path) -> bool:
+    """Whether ``path`` should be read as a CSV (vs a SQLite .db)."""
+    return path.suffix.lower() == ".csv"
+
 
 def _resolve_db_path(db_arg: str) -> Path:
-    """Accept a full path, or a bare db name resolved against data/."""
+    """Accept a full path, or a bare .db/.csv name resolved against data/."""
     p = Path(db_arg)
     if p.is_file():
         return p.resolve()
     candidate = DATA_DIR / db_arg
     if candidate.is_file():
         return candidate.resolve()
-    raise FileNotFoundError(f"Database file not found: {db_arg}")
+    raise FileNotFoundError(f"Data file not found: {db_arg}")
 
 
 def db_value_columns(db_path: Path) -> list[str]:
-    """Candidate value columns present (with data) in the db's results table."""
+    """Candidate value columns present (with data) in a .db or .csv data file."""
+    if _is_csv(db_path):
+        import pandas as pd
+
+        df = pd.read_csv(db_path, usecols=lambda c: c in set(DB_VALUE_COLS))
+        cols = [c for c in DB_VALUE_COLS if c in df.columns and df[c].notna().any()]
+        return cols or [c for c in DB_VALUE_COLS if c in df.columns]
+
     con = sqlite3.connect(str(db_path))
     try:
         have = {r[1] for r in con.execute("PRAGMA table_info(results)")}
@@ -277,15 +292,20 @@ def db_value_columns(db_path: Path) -> list[str]:
         con.close()
 
 
-def load_db_dataset(
-    db_path: Path, value_col: str = DEFAULT_DB_VALUE
-) -> tuple[np.ndarray, np.ndarray, tuple[str, str, str], str]:
-    """Read the ``results`` table → ``(X (N,3), Y (N,), labels, title)``.
+def _load_csv_rows(csv_path: Path, cols: list[str]) -> np.ndarray:
+    """Read ``cols`` from a campaign CSV, dropping rows with any null in them."""
+    import pandas as pd
 
-    Rows missing the value column or any composition column are dropped, and the
-    composition rows are renormalised to sum 1.
-    """
-    cols = DB_COMP_COLS + [value_col]
+    df = pd.read_csv(csv_path)
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"Columns {missing} not found in {csv_path}")
+    df = df[cols].apply(pd.to_numeric, errors="coerce").dropna()
+    return df.to_numpy(dtype=float)
+
+
+def _load_db_rows(db_path: Path, cols: list[str]) -> np.ndarray:
+    """Read ``cols`` from a .db results table, dropping rows with any null."""
     con = sqlite3.connect(str(db_path))
     try:
         sel = ", ".join(f'"{c}"' for c in cols)
@@ -293,9 +313,22 @@ def load_db_dataset(
         rows = con.execute(f"SELECT {sel} FROM results WHERE {where}").fetchall()
     finally:
         con.close()
-    if not rows:
+    return np.asarray(rows, dtype=float)
+
+
+def load_db_dataset(
+    db_path: Path, value_col: str = DEFAULT_DB_VALUE
+) -> tuple[np.ndarray, np.ndarray, tuple[str, str, str], str]:
+    """Read a .db ``results`` table or campaign .csv → ``(X (N,3), Y (N,), labels, title)``.
+
+    The format is chosen from the file extension. Rows missing the value column
+    or any composition column are dropped, and composition rows are renormalised
+    to sum 1.
+    """
+    cols = DB_COMP_COLS + [value_col]
+    arr = _load_csv_rows(db_path, cols) if _is_csv(db_path) else _load_db_rows(db_path, cols)
+    if arr.shape[0] == 0:
         raise RuntimeError(f"No rows with non-null {DB_COMP_COLS} + {value_col} in {db_path}")
-    arr = np.asarray(rows, dtype=float)
     X = arr[:, :3]
     Y = arr[:, 3]
     s = X.sum(axis=1, keepdims=True)
@@ -417,10 +450,11 @@ def _list_run_dirs() -> list[str]:
 
 
 def _list_db_files() -> list[str]:
-    """Names of .db files under data/."""
+    """Names of .db and .csv data files under data/."""
     if not DATA_DIR.is_dir():
         return []
-    return sorted(p.name for p in DATA_DIR.glob("*.db"))
+    files = list(DATA_DIR.glob("*.db")) + list(DATA_DIR.glob("*.csv"))
+    return sorted(p.name for p in files)
 
 
 def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS):
@@ -454,7 +488,7 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
                 id="source-type",
                 options=[
                     {"label": " Run directory", "value": "run"},
-                    {"label": " Database (.db)", "value": "db"},
+                    {"label": " Data file (.db/.csv)", "value": "db"},
                 ],
                 value="db" if default_db else "run",
                 labelStyle={"display": "block"},
@@ -470,7 +504,7 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
             ]),
 
             html.Div(id="db-controls", children=[
-                html.Label("Database", style=label_style),
+                html.Label("Data file", style=label_style),
                 dcc.Dropdown(
                     id="db-dropdown",
                     options=[{"label": n, "value": n} for n in db_names],
@@ -641,7 +675,7 @@ def main() -> None:
     parser.add_argument("--run", default=DEFAULT_RUN,
                         help="Run directory or bare run name (export; default: run_7eb9).")
     parser.add_argument("--db", default=None,
-                        help="Database file or bare name (export; overrides --run).")
+                        help="Data file (.db or .csv) or bare name (export; overrides --run).")
     parser.add_argument("--value", default=DEFAULT_DB_VALUE,
                         help="DB value column to plot (default: Objective).")
     parser.add_argument("--snapshot", default=None,
