@@ -35,7 +35,10 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from optimize.mobo_landscapes import resolve_surrogate_csv_path
+from optimize.mobo_landscapes import (
+    CAMPAIGN_COMPOSITION_COLS,
+    resolve_surrogate_csv_path,
+)
 
 VIDEO_TARGET_DURATION_S = 60.0
 VIDEO_MIN_FPS = 1.0
@@ -126,8 +129,21 @@ def draw_tetra_frame(ax) -> None:
 
 # ─── Ground-truth builders ───────────────────────────────────────────────────
 
+def _load_campaign_table(path: str) -> pd.DataFrame:
+    """Read a campaign dataset, whether stored as a CSV or a SQLite .db."""
+    if path.lower().endswith(".db"):
+        import sqlite3
+        con = sqlite3.connect(path)
+        try:
+            return pd.read_sql_query("SELECT * FROM results", con)
+        finally:
+            con.close()
+    return pd.read_csv(path)
+
+
 def _build_rf_ground_truth(csv_path: str):
-    df = pd.read_csv(csv_path).dropna(subset=["FAPbI3", "MAPbI3", "MAPbBr3", "Objective"])
+    df = _load_campaign_table(csv_path).dropna(
+        subset=["FAPbI3", "MAPbI3", "MAPbBr3", "Objective"])
     X = df[["FAPbI3", "MAPbI3", "MAPbBr3"]].values.astype(float)
     X /= X.sum(axis=1, keepdims=True)
     y = df["Objective"].values.astype(float)
@@ -177,6 +193,9 @@ def _find_config(trial_dir: str) -> dict:
 def _detect_comp_cols(df: pd.DataFrame, dim: int = 3) -> list[str]:
     if dim == 3 and {"FA", "MA", "Br"}.issubset(df.columns):
         return ["FA", "MA", "Br"]
+    # Campaign-style names (FAPbI3, MAPbI3, MAPbBr3) written by newRF reruns.
+    if dim == 3 and set(CAMPAIGN_COMPOSITION_COLS).issubset(df.columns):
+        return list(CAMPAIGN_COMPOSITION_COLS)
     x_cols = sorted([c for c in df.columns if c.startswith("x") and c[1:].isdigit()],
                     key=lambda c: int(c[1:]))
     if len(x_cols) >= dim:
@@ -393,7 +412,10 @@ def _prepare_coverage(trial_dir: str) -> dict:
     comp_cols = _detect_comp_cols(df, dim)
     map_comp = comp_to_xy if dim == 3 else comp_to_xyz
 
-    if dataset == "RF":
+    # "RF" and "newRF" (and the generic "rf" landscape) are RF surrogates built
+    # from a campaign CSV/.db; everything else is a synthetic Ackley landscape.
+    is_rf = dataset in ("RF", "newRF") or cfg.get("landscape") == "rf"
+    if is_rf:
         if dim != 3:
             raise ValueError(f"RF surrogate ground truth is only available for dim=3 "
                              f"(got dim={dim})")
