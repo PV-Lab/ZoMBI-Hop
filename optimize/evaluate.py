@@ -142,6 +142,7 @@ import random
 import re
 import sys
 import time
+import traceback
 
 import numpy as np
 import torch
@@ -850,6 +851,7 @@ def run_single_eval(
         print("\n      [run] interrupted — writing artifacts before exit …")
     except Exception as exc:
         print(f"      [run] ZoMBI crashed: {exc}")
+        traceback.print_exc()
     runtime = time.time() - t0
 
     needle_t = dh.get_all_needle_locations()

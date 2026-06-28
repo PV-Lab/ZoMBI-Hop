@@ -562,7 +562,11 @@ class GPSimplex:
 
         # Evaluate acquisition
         with torch.no_grad():
-            acq_values = acq(ic_candidates_3d).squeeze()
+            # reshape(-1), not squeeze(): when raw_samples == 1 the acq output
+            # has a single element and .squeeze() would collapse it to a 0-dim
+            # scalar, which then fails to torch.cat with additional batches below
+            # ("zero-dimensional tensor (at position 0) cannot be concatenated").
+            acq_values = acq(ic_candidates_3d).reshape(-1)
         if self.verbose:
             print(f"  [GP.cand] sample+eval: {time.time()-_t0:.2f}s")
 
@@ -588,7 +592,7 @@ class GPSimplex:
             additional_points_3d = additional_points.unsqueeze(1)
 
             with torch.no_grad():
-                additional_acq_values = acq(additional_points_3d).squeeze()
+                additional_acq_values = acq(additional_points_3d).reshape(-1)  # see reshape note above
 
             additional_unpenalized_mask = self.data_handler.get_penalty_mask(additional_points)
             additional_unpenalized_indices = torch.where(additional_unpenalized_mask.squeeze())[0]

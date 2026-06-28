@@ -32,9 +32,19 @@ trap on_time_limit USR1
 
 uv run python optimize/run_mobo.py --dataset ensemble --dim 3 --time-limit 0.2 --share-history --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112 &
 wait $!
+rc=$?
 
 # Reached only if the run exits on its own (not killed by the wall-time signal).
+# Only resubmit on a clean exit (rc=0). A non-zero rc means run_mobo.py hit a
+# fatal abort (MAX_CONSEC_FAIL consecutive crashes) or the process died — in that
+# case resubmitting just spawns another dead run_dir every couple of minutes, so
+# stop the chain and let the user fix the root cause and resubmit manually.
 if [ "$requeued" -eq 0 ]; then
-    echo "[$(date)] run exited on its own; submitting next job"
-    sbatch "$0"
+    if [ "$rc" -eq 0 ]; then
+        echo "[$(date)] run exited cleanly (rc=0); submitting next job"
+        sbatch "$0"
+    else
+        echo "[$(date)] run exited with rc=$rc (fatal abort/crash) — NOT resubmitting."
+        echo "[$(date)] fix the issue and resubmit manually with: sbatch $0"
+    fi
 fi

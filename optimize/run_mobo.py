@@ -2487,6 +2487,7 @@ def run_single_trial(
             )
     except Exception as exc:
         print(f"    [trial] ZoMBI crashed: {exc}")
+        traceback.print_exc()
     runtime = time.time() - t0
 
     n_iters = call_counter[0]
@@ -2804,6 +2805,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
     print(f"{'='*70}")
 
     consec_fail = 0
+    aborted = False
     try:
         while max_trials is None or len(Y_obs) < max_trials:
             _refresh_shared_history()  # absorb siblings' trials produced since last loop
@@ -2900,6 +2902,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                 if consec_fail >= MAX_CONSEC_FAIL:
                     print(f"\n[!] {MAX_CONSEC_FAIL} consecutive failures — aborting "
                           f"(see errors.log). Fix the issue and rerun with --resume.")
+                    aborted = True
                     break
                 continue
     except KeyboardInterrupt:
@@ -2914,6 +2917,14 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
           f"({n_prior} prior + {len(Y_obs)} new = {n_prior + len(Y_obs)} total). Results in {run_dir}")
     print(f"Resume (crawls all runs) with:  python optimize/run_mobo.py --resume")
     print(f"Pareto front across all runs:   python optimize/pareto.py")
+
+    if aborted:
+        # Fatal abort (MAX_CONSEC_FAIL consecutive crashes), not a clean finish.
+        # Exit non-zero so an auto-restart wrapper (the sbatch chain) can tell a
+        # crash-loop apart from a normal exit and STOP resubmitting instead of
+        # spawning a fresh dead run_dir every couple of minutes.
+        print(f"\n[!] aborting with exit code 3 — auto-restart chain should not resubmit.")
+        sys.exit(3)
 
 
 # ─── Main ───────────────────────────────────────────────────────────────────────
