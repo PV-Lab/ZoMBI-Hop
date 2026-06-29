@@ -21,13 +21,13 @@ is drawn from a dimension-specific range — 5–30 at dim 3, 20–50 at dim 4, 
 at dim 10). To keep the MOBO model from chasing that landscape noise, each
 hyperparameter set is evaluated on ``ENSEMBLE_N_REPEATS`` (5 by default, override
 with ``--ensemble-repeats``) independently randomized landscapes per trial and the
-three metrics are AVERAGED before the next MOBO iteration. Every landscape is saved
+four metrics are AVERAGED before the next MOBO iteration. Every landscape is saved
 for reproducibility: each repeat writes ``trial_<n>/run_<k>/ensemble_config.json``
 and the full ``ensemble_configs`` list (plus per-repeat metrics) is recorded in
 ``trial_<n>/trial.json``. ``--ensemble-seed`` makes the per-trial landscape sequence
 reproducible; ``--ensemble-margin`` sets the optima/background gap.
 
-Three objectives (all minimised):
+Four objectives (all minimised):
   1. dist_to_needles    – symmetric greedy matching distance between needles and
                           true optima (no-repeat matching; both unmatched true
                           optima AND unmatched/spurious needles incur
@@ -41,6 +41,12 @@ Three objectives (all minimised):
                           rendered AFTER the timed region so it never pollutes
                           this metric. (trial.json also records runtime_s and
                           n_iters for context.)
+  4. n_points_penalty   – penalty on the TOTAL number of points sampled across the
+                          run (== the sample count): sampling is costly, so for a
+                          fixed solution quality fewer points is better. A run that
+                          sampled nothing scores an infinite penalty and is excluded
+                          from the GP (a 0-point run means ZoMBI never picked a
+                          point — a failure, not an efficient trial).
 
 MOBO engine: qLogNEHVI (BoTorch, maximises negated objectives).
 
@@ -255,7 +261,13 @@ DATASET_CHOICES = sorted([*DATASET_DIMS, ENSEMBLE_DATASET])
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE  = torch.float64
 
-NOISE_LEVEL     = 0.01
+# Simulated input noise: per-component composition std, matched to the measured
+# average input noise of data/2nd_real_run.db (per-component std ≈ 0.064; see
+# visualization/input_noise.py). Also fed to ZoMBI as the known ``input_noise``.
+NOISE_LEVEL       = 0.064
+# Simulated output noise: the measured objective is within ~4.5% of the true value,
+# so y-noise is multiplicative (std = OUTPUT_NOISE_FRAC × |y|), not absolute.
+OUTPUT_NOISE_FRAC = 0.045
 NUM_EXPERIMENTS = 24
 NUM_LINES       = 10
 N_INIT_LINES    = 2
@@ -285,7 +297,7 @@ def _enable_share_history(dirs: list[str] | None) -> None:
 
 # For the re-randomized 'ensemble' dataset only: evaluate each hyperparameter set
 # on this many independently randomized landscapes per MOBO trial and average the
-# three metrics, to reduce the run-to-run landscape noise the MOBO model sees.
+# four metrics, to reduce the run-to-run landscape noise the MOBO model sees.
 ENSEMBLE_N_REPEATS = 5
 
 # Per-trial wall-clock budget (hours) passed to ZoMBIHop.run(time_limit_hours=…).
@@ -351,7 +363,6 @@ HPARAM_SPACE: dict[str, tuple] = {
     "max_iterations":              (2,      30,    "int"),
     "top_m_points":                (2,      8,     "int"),
     "n_consecutive_converged":     (1,      5,    "int"),
-    "convergence_pi_threshold":    (1e-4,   0.05,  "log"),
     "input_noise_threshold_mult":  (0.5,    6.0,   "linear"),
     "output_noise_threshold_mult": (0.01,    2.0,   "linear"),
     # Penalisation & needle
@@ -967,6 +978,7 @@ def append_trial_logs(
         "phase": phase,
         "dist_to_needles": round(metrics["dist"], 6),
         "dup_fraction": round(metrics["dup"], 6),
+        "n_points_penalty": round(metric_n_points_penalty(metrics["n_points"]), 4),
         "runtime_s": round(metrics["runtime"], 3),
     }
     for k, v in hparams.items():
@@ -974,7 +986,8 @@ def append_trial_logs(
     hp_cols = [f"hp_{k}" for k in HPARAM_NAMES]
     _append_csv_rows(
         os.path.join(run_dir, "trials_log.csv"),
-        ["timestamp", "trial", "phase", "dist_to_needles", "dup_fraction", "runtime_s"]
+        ["timestamp", "trial", "phase", "dist_to_needles", "dup_fraction",
+         "n_points_penalty", "runtime_s"]
         + hp_cols,
         [trial_row],
     )
@@ -1021,6 +1034,18 @@ def _time_objective(metrics: dict) -> float:
     return float(metrics["runtime_s"])
 
 
+def _n_points_objective(metrics: dict) -> float:
+    """Fourth MOBO objective: penalty on the total number of points sampled.
+
+    Reads the stored ``n_points_penalty`` (== total sample count for a finite
+    trial). Unlike ``_time_objective`` there is no legacy fallback: this
+    objective post-dates older runs, which simply never recorded a sample count,
+    so a trial missing the key raises ``KeyError`` and is skipped when seeding the
+    GP from prior history (the crawlers already treat KeyError as "unseedable").
+    """
+    return float(metrics["n_points_penalty"])
+
+
 def _norm_x_key(x: torch.Tensor) -> tuple[int, ...]:
     """Hashable key for a normalised hparam vector (rounded to 1e-6) for dedup.
 
@@ -1051,7 +1076,8 @@ def _collect_from_progress(path: str, X_obs: list, Y_obs: list) -> int:
             x = hparams_to_norm(hp)
             y = torch.tensor([-float(m["dist_to_needles"]),
                               -float(m["dup_fraction"]),
-                              -_time_objective(m)], dtype=DTYPE)
+                              -_time_objective(m),
+                              -_n_points_objective(m)], dtype=DTYPE)
         except (KeyError, ValueError, TypeError):
             continue
         X_obs.append(x)
@@ -1190,7 +1216,8 @@ def collect_rederived_observations(runs_dir: str, new_maximize: bool,
                 x = hparams_to_norm(hp)
                 y = torch.tensor([-float(dist),
                                   -float(m["dup_fraction"]),
-                                  -_time_objective(m)], dtype=DTYPE)
+                                  -_time_objective(m),
+                                  -_n_points_objective(m)], dtype=DTYPE)
             except (KeyError, ValueError, TypeError) as exc:
                 print(f"  [resume-scratch] {run_name} trial "
                       f"{t.get('trial')}: could not build observation ({exc}); skipping.")
@@ -1355,7 +1382,8 @@ def collect_shared_observations(
                     x = hparams_to_norm(hp)
                     y = torch.tensor([-float(m["dist_to_needles"]),
                                       -float(m["dup_fraction"]),
-                                      -_time_objective(m)], dtype=DTYPE)
+                                      -_time_objective(m),
+                                      -_n_points_objective(m)], dtype=DTYPE)
                 except (KeyError, ValueError, TypeError):
                     continue
                 seen.add(key)
@@ -1571,6 +1599,7 @@ from eval_metrics import (  # noqa: E402  — after sys.path setup in callers
     metric_avg_pairwise_dist,
     metric_dist_to_needles,
     metric_dup_fraction,
+    metric_n_points_penalty,
     metric_pct_matched,
     metric_pct_matched_comp,
 )
@@ -1589,7 +1618,7 @@ def make_sim_obj(fn_callable, device, dtype, *, maximize: bool):
         pts_np = pts_t.detach().cpu().numpy()
         raw    = np.array([fn_callable(x) for x in pts_np], dtype=float)
         y      = torch.tensor(raw if maximize else -raw, dtype=dtype, device=device)
-        y      = y + torch.randn_like(y) * NOISE_LEVEL
+        y      = y + torch.randn_like(y) * (OUTPUT_NOISE_FRAC * y.abs())
         return pts_t.to(dtype=dtype, device=device), y
 
     return sim_objective
@@ -1648,7 +1677,7 @@ def _gen_init_data(fn_callable, maximize: bool, dim: int = 3):
         pts_np = pts_t.detach().cpu().numpy()
         raw    = np.array([fn_callable(x) for x in pts_np], dtype=float)
         y_t    = torch.tensor(raw if maximize else -raw, dtype=DTYPE, device=DEVICE)
-        y_t    = y_t + torch.randn_like(y_t) * NOISE_LEVEL
+        y_t    = y_t + torch.randn_like(y_t) * (OUTPUT_NOISE_FRAC * y_t.abs())
         pts_out = pts_t.to(dtype=DTYPE, device=DEVICE)
         x_a_list.append(pts_out)
         x_e_list.append(pts_out)
@@ -2115,6 +2144,7 @@ def write_trial_json(path: str, trial_num: int, phase: str,
             "dist_to_needles":     round(metrics["dist"], 6),
             "dup_fraction":        round(metrics["dup"], 6),
             "avg_time_per_iter_s": round(metrics["avg_time_per_iter"], 4),
+            "n_points_penalty":    round(metric_n_points_penalty(metrics["n_points"]), 4),
             "runtime_s":           round(metrics["runtime"], 3),
             "n_iters":             int(metrics["n_iters"]),
         },
@@ -2504,9 +2534,11 @@ def run_single_trial(
     )
     dist = metric_dist_to_needles(discovered, true_optima, dim=dim)
     dup  = metric_dup_fraction(X_all_np, dim=dim)
+    n_points = int(X_all_np.shape[0])
     print(f"    [trial]  iters={n_iters}  dist={dist:.4f}  dup={dup:.4f}"
           f"  t/iter={avg_time_per_iter:.3f}s  (total {runtime:.1f}s)"
-          f"  needles={len(discovered)}/{len(true_optima)}", flush=True)
+          f"  needles={len(discovered)}/{len(true_optima)}"
+          f"  points={n_points}", flush=True)
     log_resource_usage(f"after {os.path.basename(trial_dir)} "
                        f"(n_iters={n_iters}, needles={len(discovered)})")
 
@@ -2559,6 +2591,7 @@ def run_single_trial(
 
     result = {"dist": dist, "dup": dup, "runtime": runtime,
               "avg_time_per_iter": avg_time_per_iter, "n_iters": n_iters,
+              "n_points": n_points,
               "payloads": payloads, "ackley_seed": ackley_seed,
               "ensemble_config": ensemble_config}
 
@@ -2629,6 +2662,7 @@ def evaluate_hparams(
             "avg_time_per_iter": round(r["avg_time_per_iter"], 4),
             "runtime": round(r["runtime"], 3),
             "n_iters": int(r["n_iters"]),
+            "n_points": int(r["n_points"]),
         })
 
     dist = float(np.mean([r["dist"] for r in repeats]))
@@ -2636,11 +2670,16 @@ def evaluate_hparams(
     avg_t = float(np.mean([r["avg_time_per_iter"] for r in repeats]))
     runtime = float(np.sum([r["runtime"] for r in repeats]))
     n_iters = int(np.sum([r["n_iters"] for r in repeats]))
+    # Average sample count per landscape, parallel to the other three averaged
+    # MOBO metrics (so the points penalty stays on a single-run scale). A repeat
+    # that sampled nothing makes the mean's penalty finite, but the n_iters guard
+    # in the main loop still rejects an all-zero trial before it reaches the GP.
+    n_points = float(np.mean([r["n_points"] for r in repeats]))
     print(f"    [trial] ensemble avg over {n_repeats} landscapes — "
-          f"dist={dist:.4f}  dup={dup:.4f}  t/iter={avg_t:.3f}s")
+          f"dist={dist:.4f}  dup={dup:.4f}  t/iter={avg_t:.3f}s  points={n_points:.1f}")
     return {
         "dist": dist, "dup": dup, "runtime": runtime,
-        "avg_time_per_iter": avg_t, "n_iters": n_iters,
+        "avg_time_per_iter": avg_t, "n_iters": n_iters, "n_points": n_points,
         "payloads": [], "ackley_seed": None,
         "ensemble_config": None, "ensemble_configs": configs, "repeats": repeats,
     }
@@ -2656,6 +2695,7 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
             "dist_to_needles":     round(-Y_obs[i][0].item(), 6),
             "dup_fraction":        round(-Y_obs[i][1].item(), 6),
             "avg_time_per_iter_s": round(-Y_obs[i][2].item(), 4),
+            "n_points_penalty":    round(-Y_obs[i][3].item(), 4),
         }
         for i in range(n)
     ]
@@ -2682,12 +2722,14 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
     dists = [m["dist_to_needles"]     for m in metrics_all]
     dups  = [m["dup_fraction"]        for m in metrics_all]
     times = [m["avg_time_per_iter_s"] for m in metrics_all]
+    npens = [m["n_points_penalty"]    for m in metrics_all]
     return {
         "n_trials": n,
         "averages": {
             "dist_to_needles":     round(float(np.mean(dists)), 6),
             "dup_fraction":        round(float(np.mean(dups)),  6),
             "avg_time_per_iter_s": round(float(np.mean(times)), 4),
+            "n_points_penalty":    round(float(np.mean(npens)), 4),
         },
         "best_dist": {"value": round(min(dists), 6), "trial": int(np.argmin(dists)) + 1},
         "trials": trials,
@@ -2826,7 +2868,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                     model = SingleTaskGP(
                         X_t, Y_t,
                         input_transform=Normalize(d=N_HPARAMS),
-                        outcome_transform=Standardize(m=3),
+                        outcome_transform=Standardize(m=4),
                     )
                     mll = ExactMarginalLogLikelihood(model.likelihood, model)
                     fit_gpytorch_mll(mll)
@@ -2855,11 +2897,11 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                 # surrogate, so treat it as a hard failure: raise before the
                 # X_obs/Y_obs append so it never enters the optimization (the
                 # handler below logs it and retries).
-                if res["n_iters"] <= 0 or res["avg_time_per_iter"] <= 0:
+                if res["n_iters"] <= 0 or res["avg_time_per_iter"] <= 0 or res["n_points"] <= 0:
                     raise RuntimeError(
-                        "trial completed 0 ZoMBI iterations "
-                        "(avg_time_per_iter=0); excluded from MOBO so its "
-                        "failure sentinels never enter the GP")
+                        "trial completed 0 ZoMBI iterations / sampled 0 points "
+                        "(avg_time_per_iter=0, n_points penalty=inf); excluded "
+                        "from MOBO so its failure sentinels never enter the GP")
                 try:
                     plot_hparam_edge_proximity(
                         os.path.join(trial_dir, "hparam_edge_proximity.png"), x_new)
@@ -2868,7 +2910,8 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
 
                 X_obs.append(x_new.detach().cpu())
                 Y_obs.append(torch.tensor(
-                    [-res["dist"], -res["dup"], -res["avg_time_per_iter"]],
+                    [-res["dist"], -res["dup"], -res["avg_time_per_iter"],
+                     -metric_n_points_penalty(res["n_points"])],
                     dtype=DTYPE, device="cpu"))
                 save_running_summary(X_obs, Y_obs, run_dir, n_seed=n_seed, n_sobol=n_sobol)
                 log_resource_usage(f"end of trial {trial_num} ({phase})")
@@ -2877,6 +2920,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                     trial_num, phase,
                     {"dist": res["dist"], "dup": res["dup"],
                      "avg_time_per_iter": res["avg_time_per_iter"],
+                     "n_points": res["n_points"],
                      "runtime": res["runtime"], "n_iters": res["n_iters"]},
                     hparams,
                     ackley_seed=res.get("ackley_seed"),
@@ -2886,7 +2930,8 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                 )
                 append_trial_logs(
                     run_dir, trial_num, phase, hparams,
-                    {"dist": res["dist"], "dup": res["dup"], "runtime": res["runtime"]},
+                    {"dist": res["dist"], "dup": res["dup"],
+                     "n_points": res["n_points"], "runtime": res["runtime"]},
                     trial_dir,
                     dim=landscape.dim,
                 )
@@ -3174,7 +3219,7 @@ def main() -> None:
     parser.add_argument("--ensemble-repeats", type=int, default=ENSEMBLE_N_REPEATS,
                         help="number of independently randomized landscapes each "
                              "hyperparameter set is evaluated on per trial for "
-                             f"--dataset ensemble; the three metrics are averaged "
+                             f"--dataset ensemble; the four metrics are averaged "
                              f"across them to reduce landscape noise (default: "
                              f"{ENSEMBLE_N_REPEATS}).")
     parser.add_argument("--resume-from", metavar="RUN_DIR", default=None,

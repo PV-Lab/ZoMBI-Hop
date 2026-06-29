@@ -152,7 +152,7 @@ class DataHandler:
         elif input_noise_ilr is not None:
             self.input_noise = float(input_noise_ilr) / 3.0
         else:
-            self.input_noise = 0.01
+            self.input_noise = 0.064
 
         # Jaccard sliding-window
         self.jaccard_window = int(jaccard_window)

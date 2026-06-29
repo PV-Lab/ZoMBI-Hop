@@ -182,7 +182,9 @@ DEFAULT_HW_HPARAMS: Dict[str, Any] = {
     "max_iterations": 8,
     "top_m_points": 8,
     "n_consecutive_converged": 1,
-    "convergence_pi_threshold": 0.05,
+    # Known physical input noise (per-component composition std), measured as the
+    # average input noise of data/2nd_real_run.db (see visualization/input_noise.py).
+    "input_noise": 0.064,
     "input_noise_threshold_mult": 3.98353261,
     "output_noise_threshold_mult": 0.52251166,
     "max_penalty_radius": 4.56475059,
@@ -195,7 +197,7 @@ DEFAULT_HW_HPARAMS: Dict[str, Any] = {
 # ZoMBIHop tunable kwargs that may be set from a hyperparameter JSON file.
 _VALID_HPARAM_KEYS = {
     "max_zooms", "max_iterations", "top_m_points", "n_restarts", "raw",
-    "convergence_pi_threshold", "input_noise_threshold_mult",
+    "input_noise_threshold_mult",
     "output_noise_threshold_mult", "n_consecutive_converged", "max_gp_points",
     "repulsion_lambda", "acquisition_type", "ucb_beta", "nat_grad_step",
     "nat_grad_max_steps", "ellipsoid_drop_fraction", "ellipsoid_eigenvalue_floor",

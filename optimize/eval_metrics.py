@@ -13,7 +13,9 @@ from scipy.spatial import cKDTree
 
 UNMATCHED_PENALTY = 10.0
 MATCH_RADIUS = 0.05
-NOISE_LEVEL = 0.01
+# Input-noise scale (per-component composition std) used for the duplicate-sample
+# radius; matched to the measured average input noise of data/2nd_real_run.db.
+NOISE_LEVEL = 0.064
 
 
 def as_numpy(x, *, dtype=float) -> np.ndarray:
@@ -154,6 +156,23 @@ def metric_pct_matched(
 ) -> float:
     """Alias for ``metric_pct_matched_comp``."""
     return metric_pct_matched_comp(discovered, true_optima, radius, dim=dim)
+
+
+def metric_n_points_penalty(n_points: int) -> float:
+    """Penalty on the total number of points sampled during a run (minimised).
+
+    Sampling is expensive, so for a fixed solution quality fewer samples is
+    better — the penalty therefore grows linearly with the sample count. A run
+    that sampled *nothing* (``n_points == 0``) is not an efficient run, it is a
+    broken one (ZoMBI never picked a single point), so it incurs an infinite
+    penalty rather than the minimal score a plain count would give it. Callers
+    feeding this to the GP must exclude the infinite case (it cannot be
+    standardised); the finite branch equals the raw point count.
+    """
+    n = int(n_points)
+    if n <= 0:
+        return float("inf")
+    return float(n)
 
 
 def metric_avg_pairwise_dist(discovered: np.ndarray) -> float:

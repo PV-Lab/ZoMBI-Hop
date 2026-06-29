@@ -18,6 +18,15 @@ Objectives (all MINIMISED):
                            ``runtime_s`` instead; this script reads whichever key
                            each trial recorded and labels the third axis to match
                            (it warns if a single collection mixes the two).
+    n_points_penalty     – penalty on the total number of points sampled in the run
+                           (== the sample count; fewer is better). This objective
+                           post-dates older runs, so it is only added as a 4th axis
+                           when EVERY collected trial recorded it; if any trial
+                           predates it, the front falls back to the three objectives
+                           above (filter with --only to compare new runs on all four).
+
+The number of objectives (3 or 4) therefore adapts to the collected trials, and
+the pairwise scatter panels (3 pairs for 3 objectives, 6 for 4) follow suit.
 
 Each run's ``mobo_progress.json`` records only its own trials, so the union over
 all runs never double-counts (a resumed run seeds the GP with prior history but
@@ -53,8 +62,10 @@ import os
 import sys
 import glob
 import json
+import math
 import argparse
 import datetime
+import itertools
 
 import subprocess
 import platform
@@ -72,6 +83,10 @@ import matplotlib.pyplot as plt
 DIST_KEY  = "dist_to_needles"
 DUP_KEY   = "dup_fraction"
 TIME_KEYS = ("avg_time_per_iter_s", "runtime_s")
+# Optional 4th objective: penalty on the total points sampled (== sample count).
+# Only runs created after it was added record it, so it is promoted to a real axis
+# only when every collected trial has it (see main); otherwise the front is 3-D.
+NPTS_KEY  = "n_points_penalty"
 
 HPARAM_SPACE: dict[str, tuple] = {
     "nat_grad_step":               (0.001,  0.5,   "log"),
@@ -83,7 +98,6 @@ HPARAM_SPACE: dict[str, tuple] = {
     "max_iterations":              (2,      10,    "int"),
     "top_m_points":                (2,      8,     "int"),
     "n_consecutive_converged":     (1,      5,     "int"),
-    "convergence_pi_threshold":    (1e-4,   0.05,  "log"),
     "input_noise_threshold_mult":  (0.5,    6.0,   "linear"),
     "output_noise_threshold_mult": (0.1,    2.0,   "linear"),
     "max_penalty_radius":          (0.2,    5.0,   "linear"),
@@ -160,6 +174,21 @@ def _time_metric(m: dict) -> tuple[float, str] | None:
     return None
 
 
+def _npts_metric(m: dict) -> float | None:
+    """Return a trial's finite ``n_points_penalty``, or None if absent/unusable.
+
+    A non-finite or non-positive value would be a failure sentinel (a 0-point run
+    is already dropped via the time guard), so it is treated as missing here too.
+    """
+    if NPTS_KEY not in m:
+        return None
+    try:
+        v = float(m[NPTS_KEY])
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v > 0 else None
+
+
 def _parse_only(only_str: str) -> tuple[set[str], dict[str, set[int]], set[str]]:
     """Parse ``--only`` into (run_names, {run_name: {trial_nums}}, dim_tokens).
 
@@ -218,8 +247,10 @@ def collect_trials(
     """Crawl ``runs_dir/mobo_*/mobo_progress.json`` → list of trial records.
 
     Each record: {source_run, trial, metrics{...}, time_key, time_value,
-    hparams{...}}. Trials missing dist_to_needles, dup_fraction, or any time
-    objective (avg_time_per_iter_s / runtime_s) are skipped.
+    npts_value, hparams{...}}. Trials missing dist_to_needles, dup_fraction, or any
+    time objective (avg_time_per_iter_s / runtime_s) are skipped. ``npts_value`` is
+    the optional 4th objective (n_points_penalty) or None when the trial predates
+    it; whether it becomes a real axis is decided in ``main`` (all-or-nothing).
 
     *only_runs*: if set, include only these run directories (all trials).
     *only_trials*: if set, maps run names to specific trial numbers to include.
@@ -279,12 +310,16 @@ def collect_trials(
                            time_key: time_value}
             except (TypeError, ValueError):
                 continue
+            npts_value = _npts_metric(m)
+            if npts_value is not None:
+                metrics[NPTS_KEY] = npts_value
             records.append({
                 "source_run": run_name,
                 "trial":      t.get("trial"),
                 "metrics":    metrics,
                 "time_key":   time_key,
                 "time_value": time_value,
+                "npts_value": npts_value,
                 "hparams":    t.get("hparams", {}),
             })
             used += 1
@@ -317,12 +352,21 @@ def pareto_mask_min(M: np.ndarray) -> np.ndarray:
 # ─── Visualisation ─────────────────────────────────────────────────────────────
 
 def _obj_pairs(obj_labels: list[str]) -> list[tuple[int, int, str, str]]:
-    """The three pairwise (x_idx, y_idx, x_label, y_label) panels."""
-    return [
-        (0, 2, obj_labels[0], obj_labels[2]),
-        (0, 1, obj_labels[0], obj_labels[1]),
-        (1, 2, obj_labels[1], obj_labels[2]),
-    ]
+    """Every pairwise (x_idx, y_idx, x_label, y_label) panel.
+
+    All C(K, 2) objective pairs in index order: 3 panels for 3 objectives,
+    6 for 4. Generic in the number of objectives so the same code draws the
+    3-objective and 4-objective fronts.
+    """
+    return [(i, j, obj_labels[i], obj_labels[j])
+            for i, j in itertools.combinations(range(len(obj_labels)), 2)]
+
+
+def _subplot_grid(n_pairs: int) -> tuple[int, int]:
+    """(nrows, ncols) for *n_pairs* scatter panels: up to 3 per row."""
+    ncols = min(3, n_pairs)
+    nrows = math.ceil(n_pairs / ncols)
+    return nrows, ncols
 
 
 def plot_pareto(M: np.ndarray, mask: np.ndarray, obj_labels: list[str],
@@ -331,10 +375,13 @@ def plot_pareto(M: np.ndarray, mask: np.ndarray, obj_labels: list[str],
     matplotlib.use("Agg")
     plt.switch_backend("Agg")
     pairs = _obj_pairs(obj_labels)
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    nrows, ncols = _subplot_grid(len(pairs))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows),
+                             squeeze=False)
+    axes_flat = axes.ravel().tolist()
     fig.suptitle(f"MOBO Pareto front across all runs  "
                  f"(★ = Pareto-optimal, {int(mask.sum())}/{len(mask)})", fontsize=12)
-    for ax, (ix, iy, xl, yl) in zip(axes, pairs):
+    for ax, (ix, iy, xl, yl) in zip(axes_flat, pairs):
         ax.scatter(M[~mask, ix], M[~mask, iy], c="steelblue", alpha=0.6,
                    edgecolors="k", linewidths=0.3, label="dominated")
         ax.scatter(M[mask, ix], M[mask, iy], marker="*", s=220, c="gold",
@@ -342,6 +389,8 @@ def plot_pareto(M: np.ndarray, mask: np.ndarray, obj_labels: list[str],
         ax.set_xlabel(xl)
         ax.set_ylabel(yl)
         ax.legend(fontsize=8)
+    for ax in axes_flat[len(pairs):]:   # hide any unused grid cells
+        ax.set_visible(False)
     fig.tight_layout()
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -430,7 +479,7 @@ def plot_pareto_interactive(
     """Interactive Pareto plot: hover highlights across all subplots, click opens trial image.
 
     Hovering and clicking work on *every* trial — Pareto stars and dominated
-    points alike. The hovered point is ringed in red across all three subplots,
+    points alike. The hovered point is ringed in red across all subplots,
     its metrics shown in the tooltip, and a click opens its landscape view (if
     any). The hyperparameter number-line (``--show-numberline``) only lists
     Pareto points, so it highlights when a Pareto point is hovered and clears
@@ -455,14 +504,17 @@ def plot_pareto_interactive(
                 )
 
     # --- Figure 1: Pareto scatter ---
-    fig, axes = plt.subplots(1, 3, figsize=(15, 6.5))
+    nrows, ncols = _subplot_grid(len(pairs))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 6.5 * nrows),
+                             squeeze=False)
+    axes_flat = axes.ravel().tolist()
     fig.suptitle(
         f"MOBO Pareto front across all runs  "
         f"(★ = Pareto-optimal, {n_pareto}/{len(mask)})  —  hover/click any point",
         fontsize=12,
     )
 
-    for ax, (ix, iy, xl, yl) in zip(axes, pairs):
+    for ax, (ix, iy, xl, yl) in zip(axes_flat, pairs):
         ax.scatter(
             M[~mask, ix], M[~mask, iy],
             c="steelblue", alpha=0.6, edgecolors="k", linewidths=0.3, label="dominated",
@@ -475,11 +527,13 @@ def plot_pareto_interactive(
         ax.set_xlabel(xl)
         ax.set_ylabel(yl)
         ax.legend(fontsize=8)
+    for ax in axes_flat[len(pairs):]:   # hide any unused grid cells
+        ax.set_visible(False)
 
     # A red ring marks the hovered point, whether it is a gold Pareto star or a
     # steelblue dominated dot — an open circle reads clearly over either marker.
     highlight_artists = []
-    for ax, (ix, iy, _, _) in zip(axes, pairs):
+    for ax, (ix, iy, _, _) in zip(axes_flat, pairs):
         hl = ax.scatter(
             [], [], marker="o", s=320, facecolors="none",
             edgecolors="red", linewidths=2.0, zorder=10,
@@ -544,8 +598,10 @@ def plot_pareto_interactive(
             return None
         ax = event.inaxes
         try:
-            panel = list(axes).index(ax)
+            panel = axes_flat.index(ax)
         except ValueError:
+            return None
+        if panel >= len(pairs):   # an unused (hidden) grid cell
             return None
         ix, iy = pairs[panel][0], pairs[panel][1]
         dx = M[:, ix] - event.xdata
@@ -610,11 +666,12 @@ def plot_pareto_interactive(
             rec = records[idx]
             m = rec["metrics"]
             kind = "Pareto" if mask[idx] else "dominated"
-            tooltip.set_text(
-                f"{rec['source_run']} trial {rec['trial']} ({kind})  |  "
-                f"dist={m[DIST_KEY]:.4f}  dup={m[DUP_KEY]:.4f}  "
-                f"{rec['time_key']}={rec['time_value']:.4g}"
-            )
+            txt = (f"{rec['source_run']} trial {rec['trial']} ({kind})  |  "
+                   f"dist={m[DIST_KEY]:.4f}  dup={m[DUP_KEY]:.4f}  "
+                   f"{rec['time_key']}={rec['time_value']:.4g}")
+            if NPTS_KEY in obj_labels and rec.get("npts_value") is not None:
+                txt += f"  {NPTS_KEY}={rec['npts_value']:.4g}"
+            tooltip.set_text(txt)
         fig.canvas.draw_idle()
         _update_hp_highlight(idx)
 
@@ -729,8 +786,24 @@ def main() -> None:
               "(different units). Filter with --only to compare like with like.")
     obj_labels = [DIST_KEY, DUP_KEY, time_label]
 
-    M = np.array([[r["metrics"][DIST_KEY], r["metrics"][DUP_KEY], r["time_value"]]
-                  for r in records], dtype=float)
+    # 4th objective (n_points_penalty) is all-or-nothing: promote it to a real axis
+    # only when EVERY collected trial recorded it, so the front never compares trials
+    # on a coordinate some of them lack. A partial collection drops the axis (and the
+    # 4th-objective trade-offs) with a warning rather than silently excluding trials.
+    n_with_npts = sum(r["npts_value"] is not None for r in records)
+    include_npts = n_with_npts == len(records)
+    if include_npts:
+        obj_labels.append(NPTS_KEY)
+    elif n_with_npts:
+        print(f"  [warn] {n_with_npts}/{len(records)} trials recorded {NPTS_KEY}; "
+              "the rest predate it, so it is NOT used as a 4th objective. Filter with "
+              "--only to a set of new runs to include it.")
+
+    cols = [lambda r: r["metrics"][DIST_KEY], lambda r: r["metrics"][DUP_KEY],
+            lambda r: r["time_value"]]
+    if include_npts:
+        cols.append(lambda r: r["npts_value"])
+    M = np.array([[col(r) for col in cols] for r in records], dtype=float)
     mask = pareto_mask_min(M)
     n_total, n_pareto = len(records), int(mask.sum())
     print(f"\n  {n_total} trial(s) total -> {n_pareto} Pareto-optimal.")
@@ -768,9 +841,12 @@ def main() -> None:
     print("\n  Pareto-optimal configurations (best dist first):")
     for r in pareto:
         m = r["metrics"]
-        print(f"    {r['source_run']} trial {r['trial']}:  "
-              f"dist={m[DIST_KEY]:.4f}  dup={m[DUP_KEY]:.4f}  "
-              f"{r['time_key']}={r['time_value']:.4g}")
+        line = (f"    {r['source_run']} trial {r['trial']}:  "
+                f"dist={m[DIST_KEY]:.4f}  dup={m[DUP_KEY]:.4f}  "
+                f"{r['time_key']}={r['time_value']:.4g}")
+        if include_npts:
+            line += f"  {NPTS_KEY}={r['npts_value']:.4g}"
+        print(line)
 
 
 if __name__ == "__main__":

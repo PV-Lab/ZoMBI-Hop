@@ -555,7 +555,7 @@ def gen_init_data(fn_callable, maximize: bool, dim: int):
         pts_np = pts_t.detach().cpu().numpy()
         raw = np.array([fn_callable(x) for x in pts_np], dtype=float)
         y_t = torch.tensor(raw if maximize else -raw, dtype=rm.DTYPE, device=rm.DEVICE)
-        y_t = y_t + torch.randn_like(y_t) * rm.NOISE_LEVEL
+        y_t = y_t + torch.randn_like(y_t) * (rm.OUTPUT_NOISE_FRAC * y_t.abs())
         pts_out = pts_t.to(dtype=rm.DTYPE, device=rm.DEVICE)
         x_a_list.append(pts_out)
         x_e_list.append(pts_out)

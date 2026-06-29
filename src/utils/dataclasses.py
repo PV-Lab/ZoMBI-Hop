@@ -40,8 +40,8 @@ class ZoMBIHopConfig:
     ellipsoid_containment_margin: float = 1.05
     zoom_ellipsoid_eps: float = 1e-4
 
-    # Convergence parameters (PI + noise-based Y/X thresholds)
-    convergence_pi_threshold: float = 0.01
+    # Convergence parameters (EI + noise-based Y/X thresholds)
+    convergence_pi_threshold: float = 0.01  # deprecated/ignored: convergence uses Expected Improvement vs output-noise floor (kept for config/back-compat)
     input_noise_threshold_mult: float = 2.0
     output_noise_threshold_mult: float = 2.0
     n_consecutive_converged: int = 2
@@ -59,7 +59,7 @@ class ZoMBIHopConfig:
     # Point paring (deduplicate near-identical observations before GP fitting)
     paring_spatial_halfnoise: float = 0.5   # spatial threshold = factor × input_noise
     paring_y_noise_multiplier: float = 1.0  # Y threshold = factor × GP output noise
-    input_noise: float = 0.01               # known input noise std per composition component (before renorm)
+    input_noise: float = 0.064              # known input noise std per composition component (before renorm); matches data/2nd_real_run.db
     input_noise_ilr: Optional[float] = None  # deprecated; converted to input_noise when loading old configs
 
     # Needle-ellipsoid shrink on repeated failure
@@ -154,7 +154,7 @@ class Checkpoint:
     zoom_ellipsoid_eps: float = 1e-4
     paring_spatial_halfnoise: float = 0.5
     paring_y_noise_multiplier: float = 1.0
-    input_noise: float = 0.01
+    input_noise: float = 0.064
     input_noise_ilr: Optional[float] = None
     needle_shrink_factor: float = 0.85
     needle_stop_noise_multiplier: float = 3.0
