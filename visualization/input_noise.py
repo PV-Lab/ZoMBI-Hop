@@ -356,7 +356,7 @@ def show_ternary_lengthscale(
     source: str,
     labels: tuple[str, str, str] = ("FAPbI3", "MAPbI3", "MAPbBr3"),
     ensemble_seed: int = 0,
-    grid_n: int = 100,
+    grid_n: int = 300,
 ) -> None:
     """Show an interactive ternary plot with a GP lengthscale reference circle.
 
@@ -389,16 +389,12 @@ def show_ternary_lengthscale(
     grid_vals = fn.predict(grid_pts)
     grid_xy = _comp_to_xy(grid_pts)
 
-    # ── overlay points ──────────────────────────────────────────────────────
+    # ── overlay points (real data only; nothing shown in demo mode) ─────────
     real_parts = [ln.real for ln in lines if ln.real.shape[0] > 0]
-    if real_parts:
-        pts = np.concatenate(real_parts, axis=0)
-        demo = False
-    else:
-        pts = _random_simplex_points(80, seed=ensemble_seed + 1)
-        demo = True
-    pt_vals = fn.predict(pts)
-    pts_xy = _comp_to_xy(pts)
+    pts = np.concatenate(real_parts, axis=0) if real_parts else None
+    if pts is not None:
+        pt_vals = fn.predict(pts)
+        pts_xy = _comp_to_xy(pts)
 
     # ── figure ──────────────────────────────────────────────────────────────
     vmin, vmax = float(grid_vals.min()), float(grid_vals.max())
@@ -422,11 +418,11 @@ def show_ternary_lengthscale(
     ax.text(1 + pad, -pad * 0.5, labels[1], ha="left", va="top", fontsize=11)
     ax.text(0.5, _SQRT3_2 + pad, labels[2], ha="center", va="bottom", fontsize=11)
 
-    # Data points
-    pt_label = f"{'[demo] random' if demo else source} ({pts.shape[0]} pts)"
-    ax.scatter(pts_xy[:, 0], pts_xy[:, 1], c=pt_vals, cmap=cmap, norm=norm,
-               s=40, alpha=0.95, edgecolors="black", linewidths=0.8, zorder=3,
-               label=pt_label)
+    # Data points (only if real data was loaded)
+    if pts is not None:
+        ax.scatter(pts_xy[:, 0], pts_xy[:, 1], c=pt_vals, cmap=cmap, norm=norm,
+                   s=40, alpha=0.95, edgecolors="black", linewidths=0.8, zorder=3,
+                   label=f"{source} ({pts.shape[0]} pts)")
 
     # Colorbar
     sm = ScalarMappable(cmap=cmap, norm=norm)
@@ -458,7 +454,8 @@ def show_ternary_lengthscale(
         ha="center", va="top", fontsize=8.5, color="crimson", zorder=6,
     )
 
-    ax.legend(loc="upper right", fontsize=9, framealpha=0.85)
+    if pts is not None:
+        ax.legend(loc="upper right", fontsize=9, framealpha=0.85)
     ax.set_title(
         f"Ensemble landscape (seed={ensemble_seed}) + GP min lengthscale\n{source}",
         fontsize=11, pad=10,
@@ -498,9 +495,9 @@ def main() -> None:
     parser.add_argument("--ensemble-seed", type=int, default=0, dest="ensemble_seed",
                         help="Seed for the random Ensemble landscape background "
                              "(default: 0; try different values to change the landscape).")
-    parser.add_argument("--grid-n", type=int, default=100, dest="grid_n",
+    parser.add_argument("--grid-n", type=int, default=300, dest="grid_n",
                         help="Ternary grid resolution for the Ensemble background "
-                             "(default: 100).")
+                             "(default: 300).")
     args = parser.parse_args()
 
     # Require a data source unless --ternary is used in demo mode.
