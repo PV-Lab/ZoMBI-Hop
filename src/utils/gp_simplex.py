@@ -15,6 +15,7 @@ from botorch.fit import fit_gpytorch_mll
 from botorch.acquisition import LogExpectedImprovement, UpperConfidenceBound
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.utils.errors import NotPSDError
+from gpytorch.constraints import GreaterThan
 from typing import Literal, Optional, Tuple, Callable, List
 
 from .simplex import proj_simplex, random_simplex, Ellipsoid
@@ -262,6 +263,7 @@ class GPSimplex:
                 else:
                     X_fit = X_norm
                 self.gp = SingleTaskGP(X_fit, Y)
+                self._apply_lengthscale_floor(comp_std)
                 self.mll = ExactMarginalLogLikelihood(self.gp.likelihood, self.gp)
                 fit_gpytorch_mll(self.mll)
                 if jitter > 0.0:
@@ -277,6 +279,33 @@ class GPSimplex:
         if self.verbose:
             print(f"  [GP.fit] MLL: {time.time()-_t0:.2f}s  ({X.shape[0]} pts)")
         self.data_handler.update_gp_noise(self.get_output_noise())
+
+    def _apply_lengthscale_floor(self, comp_std: torch.Tensor) -> None:
+        """Constrain the GP kernel lengthscale from below by the known input noise.
+
+        The GP trains in normalized-composition space (``X_fit = X / comp_std``), so
+        an input noise of ``input_noise`` composition units corresponds to a per-dim
+        lengthscale of ``input_noise / comp_std``. Flooring the lengthscale there stops
+        the kernel from fitting structure finer than the instrument's input noise (i.e.
+        over-fitting measurement jitter). The floor is the configured ``input_noise``
+        on the data handler; if it is unset / non-positive the kernel is left unchanged.
+        """
+        min_ls_comp = float(getattr(self.data_handler, "input_noise", 0.0) or 0.0)
+        if min_ls_comp <= 0.0 or self.gp is None:
+            return
+        kernel = self.gp.covar_module
+        if not hasattr(kernel, "raw_lengthscale"):
+            kernel = getattr(kernel, "base_kernel", kernel)
+        if not hasattr(kernel, "raw_lengthscale"):
+            return
+        lower = (min_ls_comp / comp_std).to(device=self.device, dtype=self.dtype).reshape(1, -1)
+        try:
+            kernel.register_constraint("raw_lengthscale", GreaterThan(lower))
+            with torch.no_grad():
+                kernel.lengthscale = torch.maximum(kernel.lengthscale, lower * 1.01)
+        except Exception as exc:  # never let the floor break a fit
+            if self.verbose:
+                print(f"  [GP.fit] lengthscale floor skipped: {exc}")
 
     def fit_from_data_handler(self):
         """Fit GP using data from the data handler."""
@@ -322,21 +351,13 @@ class GPSimplex:
             return 0.0
         return self.gp.likelihood.noise_covar.noise.mean().item()
 
-    def probability_of_improvement(self, x: torch.Tensor, best_f: float) -> float:
-        """
-        P(f(x) > best_f) under the GP posterior at x.
+    def expected_improvement(self, x: torch.Tensor, best_f: float) -> float:
+        """E[max(f(x) - best_f, 0)] under the GP posterior at x (maximization).
 
-        Parameters
-        ----------
-        x : torch.Tensor
-            Query point (d,) or (1, d).
-        best_f : float
-            Current best observed value.
-
-        Returns
-        -------
-        float
-            Probability of improvement, in [0, 1].
+        Analytic EI in the posterior's (raw) output units — the same units as the
+        observed Y, so it is directly comparable to the output-noise floor used by
+        the convergence check. Acquisition-type independent (unlike
+        ``compute_log_ei_at_point``, which mirrors the configured acquisition).
         """
         if self.gp is None:
             return 0.0
@@ -349,9 +370,12 @@ class GPSimplex:
                 return 0.0
             mu = posterior.mean.squeeze().item()
             var = posterior.variance.squeeze().item()
-        sigma = max(var ** 0.5, 1e-9)
+        sigma = max(var ** 0.5, 1e-12)
         z = (mu - best_f) / sigma
-        return torch.distributions.Normal(0.0, 1.0).cdf(torch.tensor(z, device=self.device)).item()
+        normal = torch.distributions.Normal(0.0, 1.0)
+        zt = torch.tensor(z, device=self.device, dtype=self.dtype)
+        ei = sigma * (z * normal.cdf(zt).item() + torch.exp(normal.log_prob(zt)).item())
+        return max(float(ei), 0.0)
 
     def compute_log_ei_at_point(self, x: torch.Tensor, best_f: float) -> float:
         """

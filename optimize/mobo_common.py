@@ -15,7 +15,9 @@ from botorch.utils.multi_objective.pareto import is_non_dominated
 
 # ─── Simulation / ZoMBI constants ─────────────────────────────────────────────
 
-NOISE_LEVEL = 0.01
+# Known input noise (per-component composition std) matched to the measured
+# average input noise of data/2nd_real_run.db (≈ 0.064; see run_mobo.NOISE_LEVEL).
+NOISE_LEVEL = 0.064
 NUM_EXPERIMENTS = 24
 NUM_LINES = 10
 N_INIT_LINES = 2
@@ -39,7 +41,6 @@ HPARAM_SPACE: dict[str, tuple] = {
     "max_iterations":              (2,      10,    "int"),
     "top_m_points":                (2,      8,     "int"),
     "n_consecutive_converged":     (2,      10,    "int"),
-    "convergence_pi_threshold":    (1e-4,   0.05,  "log"),
     "input_noise_threshold_mult":  (0.5,    6.0,   "linear"),
     "output_noise_threshold_mult": (0.1,    2.0,   "linear"),
     "max_penalty_radius":          (0.2,    3.0,   "linear"),

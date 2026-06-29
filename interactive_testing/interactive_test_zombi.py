@@ -28,7 +28,8 @@ Workflow
    ``--ackley``, whose reference optima are known analytically.)
 4. Run ZoMBI-Hop (with LineBO), exactly as in ``scripts/run_zombi_main.py``,
    but evaluating the surrogate (RF or Ackley) instead of a physical instrument.
-   0.01 Gaussian noise is added to both inputs and outputs at every sample.
+   Input noise (ILR std=NOISE_LEVEL_ILR) and multiplicative output noise
+   (OUTPUT_NOISE_FRAC × |y|) are added at every sample, matched to data/2nd_real_run.db.
 5. After every objective call, save a two-panel ternary figure to
    ``interactive_testing/plots/`` and display it (non-blocking; PNGs are still
    saved but not displayed under ``--background``):
@@ -127,8 +128,8 @@ OBJECTIVE_COL = "Objective"
 CORNER_LABELS = ("FAPbI3", "MAPbI3", "MAPbBr3")
 
 RF_N_ESTIMATORS = 500
-NOISE_LEVEL = 0.01       # output noise std (added to y at every evaluation)
-NOISE_LEVEL_ILR = 0.03  # input noise std in ILR space (≈ NOISE_LEVEL=0.01 in ambient at centroid, d=3)
+OUTPUT_NOISE_FRAC = 0.045  # output noise as a fraction of the true y (measured ≈ within 4.5%)
+NOISE_LEVEL_ILR = 0.192     # input noise std in ILR space (≈ 0.064 ambient per-component × 3; matches data/2nd_real_run.db)
 NUM_EXPERIMENTS = 24     # points sampled per suggested line (mirrors run_zombi_main.py)
 NUM_LINES = 10           # LineBO candidate lines per iteration
 TERNARY_GRID_N = 120     # ternary grid resolution for reference heatmap
@@ -168,7 +169,6 @@ ZOMBI_PARAMS: dict = dict(
     top_m_points=4,
     n_restarts=100,
     raw=1323,
-    convergence_pi_threshold=0.001,
     input_noise_threshold_mult=2.0,
     output_noise_threshold_mult=0.5,
     n_consecutive_converged=5,
@@ -457,7 +457,8 @@ def make_sim_objective(
       * ``endpoints`` is a ``(k, 2, d)`` tensor of ranked line endpoints,
       * the first line (index 0) is sampled at NUM_EXPERIMENTS evenly-spaced points,
       * Logistic-normal input noise (std=NOISE_LEVEL_ILR in ILR space) preserves the
-        compositional geometry; Gaussian noise of std=NOISE_LEVEL is added to outputs,
+        compositional geometry; multiplicative output noise (std=OUTPUT_NOISE_FRAC × |y|)
+        is added to outputs,
       * returns ``(x_actual: (N, d), y: (N,))`` tensors on ``device``.
 
     ZoMBIHop maximizes ``y``. When ``maximize`` is False, RF outputs are negated so
@@ -477,7 +478,7 @@ def make_sim_objective(
         pts_np = pts_t.detach().cpu().numpy()                  # numpy only at sklearn boundary
         raw = torch.tensor(rf.predict(pts_np).ravel(), dtype=dtype, device=device)
         y = raw if maximize else -raw
-        y = y + torch.randn_like(y) * NOISE_LEVEL
+        y = y + torch.randn_like(y) * (OUTPUT_NOISE_FRAC * y.abs())
         return pts_t.to(dtype=dtype, device=device), y
 
     return sim_objective
@@ -1057,7 +1058,7 @@ def generate_init_data(
         pts_np = pts_t.detach().cpu().numpy()
         print(f"      evaluating RF on {len(pts_np)} points …", flush=True)
         raw = torch.tensor(rf.predict(pts_np).ravel(), dtype=dtype, device=device)
-        y_vals = raw + torch.randn_like(raw) * NOISE_LEVEL
+        y_vals = raw + torch.randn_like(raw) * (OUTPUT_NOISE_FRAC * raw.abs())
         print(f"      done. y range: [{y_vals.min():.4f}, {y_vals.max():.4f}]", flush=True)
         y_zombi = y_vals if maximize else -y_vals
         pts_out = pts_t.to(dtype=dtype, device=device)
@@ -1160,7 +1161,7 @@ def main(
     print("=" * 70)
     print(f"ZoMBI-Hop Interactive Test — {surrogate_name}")
     print(f"Device : {DEVICE}")
-    print(f"Noise  : {NOISE_LEVEL}  (applied to both inputs and outputs)")
+    print(f"Noise  : input ILR std={NOISE_LEVEL_ILR}  |  output frac={OUTPUT_NOISE_FRAC} (× |y|)")
     print("=" * 70)
 
     # ── Step 1: build the objective surrogate ─────────────────────────────────

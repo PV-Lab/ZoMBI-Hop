@@ -64,7 +64,12 @@ from src.utils.datahandler import reconstruct_snapshot_tensors
 # ── constants ─────────────────────────────────────────────────────────────────
 DEVICE          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE           = torch.float64
-NOISE_LEVEL = 0.01
+# Simulated input noise: per-component composition std matched to the measured
+# average input noise of data/2nd_real_run.db (≈ 0.064; see
+# visualization/input_noise.py). OUTPUT_NOISE_FRAC makes y-noise multiplicative
+# (the measured objective is within ~4.5% of the true value).
+NOISE_LEVEL = 0.064
+OUTPUT_NOISE_FRAC = 0.045
 NUM_EXPERIMENTS = 24
 NUM_LINES       = 10
 N_INIT_LINES    = 2
@@ -139,14 +144,14 @@ HPARAM_CATEGORIES: dict[str, list[tuple]] = {
         ("acquisition_type", "str",   "ucb", "Acq. type",
          "Acquisition function used to select the next query point.\n"
          "  ucb – Upper Confidence Bound (exploration via β)\n"
-         "  ei  – Expected Improvement\n"
-         "  pi  – Probability of Improvement"),
+         "  ei  – Expected Improvement"),
         ("ucb_beta",         "float", 0.1,  "UCB β",
          "Exploration–exploitation trade-off for UCB: higher β = more exploration. "
          "Ignored when acquisition_type is 'ei' or 'pi'."),
-        ("input_noise",  "float", 0.01, "Input noise (composition)",
+        ("input_noise",  "float", 0.064, "Input noise (composition)",
          "Std dev of isotropic Gaussian noise added to each composition component "
-         "before simplex reprojection at every evaluation."),
+         "before simplex reprojection at every evaluation. Default matches the "
+         "measured average input noise of data/2nd_real_run.db."),
     ],
     "Zoom / Convergence": [
         ("max_zooms",                   "int",   3,    "Max zooms",
@@ -160,8 +165,6 @@ HPARAM_CATEGORIES: dict[str, list[tuple]] = {
         ("n_consecutive_converged",     "int",   2,    "Consec. converged",
          "Number of consecutive iterations that must meet the convergence criterion "
          "before the optimizer zooms in."),
-        ("convergence_pi_threshold",    "float", 0.01, "Conv. PI thresh",
-         "Probability of Improvement below this threshold counts as a converged iteration."),
         ("input_noise_threshold_mult",  "float", 2.0,  "Input noise mult",
          "Convergence gate: if the best observed improvement < mult × input_noise, "
          "the iteration is considered converged."),
@@ -251,7 +254,6 @@ DEFAULT_HPARAMS: dict = {
     "max_iterations": 8,
     "top_m_points": 8,
     "n_consecutive_converged": 1,
-    "convergence_pi_threshold": 0.05,
     "input_noise_threshold_mult": 3.98353261,
     "output_noise_threshold_mult": 0.52251166,
     "max_penalty_radius": 4.56475059,
@@ -277,7 +279,7 @@ def _make_sim_obj(fn_callable, device, dtype, *, maximize: bool):
         pts   = add_composition_noise(pts, NOISE_LEVEL)
         raw   = np.array([fn_callable(x) for x in pts.detach().cpu().numpy()], float)
         y     = torch.tensor(raw if maximize else -raw, dtype=dtype, device=device)
-        y     = y + torch.randn_like(y) * NOISE_LEVEL
+        y     = y + torch.randn_like(y) * (OUTPUT_NOISE_FRAC * y.abs())
         return pts.to(dtype=dtype, device=device), y
     return _obj
 
@@ -330,7 +332,7 @@ def _gen_init_data(fn_callable, d: int, maximize: bool):
         pts  = add_composition_noise(pts, NOISE_LEVEL)
         raw  = np.array([fn_callable(x) for x in pts.detach().cpu().numpy()], float)
         yt   = torch.tensor(raw if maximize else -raw, dtype=DTYPE, device=DEVICE)
-        yt   = yt + torch.randn_like(yt) * NOISE_LEVEL
+        yt   = yt + torch.randn_like(yt) * (OUTPUT_NOISE_FRAC * yt.abs())
         pts  = pts.to(dtype=DTYPE, device=DEVICE)
         xa.append(pts); xe.append(pts); yl.append(yt)
     if not xa:

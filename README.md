@@ -55,9 +55,9 @@ Each activation attempts to find and declare one new local optimum ("needle"). O
 ### Within an Activation: Zoom-In Search
 
 1. **Start at full simplex bounds** (or updated bounds after a failure-retry, see below).
-2. Fit a **Gaussian Process** in ILR-transformed space. When the bounds are not global (i.e. we are inside a zoom), **only points within the current bounds** are used for GP training: first the pared (deduplicated) points within bounds fill the `max_gp_points` budget, then raw unpenalized points within bounds fill the remainder. This makes the GP posterior tight and locally accurate so that PI drops quickly on genuine convergence.
+2. Fit a **Gaussian Process** in ILR-transformed space. When the bounds are not global (i.e. we are inside a zoom), **only points within the current bounds** are used for GP training: first the pared (deduplicated) points within bounds fill the `max_gp_points` budget, then raw unpenalized points within bounds fill the remainder. This makes the GP posterior tight and locally accurate so that EI drops quickly on genuine convergence.
 3. Run **LineBO** to propose a candidate: sample random chords through the current bounds, score each chord by integrating the acquisition function along it (mean, not max), pick the best chord, and have the physical experiment evaluate that line.
-4. After each evaluation, check **convergence**: PI (probability of improvement) is computed against the **local best** (best unpenalized point within the current zoom bounds, and `best_f` from the local GP training set). If PI drops below threshold AND the Y improvement since the previous local best is within output noise, increment a consecutive-converged counter.
+4. After each evaluation, check **convergence**: EI (expected improvement) is computed against the **local best** (best unpenalized point within the current zoom bounds, and `best_f` from the local GP training set). If EI drops below the output-noise floor AND the Y improvement since the previous local best is within output noise, increment a consecutive-converged counter.
 5. After `n_consecutive_converged` consecutive converged iterations, declare a needle.
 6. Before the next zoom: **Jaccard-aware sliding-window bounds selection** (`determine_new_bounds`) slides over windows of top-M points ranked by Y, picking the first candidate AABB whose Jaccard overlap against the last `jaccard_window` entries in `bounds_history` is ≤ `jaccard_threshold`. If all windows exceed the threshold, the least-overlapping window is used.
 7. **Secondary Jaccard guard (MC):** if the selected AABB still has Monte Carlo Jaccard > `zoom_jaccard_threshold` with any entry in `zoom_bounds_history`, the algorithm **force-declares a needle** at the current best unpenalized point — repeated zooms to the same region are taken as evidence the optimum is there even if PI hasn't formally converged.
@@ -246,7 +246,7 @@ ZoMBIHop
 
 | Parameter | Default | Controls |
 |-----------|---------|----------|
-| `convergence_pi_threshold` | 0.01 | PI below this value satisfies the first convergence condition. PI is computed against the **local best within the current zoom bounds** (not global), so this threshold is meaningful relative to the active search region. Lower = harder to converge. |
+| `convergence_pi_threshold` | 0.01 | **Deprecated / ignored.** Convergence now uses Expected Improvement vs the output-noise floor (`EI < GP_output_noise × output_noise_threshold_mult`); there is no separate PI threshold. Kept only so older configs/JSONs still load. |
 | `input_noise_threshold_mult` | 2.0 | Unused directly in convergence check (kept for backward compat); related to input noise scale. |
 | `output_noise_threshold_mult` | 2.0 | Y improvement (over the **local** prev_best within bounds) must be < this × GP output noise. Higher = easier to converge. |
 
@@ -277,7 +277,7 @@ ZoMBIHop
 |-----------|---------|----------|
 | `paring_spatial_halfnoise` | 0.5 | Spatial duplicate threshold in ILR units: points within `factor × input_noise_ilr` are candidates for deduplication. Also controls the neighbourhood radius for median relabeling of pared Y values and the needle median value computation. |
 | `paring_y_noise_multiplier` | 1.0 | Y-value duplicate threshold: `factor × GP_output_noise`. |
-| `input_noise_ilr` | 0.03 | Known physical input noise σ in ILR space (instrument precision). Used for paring, median neighbourhood radius, needle shrink stop condition, and old-needle radius. |
+| `input_noise` | 0.064 | Known physical input noise σ per composition component (instrument precision), measured from `data/2nd_real_run.db`. Used for paring, median neighbourhood radius, needle shrink stop condition, old-needle radius, and the GP min-lengthscale floor. (Legacy `input_noise_ilr` ≈ `input_noise × 3` is still accepted and converted.) |
 
 ### Needle Shrink & Stop
 
@@ -432,13 +432,13 @@ Scores each chord by **mean** acquisition over N uniformly-spaced points (not ma
 
 **Role:** Top-level orchestrator. Owns the activation/zoom/iteration loops, needle declaration, failure handling, convergence checking, and Jaccard-based repeated-zoom detection.
 
-#### `ZoMBIHop._check_convergence_to_needle(...)` → (converged, pi, log_ei)
+#### `ZoMBIHop._check_convergence_to_needle(...)` → (converged, ei, log_ei)
 
 Convergence requires **both**:
-1. PI(candidate) < `convergence_pi_threshold`
+1. EI(candidate) < GP_output_noise × `output_noise_threshold_mult` (the GP expects no more than noise-level improvement)
 2. (current batch best Y) − (prev_best_Y) < GP_output_noise × `output_noise_threshold_mult`
 
-`best_f_ref` is `Y.max()` from `get_zoom_gp_data(bounds)` — PI is measured against the best observation *within current bounds*, not globally.
+`best_f_ref` is `Y.max()` from `get_zoom_gp_data(bounds)` — EI is measured against the best observation *within current bounds*, not globally.
 
 #### `ZoMBIHop._declare_needle_at_best(...)` → Optional[Tensor]
 

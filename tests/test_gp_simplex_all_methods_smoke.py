@@ -86,9 +86,8 @@ def test_gp_simplex_all_methods_smoke(torch, monkeypatch):
     # noise getters
     _ = gp.get_output_noise()
 
-    # PI / LogEI at a point
+    # LogEI at a point
     x0 = X[0]
-    _ = gp.probability_of_improvement(x0, best_f=float(Y.max().item()))
     _ = gp.compute_log_ei_at_point(x0, best_f=float(Y.max().item()))
 
     # create_acquisition + computed lambda

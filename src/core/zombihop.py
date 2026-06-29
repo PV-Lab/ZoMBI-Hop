@@ -90,7 +90,7 @@ class ZoMBIHop:
                  top_m_points: Optional[int] = None,
                  n_restarts: int = 30,
                  raw: int = 500,
-                 convergence_pi_threshold: float = 0.01,
+                 convergence_pi_threshold: float = 0.01,  # deprecated/ignored: convergence now uses Expected Improvement vs the output-noise floor
                  input_noise_threshold_mult: float = 2.0,
                  output_noise_threshold_mult: float = 2.0,
                  n_consecutive_converged: int = 2,
@@ -114,7 +114,7 @@ class ZoMBIHop:
                  max_penalty_radius: float = 1.0,
                  paring_spatial_halfnoise: float = 0.5,
                  paring_y_noise_multiplier: float = 1.0,
-                 input_noise: float = 0.01,
+                 input_noise: float = 0.064,
                  input_noise_ilr: Optional[float] = None,
                  needle_shrink_factor: float = 0.85,
                  needle_stop_noise_multiplier: float = 3.0,
@@ -446,10 +446,10 @@ class ZoMBIHop:
             pass
 
     def _log_status(self, activation: int, zoom: int, iteration: int,
-                    candidate: Optional[torch.Tensor], pi: Optional[float] = None):
+                    candidate: Optional[torch.Tensor], ei: Optional[float] = None):
         if self.verbose:
             candidate_str = f"{candidate.cpu().numpy()}" if candidate is not None else "None"
-            extra = f" | PI={pi:.4f}" if pi is not None else ""
+            extra = f" | EI={ei:.2e}" if ei is not None else ""
             print(f"[A{activation+1}/Z{zoom+1}/I{iteration+1}] Candidate: {candidate_str}{extra}")
 
     def _check_convergence_to_needle(
@@ -462,15 +462,16 @@ class ZoMBIHop:
         best_f_ref: Optional[float] = None,
     ) -> Tuple[bool, float, float]:
         """
-        Check convergence to a local optimum. Returns (converged, pi, log_ei).
+        Check convergence to a local optimum. Returns (converged, ei, log_ei).
 
         Converge when:
-        1. PI at candidate < convergence_pi_threshold
+        1. Expected Improvement at candidate < output_noise * output_noise_threshold_mult
+           (the GP expects no more than noise-level improvement)
         2. Latest best Y improves by less than output_noise * output_noise_threshold_mult
 
-        ``best_f_ref``: if provided, used as the reference for PI and log-EI instead
+        ``best_f_ref``: if provided, used as the reference for EI / log-EI instead
         of the global max from get_gp_data().  Pass the max of the local GP training
-        data so that PI is computed relative to the best value seen *within the current
+        data so that EI is computed relative to the best value seen *within the current
         zoom bounds*, avoiding spurious convergence when an unrelated high-value point
         exists outside the active zoom region.
         """
@@ -487,30 +488,33 @@ class ZoMBIHop:
             _, Y_gp = self.data_handler.get_gp_data()
             best_f = Y_gp.max().item()
 
-        pi = 0.0
+        ei = 0.0
         log_ei = float('-inf')
         try:
-            pi = self.gp_handler.probability_of_improvement(candidate, best_f)
+            ei = self.gp_handler.expected_improvement(candidate, best_f)
             log_ei = self.gp_handler.compute_log_ei_at_point(candidate, best_f)
         except Exception:
             pass
         self.data_handler.log_ei_history.append(log_ei)
-        pi_low = pi < self.data_handler.convergence_pi_threshold
 
         if prev_best_X is None or prev_best_Y is None:
-            return False, pi, log_ei
+            return False, ei, log_ei
 
+        # Noise floor shared by both gates: the candidate's expected improvement and
+        # the realized best-Y improvement must each sit below output-noise scale.
         output_noise = self.gp_handler.get_output_noise()
+        noise_floor = output_noise * self.data_handler.output_noise_threshold_mult
+        ei_low = ei < noise_floor
         prev_y = prev_best_Y.item() if torch.is_tensor(prev_best_Y) else prev_best_Y
         improvement = latest_best_Y - prev_y
         input_distance = torch.norm(latest_best_X - prev_best_X).item()
-        output_within_noise = improvement < (output_noise * self.data_handler.output_noise_threshold_mult)
-        converged = pi_low and output_within_noise
+        output_within_noise = improvement < noise_floor
+        converged = ei_low and output_within_noise
 
         if converged and self.verbose:
-            self._log(f"Converged: PI={pi:.4f}, improvement={improvement:.2e}, "
+            self._log(f"Converged: EI={ei:.2e}, improvement={improvement:.2e}, "
                       f"input_dist={input_distance:.2e}, logEI={log_ei:.2f}")
-        return converged, pi, log_ei
+        return converged, ei, log_ei
 
     def _objective_wrapper(
         self, X: torch.Tensor, bounds: torch.Tensor, acquisition_function
@@ -608,7 +612,7 @@ class ZoMBIHop:
                 self._log(f"Search bounds: [{bounds[0].cpu().numpy()}] – [{bounds[1].cpu().numpy()}]")
 
                 # Use local GP data when zoomed in so GP posterior is tight
-                # within the active region and PI drops to signal convergence.
+                # within the active region and EI drops to signal convergence.
                 _t0 = time.time()
                 if _is_global_bounds(bounds):
                     X, Y = dh.get_gp_data()
@@ -705,7 +709,7 @@ class ZoMBIHop:
 
                     curr_best_X, curr_best_Y, _ = dh.get_best_unpenalized()
 
-                    converged, pi, log_ei = self._check_convergence_to_needle(
+                    converged, ei, log_ei = self._check_convergence_to_needle(
                         candidate, unpenalized_X, unpenalized_Y, prev_best_X, prev_best_Y,
                         best_f_ref=best_f_local,
                     )
@@ -714,7 +718,7 @@ class ZoMBIHop:
                     else:
                         consecutive_converged = 0
 
-                    self._log_status(activation, zoom, iteration, candidate, pi=pi)
+                    self._log_status(activation, zoom, iteration, candidate, ei=ei)
                     if consecutive_converged > 0:
                         self._log(f"Convergence count: {consecutive_converged}/{dh.n_consecutive_converged}")
 
@@ -726,7 +730,7 @@ class ZoMBIHop:
                     # --- Declare needle after N consecutive converged iterations ---
                     if consecutive_converged >= dh.n_consecutive_converged:
                         needle = self._declare_needle_at_best(
-                            dh, zoom, global_iteration, reason="PI convergence"
+                            dh, zoom, global_iteration, reason="EI convergence"
                         )
                         if needle is not None:
                             dh.take_snapshot(
