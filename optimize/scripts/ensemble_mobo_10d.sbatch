@@ -30,7 +30,15 @@ on_time_limit() {
 }
 trap on_time_limit USR1
 
-uv run python optimize/run_mobo.py --dataset ensemble --dim 10 --time-limit 0.7 --share-history --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112 &
+# Stable run dir keyed on the job id: a `scontrol requeue` keeps the SAME
+# SLURM_JOB_ID, so the relaunched job re-enters this exact folder and resumes the
+# interrupted ensemble trial (reusing already-finished run_<k> repeats) instead of
+# starting a fresh run and re-spending that GPU time. A clean-exit chain or the
+# fallback resubmit gets a new job id (new dir) — a genuinely fresh run, which is
+# correct. Keep the `mobo_` prefix so shared-history's `mobo_*` glob still sees it.
+RUN_DIR="optimize/runs/mobo_ensemble_10d_job${SLURM_JOB_ID}"
+
+uv run python optimize/run_mobo.py --dataset ensemble --dim 10 --time-limit 0.7 --share-history --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112 --run-dir "$RUN_DIR" &
 wait $!
 rc=$?
 
