@@ -285,7 +285,7 @@ N_MOBO_SAMPLES   = 512
 # two checkouts pool progress; when False (default), only the current user's own
 # local history is scanned. The toggle is symmetric — whoever sets it False scans
 # only their own dir, regardless of which checkout the job runs from.
-SHARE_COLLABORATOR_HISTORY = False
+SHARE_COLLABORATOR_HISTORY = True
 
 # Known collaborator runs directories (one per user). The current user's own dir
 # is detected by matching $HOME and is always scanned; the other is added only
@@ -2649,6 +2649,35 @@ def run_single_trial(
 
 # ─── One MOBO trial: single eval, or averaged ensemble repeats ──────────────────
 
+# Keys a completed ensemble repeat's metrics.json must carry to be reused on
+# resume. A file missing any of these (e.g. truncated by a mid-write kill) is
+# treated as an incomplete repeat and re-run.
+_REPEAT_METRIC_KEYS = ("run", "dist", "dup", "avg_time_per_iter",
+                       "runtime", "n_iters", "n_points")
+
+
+def _load_repeat_metrics(path: str, k: int) -> dict | None:
+    """Return a completed repeat's saved metrics, or None if absent/incomplete.
+
+    Each ``trial_<n>/run_<k>/metrics.json`` is written (atomically) only after its
+    ZoMBI run finishes, so its presence with all expected keys means repeat ``k``
+    is done and its GPU time must not be re-spent on a requeue. A corrupt/partial
+    file, or one whose ``run`` index doesn't match, is rejected so the repeat re-runs.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            m = json.load(f)
+    except Exception:
+        return None
+    if not all(key in m for key in _REPEAT_METRIC_KEYS):
+        return None
+    if int(m.get("run", -1)) != int(k):
+        return None
+    return m
+
+
 def evaluate_hparams(
     hparams: dict,
     landscape: LandscapeSpec,
@@ -2677,8 +2706,9 @@ def evaluate_hparams(
         return run_single_trial(
             hparams, landscape, trial_dir, ackley_variant=ackley_variant)
 
-    if os.path.isdir(trial_dir):
-        shutil.rmtree(trial_dir, ignore_errors=True)
+    # Do NOT wipe trial_dir: on a requeue it may already hold the completed
+    # run_<k>/ repeats of this very trial, whose GPU time we want to reuse rather
+    # than re-spend. Each completed repeat is detected by its metrics.json below.
     os.makedirs(trial_dir, exist_ok=True)
 
     n_repeats = int(ensemble_spec.get("n_repeats", ENSEMBLE_N_REPEATS))
@@ -2693,9 +2723,22 @@ def evaluate_hparams(
             optima_margin=ensemble_spec["optima_margin"])
         configs.append(cfg)
         run_dir = os.path.join(trial_dir, f"run_{k}")
+        ckpt = os.path.join(run_dir, "metrics.json")
+
+        cached = _load_repeat_metrics(ckpt, k)
+        if cached is not None:
+            print(f"    [ensemble repeat {k}/{n_repeats}] already complete — "
+                  f"reusing saved metrics (resume)", flush=True)
+            repeats.append(cached)
+            continue
+
+        # Clear any half-finished repeat dir (killed before metrics.json landed)
+        # so this repeat re-runs cleanly from scratch.
+        if os.path.isdir(run_dir):
+            shutil.rmtree(run_dir, ignore_errors=True)
         print(f"    [ensemble repeat {k}/{n_repeats}]", flush=True)
         r = run_single_trial(hparams, landscape, run_dir, ensemble_config=cfg)
-        repeats.append({
+        rep = {
             "run": k,
             "dist": round(r["dist"], 6),
             "dup": round(r["dup"], 6),
@@ -2703,7 +2746,11 @@ def evaluate_hparams(
             "runtime": round(r["runtime"], 3),
             "n_iters": int(r["n_iters"]),
             "n_points": int(r["n_points"]),
-        })
+        }
+        repeats.append(rep)
+        # Atomic success marker: write only after the ZoMBI run returned, so a
+        # repeat killed mid-run leaves no metrics.json and is re-run on resume.
+        _atomic_write_text(ckpt, json.dumps(rep, indent=2))
 
     dist = float(np.mean([r["dist"] for r in repeats]))
     dup = float(np.mean([r["dup"] for r in repeats]))
@@ -2887,11 +2934,56 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
     X_obs: list[torch.Tensor] = []
     Y_obs: list[torch.Tensor] = []
 
-    n_seed  = len(seed_X)
-    n_sobol = n_init_trials if n_prior == 0 else 0
-    X_sobol = load_or_make_sobol(run_dir, bounds, n_sobol)
-    init_design = ([(x, "seed") for x in seed_X]
-                   + [(X_sobol[i], "sobol") for i in range(X_sobol.shape[0])])
+    # ── Resume into a reused run_dir: if this folder already holds completed
+    #    trials (e.g. the Slurm job was requeued at the wall-time limit and
+    #    relaunched with the same --run-dir), reload them so trial numbering
+    #    continues and the GP includes them, instead of starting over at trial 1
+    #    and orphaning the prior work. A fresh run has no mobo_progress.json, so
+    #    this is a no-op. (Own trials live in X_obs/Y_obs, not X_prior, so
+    #    len(Y_obs) drives the next trial index; shared-history excludes run_dir,
+    #    so there is no double-counting.)
+    _own_progress = os.path.join(run_dir, "mobo_progress.json")
+    if os.path.exists(_own_progress):
+        rX, rY = [], []
+        n_reload = _collect_from_progress(_own_progress, rX, rY)
+        if n_reload:
+            X_obs.extend(x.detach().cpu() for x in rX)
+            Y_obs.extend(y.detach().cpu() for y in rY)
+            print(f"  [resume] reloaded {n_reload} completed trial(s) from this "
+                  f"run_dir — continuing at trial {len(Y_obs) + 1}", flush=True)
+
+    # ── Pin the initial design (seeds + Sobol) for the lifetime of this run_dir.
+    #    On first launch build it from the (possibly deduped) seeds + a fresh Sobol
+    #    draw and persist it; on every resume reload it verbatim. This keeps trial
+    #    indexing/phases stable even though --share-history can grow X_prior between
+    #    requeues — which would otherwise change the seed dedup and the n_prior-gated
+    #    Sobol count, desyncing which design point each trial index maps to.
+    init_path = os.path.join(run_dir, "init_design.pt")
+    init_design = None
+    if os.path.exists(init_path):
+        try:
+            saved = torch.load(init_path, map_location="cpu")
+            init_X = saved["X"].to(dtype=DTYPE)
+            init_phases = list(saved["phases"])
+            init_design = [(init_X[i], init_phases[i]) for i in range(init_X.shape[0])]
+            n_seed = sum(1 for p in init_phases if p == "seed")
+            n_sobol = sum(1 for p in init_phases if p == "sobol")
+            print(f"  [resume] reusing persisted init design "
+                  f"({n_seed} seed + {n_sobol} Sobol)", flush=True)
+        except Exception as exc:
+            print(f"  [resume] init_design.pt unreadable ({exc}); rebuilding.")
+            init_design = None
+    if init_design is None:
+        n_seed  = len(seed_X)
+        n_sobol = n_init_trials if n_prior == 0 else 0
+        X_sobol = load_or_make_sobol(run_dir, bounds, n_sobol)
+        init_design = ([(x, "seed") for x in seed_X]
+                       + [(X_sobol[i], "sobol") for i in range(X_sobol.shape[0])])
+        if init_design:
+            _atomic_torch_save(
+                {"X": torch.stack([x for x, _ in init_design]).cpu(),
+                 "phases": [ph for _, ph in init_design]},
+                init_path)
     n_init = len(init_design)
 
     stop_desc = (
@@ -2920,9 +3012,26 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
             phase     = init_design[n_done][1] if use_init else "mobo"
             trial_num = n_done + 1
             trial_dir = os.path.join(run_dir, f"trial_{trial_num}")
+            pending_path = os.path.join(trial_dir, "pending.json")
+            # An ensemble trial whose folder exists with a saved pending.json but
+            # no trial.json was interrupted partway through its repeats. Resume it
+            # with the IDENTICAL hyperparameters (a BO re-proposal would differ
+            # from the GP, mixing hparams across the averaged repeats), letting
+            # evaluate_hparams reuse the completed run_<k> and run only the rest.
+            resume_pending = (
+                ensemble_spec is not None
+                and os.path.exists(pending_path)
+                and not os.path.exists(os.path.join(trial_dir, "trial.json"))
+            )
 
             try:
-                if use_init:
+                if resume_pending:
+                    with open(pending_path) as f:
+                        pend = json.load(f)
+                    x_new = torch.tensor(pend["x_norm"], dtype=DTYPE)
+                    print(f"\n[trial {trial_num} | {phase}]  RESUMING interrupted "
+                          f"trial — reusing saved hyperparameters", flush=True)
+                elif use_init:
                     x_new = init_design[n_done][0].detach().cpu().clone()
                 else:
                     X_t = torch.stack(X_prior + X_obs).to(DEVICE)
@@ -2947,6 +3056,17 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                 hp_str = "  ".join(f"{k}={round(v,4) if isinstance(v,float) else v}"
                                    for k, v in hparams.items())
                 print(f"\n[trial {trial_num} | {phase}]  {hp_str}", flush=True)
+
+                # Persist the chosen hyperparameters BEFORE running any (costly)
+                # ensemble repeat, so a requeue mid-trial resumes these exact
+                # hparams and reuses already-finished repeats. Only meaningful for
+                # the multi-repeat ensemble dataset (single-eval datasets rewrite
+                # the trial dir wholesale and cannot resume mid-trial).
+                if ensemble_spec is not None and not resume_pending:
+                    os.makedirs(trial_dir, exist_ok=True)
+                    _atomic_write_text(pending_path, json.dumps(
+                        {"trial": trial_num, "phase": phase,
+                         "x_norm": x_new.detach().cpu().tolist()}, indent=2))
 
                 res = evaluate_hparams(
                     hparams, landscape, trial_dir, trial_num,
@@ -2995,6 +3115,8 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                         repeats=res.get("repeats"),
                         failed=True,
                     )
+                    if os.path.exists(pending_path):
+                        os.remove(pending_path)  # trial finalised; not resumable
                     save_running_summary(X_obs, Y_obs, run_dir,
                                          n_seed=n_seed, n_sobol=n_sobol)
                     if consec_hardfail >= MAX_CONSEC_FAIL:
@@ -3037,6 +3159,8 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                     trial_dir,
                     dim=landscape.dim,
                 )
+                if os.path.exists(pending_path):
+                    os.remove(pending_path)  # trial finalised; not resumable
                 consec_fail = 0
                 consec_hardfail = 0
 
