@@ -279,13 +279,34 @@ N_MOBO_SAMPLES   = 512
 
 # Shared-history seeding (--share-history): when enabled, each MOBO run repeatedly
 # ingests (X,Y) trials from OTHER runs whose run_config matches its own, so several
-# concurrent jobs (possibly different users) pool their progress into one GP. These
-# are the runs directories scanned by default — keep both so the feature is
-# symmetric whether the job runs from Brianna's or Evelyn's checkout.
-SHARED_RUNS_DIRS_DEFAULT = [
+# concurrent jobs (possibly different users) pool their progress into one GP.
+#
+# Toggle: when True, ALSO pull from the other collaborator's runs directory so the
+# two checkouts pool progress; when False (default), only the current user's own
+# local history is scanned. The toggle is symmetric — whoever sets it False scans
+# only their own dir, regardless of which checkout the job runs from.
+SHARE_COLLABORATOR_HISTORY = False
+
+# Known collaborator runs directories (one per user). The current user's own dir
+# is detected by matching $HOME and is always scanned; the other is added only
+# when SHARE_COLLABORATOR_HISTORY is True.
+_COLLABORATOR_RUNS_DIRS = [
     "/home/adewinmb/ZoMBI-Hop/optimize/runs",
     "/home/eve_lal/ZoMBI-Hop/optimize/runs",
 ]
+
+
+def _default_shared_runs_dirs() -> list[str]:
+    """Own runs dir first, then collaborators' iff SHARE_COLLABORATOR_HISTORY."""
+    home = os.path.expanduser("~").rstrip("/") + "/"
+    own = [d for d in _COLLABORATOR_RUNS_DIRS if d.startswith(home)]
+    others = [d for d in _COLLABORATOR_RUNS_DIRS if d not in own]
+    if not own:  # running from an unrecognized checkout — fall back to the first dir
+        own, others = _COLLABORATOR_RUNS_DIRS[:1], _COLLABORATOR_RUNS_DIRS[1:]
+    return own + (others if SHARE_COLLABORATOR_HISTORY else [])
+
+
+SHARED_RUNS_DIRS_DEFAULT = _default_shared_runs_dirs()
 # Set by main() from --share-history; None disables sharing.
 SHARE_HISTORY_DIRS: list[str] | None = None
 
