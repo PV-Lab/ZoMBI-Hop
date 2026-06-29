@@ -2107,10 +2107,12 @@ def write_trial_json(path: str, trial_num: int, phase: str,
                      ackley_seed: int | None = None,
                      ensemble_config: dict | None = None,
                      ensemble_configs: list[dict] | None = None,
-                     repeats: list[dict] | None = None) -> None:
+                     repeats: list[dict] | None = None,
+                     failed: bool = False) -> None:
     obj = {
         "trial": trial_num,
         "phase": phase,
+        "failed": failed,
         "metrics": {
             "dist_to_needles":     round(metrics["dist"], 6),
             "dup_fraction":        round(metrics["dup"], 6),
@@ -2711,6 +2713,24 @@ def save_running_summary(X_obs, Y_obs, run_dir: str, n_seed: int = 0,
     print(f"  [summary] {len(Y_obs)} trials recorded", flush=True)
 
 
+def _failure_penalty_Y(prior_Y: list[torch.Tensor]) -> torch.Tensor:
+    """Dominated objective vector for a hard-failed trial (0 ZoMBI iterations).
+
+    The MOBO objective is Y = (-dist, -dup, -avg_time_per_iter), maximised. A
+    failed trial's *raw* sentinels (dist=UNMATCHED_PENALTY, dup=0, time=0) look
+    GOOD on the duplicate- and time-objectives — ``-0`` is the best attainable on
+    both — so feeding them to the GP would actively reward instant crashes. This
+    instead emits a vector that is the worst attainable on every objective: worst
+    distance, full duplication, and a per-iter time at least as large as the
+    slowest real trial seen so far. The point is therefore Pareto-dominated by any
+    genuine measurement, so the GP learns the hyperparameter region is bad and
+    qLogNEHVI is nudged away from it — without the sentinel ever poisoning the
+    time objective or appearing on the Pareto front.
+    """
+    times = [float(-y[2].item()) for y in prior_Y] if prior_Y else []
+    time_pen = max(times) if times else 1.0
+    return torch.tensor([-UNMATCHED_PENALTY, -1.0, -time_pen], dtype=DTYPE, device="cpu")
+
 
 # ─── MOBO loop (unbounded, resumable) ───────────────────────────────────────────
 
@@ -2805,6 +2825,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
     print(f"{'='*70}")
 
     consec_fail = 0
+    consec_hardfail = 0
     aborted = False
     try:
         while max_trials is None or len(Y_obs) < max_trials:
@@ -2850,16 +2871,52 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                 # crashed before the first iteration; the crash is swallowed in
                 # run_single_trial) carries only failure sentinels — the
                 # unmatched-needle penalty distance and avg_time_per_iter=0.0,
-                # not a real measurement. Feeding that to the GP would reward
-                # instant crashes on the minimised-time objective and poison the
-                # surrogate, so treat it as a hard failure: raise before the
-                # X_obs/Y_obs append so it never enters the optimization (the
-                # handler below logs it and retries).
+                # not a real measurement. Its *raw* sentinels look GOOD on the
+                # duplicate- and time-objectives (-0 is the best attainable), so
+                # feeding them verbatim would reward instant crashes. Instead
+                # record a DOMINATED penalty sentinel (worst on every objective):
+                # the GP learns to avoid this region so BO proposes something new
+                # next trial, rather than re-proposing the identical failing point
+                # until MAX_CONSEC_FAIL aborts the whole run. A separate
+                # consecutive-hard-failure counter still aborts if every proposal
+                # in a row hard-fails (a genuinely broken config/landscape).
                 if res["n_iters"] <= 0 or res["avg_time_per_iter"] <= 0:
-                    raise RuntimeError(
-                        "trial completed 0 ZoMBI iterations "
-                        "(avg_time_per_iter=0); excluded from MOBO so its "
-                        "failure sentinels never enter the GP")
+                    consec_hardfail += 1
+                    consec_fail = 0
+                    y_pen = _failure_penalty_Y(Y_prior + Y_obs)
+                    X_obs.append(x_new.detach().cpu())
+                    Y_obs.append(y_pen)
+                    msg = (f"trial completed 0 ZoMBI iterations "
+                           f"(n_iters={res['n_iters']}, "
+                           f"avg_time_per_iter={res['avg_time_per_iter']}); "
+                           f"recorded dominated penalty sentinel "
+                           f"Y={[round(v, 4) for v in y_pen.tolist()]} to steer "
+                           f"BO away from these hyperparameters")
+                    print(f"    [trial {trial_num}] HARD FAIL: {msg} "
+                          f"({consec_hardfail}/{MAX_CONSEC_FAIL} consecutive)")
+                    _log_error(run_dir, trial_num, RuntimeError(msg))
+                    write_trial_json(
+                        os.path.join(trial_dir, "trial.json"),
+                        trial_num, phase,
+                        {"dist": res["dist"], "dup": res["dup"],
+                         "avg_time_per_iter": res["avg_time_per_iter"],
+                         "runtime": res["runtime"], "n_iters": res["n_iters"]},
+                        hparams,
+                        ackley_seed=res.get("ackley_seed"),
+                        ensemble_config=res.get("ensemble_config"),
+                        ensemble_configs=res.get("ensemble_configs"),
+                        repeats=res.get("repeats"),
+                        failed=True,
+                    )
+                    save_running_summary(X_obs, Y_obs, run_dir,
+                                         n_seed=n_seed, n_sobol=n_sobol)
+                    if consec_hardfail >= MAX_CONSEC_FAIL:
+                        print(f"\n[!] {MAX_CONSEC_FAIL} consecutive hard failures "
+                              f"— aborting (see errors.log). Fix the issue and "
+                              f"rerun with --resume.")
+                        aborted = True
+                        break
+                    continue
                 try:
                     plot_hparam_edge_proximity(
                         os.path.join(trial_dir, "hparam_edge_proximity.png"), x_new)
@@ -2891,6 +2948,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                     dim=landscape.dim,
                 )
                 consec_fail = 0
+                consec_hardfail = 0
 
             except KeyboardInterrupt:
                 raise

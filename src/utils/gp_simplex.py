@@ -610,7 +610,20 @@ class GPSimplex:
         if len(current_unpenalized_indices) == 0:
             return None  # No valid candidates found
 
-        if len(current_unpenalized_indices) < 0.1 * self.num_restarts:
+        # Quality gate: bail when too few unpenalized candidates remain relative
+        # to num_restarts — i.e. needles have penalized most of the explorable
+        # area. Only apply it when enough points were actually sampled to make it
+        # satisfiable. With a small raw_samples relative to num_restarts (e.g.
+        # raw=1, n_restarts=124) only raw_samples*(max_attempts+1) points are ever
+        # drawn, so this floor can never be reached even when nothing is
+        # penalized; applying it then would spuriously return None on the first
+        # iteration and abort the whole run with zero ZoMBI iterations. In that
+        # sampling-limited regime we fall through to the `== 0` guard above and
+        # proceed with however many unpenalized restarts we have (>= 1). The
+        # normal large-raw regime behaves exactly as before.
+        floor = 0.1 * self.num_restarts
+        total_sampled = current_candidates.shape[0]
+        if total_sampled >= floor and len(current_unpenalized_indices) < floor:
             return None  # Not enough unpenalized area
 
         num_restarts_to_use = min(self.num_restarts, len(current_unpenalized_indices))
