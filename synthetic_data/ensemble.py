@@ -349,7 +349,7 @@ def _point_segment_dist(X: np.ndarray, p: np.ndarray, q: np.ndarray) -> np.ndarr
     p = np.asarray(p, dtype=float).reshape(1, -1)
     q = np.asarray(q, dtype=float).reshape(1, -1)
     pq = q - p
-    l2 = float(pq @ pq.T)
+    l2 = float(np.dot(pq.ravel(), pq.ravel()))
     if l2 < 1e-18:
         return np.linalg.norm(X - p, axis=1)
     t = np.clip(((X - p) @ pq.T).ravel() / l2, 0.0, 1.0)
