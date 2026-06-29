@@ -99,9 +99,10 @@ def build_app():
         html.Div([
             html.Label("True Optima", style={"fontWeight": "bold"}),
             _slider("Number of Optima", "n-optima", 1, 150, 1, 4, 25, str),
-            _slider("Basin Width (b)", "basin-width", 5, 200, 1, 65, 35, str),
+            _slider("Basin Width (b)", "basin-width", 2.2, 15, 0.1, 5, 2.56,
+                    lambda v: f"{v:.1f}"),
             _slider("Optima Margin (normalized gap above background)",
-                    "optima-margin", 0.0, 0.5, 0.01, 0.1, 0.1,
+                    "optima-margin", 0.0, 0.5, 0.01, 0.2, 0.1,
                     lambda v: f"{v:.2f}"),
             html.Div([
                 html.Label("Placement / Clustering"),

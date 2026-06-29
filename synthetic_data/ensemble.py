@@ -162,23 +162,17 @@ def optima_count_range(dim: int) -> tuple[int, int]:
     return (5 * dim, 15 * dim)
 
 
-BASIN_WIDTH_RANGES: dict[int, tuple[float, float]] = {
-    3: (2.2, 90.0),
-    4: (2.2, 50.0),
-    10: (2.2, 20.0),
-}
+# Range of basin sharpness ``b`` to draw, fixed for every simplex dimension.
+BASIN_WIDTH_RANGE: tuple[float, float] = (2.2, 15.0)
 
 
 def basin_width_range(dim: int) -> tuple[float, float]:
-    """``(lo, hi)`` range of basin sharpness ``b`` to draw at simplex ``dim``.
+    """``(lo, hi)`` range of basin sharpness ``b`` to draw.
 
-    Uses the hardcoded :data:`BASIN_WIDTH_RANGES` table for the benchmarked
-    dimensions (3/4/10); other dimensions fall back to ``(sqrt(dim/2), 90.0)`` —
-    the "widest basin that still localizes" floor up to a sharp basin.
+    Fixed at :data:`BASIN_WIDTH_RANGE` for all dimensions: a broad basin floor
+    (``2.2``) up to a moderately sharp basin (``15``).
     """
-    if dim in BASIN_WIDTH_RANGES:
-        return BASIN_WIDTH_RANGES[dim]
-    return (round(float(np.sqrt(dim / 2.0)), 1), 90.0)
+    return BASIN_WIDTH_RANGE
 
 
 def _sobol_point(d: int, index: int, seed: int) -> np.ndarray:
@@ -432,7 +426,7 @@ class Ensemble:
         # true optima
         n_optima: int = 4,
         basin_width: float = 65.0,
-        optima_margin: float = 0.1,
+        optima_margin: float = 0.2,
         # optima placement / clustering
         optima_layout: str = "scatter",
         n_optima_clusters: int = 3,
