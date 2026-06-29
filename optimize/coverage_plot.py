@@ -412,24 +412,40 @@ def _prepare_coverage(trial_dir: str) -> dict:
     comp_cols = _detect_comp_cols(df, dim)
     map_comp = comp_to_xy if dim == 3 else comp_to_xyz
 
-    # "RF" and "newRF" (and the generic "rf" landscape) are RF surrogates built
-    # from a campaign CSV/.db; everything else is a synthetic Ackley landscape.
-    is_rf = dataset in ("RF", "newRF") or cfg.get("landscape") == "rf"
-    if is_rf:
-        if dim != 3:
-            raise ValueError(f"RF surrogate ground truth is only available for dim=3 "
-                             f"(got dim={dim})")
-        try:
-            csv_path = resolve_surrogate_csv_path(cfg.get("csv_path"))
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(str(exc)) from exc
-        grid_pts, grid_vals = _build_rf_ground_truth(csv_path)
-    else:
-        variant = cfg.get("ackley_variant", "realistic")
-        grid_pts, grid_vals = _build_ackley_ground_truth(variant, dim)
-
-    true_optima = cfg.get("true_optima", [])
     maximize = cfg.get("maximize", True)
+
+    # Prefer the per-trial ground truth written by run_mobo. Reseeded landscapes
+    # (realistic Ackley, ensemble) re-randomize the optima/grid every trial, so
+    # the run-level run_config.json only holds the initial draw. Rebuilding from
+    # the config there would plant "True maxima" stars (and a background) from a
+    # different landscape than the one this trial actually ran on.
+    gt_path = os.path.join(trial_dir, "coverage_ground_truth.npz")
+    grid_pts = grid_vals = None
+    true_optima: list = []
+    if os.path.isfile(gt_path):
+        with np.load(gt_path) as gt:
+            grid_pts = gt["grid_pts"]
+            grid_vals = gt["grid_vals"]
+            true_optima = [row for row in gt["true_optima"]]
+
+    if grid_pts is None:
+        # No per-trial truth (older runs): rebuild from the config. "RF"/"newRF"
+        # (and the generic "rf" landscape) are RF surrogates built from a campaign
+        # CSV/.db; everything else is a synthetic Ackley landscape.
+        is_rf = dataset in ("RF", "newRF") or cfg.get("landscape") == "rf"
+        if is_rf:
+            if dim != 3:
+                raise ValueError(f"RF surrogate ground truth is only available for dim=3 "
+                                 f"(got dim={dim})")
+            try:
+                csv_path = resolve_surrogate_csv_path(cfg.get("csv_path"))
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(str(exc)) from exc
+            grid_pts, grid_vals = _build_rf_ground_truth(csv_path)
+        else:
+            variant = cfg.get("ackley_variant", "realistic")
+            grid_pts, grid_vals = _build_ackley_ground_truth(variant, dim)
+        true_optima = cfg.get("true_optima", [])
 
     comps = df[comp_cols].values.astype(float)
     y_vals = df["Y"].values.astype(float)

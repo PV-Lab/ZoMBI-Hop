@@ -2403,6 +2403,23 @@ def run_single_trial(
         with open(os.path.join(trial_dir, "ensemble_config.json"), "w") as f:
             json.dump(ensemble_config, f, indent=2)
 
+    # Persist this trial's *actual* ground truth (post-reseed optima + ternary
+    # grid) so the coverage plot draws the landscape THIS trial ran on. Reseeded
+    # landscapes (realistic Ackley, ensemble) differ per trial, so the run-level
+    # run_config.json carries only the initial draw — coverage_plot must read the
+    # per-trial truth from here instead, or its "True maxima" stars and background
+    # belong to a different landscape entirely.
+    if dim == 3 and grid_pts is not None and grid_vals is not None:
+        try:
+            np.savez(
+                os.path.join(trial_dir, "coverage_ground_truth.npz"),
+                grid_pts=np.asarray(grid_pts, dtype=float),
+                grid_vals=np.asarray(grid_vals, dtype=float),
+                true_optima=np.asarray(true_optima, dtype=float),
+            )
+        except Exception as exc:
+            print(f"    [trial] coverage ground-truth write failed: {exc}")
+
     plot_state: dict = {"line_0": None, "line_1": None}
     payloads: list[dict] = []
     snap_records: list[tuple] = []
