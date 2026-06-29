@@ -3,10 +3,18 @@
 # slurm/run_mobo_manual.sbatch — one-off MOBO job (edit flags, then sbatch)
 # =============================================================================
 #
+# For ensemble 3d/4d with auto-requeue chains, use instead:
+#   sbatch slurm/run_mobo_manual_ensemble_3d.sbatch
+#   sbatch slurm/run_mobo_manual_ensemble_4d.sbatch
+#
 # Submit from repo root on ORCD / Engaging:
 #
 #   cd ~/ZoMBI-Hop
 #   sbatch slurm/run_mobo_manual.sbatch
+#
+# Ensemble MOBO with auto-requeue chain (wall-time + clean-exit resubmit):
+#   sbatch slurm/run_mobo_manual_ensemble_3d.sbatch
+#   sbatch slurm/run_mobo_manual_ensemble_4d.sbatch
 #
 # This file is a template: edit the #SBATCH headers and the single MOBO_CMD
 # block below, exactly like typing ``python optimize/run_mobo.py ...`` locally.
@@ -55,28 +63,47 @@
 #     #SBATCH --time=12:00:00
 #     MOBO: --device cpu
 #
-#   GPU (cuda ZoMBI trials):
-#     #SBATCH --partition=mit_normal_gpu
+#   GPU ensemble 3d (matches optimize/scripts/ensemble_mobo_3d.sbatch):
+#     #SBATCH --job-name=ensemble_mobo_3d
+#     #SBATCH --output=optimize/scripts/logs/ensemble_mobo_3d_%j.out
+#     #SBATCH --error=optimize/scripts/logs/ensemble_mobo_3d_%j.err
+#     #SBATCH --time=12:00:00
+#     #SBATCH --ntasks=1
+#     #SBATCH --cpus-per-task=1
+#     #SBATCH --mem=32G
+#     #SBATCH --partition=sched_mit_sloan_gpu_r8
 #     #SBATCH --gres=gpu:1
-#     #SBATCH --cpus-per-task=16
-#     #SBATCH --mem=64G
-#     #SBATCH --time=6:00:00
-#     MOBO: --device cuda
+#     MOBO: --dataset ensemble --dim 3 --time-limit 0.2 --share-history
+#           --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112
 #
-# How to switch modes: replace the MOBO_CMD block with one of the examples
-# in the comment section below (copy/paste into MOBO_CMD, do not uncomment
-# a second MOBO_CMD= assignment — only one active block).
+#   GPU ensemble 4d (matches optimize/scripts/ensemble_mobo_4d.sbatch):
+#     #SBATCH --job-name=ensemble_mobo_4d
+#     #SBATCH --output=optimize/scripts/logs/ensemble_mobo_4d_%j.out
+#     #SBATCH --error=optimize/scripts/logs/ensemble_mobo_4d_%j.err
+#     #SBATCH --time=12:00:00
+#     #SBATCH --ntasks=1
+#     #SBATCH --cpus-per-task=1
+#     #SBATCH --mem=64G
+#     #SBATCH --partition=sched_mit_sloan_gpu_r8
+#     #SBATCH --gres=gpu:1
+#     MOBO: --dataset ensemble --dim 4 --time-limit 0.3 --share-history
+#           --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112
+#
+# How to switch modes: replace the #SBATCH headers and MOBO_CMD block with one
+# of the examples below (only one active MOBO_CMD= assignment in this file).
 #
 # =============================================================================
+# ACTIVE #SBATCH — ensemble 3d (swap for the 4d block in the cheat sheet above)
+# =============================================================================
 
-#SBATCH --job-name=zombi-mobo
+#SBATCH --job-name=ensemble_mobo_3d
+#SBATCH --output=optimize/scripts/logs/ensemble_mobo_3d_%j.out
+#SBATCH --error=optimize/scripts/logs/ensemble_mobo_3d_%j.err
+#SBATCH --time=6:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=128GB
 #SBATCH --partition=mit_normal_gpu
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
-#SBATCH --time=6:00:00
-#SBATCH --output=logs/mobo-%j.out
-#SBATCH --error=logs/mobo-%j.err
 
 set -euo pipefail
 
@@ -147,19 +174,41 @@ _mobo_setup_env
 #   --start-from-best optimize/runs/mobo_05_06_15_32/trial_315
 # )
 #
+# --- Ensemble 3d (matches optimize/scripts/ensemble_mobo_3d.sbatch) ------------
+# MOBO_CMD=(
+#   python optimize/run_mobo.py
+#   --no-show
+#   --dataset ensemble
+#   --dim 3
+#   --time-limit 0.2
+#   --share-history
+#   --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112
+# )
+#
+# --- Ensemble 4d (matches optimize/scripts/ensemble_mobo_4d.sbatch) ------------
+# MOBO_CMD=(
+#   python optimize/run_mobo.py
+#   --no-show
+#   --dataset ensemble
+#   --dim 4
+#   --time-limit 0.3
+#   --share-history
+#   --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112
+# )
+#
 # =============================================================================
 # ACTIVE COMMAND — edit this block only (one MOBO_CMD= assignment in this file)
 # =============================================================================
 
-  MOBO_CMD=(
-    python optimize/run_mobo.py
-    --no-show
-    --device cuda
-    --dataset ackley4d
-    --resume-dim
-    --time-limit 0.1
-  )
-
+MOBO_CMD=(
+  python optimize/run_mobo.py
+  --no-show
+  --dataset ensemble
+  --dim 3
+  --time-limit 0.2
+  --share-history
+  --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112
+)
 # =============================================================================
 
 echo "=== MOBO command ==="
