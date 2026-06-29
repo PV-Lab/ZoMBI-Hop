@@ -36,16 +36,25 @@ Usage
   python visualization/input_noise.py --db data/2nd_real_run.db --per-line
   python visualization/input_noise.py --run runs/run_7eb9
   python visualization/input_noise.py --db data/2nd_real_run.db --plot noise.png
+  python visualization/input_noise.py --ternary
+  python visualization/input_noise.py --run runs/run_7eb9 --ternary
+  python visualization/input_noise.py --db data/2nd_real_run.db --ternary --input-noise 0.05
 
 Flags
 -----
-  --db PATH       Data file (.db results table or .csv campaign) to analyse.
-  --run PATH      Run directory (or bare run name under runs/) to analyse.
-  --snapshot N    Snapshot to reconstruct up to for --run (default: latest.txt).
-  --force-legacy  Ignore any logged sent compositions and always reconstruct
-                  them from the per-line endpoints (useful for sanity checks).
-  --per-line      Also print the mean noise of each individual line.
-  --plot PATH     Save a histogram of per-sample noise magnitudes to PATH.
+  --db PATH        Data file (.db results table or .csv campaign) to analyse.
+  --run PATH       Run directory (or bare run name under runs/) to analyse.
+  --snapshot N     Snapshot to reconstruct up to for --run (default: latest.txt).
+  --force-legacy   Ignore any logged sent compositions and always reconstruct
+                   them from the per-line endpoints (useful for sanity checks).
+  --per-line       Also print the mean noise of each individual line.
+  --plot PATH      Save a histogram of per-sample noise magnitudes to PATH.
+  --ternary        Show an interactive ternary plot of the compositions with the
+                   GP minimum lengthscale drawn as a reference circle. If no
+                   data source is given, random demo points are generated.
+  --input-noise V  Override the input noise / GP min lengthscale shown on the
+                   ternary (composition L2 units; default: 0.064 or read from
+                   run config.json).
 """
 from __future__ import annotations
 
@@ -68,6 +77,8 @@ from visualization.plot_run import (  # noqa: E402
     _resolve_db_path,
     _resolve_run_dir,
 )
+
+_DEFAULT_INPUT_NOISE = 0.064  # composition L2; DataHandler default
 
 # Column-name patterns tried, per component, when looking for an explicitly
 # logged "sent" composition in a data file (correct-logging case).
@@ -295,13 +306,176 @@ def _save_histogram(mag: np.ndarray, out: Path, mean: float) -> None:
     print(f"\nSaved histogram -> {out}")
 
 
+# ── ternary plot with lengthscale reference ────────────────────────────────────
+
+_SQRT3_2 = np.sqrt(3) / 2
+
+def _random_simplex_points(n: int = 100, seed: int = 42) -> np.ndarray:
+    """Sample n uniform points from the 3-simplex (Dirichlet(1,1,1))."""
+    rng = np.random.default_rng(seed)
+    raw = rng.exponential(1.0, size=(n, 3))
+    return raw / raw.sum(axis=1, keepdims=True)
+
+
+def _read_run_input_noise(run_dir: Path) -> float | None:
+    """Try to read input_noise from a run's config.json; return None if absent."""
+    import json
+    cfg_path = run_dir / "config.json"
+    if not cfg_path.exists():
+        return None
+    try:
+        cfg = json.loads(cfg_path.read_text())
+        v = cfg.get("input_noise")
+        if v is not None:
+            return float(v)
+        v_ilr = cfg.get("input_noise_ilr")
+        if v_ilr is not None:
+            return float(v_ilr) / 3.0
+    except Exception:
+        pass
+    return None
+
+
+def _comp_to_xy(comp: np.ndarray) -> np.ndarray:
+    """(N, 3) simplex compositions → (N, 2) Cartesian ternary coords.
+
+    Corner map: comp[:,0]→(0,0) bottom-left, comp[:,1]→(1,0) bottom-right,
+    comp[:,2]→(0.5, √3/2) top.
+    """
+    p = np.asarray(comp, dtype=float)
+    if p.ndim == 1:
+        p = p.reshape(1, -1)
+    s = p.sum(axis=-1, keepdims=True)
+    p = p / np.where(s == 0, 1.0, s)
+    return np.column_stack([p[:, 1] + 0.5 * p[:, 2], _SQRT3_2 * p[:, 2]])
+
+
+def show_ternary_lengthscale(
+    lines: list["Line"],
+    input_noise: float,
+    source: str,
+    labels: tuple[str, str, str] = ("FAPbI3", "MAPbI3", "MAPbBr3"),
+    ensemble_seed: int = 0,
+    grid_n: int = 100,
+) -> None:
+    """Show an interactive ternary plot with a GP lengthscale reference circle.
+
+    The background is a random ``Ensemble`` landscape (dim=3) so there are
+    real features to compare the lengthscale against.  Real data points from
+    ``lines`` are overlaid; if ``lines`` is empty, 80 random simplex points
+    are scattered instead.
+
+    The circle radius equals ``input_noise / sqrt(2)`` in 2D Cartesian ternary
+    coordinates, which corresponds to a ball of radius ``input_noise`` in
+    3D composition L2 space (the ternary map is an isometry scaled by sqrt(2)).
+    """
+    import matplotlib
+    try:
+        matplotlib.use("TkAgg")
+    except Exception:
+        pass
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+    from matplotlib.cm import ScalarMappable
+
+    from synthetic_data.ensemble import Ensemble, random_ensemble_config
+    from visualization.plot_run import ternary_grid
+
+    # ── ensemble background ─────────────────────────────────────────────────
+    cfg = random_ensemble_config(dim=3, index=0, seed=ensemble_seed)
+    fn = Ensemble(**cfg)
+
+    grid_pts = ternary_grid(grid_n)
+    grid_vals = fn.predict(grid_pts)
+    grid_xy = _comp_to_xy(grid_pts)
+
+    # ── overlay points ──────────────────────────────────────────────────────
+    real_parts = [ln.real for ln in lines if ln.real.shape[0] > 0]
+    if real_parts:
+        pts = np.concatenate(real_parts, axis=0)
+        demo = False
+    else:
+        pts = _random_simplex_points(80, seed=ensemble_seed + 1)
+        demo = True
+    pt_vals = fn.predict(pts)
+    pts_xy = _comp_to_xy(pts)
+
+    # ── figure ──────────────────────────────────────────────────────────────
+    vmin, vmax = float(grid_vals.min()), float(grid_vals.max())
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    cmap = plt.cm.viridis
+
+    fig, ax = plt.subplots(figsize=(8.4, 7.6))
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    # Background heatmap
+    ax.scatter(grid_xy[:, 0], grid_xy[:, 1], c=grid_vals, cmap=cmap,
+               norm=norm, s=6, alpha=0.85, zorder=1, linewidths=0, rasterized=True)
+
+    # Triangle outline
+    ax.plot([0, 1, 0.5, 0], [0, 0, _SQRT3_2, 0], color="black", lw=1.5, zorder=2)
+
+    # Corner labels
+    pad = 0.06
+    ax.text(-pad, -pad * 0.5, labels[0], ha="right", va="top", fontsize=11)
+    ax.text(1 + pad, -pad * 0.5, labels[1], ha="left", va="top", fontsize=11)
+    ax.text(0.5, _SQRT3_2 + pad, labels[2], ha="center", va="bottom", fontsize=11)
+
+    # Data points
+    pt_label = f"{'[demo] random' if demo else source} ({pts.shape[0]} pts)"
+    ax.scatter(pts_xy[:, 0], pts_xy[:, 1], c=pt_vals, cmap=cmap, norm=norm,
+               s=40, alpha=0.95, edgecolors="black", linewidths=0.8, zorder=3,
+               label=pt_label)
+
+    # Colorbar
+    sm = ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    fig.colorbar(sm, ax=ax, label="Ensemble objective", fraction=0.035, pad=0.02)
+
+    # ── GP min lengthscale reference circle ─────────────────────────────────
+    # In composition L2:  ||Δcomp|| = sqrt(2) * ||Δxy||_Cartesian
+    # so a ball of radius input_noise in composition space → radius / sqrt(2) in Cartesian.
+    r_cart = input_noise / np.sqrt(2)
+
+    # Place near the lower-left interior so it doesn't clip the triangle edge.
+    cx, cy = 0.18, _SQRT3_2 * 0.28
+
+    circle = plt.Circle((cx, cy), r_cart, fill=False, color="crimson",
+                         linewidth=2.2, linestyle="-", zorder=5)
+    ax.add_patch(circle)
+
+    ax.annotate(
+        "",
+        xy=(cx - r_cart, cy), xytext=(cx + r_cart, cy),
+        arrowprops=dict(arrowstyle="<->", color="crimson", lw=1.5),
+        zorder=6,
+    )
+    ax.text(
+        cx, cy - r_cart - 0.025,
+        f"GP min ℓ = {input_noise:.4f}  (comp. L₂)\n"
+        f"Cartesian r = {r_cart:.4f}",
+        ha="center", va="top", fontsize=8.5, color="crimson", zorder=6,
+    )
+
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.85)
+    ax.set_title(
+        f"Ensemble landscape (seed={ensemble_seed}) + GP min lengthscale\n{source}",
+        fontsize=11, pad=10,
+    )
+    ax.set_xlim(-0.22, 1.22)
+    ax.set_ylim(-0.22, _SQRT3_2 + 0.22)
+    fig.tight_layout()
+    plt.show()
+
+
 # ── main ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Average input noise (sent vs. real composition) of a ZoMBI-Hop run."
     )
-    src = parser.add_mutually_exclusive_group(required=True)
+    src = parser.add_mutually_exclusive_group(required=False)
     src.add_argument("--db", help="Data file (.db results table or .csv campaign).")
     src.add_argument("--run", help="Run directory or bare run name under runs/.")
     parser.add_argument("--snapshot", default=None,
@@ -312,22 +486,60 @@ def main() -> None:
                         help="Also print each line's mean noise.")
     parser.add_argument("--plot", default=None,
                         help="Save a histogram of per-sample noise to this PNG path.")
+    parser.add_argument("--ternary", action="store_true",
+                        help="Show an interactive ternary plot with an Ensemble "
+                             "landscape background and the GP minimum lengthscale "
+                             "drawn as a reference circle. If no data source is "
+                             "given, random demo points are generated.")
+    parser.add_argument("--input-noise", type=float, default=None, dest="input_noise",
+                        help="Override the input noise / GP min lengthscale shown on "
+                             "the ternary (composition L2; default: read from run "
+                             f"config.json or {_DEFAULT_INPUT_NOISE}).")
+    parser.add_argument("--ensemble-seed", type=int, default=0, dest="ensemble_seed",
+                        help="Seed for the random Ensemble landscape background "
+                             "(default: 0; try different values to change the landscape).")
+    parser.add_argument("--grid-n", type=int, default=100, dest="grid_n",
+                        help="Ternary grid resolution for the Ensemble background "
+                             "(default: 100).")
     args = parser.parse_args()
+
+    # Require a data source unless --ternary is used in demo mode.
+    if not args.db and not args.run and not args.ternary:
+        parser.error("one of --db or --run is required (or use --ternary alone for a demo)")
+
+    lines: list[Line] = []
+    correct: bool = False
+    source: str = "demo"
+    run_dir: Path | None = None
 
     if args.db:
         db_path = _resolve_db_path(args.db)
         lines, correct = load_db_lines(db_path, args.force_legacy)
         source = db_path.name
-    else:
+    elif args.run:
         run_dir = _resolve_run_dir(args.run)
         lines, correct = load_run_lines(run_dir, args.snapshot, args.force_legacy)
         source = run_dir.name
 
-    stats = compute_noise(lines)
-    _print_report(stats, correct, source, args.per_line)
+    if lines:
+        stats = compute_noise(lines)
+        _print_report(stats, correct, source, args.per_line)
 
-    if args.plot:
-        _save_histogram(stats["magnitudes"], Path(args.plot), stats["mean_magnitude"])
+        if args.plot:
+            _save_histogram(stats["magnitudes"], Path(args.plot), stats["mean_magnitude"])
+
+    if args.ternary:
+        # Resolve GP min lengthscale: CLI override → run config.json → default.
+        ls_val = args.input_noise
+        if ls_val is None and run_dir is not None:
+            ls_val = _read_run_input_noise(run_dir)
+        if ls_val is None:
+            ls_val = _DEFAULT_INPUT_NOISE
+        show_ternary_lengthscale(
+            lines, ls_val, source,
+            ensemble_seed=args.ensemble_seed,
+            grid_n=args.grid_n,
+        )
 
 
 if __name__ == "__main__":
