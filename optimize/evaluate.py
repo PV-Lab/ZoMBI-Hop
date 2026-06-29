@@ -160,6 +160,7 @@ import random
 import re
 import sys
 import time
+import traceback
 
 import numpy as np
 import torch
@@ -746,7 +747,7 @@ def gen_init_data(fn_callable, maximize: bool, dim: int):
         pts_np = pts_t.detach().cpu().numpy()
         raw = np.array([fn_callable(x) for x in pts_np], dtype=float)
         y_t = torch.tensor(raw if maximize else -raw, dtype=rm.DTYPE, device=rm.DEVICE)
-        y_t = y_t + torch.randn_like(y_t) * rm.NOISE_LEVEL
+        y_t = y_t + torch.randn_like(y_t) * (rm.OUTPUT_NOISE_FRAC * y_t.abs())
         pts_out = pts_t.to(dtype=rm.DTYPE, device=rm.DEVICE)
         x_a_list.append(pts_out)
         x_e_list.append(pts_out)
@@ -1044,6 +1045,7 @@ def run_single_eval(
         print("\n      [run] interrupted — writing artifacts before exit …")
     except Exception as exc:
         print(f"      [run] ZoMBI crashed: {exc}")
+        traceback.print_exc()
     runtime = time.time() - t0
 
     needle_t = dh.get_all_needle_locations()
