@@ -1794,8 +1794,8 @@ def _needle_penalty_bands(needle_x, M, B, *, n_bands: int = 18, n_ang: int = 160
 def _draw_needle_ellipsoid(ax, needle_x, M, B) -> None:
     """Red star for the needle + red penalty gradient (centre → transparent edge)."""
     xy = comp_to_xy(needle_x.reshape(1, 3))
-    ax.scatter(xy[0, 0], xy[0, 1], marker="*", s=280, c="red",
-               zorder=9, edgecolors="darkred", linewidths=1.0)
+    ax.scatter(xy[0, 0], xy[0, 1], marker="*", s=280, c="red", alpha=0.8,
+               zorder=12, edgecolors="darkred", linewidths=1.0)
     if M is None:
         return
     try:
@@ -1846,7 +1846,7 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
     ref_lbl = "True maxima" if maximize else "True minima"
     if true_optima:
         mxy = comp_to_xy(np.array(true_optima))
-        ax_ref.scatter(mxy[:, 0], mxy[:, 1], marker="*", s=360, c="blue",
+        ax_ref.scatter(mxy[:, 0], mxy[:, 1], marker="*", s=360, c="blue", alpha=0.8,
                        zorder=11, edgecolors="navy", linewidths=1.3, label=ref_lbl)
         ax_ref.legend(loc="upper right", fontsize=8, framealpha=0.9)
 
@@ -1903,7 +1903,7 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
 
     if true_optima:
         mxy = comp_to_xy(np.array(true_optima))
-        h_min = ax_exp.scatter(mxy[:, 0], mxy[:, 1], marker="*", s=360, c="blue",
+        h_min = ax_exp.scatter(mxy[:, 0], mxy[:, 1], marker="*", s=360, c="blue", alpha=0.8,
                                zorder=11, edgecolors="navy", linewidths=1.3, label=ref_lbl)
         legend_handles.append(h_min)
 
