@@ -107,6 +107,12 @@ _SPAN = 0.0 - _BASE  # == ACKLEY_SCALE * ACKLEY_A
 _PEAK = _SPAN        # raw value at a true optimum (one span above neutral 0)
 _RANGE_SAMPLES = 100_000  # simplex samples used to estimate raw min/max for the output map
 
+# Default minimum separation (composition L2) below which two true optima are
+# considered indistinguishable: a basin placed this close to an already-tagged
+# optimum still appears on the landscape but is *not* advertised as a true
+# optimum.  Matches ``DataHandler``'s default input noise.
+_DEFAULT_INPUT_NOISE = 0.064
+
 # Anisotropy: max log-stretch grows as ``log1p(ANISO_RATE * strength)`` so the
 # stretched axes widen by ~4x at strength 10 and ~16x at strength 50.
 ANISO_RATE = 0.3
@@ -199,6 +205,7 @@ def random_ensemble_config(
     *,
     seed: int = 0,
     optima_margin: float = 0.2,
+    input_noise: float = _DEFAULT_INPUT_NOISE,
 ) -> dict:
     """Draw the ``index``-th :class:`Ensemble` configuration from a Sobol' sweep.
 
@@ -208,7 +215,8 @@ def random_ensemble_config(
     configuration space (mirrors the "Randomize" button in
     ``synthetic_data/plot_ensemble.py``).  A disabled feature passes its
     count/amplitude as 0.  ``n_optima`` is drawn from the dimension-specific
-    :func:`optima_count_range`; ``optima_margin`` is held fixed.  Returns a kwargs
+    :func:`optima_count_range`; ``optima_margin`` and ``input_noise`` are held
+    fixed.  Returns a kwargs
     dict accepted directly by ``Ensemble(**config)``, so a saved config exactly
     recreates the landscape.
 
@@ -293,6 +301,8 @@ def random_ensemble_config(
         "edge_reach": round(f_range(0.10, 0.80), 2),
         # signed-feature mix (fraction of instances that subtract mass)
         "neg_frac": round(f_range(0.3, 0.6), 2),
+        # optima paring (held fixed, like optima_margin)
+        "input_noise": float(input_noise),
         # global
         "seed": int(feature_seed),
     }
@@ -416,6 +426,14 @@ class Ensemble:
     neg_frac : float
         Fraction of signed-feature instances that *subtract* mass instead of
         adding it (in ``[0, 1]``; ~0.5 keeps the surface centred).
+    input_noise : float
+        Minimum separation (composition L2) below which two optima are treated
+        as the same peak.  Optima are tagged as *true* optima greedily in
+        placement order: a basin placed within ``input_noise`` of an
+        already-tagged optimum is still drawn on the landscape (its peak is
+        real) but is left **untagged**, so ``centers`` / ``known_maxima`` only
+        ever advertise mutually-separated optima.  ``0`` disables paring (every
+        basin is a true optimum).  Defaults to :data:`_DEFAULT_INPUT_NOISE`.
     seed : single master seed driving every random placement and sign.
     """
 
@@ -457,6 +475,8 @@ class Ensemble:
         edge_reach: float = 0.3,
         # signed-feature mix
         neg_frac: float = 0.5,
+        # optima paring
+        input_noise: float = _DEFAULT_INPUT_NOISE,
         # global
         seed: int = 0,
     ) -> None:
@@ -485,12 +505,17 @@ class Ensemble:
         self.edge_amp = float(np.clip(edge_amp, 0.0, 1.0))
         self.edge_reach = max(1e-4, float(edge_reach))
         self.neg_frac = float(np.clip(neg_frac, 0.0, 1.0))
+        self.input_noise = max(0.0, float(input_noise))
 
         # Per-axis stretch shared by every distance-based feature.
         self.axis_scale = _anisotropy_scale(dim, float(aniso_strength), self.seed + _SEED_ANISO)
 
-        # Random placement of every feature.
-        self.centers = self._sample_optima(int(n_optima))
+        # Random placement of every feature.  ``peak_centers`` holds *every*
+        # placed basin (all of them shape the landscape); ``centers`` is the
+        # subset advertised as true optima after paring out near-duplicates.
+        self.peak_centers = self._sample_optima(int(n_optima))
+        self._true_mask = self._tag_true_optima(self.peak_centers, self.input_noise)
+        self.centers = self.peak_centers[self._true_mask]
         self.weak_centers = self._sample_simplex(int(n_weak), _SEED_WEAK)
         self.plateau_centers = self._sample_simplex(int(n_plateaus), _SEED_PLATEAUS)
         self.ridges = self._sample_ridges(int(n_ridges))
@@ -515,8 +540,8 @@ class Ensemble:
         # centers so the analytic peak anchors the top of the range.
         rng = np.random.default_rng(12345)
         samples = rng.dirichlet(np.ones(dim), size=_RANGE_SAMPLES)
-        if len(self.centers):
-            samples = np.vstack([samples, self.centers])
+        if len(self.peak_centers):
+            samples = np.vstack([samples, self.peak_centers])
         final = self._predict_raw(samples)
         self._raw_min = float(final.min())
         self._raw_max = float(final.max())
@@ -591,6 +616,30 @@ class Ensemble:
             centers[k] = rng.dirichlet(alpha)
         return centers
 
+    def _tag_true_optima(self, centers: np.ndarray, min_dist: float) -> np.ndarray:
+        """Boolean mask over ``centers`` marking which count as *true* optima.
+
+        Walks the basins in placement order and tags one greedily as a true
+        optimum only if it sits at least ``min_dist`` (composition L2) from every
+        already-tagged optimum.  Basins closer than that to an existing optimum
+        stay on the landscape (they are still real peaks) but are left untagged,
+        so the advertised optima are guaranteed mutually >= ``min_dist`` apart.
+        ``min_dist <= 0`` tags every basin.
+        """
+        n = centers.shape[0]
+        if n == 0:
+            return np.zeros(0, dtype=bool)
+        if min_dist <= 0.0:
+            return np.ones(n, dtype=bool)
+        keep = np.zeros(n, dtype=bool)
+        kept: list[np.ndarray] = []
+        for i in range(n):
+            c = centers[i]
+            if all(np.linalg.norm(c - k) >= min_dist for k in kept):
+                keep[i] = True
+                kept.append(c)
+        return keep
+
     def _sample_ridges(self, n: int) -> list[tuple[np.ndarray, np.ndarray]]:
         """``n`` segments of controlled length: a random midpoint plus a random
         tangent direction, endpoints offset by ``ridge_length`` and reprojected
@@ -619,11 +668,11 @@ class Ensemble:
     def _true_field(self, X: np.ndarray) -> np.ndarray:
         """Clean true-optima field: ``_PEAK`` at each optimum, ``_BASE`` far away."""
         X = np.atleast_2d(np.asarray(X, dtype=float))
-        if not len(self.centers):
+        if not len(self.peak_centers):
             return np.full(X.shape[0], _BASE)
         env = np.stack(
             [_negated_ackley_env01(X, c, self.basin_width, self.axis_scale)
-             for c in self.centers],
+             for c in self.peak_centers],
             axis=0,
         ).max(axis=0)
         return _BASE + (_PEAK - _BASE) * env
@@ -746,7 +795,8 @@ class Ensemble:
         return [(c.copy(), float(self.predict(c.reshape(1, -1))[0])) for c in self.centers]
 
     def __repr__(self) -> str:  # pragma: no cover
-        return (f"Ensemble(dim={self.dim}, n_optima={len(self.centers)}, "
+        return (f"Ensemble(dim={self.dim}, n_optima={len(self.centers)}"
+                f"/{len(self.peak_centers)} true/peaks, "
                 f"layout={self.optima_layout!r}, n_weak={len(self.weak_centers)}, "
                 f"n_ridges={len(self.ridges)}, n_plateaus={len(self.plateau_centers)}, "
                 f"edge_region={self.edge_region!r}, seed={self.seed})")

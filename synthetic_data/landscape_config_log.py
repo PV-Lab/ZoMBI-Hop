@@ -70,6 +70,12 @@ def resolved_from_fn(fn: Any) -> dict[str, Any]:
         out["variant"] = fn.variant
     if hasattr(fn, "centers"):
         out["n_peaks"] = len(fn.centers)
+    # Ensemble advertises only pared true optima via ``centers``; record the
+    # full count of placed basins separately when available.
+    if hasattr(fn, "peak_centers"):
+        out["n_placed_peaks"] = len(fn.peak_centers)
+        if hasattr(fn, "input_noise"):
+            out["input_noise"] = float(fn.input_noise)
     if hasattr(fn, "basin_widths") and fn.basin_widths:
         out["basin_width"] = float(fn.basin_widths[0])
     if hasattr(fn, "sigmas") and fn.sigmas:

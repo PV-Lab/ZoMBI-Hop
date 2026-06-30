@@ -22,8 +22,25 @@ from pathlib import Path
 from tqdm import tqdm
 
 REMOTE = "adewinmb@orcd-login.mit.edu"
-REMOTE_DIR = "/home/adewinmb/ZoMBI-Hop/optimize/runs"
 LOCAL_DIR = Path(__file__).parent / "runs"
+
+# Shared-history sync (mirrors --share-history in run_mobo.py): when enabled,
+# ALSO pull run directories from the collaborator's runs dir so this checkout
+# accumulates both users' history locally. When False (default), only the
+# current user's own remote runs dir is synced.
+SHARE_COLLABORATOR_HISTORY = False
+
+# Known collaborator runs directories (one per user). Always sync the first
+# (this account's own dir, since we ssh in as adewinmb); the rest are added
+# only when SHARE_COLLABORATOR_HISTORY is True.
+_COLLABORATOR_RUNS_DIRS = [
+    "/home/adewinmb/ZoMBI-Hop/optimize/runs",
+    "/home/eve_lal/ZoMBI-Hop/optimize/runs",
+]
+REMOTE_DIRS = (
+    _COLLABORATOR_RUNS_DIRS if SHARE_COLLABORATOR_HISTORY
+    else _COLLABORATOR_RUNS_DIRS[:1]
+)
 
 SSH_OPTS = [
     "-o", "StrictHostKeyChecking=accept-new",
@@ -31,39 +48,57 @@ SSH_OPTS = [
 ]
 
 
-def _remote_script(pattern: str, have: list[str], dry_run: bool) -> str:
-    """Build the shell snippet that runs on ORCD over the single connection."""
+def _remote_script(pattern: str, have: list[str], dirs: list[str],
+                   dry_run: bool) -> str:
+    """Build the shell snippet that runs on ORCD over the single connection.
+
+    Scans each directory in *dirs* in order, collecting matching run dirs we
+    don't already have. A name seen in an earlier dir wins, so a run present in
+    more than one dir is fetched only once (and extracts flat into LOCAL_DIR).
+    """
     have_str = " ".join(have)
+    dirs_str = " ".join(f"'{d}'" for d in dirs)
     dry = "1" if dry_run else "0"
     # `pattern` is interpolated unquoted on purpose so the remote shell expands
-    # the glob. `have` names are validated to be glob-safe before we get here.
+    # the glob (relative to each base dir). `have` names are validated to be
+    # glob-safe before we get here; `dirs` are our own trusted constants.
     return f"""
-cd '{REMOTE_DIR}' || {{ echo "Cannot cd to {REMOTE_DIR}" >&2; exit 1; }}
 have="{have_str}"
 dry={dry}
-to_get=""
-for d in {pattern}; do
-  [ -e "$d" ] || continue
-  skip=0
-  for h in $have; do [ "$h" = "$d" ] && {{ skip=1; break; }}; done
-  [ "$skip" -eq 0 ] && to_get="$to_get $d"
+got_names="$have"   # names already chosen (or local) — used to dedupe
+tar_args=""         # "-C <base> <name> ..." pairs for a single flat tar
+du_paths=""         # full paths for the size header
+found=0
+for base in {dirs_str}; do
+  [ -d "$base" ] || {{ echo "Skipping missing dir: $base" >&2; continue; }}
+  for d in "$base"/{pattern}; do
+    [ -e "$d" ] || continue
+    name=$(basename "$d")
+    skip=0
+    for h in $got_names; do [ "$h" = "$name" ] && {{ skip=1; break; }}; done
+    [ "$skip" -eq 1 ] && continue
+    got_names="$got_names $name"
+    tar_args="$tar_args -C $base $name"
+    du_paths="$du_paths $base/$name"
+    found=1
+    echo "  $name  ($base)" >&2
+  done
 done
-if [ -z "$to_get" ]; then
+if [ "$found" -eq 0 ]; then
   echo "Everything is already synced (or nothing matched the pattern)." >&2
   [ "$dry" -eq 0 ] && {{ printf 'SIZE 0\n'; tar czf - -T /dev/null; }}
   exit 0
 fi
 if [ "$dry" -eq 1 ]; then
-  echo "Would download:" >&2
-  for d in $to_get; do echo "  $d" >&2; done
+  echo "(above is what would be downloaded)" >&2
   exit 0
 fi
-echo "Downloading:$to_get" >&2
+echo "Downloading the directories listed above." >&2
 # Emit a parseable size header (total uncompressed bytes) before the tar so the
 # client can render a determinate progress bar, then stream the archive.
-size=$(du -scb $to_get | tail -n1 | cut -f1)
+size=$(du -scb $du_paths | tail -n1 | cut -f1)
 printf 'SIZE %s\n' "$size"
-tar czf - $to_get
+tar czf - $tar_args
 """
 
 
@@ -98,7 +133,10 @@ def sync(pattern: str, dry_run: bool = False):
     if existing:
         print(f"{len(safe)} director(ies) already local; they'll be skipped.")
 
-    remote_cmd = _remote_script(pattern, safe, dry_run)
+    if len(REMOTE_DIRS) > 1:
+        print(f"Sharing collaborator history; scanning: {', '.join(REMOTE_DIRS)}")
+
+    remote_cmd = _remote_script(pattern, safe, REMOTE_DIRS, dry_run)
     ssh_cmd = ["ssh", *SSH_OPTS, REMOTE, remote_cmd]
 
     print("Connecting to ORCD (you'll be prompted for your password once)...")
