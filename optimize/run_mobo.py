@@ -2981,7 +2981,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                        + [(X_sobol[i], "sobol") for i in range(X_sobol.shape[0])])
         if init_design:
             _atomic_torch_save(
-                {"X": torch.stack([x for x, _ in init_design]).cpu(),
+                {"X": torch.stack([x.detach().cpu() for x, _ in init_design]),
                  "phases": [ph for _, ph in init_design]},
                 init_path)
     n_init = len(init_design)
