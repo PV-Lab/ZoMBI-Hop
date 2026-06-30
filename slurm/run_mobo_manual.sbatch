@@ -175,6 +175,7 @@ _mobo_setup_env
 # )
 #
 # --- Ensemble 3d (matches optimize/scripts/ensemble_mobo_3d.sbatch) ------------
+# RUN_DIR="optimize/runs/mobo_ensemble_3d_job${SLURM_JOB_ID}"
 # MOBO_CMD=(
 #   python optimize/run_mobo.py
 #   --no-show
@@ -183,9 +184,11 @@ _mobo_setup_env
 #   --time-limit 0.2
 #   --share-history
 #   --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112
+#   --run-dir "${RUN_DIR}"
 # )
 #
 # --- Ensemble 4d (matches optimize/scripts/ensemble_mobo_4d.sbatch) ------------
+# RUN_DIR="optimize/runs/mobo_ensemble_4d_job${SLURM_JOB_ID}"
 # MOBO_CMD=(
 #   python optimize/run_mobo.py
 #   --no-show
@@ -194,11 +197,14 @@ _mobo_setup_env
 #   --time-limit 0.3
 #   --share-history
 #   --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112
+#   --run-dir "${RUN_DIR}"
 # )
 #
 # =============================================================================
 # ACTIVE COMMAND — edit this block only (one MOBO_CMD= assignment in this file)
 # =============================================================================
+
+RUN_DIR="optimize/runs/mobo_ensemble_3d_job${SLURM_JOB_ID}"
 
 MOBO_CMD=(
   python optimize/run_mobo.py
@@ -208,6 +214,7 @@ MOBO_CMD=(
   --time-limit 0.2
   --share-history
   --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112
+  --run-dir "${RUN_DIR}"
 )
 # =============================================================================
 
