@@ -13,6 +13,7 @@ Usage
 from __future__ import annotations
 
 import datetime
+import functools
 import json
 import math
 import os
@@ -328,13 +329,17 @@ def _gen_init_data(fn_callable, d: int, maximize: bool):
             continue
         _, _, xl, xr = seg
         t    = torch.linspace(0.0, 1.0, NUM_EXPERIMENTS, dtype=torch.float64, device=DEVICE)
-        pts  = xl.to(torch.float64).unsqueeze(0) + t.unsqueeze(1) * (xr - xl).to(torch.float64).unsqueeze(0)
-        pts  = add_composition_noise(pts, NOISE_LEVEL)
+        # Clean straight segment = what we "request"; noised copy = what we "measure".
+        # Record them separately (mirroring the optimizer path in _make_linebo_wrapper)
+        # so the expected/sent init is a true line, not the noise-blurred points.
+        pts_clean = xl.to(torch.float64).unsqueeze(0) + t.unsqueeze(1) * (xr - xl).to(torch.float64).unsqueeze(0)
+        pts  = add_composition_noise(pts_clean, NOISE_LEVEL)
         raw  = np.array([fn_callable(x) for x in pts.detach().cpu().numpy()], float)
         yt   = torch.tensor(raw if maximize else -raw, dtype=DTYPE, device=DEVICE)
         yt   = yt + torch.randn_like(yt) * (OUTPUT_NOISE_FRAC * yt.abs())
-        pts  = pts.to(dtype=DTYPE, device=DEVICE)
-        xa.append(pts); xe.append(pts); yl.append(yt)
+        pts       = pts.to(dtype=DTYPE, device=DEVICE)
+        pts_clean = pts_clean.to(dtype=DTYPE, device=DEVICE)
+        xa.append(pts); xe.append(pts_clean); yl.append(yt)
     if not xa:
         raise RuntimeError("Could not generate any initial simplex lines.")
     return (torch.cat(xa), torch.cat(xe), torch.cat(yl).reshape(-1, 1))
@@ -750,6 +755,34 @@ def load_run(run_dir: Path, snapshot_name: Optional[str] = None) -> RunData:
     return rd
 
 
+def _snapshot_signature(run_dir: Path, snapshot_name: str) -> float:
+    """Cache-busting mtime for a snapshot. Historical snapshots are immutable, so
+    this rarely changes; it only guards against a snapshot being rewritten."""
+    try:
+        delta = run_dir / "snapshots" / snapshot_name / "delta.pt"
+        return delta.stat().st_mtime if delta.exists() else 0.0
+    except OSError:
+        return 0.0
+
+
+@functools.lru_cache(maxsize=64)
+def _load_run_cached_impl(run_dir_str: str, snapshot_name: str, _sig: float) -> RunData:
+    return load_run(Path(run_dir_str), snapshot_name)
+
+
+def load_run_cached(run_dir: Path, snapshot_name: str) -> RunData:
+    """Cached ``load_run`` for browsing *historical* snapshots (slider scrubbing).
+
+    ``reconstruct_snapshot_tensors`` replays every delta from the start on each
+    call, so scrubbing back and forth is O(n) per tick without this cache. Keyed
+    on the snapshot's mtime so a rewritten snapshot still refreshes. Not used for
+    the live poll path, whose ``RunData`` may be mutated in place by live-state
+    reloads.
+    """
+    sig = _snapshot_signature(run_dir, snapshot_name)
+    return _load_run_cached_impl(str(run_dir), snapshot_name, sig)
+
+
 def scan_runs(base_dir: str) -> list[dict]:
     base = Path(base_dir)
     if not base.exists():
@@ -974,9 +1007,15 @@ class SnapshotSliderFrame(ttk.Frame):
 
         ttk.Label(self, text="Snapshot:").pack(side="left", padx=4)
         self._var = tk.IntVar(value=0)
+        self._loaded_idx = -1  # index last actually loaded (avoids redundant reloads)
         self._slider = ttk.Scale(self, from_=0, to=0, orient="horizontal",
                                   variable=self._var, command=self._on_slide)
         self._slider.pack(side="left", fill="x", expand=True, padx=4)
+        # Load only when the drag ends (mouse release) or a keyboard step settles —
+        # the label still tracks live in _on_slide, so scrubbing stays smooth while
+        # the expensive snapshot load fires just once.
+        self._slider.bind("<ButtonRelease-1>", lambda _e: self._fire_load())
+        self._slider.bind("<KeyRelease>",      lambda _e: self._debounced_fire())
         self._lbl = ttk.Label(self, text="", width=26, font=("Consolas", 8))
         self._lbl.pack(side="left", padx=4)
 
@@ -985,23 +1024,34 @@ class SnapshotSliderFrame(ttk.Frame):
         if not snapshots:
             self._slider.config(to=0)
             self._lbl.config(text="")
+            self._loaded_idx = -1
             return
         self._slider.config(to=max(len(snapshots) - 1, 0))
         idx = snapshots.index(current) if current in snapshots else len(snapshots) - 1
         self._var.set(idx)
         self._lbl.config(text=current)
+        # `current` is already displayed by the caller; treat it as loaded so a
+        # stray release event doesn't trigger a redundant reload.
+        self._loaded_idx = idx
 
     def _on_slide(self, val):
+        """Fires continuously during a drag — only updates the label (cheap)."""
         idx = int(float(val))
         if 0 <= idx < len(self._snapshots):
             self._lbl.config(text=self._snapshots[idx])
+
+    def _debounced_fire(self):
         if self._slide_job:
             self.after_cancel(self._slide_job)
-        self._slide_job = self.after(350, self._fire_load)
+        self._slide_job = self.after(200, self._fire_load)
 
     def _fire_load(self):
+        if self._slide_job:
+            self.after_cancel(self._slide_job)
+            self._slide_job = None
         idx = int(self._var.get())
-        if 0 <= idx < len(self._snapshots):
+        if 0 <= idx < len(self._snapshots) and idx != self._loaded_idx:
+            self._loaded_idx = idx
             self._app.load_snapshot(self._snapshots[idx])
 
 
@@ -3473,6 +3523,23 @@ class ZoMBIApp(tk.Tk):
         self._manual = ManualControlFrame(self._nb)
         self._nb.add(self._manual, text="Manual Ctrl")
 
+        # Lazy per-tab rendering: only the visible tab is redrawn on a snapshot
+        # change; the rest are marked stale and re-rendered when selected. This
+        # avoids redrawing all six matplotlib figures on every slider tick.
+        # (Manual Ctrl has no per-snapshot view, so it is intentionally omitted.)
+        self._tab_updaters = {
+            str(self._conv): self._conv.update,
+            str(self._dist): self._dist.update,
+            str(self._pts):  self._pts.update,
+            str(self._neds): self._neds.update,
+            str(self._gp):   self._gp.update_for_run,
+            str(self._tern): self._tern.update,
+        }
+        self._pending_rd: Optional[RunData] = None
+        self._dirty_tabs: set[str] = set()
+        self._nb.bind("<<NotebookTabChanged>>",
+                      lambda _e: self._render_current_tab())
+
         self._live_log = LiveLogPanel(right_pw, text="Live Run Log")
         right_pw.add(self._live_log, weight=1)
 
@@ -3736,7 +3803,7 @@ class ZoMBIApp(tk.Tk):
     def load_snapshot(self, snapshot_name: str):
         if self.current_run is None:
             return
-        rd = load_run(self.current_run.run_dir, snapshot_name)
+        rd = load_run_cached(self.current_run.run_dir, snapshot_name)
         self.current_run = rd
         self._refresh_plots(rd)
         self.set_status(
@@ -3749,12 +3816,24 @@ class ZoMBIApp(tk.Tk):
         self._refresh_plots(rd)
 
     def _refresh_plots(self, rd: RunData):
-        self._conv.update(rd)
-        self._dist.update(rd)
-        self._pts.update(rd)
-        self._neds.update(rd)
-        self._gp.update_for_run(rd)
-        self._tern.update(rd)
+        # Render only the visible tab now; mark the rest stale so they re-render
+        # when the user switches to them (see _render_current_tab).
+        self._pending_rd = rd
+        self._dirty_tabs = set(self._tab_updaters)
+        self._render_current_tab()
+
+    def _render_current_tab(self):
+        rd = self._pending_rd
+        if rd is None:
+            return
+        try:
+            current = str(self._nb.nametowidget(self._nb.select()))
+        except Exception:
+            return
+        updater = self._tab_updaters.get(current)
+        if updater is not None and current in self._dirty_tabs:
+            self._dirty_tabs.discard(current)
+            updater(rd)
 
     def open_new_run_dialog(self):
         NewRunDialog(self, self)
