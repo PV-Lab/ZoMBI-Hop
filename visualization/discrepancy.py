@@ -43,6 +43,7 @@ Usage
 """
 from __future__ import annotations
 
+import csv
 import json
 import random
 import sys
@@ -64,6 +65,13 @@ import plotly.graph_objects as go  # noqa: E402
 RUNS_DIR    = _HERE.parent / "runs"
 DEFAULT_RUN = "run_7eb9"
 COMP_LOG    = "composition_log.jsonl"
+
+# Standalone CSV pair (see module docstring, source 3). Hardcoded paths — there is
+# only ever this one pair. `sent` is grouped by its `line` column; `actual` is a
+# wide table (one column per possible component) row-aligned 1:1 with `sent`.
+SENT_CSV    = _HERE.parent / "data" / "sent_compositions.csv"
+ACTUAL_CSV  = _HERE.parent / "data" / "actual_compositions.csv"
+CSV_RUN     = "📄 CSV: sent vs actual"
 
 # Cache of loaded groups, keyed by (run, snapshot). Single-process dev server.
 _CACHE: dict[tuple[str, str], tuple] = {}
@@ -214,8 +222,102 @@ def load_legacy(run: str, snapshot: str) -> list[dict]:
     return groups
 
 
-def get_groups(run: str, snapshot: str) -> tuple[list[dict], str]:
-    """Return (groups, mode) where mode is 'log' or 'legacy'."""
+# ── standalone CSV pair (source 3) ────────────────────────────────────────────────
+
+def _read_sent_csv(path: Path = SENT_CSV) -> list[tuple[str, np.ndarray]]:
+    """Read sent_compositions.csv into ordered (line_label, (N,3) array) groups."""
+    groups: list[tuple[str, list]] = []
+    cur_label, cur = None, []
+    with open(path, newline="") as f:
+        reader = csv.reader(f)
+        next(reader, None)  # header: line,c0,c1,c2
+        for row in reader:
+            if not row:
+                continue
+            label = row[0]
+            vals = [float(x) for x in row[1:4]]
+            if label != cur_label:
+                if cur:
+                    groups.append((cur_label, cur))
+                cur_label, cur = label, []
+            cur.append(vals)
+    if cur:
+        groups.append((cur_label, cur))
+    return [(lbl, np.asarray(v, float)) for lbl, v in groups]
+
+
+def _read_actual_csv(path: Path = ACTUAL_CSV) -> tuple[np.ndarray, list[str]]:
+    """Read actual_compositions.csv into a wide (M, C) array (dropping the index
+    column) plus the C component-column labels from the header."""
+    with open(path, newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        col_labels = header[1:]          # first header cell is the row index
+        data = [[float(x) for x in row[1:]] for row in reader if row]
+    return np.asarray(data, float), col_labels
+
+
+def _auto_col_map(actual_raw: np.ndarray, anchor: np.ndarray) -> tuple[int, int, int]:
+    """Infer which 3 wide-table columns correspond to sent components x0,x1,x2.
+
+    The measured table stores every possible component but only three are ever
+    non-zero. The very first sent point is echoed verbatim as the first measured
+    point, so we match each sent component to the active column nearest to it at
+    that anchor row — an unambiguous, order-preserving assignment.
+    """
+    active = [j for j in range(actual_raw.shape[1]) if np.abs(actual_raw[:, j]).max() > 1e-9]
+    mapping, used = [], set()
+    for k in range(3):
+        target = anchor[k]
+        cand = [j for j in active if j not in used] or [j for j in range(actual_raw.shape[1]) if j not in used]
+        best = min(cand, key=lambda j: abs(actual_raw[0, j] - target))
+        mapping.append(best)
+        used.add(best)
+    return tuple(mapping)  # type: ignore[return-value]
+
+
+# Parsed once at import; the files are tiny and never change during a session.
+try:
+    _SENT_GROUPS = _read_sent_csv()
+    _ACTUAL_RAW, _ACTUAL_COLS = _read_actual_csv()
+    _SENT_FLAT = np.vstack([a for _, a in _SENT_GROUPS])
+    _AUTO_COL_MAP = _auto_col_map(_ACTUAL_RAW, _SENT_FLAT[0])
+    _HAS_CSV = _SENT_FLAT.shape[0] == _ACTUAL_RAW.shape[0]
+except (OSError, ValueError):
+    _SENT_GROUPS, _ACTUAL_RAW, _ACTUAL_COLS = [], np.empty((0, 0)), []
+    _SENT_FLAT, _AUTO_COL_MAP, _HAS_CSV = np.empty((0, 3)), (0, 1, 2), False
+
+
+def load_csv_pair(col_map: tuple[int, int, int] | None) -> list[dict]:
+    """Build groups from the sent/actual CSV pair.
+
+    Rows are aligned 1:1 in file order and segmented into rails by the sent file's
+    `line` column. `col_map` overrides which wide-table columns feed x0/x1/x2;
+    when None the auto-inferred mapping is used.
+    """
+    cmap = list(col_map or _AUTO_COL_MAP)
+    actual_xyz = _ACTUAL_RAW[:, cmap] if _ACTUAL_RAW.size else _ACTUAL_RAW
+    groups: list[dict] = []
+    pos = 0
+    for gi, (label, sent) in enumerate(_SENT_GROUPS):
+        n = len(sent)
+        act = actual_xyz[pos:pos + n]
+        pos += n
+        rail = _rail(label, sent, act, [], kind="sent")
+        # `init` is a scatter of seed points, not a swept line — don't connect them.
+        rail["connect"] = not label.lower().startswith("init")
+        groups.append({"index": gi, "label": label, "rails": [rail]})
+    return groups
+
+
+def get_groups(run: str, snapshot: str,
+               col_map: tuple[int, int, int] | None = None) -> tuple[list[dict], str]:
+    """Return (groups, mode) where mode is 'csv', 'log' or 'legacy'."""
+    if run == CSV_RUN:
+        key = ("__csv__", col_map)
+        if key not in _CACHE:
+            _CACHE[key] = (load_csv_pair(col_map), "csv")
+        return _CACHE[key]
     key = (run, snapshot if not has_comp_log(run) else "__log__")
     if key not in _CACHE:
         if has_comp_log(run):
@@ -235,10 +337,14 @@ def all_rails(groups: list[dict]) -> list[tuple[dict, dict]]:
 
 def make_figure(rail: dict) -> go.Figure:
     e, a, y = rail["expected"], rail["actual"], rail["y"]
+    # `init`-style rails are scatters of unordered seed points, not a swept line, so
+    # drawing a polyline through them is misleading — show markers only for those.
+    connect = rail.get("connect", True)
+    pt_mode = "lines+markers" if connect else "markers"
 
     fig = go.Figure()
     # The grey "expected/sent" line + connectors are only meaningful when we have a
-    # real sent line to compare against (log mode). For legacy runs (kind="fit")
+    # real sent line to compare against (log/csv mode). For legacy runs (kind="fit")
     # there is no true expected line, so just show the measured points.
     if rail["kind"] != "fit":
         ca, cb, cc = [], [], []
@@ -251,13 +357,13 @@ def make_figure(rail: dict) -> go.Figure:
             line=dict(color="rgba(150,150,150,0.45)", width=1),
             hoverinfo="skip", showlegend=False))
         fig.add_trace(go.Scatterternary(
-            a=e[:, 0], b=e[:, 1], c=e[:, 2], mode="lines+markers",
+            a=e[:, 0], b=e[:, 1], c=e[:, 2], mode=pt_mode,
             line=dict(color="lightgrey", width=1),
             marker=dict(size=7, color="lightgrey", line=dict(color="grey", width=1)),
             name="Expected (sent)", hovertemplate="Expected (sent)<extra></extra>"))
     has_y = y.size == len(a) and np.isfinite(y).any()
     fig.add_trace(go.Scatterternary(
-        a=a[:, 0], b=a[:, 1], c=a[:, 2], mode="lines+markers",
+        a=a[:, 0], b=a[:, 1], c=a[:, 2], mode=pt_mode,
         line=dict(color="rgba(0,0,0,0.2)", width=1),
         marker=dict(
             size=10,
@@ -311,8 +417,16 @@ def metric_children(groups: list[dict], group_index: int):
 app = dash.Dash(__name__)
 app.title = "ZoMBI-Hop · Line Discrepancy"
 
-_runs        = list_runs()
-_default_run = DEFAULT_RUN if DEFAULT_RUN in _runs else (_runs[0] if _runs else None)
+_runs         = list_runs()
+_run_options  = ([{"label": CSV_RUN, "value": CSV_RUN}] if _HAS_CSV else []) \
+                + [{"label": r, "value": r} for r in _runs]
+# Default to the CSV pair when present (it's the current focus); else fall back.
+_default_run  = CSV_RUN if _HAS_CSV else \
+                (DEFAULT_RUN if DEFAULT_RUN in _runs else (_runs[0] if _runs else None))
+
+# Options for the "which wide column feeds x0/x1/x2" override dropdowns.
+_col_options  = [{"label": f"col {name}", "value": j}
+                 for j, name in enumerate(_ACTUAL_COLS)]
 
 app.layout = html.Div(
     style={"fontFamily": "system-ui, sans-serif", "padding": "12px"},
@@ -326,7 +440,7 @@ app.layout = html.Div(
                     html.Label("Run"),
                     dcc.Dropdown(
                         id="run-dd",
-                        options=[{"label": r, "value": r} for r in _runs],
+                        options=_run_options,
                         value=_default_run, clearable=False,
                         style={"width": "240px"}),
                 ]),
@@ -336,6 +450,23 @@ app.layout = html.Div(
                 ]),
                 html.Button("🎲 Random line", id="random-btn", n_clicks=0,
                             style={"height": "38px", "cursor": "pointer"}),
+            ],
+        ),
+        # Column-mapping override — CSV mode only. The mapping is auto-inferred from
+        # the anchor point; these let you correct it if the guess is ever wrong.
+        html.Div(
+            id="csv-controls",
+            style={"display": "flex", "gap": "10px", "alignItems": "flex-end",
+                   "flexWrap": "wrap", "marginBottom": "6px"},
+            children=[
+                html.Div("Actual-column → component mapping:",
+                         style={"fontSize": "13px", "alignSelf": "center"}),
+                *[html.Div([
+                    html.Label(f"x{k}", style={"fontSize": "12px"}),
+                    dcc.Dropdown(id=f"col-x{k}", options=_col_options,
+                                 value=_AUTO_COL_MAP[k], clearable=False,
+                                 style={"width": "110px"}),
+                  ]) for k in range(3)],
             ],
         ),
         html.Div(id="mode-banner", style={
@@ -379,6 +510,23 @@ app.layout = html.Div(
 
 # ── callbacks ────────────────────────────────────────────────────────────────────
 
+def _col_map(x0, x1, x2):
+    """Assemble the three override dropdown values into a col_map tuple (or None)."""
+    if None in (x0, x1, x2):
+        return None
+    return (int(x0), int(x1), int(x2))
+
+
+@app.callback(
+    Output("csv-controls", "style"),
+    Input("run-dd", "value"),
+)
+def _toggle_csv_controls(run):
+    base = {"display": "flex", "gap": "10px", "alignItems": "flex-end",
+            "flexWrap": "wrap", "marginBottom": "6px"}
+    return base if run == CSV_RUN else {"display": "none"}
+
+
 @app.callback(
     Output("snap-dd", "options"),
     Output("snap-dd", "value"),
@@ -388,6 +536,8 @@ app.layout = html.Div(
 def _update_snapshots(run):
     if not run:
         return [], None, True
+    if run == CSV_RUN:
+        return [], None, True  # CSV spans a whole fixed dataset; no snapshot axis.
     snaps = list_snapshots(run)
     # In log mode the snapshot axis is irrelevant (the log spans the whole run).
     return ([{"label": s, "value": s} for s in snaps],
@@ -401,15 +551,18 @@ def _update_snapshots(run):
     Output("mode-banner", "style"),
     Input("snap-dd", "value"),
     Input("random-btn", "n_clicks"),
+    Input("col-x0", "value"),
+    Input("col-x1", "value"),
+    Input("col-x2", "value"),
     State("run-dd", "value"),
     State("line-list", "value"),
 )
-def _populate(snapshot, _n_clicks, run, current_value):
+def _populate(snapshot, _n_clicks, cx0, cx1, cx2, run, current_value):
     base_style = {"fontSize": "13px", "padding": "6px 10px", "borderRadius": "6px",
                   "marginBottom": "8px"}
-    if not run or not snapshot:
+    if not run or (run != CSV_RUN and not snapshot):
         return [], None, "", base_style
-    groups, mode = get_groups(run, snapshot)
+    groups, mode = get_groups(run, snapshot, _col_map(cx0, cx1, cx2))
     if not groups:
         return [], None, "No lines found for this run.", base_style
 
@@ -421,7 +574,12 @@ def _populate(snapshot, _n_clicks, run, current_value):
     else:
         value = random.choice(groups)["index"]
 
-    if mode == "log":
+    if mode == "csv":
+        banner = ("✓ Using data/sent_compositions.csv vs. data/actual_compositions.csv "
+                  "— rows aligned 1:1 in file order, one rail per sent `line`. "
+                  "Adjust the column→component mapping above if the auto-guess is wrong.")
+        style = {**base_style, "background": "#e6f0fb", "border": "1px solid #9bf"}
+    elif mode == "log":
         banner = ("✓ Using composition_log.jsonl — true sent vs. measured "
                   "compositions, both rails (a = main, b = cache). "
                   "Snapshot selector is ignored in this mode.")
@@ -438,11 +596,14 @@ def _populate(snapshot, _n_clicks, run, current_value):
     Input("line-list", "value"),
     State("run-dd", "value"),
     State("snap-dd", "value"),
+    State("col-x0", "value"),
+    State("col-x1", "value"),
+    State("col-x2", "value"),
 )
-def _render(group_index, run, snapshot):
-    if group_index is None or not run or not snapshot:
+def _render(group_index, run, snapshot, cx0, cx1, cx2):
+    if group_index is None or not run or (run != CSV_RUN and not snapshot):
         return [], "Select a run and line."
-    groups, _ = get_groups(run, snapshot)
+    groups, _ = get_groups(run, snapshot, _col_map(cx0, cx1, cx2))
     grp = next((g for g in groups if g["index"] == group_index), None)
     if grp is None:
         return [], "Line not found."
@@ -455,7 +616,8 @@ def _render(group_index, run, snapshot):
 
 
 if __name__ == "__main__":
-    if not _runs:
-        print(f"No runs found under {RUNS_DIR}", file=sys.stderr)
+    if not _runs and not _HAS_CSV:
+        print(f"No runs found under {RUNS_DIR} and no CSV pair at "
+              f"{SENT_CSV} / {ACTUAL_CSV}", file=sys.stderr)
         sys.exit(1)
     app.run(debug=True)
