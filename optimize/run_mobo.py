@@ -285,15 +285,14 @@ N_MOBO_SAMPLES   = 512
 # two checkouts pool progress; when False (default), only the current user's own
 # local history is scanned. The toggle is symmetric — whoever sets it False scans
 # only their own dir, regardless of which checkout the job runs from.
-SHARE_COLLABORATOR_HISTORY = False
-
-# Known collaborator runs directories (one per user). The current user's own dir
-# is detected by matching $HOME and is always scanned; the other is added only
-# when SHARE_COLLABORATOR_HISTORY is True.
-_COLLABORATOR_RUNS_DIRS = [
-    "/home/adewinmb/orcd/scratch/ZoMBI-Hop/optimize/runs",
-    "/home/eve_lal/orcd/scratch/ZoMBI-Hop/optimize/runs",
-]
+# The runs-dir list and the collaborator toggle are defined once in
+# optimize/collab_dirs.py so run_mobo, pareto, and sync_runs can't drift apart.
+# The current user's own dir is detected by matching $HOME below and is always
+# scanned; the other is added only when SHARE_COLLABORATOR_HISTORY is True.
+from optimize.collab_dirs import (  # noqa: E402  — repo root on sys.path from import block above
+    SHARE_COLLABORATOR_HISTORY,
+    COLLABORATOR_RUNS_DIRS as _COLLABORATOR_RUNS_DIRS,
+)
 
 
 def _default_shared_runs_dirs() -> list[str]:
@@ -1320,16 +1319,20 @@ def _run_signature(cfg: dict) -> dict:
 
     These pin down the *objective* a trial was scored against — the same
     hyperparameters yield comparable (dist, dup, avg_time_per_iter) only when the
-    dataset, dimension, per-trial time budget, search direction, and (for the
-    ensemble objective) the landscape difficulty/averaging all agree. Fields
-    absent in older configs come back as ``None`` and simply have to match
-    ``None`` on both sides.
+    dataset, dimension, per-trial time budget, search direction, optimiser variant,
+    and (for the ensemble objective) the landscape difficulty/averaging all agree.
+    The ``variant`` field separates optimisers (e.g. ``"hebo"``) from the default
+    ZoMBI runs (no ``variant`` key -> ``None``), so a hebo run is never pooled with
+    a ZoMBI run of the same dataset/dim. Fields absent in older configs come back as
+    ``None`` and simply have to match ``None`` on both sides. Kept in sync with
+    ``pareto._run_signature``.
     """
     return {
         "dataset": cfg.get("dataset") or cfg.get("oracle") or cfg.get("landscape"),
         "dim": int(cfg["dim"]) if cfg.get("dim") is not None else None,
         "time_limit_hours": cfg.get("time_limit_hours"),
         "maximize": bool(cfg.get("maximize", False)),
+        "variant": cfg.get("variant"),
         "ensemble_optima_margin": cfg.get("ensemble_optima_margin"),
         "ensemble_repeats": cfg.get("ensemble_repeats"),
     }

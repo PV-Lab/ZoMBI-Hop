@@ -44,8 +44,10 @@ Usage
   python optimize/pareto.py                 # crawl optimize/runs, write there
   python optimize/pareto.py <runs_dir>      # crawl a specific runs directory
   python optimize/pareto.py <run_dir>       # a single run dir: pools its config-
-                                            #   matching siblings (shared history)
+                                            #   matching siblings (shared history),
+                                            #   incl. collaborators' runs dirs
   python optimize/pareto.py <run_dir> --no-shared-history  # that one run only
+  python optimize/pareto.py <run_dir> --no-collab          # own runs dir only
   python optimize/pareto.py --out <dir>     # write pareto.json / .png elsewhere
   python optimize/pareto.py --no-interactive # save static PNG instead of live window
   python optimize/pareto.py --with-old       # include mobo_old_jackson (excluded by default)
@@ -111,6 +113,65 @@ HPARAM_SPACE: dict[str, tuple] = {
 HPARAM_NAMES = list(HPARAM_SPACE.keys())
 
 
+# ─── Collaborator runs directories (cross-user shared history) ───────────────────
+# Several users run the same MOBO configs and pool history so their concurrent jobs
+# share one GP. pareto.py pools their stored trials too, so a shared-history Pareto
+# plot shows every collaborator's signature-matching runs (each point labelled by
+# the user who owns it). The dir list and toggle come from collab_dirs so run_mobo,
+# pareto, and sync_runs share one definition (works whether launched as a script,
+# with optimize/ on the path, or as the optimize.pareto package module).
+try:
+    from optimize.collab_dirs import (
+        SHARE_COLLABORATOR_HISTORY,
+        COLLABORATOR_RUNS_DIRS as _COLLABORATOR_RUNS_DIRS,
+    )
+except ImportError:
+    from collab_dirs import (
+        SHARE_COLLABORATOR_HISTORY,
+        COLLABORATOR_RUNS_DIRS as _COLLABORATOR_RUNS_DIRS,
+    )
+
+
+def _dedup_realpath(dirs: list[str]) -> list[str]:
+    """Order-preserving dedup of *dirs* by resolved real path.
+
+    A user's own runs dir is usually reachable by two names at once (the crawled
+    parent, and its /home/<user>/orcd/scratch symlink entry in
+    _COLLABORATOR_RUNS_DIRS), so pooling must not count it twice.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for d in dirs:
+        key = os.path.realpath(d)
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
+
+
+def _collaborator_runs_dirs() -> list[str]:
+    """Existing collaborator runs dirs to pool (empty when collaborator sharing off).
+
+    A configured dir that isn't a directory here (missing, or perms not yet granted)
+    is dropped — the caller reports it separately so a silent contributor is explained.
+    """
+    if not SHARE_COLLABORATOR_HISTORY:
+        return []
+    return [d for d in _COLLABORATOR_RUNS_DIRS if os.path.isdir(d)]
+
+
+def _dir_owner(path: str) -> str:
+    """Username that owns *path* (a runs dir), used to label a trial's source user.
+
+    Falls back to the final path component if the owner can't be resolved.
+    """
+    try:
+        import pwd
+        return pwd.getpwuid(os.stat(path).st_uid).pw_name
+    except Exception:
+        return os.path.basename(os.path.normpath(path)) or "unknown"
+
+
 # ─── Run-config signatures (shared history) ──────────────────────────────────────
 # Mirror of run_mobo.py's --share-history matching: a single run dir's trials are
 # only comparable to a sibling's when the objective they were scored against is the
@@ -121,16 +182,20 @@ def _run_signature(cfg: dict) -> dict:
 
     These pin down the *objective* a trial was scored against — the same
     hyperparameters yield comparable (dist, dup, avg_time_per_iter) only when the
-    dataset, dimension, per-trial time budget, search direction, and (for the
-    ensemble objective) the landscape difficulty/averaging all agree. Fields absent
-    in older configs come back as ``None`` and simply have to match ``None`` on both
-    sides. Kept in sync with ``run_mobo._run_signature``.
+    dataset, dimension, per-trial time budget, search direction, optimiser variant,
+    and (for the ensemble objective) the landscape difficulty/averaging all agree.
+    The ``variant`` field separates optimisers (e.g. ``"hebo"``) from the default
+    ZoMBI runs (no ``variant`` key -> ``None``), so a hebo run is never pooled with
+    a ZoMBI run of the same dataset/dim. Fields absent in older configs come back as
+    ``None`` and simply have to match ``None`` on both sides. Kept in sync with
+    ``run_mobo._run_signature``.
     """
     return {
         "dataset": cfg.get("dataset") or cfg.get("oracle") or cfg.get("landscape"),
         "dim": int(cfg["dim"]) if cfg.get("dim") is not None else None,
         "time_limit_hours": cfg.get("time_limit_hours"),
         "maximize": bool(cfg.get("maximize", False)),
+        "variant": cfg.get("variant"),
         "ensemble_optima_margin": cfg.get("ensemble_optima_margin"),
         "ensemble_repeats": cfg.get("ensemble_repeats"),
     }
@@ -282,6 +347,7 @@ def collect_trials(
     has_filter = (only_runs or only_trials or only_prefixes
                   or require_subs or exclude_subs)
     records: list[dict] = []
+    owner_cache: dict[str, str] = {}
     # Accept either a runs *parent* directory (containing mobo_*/mobo_progress.json)
     # or a single run directory (containing mobo_progress.json directly).
     progress_paths = sorted(glob.glob(os.path.join(runs_dir, "mobo_*", "mobo_progress.json")))
@@ -289,6 +355,12 @@ def collect_trials(
         progress_paths = [os.path.join(runs_dir, "mobo_progress.json")]
     for path in progress_paths:
         run_name = os.path.basename(os.path.dirname(path))
+        # The runs dir this trial lives under (== the parent of its run dir): the
+        # base for click-to-open landscape lookup, and whose owner labels its user.
+        source_dir = os.path.dirname(os.path.dirname(path))
+        source_user = owner_cache.get(source_dir)
+        if source_user is None:
+            source_user = owner_cache[source_dir] = _dir_owner(source_dir)
         if has_filter:
             # Shorthand selection: dim tokens union, then variant subs AND-narrow.
             shorthand_active = bool(only_prefixes or require_subs or exclude_subs)
@@ -344,13 +416,15 @@ def collect_trials(
             if npts_value is not None:
                 metrics[NPTS_KEY] = npts_value
             records.append({
-                "source_run": run_name,
-                "trial":      t.get("trial"),
-                "metrics":    metrics,
-                "time_key":   time_key,
-                "time_value": time_value,
-                "npts_value": npts_value,
-                "hparams":    t.get("hparams", {}),
+                "source_run":  run_name,
+                "source_dir":  source_dir,
+                "source_user": source_user,
+                "trial":       t.get("trial"),
+                "metrics":     metrics,
+                "time_key":    time_key,
+                "time_value":  time_value,
+                "npts_value":  npts_value,
+                "hparams":     t.get("hparams", {}),
             })
             used += 1
         if used or skipped_failed:
@@ -399,9 +473,22 @@ def _subplot_grid(n_pairs: int) -> tuple[int, int]:
     return nrows, ncols
 
 
+def _user_colors(users: list[str]) -> tuple[dict[str, tuple], list[str]]:
+    """(color per user, sorted unique users) for provenance-coloured plots."""
+    uniq = sorted(set(users))
+    palette = plt.get_cmap("tab10").colors
+    return {u: palette[i % len(palette)] for i, u in enumerate(uniq)}, uniq
+
+
 def plot_pareto(M: np.ndarray, mask: np.ndarray, obj_labels: list[str],
-                out_path: str) -> None:
-    """Pairwise objective scatter; Pareto-optimal points starred (static PNG)."""
+                out_path: str, users: list[str] | None = None) -> None:
+    """Pairwise objective scatter; Pareto-optimal points starred (static PNG).
+
+    When *users* spans more than one collaborator, Pareto stars are coloured by the
+    user who produced them (dominated points greyed as context) so a shared-history
+    plot shows each person's contributions; a single-user collection keeps the plain
+    gold-star / steelblue look.
+    """
     matplotlib.use("Agg")
     plt.switch_backend("Agg")
     pairs = _obj_pairs(obj_labels)
@@ -409,13 +496,26 @@ def plot_pareto(M: np.ndarray, mask: np.ndarray, obj_labels: list[str],
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows),
                              squeeze=False)
     axes_flat = axes.ravel().tolist()
+    multiuser = users is not None and len(set(users)) > 1
+    if multiuser:
+        colors, uniq = _user_colors(users)
+        users_arr = np.array(users)
     fig.suptitle(f"MOBO Pareto front across all runs  "
                  f"(★ = Pareto-optimal, {int(mask.sum())}/{len(mask)})", fontsize=12)
     for ax, (ix, iy, xl, yl) in zip(axes_flat, pairs):
-        ax.scatter(M[~mask, ix], M[~mask, iy], c="steelblue", alpha=0.6,
-                   edgecolors="k", linewidths=0.3, label="dominated")
-        ax.scatter(M[mask, ix], M[mask, iy], marker="*", s=220, c="gold",
-                   zorder=5, edgecolors="k", linewidths=0.5, label="Pareto")
+        if multiuser:
+            ax.scatter(M[~mask, ix], M[~mask, iy], c="lightgray", alpha=0.5,
+                       edgecolors="none", zorder=1, label="dominated")
+            for u in uniq:
+                um = (users_arr == u) & mask
+                ax.scatter(M[um, ix], M[um, iy], marker="*", s=220,
+                           c=[colors[u]], zorder=5, edgecolors="k", linewidths=0.5,
+                           label=f"{u} (Pareto)")
+        else:
+            ax.scatter(M[~mask, ix], M[~mask, iy], c="steelblue", alpha=0.6,
+                       edgecolors="k", linewidths=0.3, label="dominated")
+            ax.scatter(M[mask, ix], M[mask, iy], marker="*", s=220, c="gold",
+                       zorder=5, edgecolors="k", linewidths=0.5, label="Pareto")
         ax.set_xlabel(xl)
         ax.set_ylabel(yl)
         ax.legend(fontsize=8)
@@ -544,16 +644,35 @@ def plot_pareto_interactive(
         fontsize=12,
     )
 
+    # Colour Pareto stars by owning user when the pool spans collaborators, so a
+    # shared-history plot shows whose runs contributed (single-user stays gold).
+    users = [r["source_user"] for r in records]
+    multiuser = len(set(users)) > 1
+    if multiuser:
+        colors, uniq = _user_colors(users)
+        users_arr = np.array(users)
     for ax, (ix, iy, xl, yl) in zip(axes_flat, pairs):
-        ax.scatter(
-            M[~mask, ix], M[~mask, iy],
-            c="steelblue", alpha=0.6, edgecolors="k", linewidths=0.3, label="dominated",
-        )
-        ax.scatter(
-            pareto_M[:, ix], pareto_M[:, iy],
-            marker="*", s=220, c="gold", zorder=5,
-            edgecolors="k", linewidths=0.5, label="Pareto",
-        )
+        if multiuser:
+            ax.scatter(
+                M[~mask, ix], M[~mask, iy],
+                c="lightgray", alpha=0.5, edgecolors="none", zorder=1, label="dominated",
+            )
+            for u in uniq:
+                um = (users_arr == u) & mask
+                ax.scatter(
+                    M[um, ix], M[um, iy], marker="*", s=220, c=[colors[u]],
+                    zorder=5, edgecolors="k", linewidths=0.5, label=f"{u} (Pareto)",
+                )
+        else:
+            ax.scatter(
+                M[~mask, ix], M[~mask, iy],
+                c="steelblue", alpha=0.6, edgecolors="k", linewidths=0.3, label="dominated",
+            )
+            ax.scatter(
+                pareto_M[:, ix], pareto_M[:, iy],
+                marker="*", s=220, c="gold", zorder=5,
+                edgecolors="k", linewidths=0.5, label="Pareto",
+            )
         ax.set_xlabel(xl)
         ax.set_ylabel(yl)
         ax.legend(fontsize=8)
@@ -696,8 +815,8 @@ def plot_pareto_interactive(
             rec = records[idx]
             m = rec["metrics"]
             kind = "Pareto" if mask[idx] else "dominated"
-            txt = (f"{rec['source_run']} trial {rec['trial']} ({kind})  |  "
-                   f"dist={m[DIST_KEY]:.4f}  dup={m[DUP_KEY]:.4f}  "
+            txt = (f"[{rec['source_user']}] {rec['source_run']} trial {rec['trial']} "
+                   f"({kind})  |  dist={m[DIST_KEY]:.4f}  dup={m[DUP_KEY]:.4f}  "
                    f"{rec['time_key']}={rec['time_value']:.4g}")
             if NPTS_KEY in obj_labels and rec.get("npts_value") is not None:
                 txt += f"  {NPTS_KEY}={rec['npts_value']:.4g}"
@@ -710,7 +829,10 @@ def plot_pareto_interactive(
         if idx is None:
             return
         rec = records[idx]
-        img = _final_plot_for_trial(runs_dir, rec["source_run"], rec["trial"])
+        # Resolve the landscape image against the trial's OWN runs dir, so clicks on
+        # a collaborator's point open their image rather than looking under ours.
+        img = _final_plot_for_trial(rec.get("source_dir") or runs_dir,
+                                    rec["source_run"], rec["trial"])
         # Higher-dimensional trials have no landscape image: silently do nothing
         # (no error, no popup) — hover highlighting still works for them.
         if not img:
@@ -759,6 +881,9 @@ def main() -> None:
     parser.add_argument("--no-shared-history", action="store_true",
                         help="When a single run dir is given, do NOT pool sibling runs "
                              "with a matching run_config; use only that one run's trials.")
+    parser.add_argument("--no-collab", action="store_true",
+                        help="Do NOT pool collaborators' runs directories; restrict the "
+                             "shared-history pool to this checkout's own runs.")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -797,13 +922,32 @@ def main() -> None:
 
     only_runs, only_trials, only_prefixes, require_subs, exclude_subs = (
         _parse_only(args.only) if args.only else (None, None, None, None, None))
-    records = collect_trials(runs_dir, exclude_old=not args.with_old,
-                             only_runs=only_runs or None,
-                             only_trials=only_trials or None,
-                             only_prefixes=only_prefixes or None,
-                             require_subs=require_subs or None,
-                             exclude_subs=exclude_subs or None,
-                             only_signature=only_signature)
+
+    # Cross-user pooling: when doing a signature-filtered shared-history pool, also
+    # crawl collaborators' runs dirs (deduped against our own) so their matching
+    # trials land on the plot. Only meaningful with a signature — pooling different
+    # users' *unfiltered* runs would mix incomparable objectives.
+    crawl_dirs = [runs_dir]
+    if only_signature is not None and not args.no_collab:
+        crawl_dirs = _dedup_realpath([runs_dir] + _collaborator_runs_dirs())
+        if SHARE_COLLABORATOR_HISTORY:
+            for d in _COLLABORATOR_RUNS_DIRS:
+                if not os.path.isdir(d):
+                    print(f"  [collab] {d} not accessible (missing or no permission "
+                          "yet); skipping.")
+        if len(crawl_dirs) > 1:
+            print(f"  [collab] pooling {len(crawl_dirs)} runs dirs: "
+                  + ", ".join(crawl_dirs))
+
+    records: list[dict] = []
+    for d in crawl_dirs:
+        records += collect_trials(d, exclude_old=not args.with_old,
+                                  only_runs=only_runs or None,
+                                  only_trials=only_trials or None,
+                                  only_prefixes=only_prefixes or None,
+                                  require_subs=require_subs or None,
+                                  exclude_subs=exclude_subs or None,
+                                  only_signature=only_signature)
     if not records:
         sys.exit(f"No usable trials found under {runs_dir}/mobo_*/mobo_progress.json.")
 
@@ -846,9 +990,11 @@ def main() -> None:
     pareto = [records[i] for i in np.where(mask)[0]]
     pareto.sort(key=lambda r: r["metrics"][DIST_KEY])
 
+    users = [r["source_user"] for r in records]
+
     out = {
         "generated":      datetime.datetime.now().isoformat(timespec="seconds"),
-        "runs_dir":       runs_dir,
+        "runs_dirs":      crawl_dirs,
         "objectives":     {lbl: "minimize" for lbl in obj_labels},
         "n_trials_total": n_total,
         "n_pareto":       n_pareto,
@@ -860,14 +1006,15 @@ def main() -> None:
     print(f"  pareto.json -> {json_path}")
 
     if args.no_interactive:
-        plot_pareto(M, mask, obj_labels, os.path.join(out_dir, "pareto_front.png"))
+        plot_pareto(M, mask, obj_labels, os.path.join(out_dir, "pareto_front.png"),
+                    users=users)
     elif not _has_display():
         # Headless system (e.g. SSH / batch node): an interactive window can't be
         # shown, so save a static PNG into optimize/ instead of failing.
         png_path = os.path.join(script_dir, "pareto_front.png")
         print("  No display detected (headless); saving static PNG instead of "
               "opening an interactive window.")
-        plot_pareto(M, mask, obj_labels, png_path)
+        plot_pareto(M, mask, obj_labels, png_path, users=users)
     else:
         plot_pareto_interactive(M, mask, records, plot_runs_dir, obj_labels,
                                 show_numberline=args.show_numberline)
@@ -875,7 +1022,7 @@ def main() -> None:
     print("\n  Pareto-optimal configurations (best dist first):")
     for r in pareto:
         m = r["metrics"]
-        line = (f"    {r['source_run']} trial {r['trial']}:  "
+        line = (f"    [{r['source_user']}] {r['source_run']} trial {r['trial']}:  "
                 f"dist={m[DIST_KEY]:.4f}  dup={m[DUP_KEY]:.4f}  "
                 f"{r['time_key']}={r['time_value']:.4g}")
         if include_npts:

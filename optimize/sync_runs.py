@@ -24,19 +24,26 @@ from tqdm import tqdm
 REMOTE = "adewinmb@orcd-login.mit.edu"
 LOCAL_DIR = Path(__file__).parent / "runs"
 
-# Shared-history sync (mirrors --share-history in run_mobo.py): when enabled,
-# ALSO pull run directories from the collaborator's runs dir so this checkout
-# accumulates both users' history locally. When False (default), only the
-# current user's own remote runs dir is synced.
-SHARE_COLLABORATOR_HISTORY = False
-
-# Known collaborator runs directories (one per user). Always sync the first
-# (this account's own dir, since we ssh in as adewinmb); the rest are added
-# only when SHARE_COLLABORATOR_HISTORY is True.
-_COLLABORATOR_RUNS_DIRS = [
-    "/home/adewinmb/ZoMBI-Hop/optimize/runs",
-    "/home/eve_lal/ZoMBI-Hop/optimize/runs",
-]
+# Shared-history sync (mirrors --share-history in run_mobo.py): when
+# SHARE_COLLABORATOR_HISTORY is set, ALSO pull run directories from the
+# collaborator's runs dir so this checkout accumulates both users' history
+# locally; otherwise only the current user's own remote runs dir is synced.
+#
+# The dir list and toggle come from collab_dirs (the single definition shared with
+# run_mobo and pareto) so the paths can't drift. These are evaluated on the ORCD
+# login node: each user's ~/orcd/scratch runs dir, reachable as adewinmb over ssh
+# via the sched_mit_hill group grant. Always sync the first (this account's own
+# dir, since we ssh in as adewinmb); the rest are added only when sharing is on.
+try:
+    from optimize.collab_dirs import (
+        SHARE_COLLABORATOR_HISTORY,
+        COLLABORATOR_RUNS_DIRS as _COLLABORATOR_RUNS_DIRS,
+    )
+except ImportError:
+    from collab_dirs import (
+        SHARE_COLLABORATOR_HISTORY,
+        COLLABORATOR_RUNS_DIRS as _COLLABORATOR_RUNS_DIRS,
+    )
 REMOTE_DIRS = (
     _COLLABORATOR_RUNS_DIRS if SHARE_COLLABORATOR_HISTORY
     else _COLLABORATOR_RUNS_DIRS[:1]
