@@ -285,14 +285,14 @@ N_MOBO_SAMPLES   = 512
 # two checkouts pool progress; when False (default), only the current user's own
 # local history is scanned. The toggle is symmetric — whoever sets it False scans
 # only their own dir, regardless of which checkout the job runs from.
-SHARE_COLLABORATOR_HISTORY = True
+SHARE_COLLABORATOR_HISTORY = False
 
 # Known collaborator runs directories (one per user). The current user's own dir
 # is detected by matching $HOME and is always scanned; the other is added only
 # when SHARE_COLLABORATOR_HISTORY is True.
 _COLLABORATOR_RUNS_DIRS = [
-    "/home/adewinmb/ZoMBI-Hop/optimize/runs",
-    "/home/eve_lal/ZoMBI-Hop/optimize/runs",
+    "/home/adewinmb/orcd/scratch/ZoMBI-Hop/optimize/runs",
+    "/home/eve_lal/orcd/scratch/ZoMBI-Hop/optimize/runs",
 ]
 
 
