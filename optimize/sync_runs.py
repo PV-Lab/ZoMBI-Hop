@@ -209,8 +209,24 @@ def sync(pattern: str, dry_run: bool = False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("pattern", nargs="?", default="mobo_ensemble_*",
+    parser.add_argument("pattern", nargs="?", default=None,
                         help="Glob pattern for directory names (default: mobo_ensemble_*)")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--ensemble", action="store_true",
+                       help="Sync the ensemble runs (mobo_ensemble_*).")
+    group.add_argument("--hebo", action="store_true",
+                       help="Sync the HEBO runs (mobo_hebo_*).")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be downloaded")
     args = parser.parse_args()
-    sync(args.pattern, args.dry_run)
+
+    # A positional pattern always wins; otherwise the convenience flags pick a
+    # preset, falling back to the historical ensemble default.
+    if args.pattern is not None:
+        pattern = args.pattern
+    elif args.hebo:
+        pattern = "mobo_hebo_*"
+    elif args.ensemble:
+        pattern = "mobo_ensemble_*"
+    else:
+        pattern = "mobo_ensemble_*"
+    sync(pattern, args.dry_run)
