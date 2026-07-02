@@ -27,13 +27,16 @@ and the full ``ensemble_configs`` list (plus per-repeat metrics) is recorded in
 ``trial_<n>/trial.json``. ``--ensemble-seed`` makes the per-trial landscape sequence
 reproducible; ``--ensemble-margin`` sets the optima/background gap.
 
-Four objectives (all minimised):
+Three objectives (all minimised):
   1. dist_to_needles    – symmetric greedy matching distance between needles and
                           true optima (no-repeat matching; both unmatched true
                           optima AND unmatched/spurious needles incur
                           UNMATCHED_PENALTY, mean over max(#needles, #optima))
-  2. dup_fraction       – fraction of sampled points whose nearest neighbour
-                          in input space is within noise/2
+  2. dup_fraction       – fraction of sampled points whose nearest neighbour in
+                          input space is within a zoom-scaled duplicate distance
+                          (noise/2 at full domain, shrinking with the zoom-zone
+                          size so tightly-packed points inside a zoom are not
+                          penalised; see eval_metrics.metric_dup_fraction)
   3. avg_time_per_iter_s  – average wall-clock seconds per ZoMBI iteration, where
                           an iteration is one LineBO main-line pick (== one
                           obj_wrapper call / one would-be plot frame): total
@@ -41,12 +44,11 @@ Four objectives (all minimised):
                           rendered AFTER the timed region so it never pollutes
                           this metric. (trial.json also records runtime_s and
                           n_iters for context.)
-  4. n_points_penalty   – penalty on the TOTAL number of points sampled across the
-                          run (== the sample count): sampling is costly, so for a
-                          fixed solution quality fewer points is better. A run that
-                          sampled nothing scores an infinite penalty and is excluded
-                          from the GP (a 0-point run means ZoMBI never picked a
-                          point — a failure, not an efficient trial).
+
+The former 4th objective (n_points_penalty) was removed: it was ~redundant with
+dup_fraction (rank corr ≈ 0.98) and, as a sampling-cost objective, discouraged the
+dense local sampling needed to localise optima. trial.json still records the raw
+n_points per repeat as a diagnostic.
 
 MOBO engine: qLogNEHVI (BoTorch, maximises negated objectives).
 
@@ -285,15 +287,14 @@ N_MOBO_SAMPLES   = 512
 # two checkouts pool progress; when False (default), only the current user's own
 # local history is scanned. The toggle is symmetric — whoever sets it False scans
 # only their own dir, regardless of which checkout the job runs from.
-SHARE_COLLABORATOR_HISTORY = False
-
-# Known collaborator runs directories (one per user). The current user's own dir
-# is detected by matching $HOME and is always scanned; the other is added only
-# when SHARE_COLLABORATOR_HISTORY is True.
-_COLLABORATOR_RUNS_DIRS = [
-    "/home/adewinmb/orcd/scratch/ZoMBI-Hop/optimize/runs",
-    "/home/eve_lal/orcd/scratch/ZoMBI-Hop/optimize/runs",
-]
+# The runs-dir list and the collaborator toggle are defined once in
+# optimize/collab_dirs.py so run_mobo, pareto, and sync_runs can't drift apart.
+# The current user's own dir is detected by matching $HOME below and is always
+# scanned; the other is added only when SHARE_COLLABORATOR_HISTORY is True.
+from optimize.collab_dirs import (  # noqa: E402  — repo root on sys.path from import block above
+    SHARE_COLLABORATOR_HISTORY,
+    COLLABORATOR_RUNS_DIRS as _COLLABORATOR_RUNS_DIRS,
+)
 
 
 def _default_shared_runs_dirs() -> list[str]:
@@ -708,6 +709,11 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
     }
     if dataset is not None:
         cfg["dataset"] = dataset
+    # Variant tag (hebo vs ensemble) keeps their shared histories disjoint even
+    # though both use dataset="ensemble"; derived from the run-dir family.
+    _variant = _run_variant(run_dir)
+    if _variant is not None:
+        cfg["variant"] = _variant
     if ackley_variant is not None:
         cfg["ackley_variant"] = ackley_variant
     if landscape.landscape == "rf":
@@ -1055,18 +1061,6 @@ def _time_objective(metrics: dict) -> float:
     return float(metrics["runtime_s"])
 
 
-def _n_points_objective(metrics: dict) -> float:
-    """Fourth MOBO objective: penalty on the total number of points sampled.
-
-    Reads the stored ``n_points_penalty`` (== total sample count for a finite
-    trial). Unlike ``_time_objective`` there is no legacy fallback: this
-    objective post-dates older runs, which simply never recorded a sample count,
-    so a trial missing the key raises ``KeyError`` and is skipped when seeding the
-    GP from prior history (the crawlers already treat KeyError as "unseedable").
-    """
-    return float(metrics["n_points_penalty"])
-
-
 def _norm_x_key(x: torch.Tensor) -> tuple[int, ...]:
     """Hashable key for a normalised hparam vector (rounded to 1e-6) for dedup.
 
@@ -1097,8 +1091,7 @@ def _collect_from_progress(path: str, X_obs: list, Y_obs: list) -> int:
             x = hparams_to_norm(hp)
             y = torch.tensor([-float(m["dist_to_needles"]),
                               -float(m["dup_fraction"]),
-                              -_time_objective(m),
-                              -_n_points_objective(m)], dtype=DTYPE)
+                              -_time_objective(m)], dtype=DTYPE)
         except (KeyError, ValueError, TypeError):
             continue
         X_obs.append(x)
@@ -1237,8 +1230,7 @@ def collect_rederived_observations(runs_dir: str, new_maximize: bool,
                 x = hparams_to_norm(hp)
                 y = torch.tensor([-float(dist),
                                   -float(m["dup_fraction"]),
-                                  -_time_objective(m),
-                                  -_n_points_objective(m)], dtype=DTYPE)
+                                  -_time_objective(m)], dtype=DTYPE)
             except (KeyError, ValueError, TypeError) as exc:
                 print(f"  [resume-scratch] {run_name} trial "
                       f"{t.get('trial')}: could not build observation ({exc}); skipping.")
@@ -1315,21 +1307,53 @@ def collect_observations_for_dim(runs_dir: str, dim: int):
 
 # ─── Shared-history seeding across concurrent runs (--share-history) ─────────────
 
+def _run_variant(run_dir_or_name: str | None) -> str | None:
+    """Variant tag for a run, derived from its directory-name prefix.
+
+    HEBO and ensemble MOBO runs share the same ``dataset="ensemble"`` objective, so
+    without an extra discriminator their histories would pool together. In this
+    collaboration HEBO is the *only* non-ensemble variant, and HEBO runs always live
+    in ``mobo_hebo_*`` directories; every other run (this account's and eve_lal's,
+    whether prefixed ``mobo_ensemble_*`` or not) is an ensemble run. So the rule is:
+    ``mobo_hebo_*`` -> ``"hebo"``, everything else -> ``"ensemble"``.
+
+    Tagging a run that happens to use a *different dataset* (rf, ackley, …) as
+    ``"ensemble"`` never mispools it: the separate ``dataset`` signature field still
+    keeps datasets disjoint, so only the hebo-vs-ensemble split (same dataset) is what
+    ``variant`` actually decides. Kept in sync with ``pareto._run_variant``.
+    """
+    if not run_dir_or_name:
+        return None
+    name = os.path.basename(str(run_dir_or_name).rstrip("/"))
+    if name.startswith("mobo_hebo_"):
+        return "hebo"
+    return "ensemble"
+
+
 def _run_signature(cfg: dict) -> dict:
     """Config fields that must match for another run's stored Y to be trusted here.
 
     These pin down the *objective* a trial was scored against — the same
     hyperparameters yield comparable (dist, dup, avg_time_per_iter) only when the
-    dataset, dimension, per-trial time budget, search direction, and (for the
-    ensemble objective) the landscape difficulty/averaging all agree. Fields
-    absent in older configs come back as ``None`` and simply have to match
-    ``None`` on both sides.
+    dataset, dimension, per-trial time budget, search direction, optimiser variant,
+    and (for the ensemble objective) the landscape difficulty/averaging all agree.
+
+    ``variant`` separates optimisers (e.g. ``"hebo"``) from the default ZoMBI runs
+    (no ``variant`` key -> ``None``), so a hebo run is never pooled with a ZoMBI run
+    of the same dataset/dim. It also keeps HEBO runs' shared history completely
+    separate from the legacy ensemble runs even though both use
+    ``dataset="ensemble"``. Callers that don't store it in the config inject it from
+    the run-dir name (see ``cfg.setdefault("variant", _run_variant(run_dir))``)
+    before comparing, so older ensemble configs are still classified by their folder
+    family. Fields absent in older configs come back as ``None`` and simply have to
+    match ``None`` on both sides. Kept in sync with ``pareto._run_signature``.
     """
     return {
         "dataset": cfg.get("dataset") or cfg.get("oracle") or cfg.get("landscape"),
         "dim": int(cfg["dim"]) if cfg.get("dim") is not None else None,
         "time_limit_hours": cfg.get("time_limit_hours"),
         "maximize": bool(cfg.get("maximize", False)),
+        "variant": cfg.get("variant"),
         "ensemble_optima_margin": cfg.get("ensemble_optima_margin"),
         "ensemble_repeats": cfg.get("ensemble_repeats"),
     }
@@ -1382,6 +1406,9 @@ def collect_shared_observations(
                     cfg = json.load(f)
             except Exception:
                 continue
+            # Classify legacy configs (no stored variant) by their folder family
+            # so hebo/ensemble histories never pool across the boundary.
+            cfg.setdefault("variant", _run_variant(run_dir))
             if not _signatures_match(signature, _run_signature(cfg)):
                 continue
             prog = os.path.join(run_dir, "mobo_progress.json")
@@ -1403,8 +1430,7 @@ def collect_shared_observations(
                     x = hparams_to_norm(hp)
                     y = torch.tensor([-float(m["dist_to_needles"]),
                                       -float(m["dup_fraction"]),
-                                      -_time_objective(m),
-                                      -_n_points_objective(m)], dtype=DTYPE)
+                                      -_time_objective(m)], dtype=DTYPE)
                 except (KeyError, ValueError, TypeError):
                     continue
                 seen.add(key)
@@ -1621,6 +1647,7 @@ from eval_metrics import (  # noqa: E402  — after sys.path setup in callers
     metric_dist_to_needles,
     metric_dup_fraction,
     metric_n_points_penalty,
+    zoom_size_fraction,
     metric_pct_matched,
     metric_pct_matched_comp,
 )
@@ -1973,14 +2000,16 @@ def _activation_zoom_per_point(n_points: int, snap_records: list[tuple]) -> tupl
     """Map each stored point index → (activation, zoom) from snapshot records.
 
     snap_records is the chronological list of (cumulative_n_points, activation,
-    zoom) captured at every take_snapshot.  Points in [prev_n, n) were added by
-    that snapshot's objective call; init points fall into the first record.
+    zoom, [zoom_size]) captured at every take_snapshot.  Points in [prev_n, n) were
+    added by that snapshot's objective call; init points fall into the first record.
+    Records may carry an optional 4th element (zoom-zone size); it is ignored here.
     """
     act = np.zeros(n_points, dtype=int)
     zm  = np.zeros(n_points, dtype=int)
     prev = 0
-    for (n, a, z) in snap_records:
-        n = min(int(n), n_points)
+    for rec in snap_records:
+        n, a, z = int(rec[0]), rec[1], rec[2]
+        n = min(n, n_points)
         if n > prev:
             act[prev:n] = a
             zm[prev:n] = z
@@ -1989,6 +2018,29 @@ def _activation_zoom_per_point(n_points: int, snap_records: list[tuple]) -> tupl
         act[prev:] = snap_records[-1][1]
         zm[prev:]  = snap_records[-1][2]
     return act, zm
+
+
+def _zoom_size_per_point(n_points: int, snap_records: list[tuple]) -> np.ndarray:
+    """Per-point zoom-zone linear size ``s`` ∈ (0,1] from snapshot records.
+
+    Mirrors ``_activation_zoom_per_point``'s index bucketing but reads each
+    record's optional 4th element (the zoom-zone size captured at snapshot time;
+    see ``zoom_size_fraction``). Points before any recorded zoom, or records that
+    predate size capture, default to ``s=1`` (full domain → unscaled dup radius).
+    Fed to ``metric_dup_fraction(..., zoom_sizes=...)``.
+    """
+    s = np.ones(n_points, dtype=float)
+    prev = 0
+    for rec in snap_records:
+        n = min(int(rec[0]), n_points)
+        sz = float(rec[3]) if len(rec) > 3 else 1.0
+        if n > prev:
+            s[prev:n] = sz
+            prev = n
+    if prev < n_points and snap_records:   # tail safety
+        last = snap_records[-1]
+        s[prev:] = float(last[3]) if len(last) > 3 else 1.0
+    return s
 
 
 def write_points_csv(path: str, dh, snap_records: list[tuple], *, dim: int = 3) -> None:
@@ -2536,8 +2588,13 @@ def run_single_trial(
     def snap_wrap(*a, **k):
         orig_snap(*a, **k)
         if dh.X_all_actual is not None:
+            # Capture the current zoom zone's linear size (relative to the full
+            # [0,1]^d domain) so metric_dup_fraction can shrink the duplicate radius
+            # for points sampled inside a zoom (see _zoom_size_per_point).
+            czb = dh.current_zoom_bounds if dh.current_zoom_bounds is not None else dh.bounds
+            zoom_size = zoom_size_fraction(czb) if czb is not None else 1.0
             snap_records.append((dh.X_all_actual.shape[0],
-                                 dh.current_activation, dh.current_zoom))
+                                 dh.current_activation, dh.current_zoom, zoom_size))
     dh.take_snapshot = snap_wrap
 
     if torch.cuda.is_available():
@@ -2573,7 +2630,10 @@ def run_single_trial(
         if dh.X_all_actual is not None else np.empty((0, dim))
     )
     dist = metric_dist_to_needles(discovered, true_optima, dim=dim)
-    dup  = metric_dup_fraction(X_all_np, dim=dim)
+    # Zoom-scaled duplicate radius: points sampled inside a small zoom zone must be
+    # closer to count as duplicates, so zooming isn't penalised on the dup objective.
+    zoom_sizes = _zoom_size_per_point(X_all_np.shape[0], snap_records)
+    dup  = metric_dup_fraction(X_all_np, dim=dim, zoom_sizes=zoom_sizes)
     n_points = int(X_all_np.shape[0])
     print(f"    [trial]  iters={n_iters}  dist={dist:.4f}  dup={dup:.4f}"
           f"  t/iter={avg_time_per_iter:.3f}s  (total {runtime:.1f}s)"
@@ -2782,7 +2842,6 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
             "dist_to_needles":     round(-Y_obs[i][0].item(), 6),
             "dup_fraction":        round(-Y_obs[i][1].item(), 6),
             "avg_time_per_iter_s": round(-Y_obs[i][2].item(), 4),
-            "n_points_penalty":    round(-Y_obs[i][3].item(), 4),
         }
         for i in range(n)
     ]
@@ -2809,14 +2868,12 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
     dists = [m["dist_to_needles"]     for m in metrics_all]
     dups  = [m["dup_fraction"]        for m in metrics_all]
     times = [m["avg_time_per_iter_s"] for m in metrics_all]
-    npens = [m["n_points_penalty"]    for m in metrics_all]
     return {
         "n_trials": n,
         "averages": {
             "dist_to_needles":     round(float(np.mean(dists)), 6),
             "dup_fraction":        round(float(np.mean(dups)),  6),
             "avg_time_per_iter_s": round(float(np.mean(times)), 4),
-            "n_points_penalty":    round(float(np.mean(npens)), 4),
         },
         "best_dist": {"value": round(min(dists), 6), "trial": int(np.argmin(dists)) + 1},
         "trials": trials,
@@ -2843,24 +2900,20 @@ def save_running_summary(X_obs, Y_obs, run_dir: str, n_seed: int = 0,
 def _failure_penalty_Y(prior_Y: list[torch.Tensor]) -> torch.Tensor:
     """Dominated objective vector for a hard-failed trial (0 ZoMBI iterations).
 
-    The MOBO objective is Y = (-dist, -dup, -avg_time_per_iter, -n_points_penalty),
-    maximised. A failed trial's *raw* sentinels (dist=UNMATCHED_PENALTY, dup=0,
-    time=0, n_points_penalty=inf) look GOOD on the duplicate- and time-objectives
-    — ``-0`` is the best attainable on both — and the infinite point penalty can't
-    even be standardised, so feeding them to the GP would actively reward instant
-    crashes. This instead emits a vector that is the worst attainable on every
-    objective: worst distance, full duplication, a per-iter time at least as large
-    as the slowest real trial, and a sample-count penalty at least as large as the
-    most-sampling real trial seen so far. The point is therefore Pareto-dominated
-    by any genuine measurement, so the GP learns the hyperparameter region is bad
-    and qLogNEHVI is nudged away from it — without the sentinel ever poisoning an
+    The MOBO objective is Y = (-dist, -dup, -avg_time_per_iter), maximised. A
+    failed trial's *raw* sentinels (dist=UNMATCHED_PENALTY, dup=0, time=0) look
+    GOOD on the duplicate- and time-objectives — ``-0`` is the best attainable on
+    both — so feeding them to the GP would actively reward instant crashes. This
+    instead emits a vector that is the worst attainable on every objective: worst
+    distance, full duplication, and a per-iter time at least as large as the
+    slowest real trial seen so far. The point is therefore Pareto-dominated by any
+    genuine measurement, so the GP learns the hyperparameter region is bad and
+    qLogNEHVI is nudged away from it — without the sentinel ever poisoning an
     objective or appearing on the Pareto front.
     """
     times  = [float(-y[2].item()) for y in prior_Y] if prior_Y else []
-    npens  = [float(-y[3].item()) for y in prior_Y] if prior_Y else []
     time_pen   = max(times) if times else 1.0
-    npoint_pen = max(npens) if npens else 1.0
-    return torch.tensor([-UNMATCHED_PENALTY, -1.0, -time_pen, -npoint_pen],
+    return torch.tensor([-UNMATCHED_PENALTY, -1.0, -time_pen],
                         dtype=DTYPE, device="cpu")
 
 
@@ -2885,7 +2938,9 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
     if share_dirs:
         try:
             with open(os.path.join(run_dir, "run_config.json")) as f:
-                shared_sig = _run_signature(json.load(f))
+                own_cfg = json.load(f)
+            own_cfg.setdefault("variant", _run_variant(run_dir))
+            shared_sig = _run_signature(own_cfg)
         except Exception as exc:
             print(f"  [share] could not read own run_config ({exc}); sharing disabled.")
             share_dirs = None
@@ -3041,7 +3096,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                     model = SingleTaskGP(
                         X_t, Y_t,
                         input_transform=Normalize(d=N_HPARAMS),
-                        outcome_transform=Standardize(m=4),
+                        outcome_transform=Standardize(m=3),
                     )
                     mll = ExactMarginalLogLikelihood(model.likelihood, model)
                     fit_gpytorch_mll(mll)
@@ -3134,8 +3189,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
 
                 X_obs.append(x_new.detach().cpu())
                 Y_obs.append(torch.tensor(
-                    [-res["dist"], -res["dup"], -res["avg_time_per_iter"],
-                     -metric_n_points_penalty(res["n_points"])],
+                    [-res["dist"], -res["dup"], -res["avg_time_per_iter"]],
                     dtype=DTYPE, device="cpu"))
                 save_running_summary(X_obs, Y_obs, run_dir, n_seed=n_seed, n_sobol=n_sobol)
                 log_resource_usage(f"end of trial {trial_num} ({phase})")

@@ -38,7 +38,16 @@ trap on_time_limit USR1
 # correct. Keep the `mobo_` prefix so shared-history's `mobo_*` glob still sees it.
 RUN_DIR="optimize/runs/mobo_ensemble_4d_job${SLURM_JOB_ID}"
 
-uv run python optimize/run_mobo.py --dataset ensemble --dim 4 --time-limit 0.3 --share-history --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112 --run-dir "$RUN_DIR" &
+# Seed with the archived trial_112, plus the 3 best-dist_to_needles trials from the
+# ensemble 4d shared-history pool (own + eve_lal's, ranked by pareto.py). eve_lal's
+# runs are referenced under her archived_runs, matching this account's move.
+uv run python optimize/run_mobo.py --dataset ensemble --dim 4 --time-limit 0.3 --share-history \
+    --start-from-best \
+        optimize/runs/archived_runs/mobo_3d_05_06_15_32/trial_112 \
+        /home/eve_lal/orcd/scratch/ZoMBI-Hop/optimize/runs/archived_runs/mobo_ensemble_4d_job16861904/trial_3 \
+        optimize/runs/archived_runs/mobo_ensemble_4d_job16948639/trial_33 \
+        optimize/runs/archived_runs/mobo_ensemble_4d_job16948639/trial_19 \
+    --run-dir "$RUN_DIR" &
 wait $!
 rc=$?
 
