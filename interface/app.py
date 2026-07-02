@@ -25,6 +25,7 @@ import threading
 import time
 import traceback
 import warnings
+from collections import deque
 from pathlib import Path
 from uuid import uuid4
 from typing import Optional
@@ -2905,7 +2906,19 @@ def _fmt_status(state: dict) -> str:
 
 
 class LiveLogPanel(ttk.LabelFrame):
-    """Bottom-right panel: static status line + scrollable colour log."""
+    """Bottom-right panel: static status line + scrollable colour log.
+
+    Log lines can arrive in bursts from a worker thread (verbose optimizer output,
+    or a hardware subprocess's stdout). Rather than scheduling one Tk callback plus
+    a text-widget reflow per line — which floods the main loop and freezes the UI
+    during a run — ``log()`` only enqueues, and a single periodic ``_drain`` on the
+    main thread flushes the whole backlog in one insert + one scroll. This bounds
+    main-thread work regardless of how fast lines are produced.
+    """
+
+    _DRAIN_MS  = 80      # how often the main thread flushes queued log lines
+    _MAX_LINES = 5000    # cap the visible log; older lines are trimmed on drain
+    _MAX_QUEUE = 8000    # cap the pending backlog so a flood can't grow unbounded
 
     def __init__(self, parent, **kwargs):
         kwargs.setdefault("text", "Live Run Log")
@@ -2915,6 +2928,10 @@ class LiveLogPanel(ttk.LabelFrame):
             "candidate": "", "line0_left": "", "line0_right": "",
             "status_tag": "",
         }
+        # (msg, tag) awaiting insertion; appended from any thread, drained on main.
+        self._pending: deque = deque()
+        self._pending_lock = threading.Lock()
+        self._drain_job: Optional[str] = None
         # Static status line (single non-wrapping label)
         self._status_var = tk.StringVar(value="A:—  Z:—  I:—")
         ttk.Label(
@@ -2931,26 +2948,54 @@ class LiveLogPanel(ttk.LabelFrame):
         for tag, cfg in _LOG_TAGS.items():
             self._log.tag_configure(tag, **cfg)
 
+        self._schedule_drain()
+
     def log(self, msg: str, tag: Optional[str] = None):
+        """Enqueue a line for display. Safe to call from any thread; cheap by
+        design — the actual widget update happens in ``_drain`` on the main
+        thread. Never touches Tk here, so a fast producer can't stall the UI."""
         if tag is None:
             tag = _log_tag_for(msg)
-        _parse_status_from_line(msg, self._state)
+        with self._pending_lock:
+            self._pending.append((msg, tag))
+            # Drop oldest if a burst outruns the drainer — the visible log is
+            # capped anyway, so the head would be trimmed on insert regardless.
+            while len(self._pending) > self._MAX_QUEUE:
+                self._pending.popleft()
 
-        def _do():
-            try:
-                if not self.winfo_exists():
-                    return
-                self._status_var.set(_fmt_status(self._state))
-                self._log.config(state="normal")
-                self._log.insert("end", msg + "\n", tag)
-                self._log.see("end")
-                self._log.config(state="disabled")
-            except tk.TclError:
-                pass
+    def _schedule_drain(self):
+        self._drain_job = self.after(self._DRAIN_MS, self._drain)
 
-        self.after(0, _do)
+    def _drain(self):
+        """Flush all queued lines in a single batched widget update (main thread)."""
+        try:
+            with self._pending_lock:
+                batch = list(self._pending)
+                self._pending.clear()
+            if batch:
+                for msg, _tag in batch:
+                    _parse_status_from_line(msg, self._state)
+                try:
+                    if self.winfo_exists():
+                        self._status_var.set(_fmt_status(self._state))
+                        self._log.config(state="normal")
+                        for msg, tag in batch:
+                            self._log.insert("end", msg + "\n", tag)
+                        # Trim the widget to the last _MAX_LINES lines so a long
+                        # run doesn't accumulate an unbounded, slow-to-render log.
+                        total = int(self._log.index("end-1c").split(".")[0])
+                        if total > self._MAX_LINES:
+                            self._log.delete("1.0", f"{total - self._MAX_LINES}.0")
+                        self._log.see("end")
+                        self._log.config(state="disabled")
+                except tk.TclError:
+                    pass
+        finally:
+            self._schedule_drain()
 
     def clear(self):
+        with self._pending_lock:
+            self._pending.clear()
         self._log.config(state="normal")
         self._log.delete("1.0", "end")
         self._log.config(state="disabled")
