@@ -1314,6 +1314,29 @@ def collect_observations_for_dim(runs_dir: str, dim: int):
 
 # ─── Shared-history seeding across concurrent runs (--share-history) ─────────────
 
+def _run_variant(run_dir_or_name: str | None) -> str | None:
+    """Variant tag for a run, derived from its directory-name prefix.
+
+    HEBO and ensemble MOBO runs share the same ``dataset="ensemble"`` objective, so
+    without an extra discriminator their histories would pool together. In this
+    collaboration HEBO is the *only* non-ensemble variant, and HEBO runs always live
+    in ``mobo_hebo_*`` directories; every other run (this account's and eve_lal's,
+    whether prefixed ``mobo_ensemble_*`` or not) is an ensemble run. So the rule is:
+    ``mobo_hebo_*`` -> ``"hebo"``, everything else -> ``"ensemble"``.
+
+    Tagging a run that happens to use a *different dataset* (rf, ackley, …) as
+    ``"ensemble"`` never mispools it: the separate ``dataset`` signature field still
+    keeps datasets disjoint, so only the hebo-vs-ensemble split (same dataset) is what
+    ``variant`` actually decides. Kept in sync with ``pareto._run_variant``.
+    """
+    if not run_dir_or_name:
+        return None
+    name = os.path.basename(str(run_dir_or_name).rstrip("/"))
+    if name.startswith("mobo_hebo_"):
+        return "hebo"
+    return "ensemble"
+
+
 def _run_signature(cfg: dict) -> dict:
     """Config fields that must match for another run's stored Y to be trusted here.
 

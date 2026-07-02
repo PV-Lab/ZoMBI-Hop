@@ -177,6 +177,33 @@ def _dir_owner(path: str) -> str:
 # only comparable to a sibling's when the objective they were scored against is the
 # same, which is pinned down by these run_config.json fields.
 
+def _run_variant(run_dir_or_name: str | None) -> str | None:
+    """Variant tag for a run, derived from its directory-name prefix.
+
+    HEBO and ensemble MOBO runs share the same ``dataset="ensemble"`` objective, so
+    without an extra discriminator their histories would pool together. In this
+    collaboration HEBO is the *only* non-ensemble variant and HEBO runs always live in
+    ``mobo_hebo_*`` directories; every other run (this account's and eve_lal's, whether
+    prefixed ``mobo_ensemble_*`` or not) is an ensemble run. So the rule is:
+    ``mobo_hebo_*`` -> ``"hebo"``, everything else -> ``"ensemble"``. Cross-dataset
+    pooling is still prevented by the separate ``dataset`` signature field, so this
+    only ever decides the hebo-vs-ensemble split. Kept in sync with
+    ``run_mobo._run_variant``.
+
+    Newer run_mobo stamps ``variant`` into run_config.json at write time, but runs
+    created before that (e.g. older collaborator ensemble runs) never stored the key.
+    run_mobo backfills it from the folder name before comparing signatures; pareto
+    must do the same via ``_load_run_signature`` or those older runs would look like
+    ``variant=None`` and fail to match a newer run's stored ``variant="ensemble"``.
+    """
+    if not run_dir_or_name:
+        return None
+    name = os.path.basename(str(run_dir_or_name).rstrip("/"))
+    if name.startswith("mobo_hebo_"):
+        return "hebo"
+    return "ensemble"
+
+
 def _run_signature(cfg: dict) -> dict:
     """Config fields that must match for another run's stored trials to be pooled.
 
@@ -219,10 +246,16 @@ def _load_run_signature(run_dir: str) -> dict | None:
         return None
     try:
         with open(cfg_path) as f:
-            return _run_signature(json.load(f))
+            cfg = json.load(f)
     except Exception as exc:
         print(f"  [shared-history] {run_dir}: run_config.json unreadable ({exc}).")
         return None
+    # Backfill variant from the folder-name family when the config predates it being
+    # stored, mirroring run_mobo's cfg.setdefault("variant", _run_variant(run_dir)).
+    # Without this, older collaborator ensemble runs (no stored variant) read as
+    # variant=None and never match a newer run's variant="ensemble".
+    cfg.setdefault("variant", _run_variant(run_dir))
+    return _run_signature(cfg)
 
 
 # ─── Collection ────────────────────────────────────────────────────────────────
