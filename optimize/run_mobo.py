@@ -233,6 +233,7 @@ from src.utils.simplex import (
     proj_simplex,
 )
 
+from optimize.composition_prediction import physics_simulate_line
 from optimize.mobo_landscapes import (
     LandscapeSpec,
     build_ackley_oracle_landscape,
@@ -1659,10 +1660,11 @@ def make_sim_obj(fn_callable, device, dtype, *, maximize: bool):
     def sim_objective(endpoints: torch.Tensor):
         left  = endpoints[0, 0].to(torch.float64)
         right = endpoints[0, 1].to(torch.float64)
-        t     = torch.linspace(0.0, 1.0, NUM_EXPERIMENTS,
-                               dtype=torch.float64, device=left.device)
-        pts_t = left.unsqueeze(0) + t.unsqueeze(1) * (right - left).unsqueeze(0)
-        pts_t = add_composition_noise(pts_t, NOISE_LEVEL)
+        # Physics-based "actual" compositions: push the requested start→end line
+        # through the deterministic hardware print model (ramp lag/overshoot +
+        # junction-volume diffusion mixing) instead of adding random input noise.
+        pts_t = physics_simulate_line(left, right, num_points=NUM_EXPERIMENTS,
+                                      device=left.device, dtype=torch.float64)
         pts_np = pts_t.detach().cpu().numpy()
         raw    = np.array([fn_callable(x) for x in pts_np], dtype=float)
         y      = torch.tensor(raw if maximize else -raw, dtype=dtype, device=device)
@@ -1719,16 +1721,20 @@ def _gen_init_data(fn_callable, maximize: bool, dim: int = 3):
             continue
         _, _, x_left, x_right = seg
         t     = torch.linspace(0.0, 1.0, NUM_EXPERIMENTS, dtype=torch.float64, device=DEVICE)
-        pts_t = (x_left.to(torch.float64).unsqueeze(0)
-                 + t.unsqueeze(1) * (x_right - x_left).to(torch.float64).unsqueeze(0))
-        pts_t = add_composition_noise(pts_t, NOISE_LEVEL)
+        # Clean straight segment = what we "request"; physics-simulated print =
+        # what we "measure" (replaces the random add_composition_noise perturbation).
+        pts_clean = (x_left.to(torch.float64).unsqueeze(0)
+                     + t.unsqueeze(1) * (x_right - x_left).to(torch.float64).unsqueeze(0))
+        pts_t = physics_simulate_line(x_left, x_right, num_points=NUM_EXPERIMENTS,
+                                      device=DEVICE, dtype=torch.float64)
         pts_np = pts_t.detach().cpu().numpy()
         raw    = np.array([fn_callable(x) for x in pts_np], dtype=float)
         y_t    = torch.tensor(raw if maximize else -raw, dtype=DTYPE, device=DEVICE)
         y_t    = y_t + torch.randn_like(y_t) * (OUTPUT_NOISE_FRAC * y_t.abs())
-        pts_out = pts_t.to(dtype=DTYPE, device=DEVICE)
+        pts_out   = pts_t.to(dtype=DTYPE, device=DEVICE)
+        pts_clean = pts_clean.to(dtype=DTYPE, device=DEVICE)
         x_a_list.append(pts_out)
-        x_e_list.append(pts_out)
+        x_e_list.append(pts_clean)
         y_list.append(y_t)
     if not x_a_list:
         raise RuntimeError("Could not generate any initial simplex lines.")

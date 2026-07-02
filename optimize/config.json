@@ -1,0 +1,11 @@
+{
+    "syringe_radius": 5.15,
+    "lead": 2,
+    "micro_steps": 25600,
+    "total_num_drops": 24,
+    "grad_steps": 80,
+    "max_print_time": 84,
+    "max_total_speed": 1050,
+    "grad_start_step": [0, 0],
+    "grad_interval_time": [500, 500]
+}

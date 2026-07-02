@@ -62,6 +62,7 @@ from src import ZoMBIHop, LineBO
 from src.core.linebo import line_simplex_segment, zero_sum_dirs
 from src.utils.simplex import add_composition_noise, proj_simplex, get_tangent_basis
 from src.utils.datahandler import reconstruct_snapshot_tensors
+from optimize.composition_prediction import physics_simulate_line
 
 # ── constants ─────────────────────────────────────────────────────────────────
 DEVICE          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -275,10 +276,11 @@ def _make_sim_obj(fn_callable, device, dtype, *, maximize: bool):
     def _obj(endpoints: torch.Tensor):
         left  = endpoints[0, 0].to(torch.float64)
         right = endpoints[0, 1].to(torch.float64)
-        t     = torch.linspace(0.0, 1.0, NUM_EXPERIMENTS,
-                               dtype=torch.float64, device=left.device)
-        pts   = left.unsqueeze(0) + t.unsqueeze(1) * (right - left).unsqueeze(0)
-        pts   = add_composition_noise(pts, NOISE_LEVEL)
+        # Physics-based "actual" compositions: push the requested start→end line
+        # through the deterministic hardware print model (ramp lag/overshoot +
+        # junction-volume diffusion mixing) instead of adding random input noise.
+        pts   = physics_simulate_line(left, right, num_points=NUM_EXPERIMENTS,
+                                      device=left.device, dtype=torch.float64)
         raw   = np.array([fn_callable(x) for x in pts.detach().cpu().numpy()], float)
         y     = torch.tensor(raw if maximize else -raw, dtype=dtype, device=device)
         y     = y + torch.randn_like(y) * (OUTPUT_NOISE_FRAC * y.abs())
@@ -334,7 +336,8 @@ def _gen_init_data(fn_callable, d: int, maximize: bool):
         # Record them separately (mirroring the optimizer path in _make_linebo_wrapper)
         # so the expected/sent init is a true line, not the noise-blurred points.
         pts_clean = xl.to(torch.float64).unsqueeze(0) + t.unsqueeze(1) * (xr - xl).to(torch.float64).unsqueeze(0)
-        pts  = add_composition_noise(pts_clean, NOISE_LEVEL)
+        pts  = physics_simulate_line(xl, xr, num_points=NUM_EXPERIMENTS,
+                                     device=DEVICE, dtype=torch.float64)
         raw  = np.array([fn_callable(x) for x in pts.detach().cpu().numpy()], float)
         yt   = torch.tensor(raw if maximize else -raw, dtype=DTYPE, device=DEVICE)
         yt   = yt + torch.randn_like(yt) * (OUTPUT_NOISE_FRAC * yt.abs())
