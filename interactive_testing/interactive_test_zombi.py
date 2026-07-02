@@ -82,6 +82,7 @@ Flags
 from __future__ import annotations
 
 import os
+import gc
 import time
 import sys
 import json
@@ -1297,6 +1298,18 @@ def main(
     zombi_thread = threading.Thread(target=_run_zombi, daemon=True, name="zombi-worker")
     zombi_thread.start()
 
+    # Matplotlib TkAgg figures live in reference cycles (figure↔axes↔canvas), so
+    # refcounting alone never frees their child Tk PhotoImage/Variable objects —
+    # they wait for the cyclic garbage collector. That collector runs on whatever
+    # thread crosses the allocation threshold, which is the allocation-heavy
+    # zombi-worker thread; finalizing Tk objects off the main thread raises
+    # "main thread is not in main loop". Disable automatic GC and drive cyclic
+    # collection explicitly from the main-thread loop below so every Tk finalizer
+    # runs on the main thread. (Harmless in Agg/headless mode: no Tk objects.)
+    _tk_windowed = not matplotlib.get_backend().lower().startswith("agg")
+    if _tk_windowed:
+        gc.disable()
+
     current_fig: list = [None]
 
     def _drain_queue():
@@ -1321,6 +1334,10 @@ def main(
     try:
         while zombi_thread.is_alive():
             _drain_queue()
+            # Run cyclic GC here (main thread) so any Tk finalizers for closed
+            # figures execute on-thread rather than on the worker thread.
+            if _tk_windowed:
+                gc.collect()
             # plt.pause pumps the Tk event loop AND yields the CPU briefly.
             try:
                 plt.pause(0.05)
@@ -1331,6 +1348,9 @@ def main(
 
     # Drain any plots that arrived after the thread finished.
     _drain_queue()
+    if _tk_windowed:
+        gc.collect()
+        gc.enable()
 
     if zombi_exc:
         print(f"\n[!] ZoMBI-Hop raised an exception: {zombi_exc[0]}")
