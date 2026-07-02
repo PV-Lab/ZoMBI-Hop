@@ -709,6 +709,11 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
     }
     if dataset is not None:
         cfg["dataset"] = dataset
+    # Variant tag (hebo vs ensemble) keeps their shared histories disjoint even
+    # though both use dataset="ensemble"; derived from the run-dir family.
+    _variant = _run_variant(run_dir)
+    if _variant is not None:
+        cfg["variant"] = _variant
     if ackley_variant is not None:
         cfg["ackley_variant"] = ackley_variant
     if landscape.landscape == "rf":
@@ -1332,11 +1337,16 @@ def _run_signature(cfg: dict) -> dict:
     hyperparameters yield comparable (dist, dup, avg_time_per_iter) only when the
     dataset, dimension, per-trial time budget, search direction, optimiser variant,
     and (for the ensemble objective) the landscape difficulty/averaging all agree.
-    The ``variant`` field separates optimisers (e.g. ``"hebo"``) from the default
-    ZoMBI runs (no ``variant`` key -> ``None``), so a hebo run is never pooled with
-    a ZoMBI run of the same dataset/dim. Fields absent in older configs come back as
-    ``None`` and simply have to match ``None`` on both sides. Kept in sync with
-    ``pareto._run_signature``.
+
+    ``variant`` separates optimisers (e.g. ``"hebo"``) from the default ZoMBI runs
+    (no ``variant`` key -> ``None``), so a hebo run is never pooled with a ZoMBI run
+    of the same dataset/dim. It also keeps HEBO runs' shared history completely
+    separate from the legacy ensemble runs even though both use
+    ``dataset="ensemble"``. Callers that don't store it in the config inject it from
+    the run-dir name (see ``cfg.setdefault("variant", _run_variant(run_dir))``)
+    before comparing, so older ensemble configs are still classified by their folder
+    family. Fields absent in older configs come back as ``None`` and simply have to
+    match ``None`` on both sides. Kept in sync with ``pareto._run_signature``.
     """
     return {
         "dataset": cfg.get("dataset") or cfg.get("oracle") or cfg.get("landscape"),
@@ -1396,6 +1406,9 @@ def collect_shared_observations(
                     cfg = json.load(f)
             except Exception:
                 continue
+            # Classify legacy configs (no stored variant) by their folder family
+            # so hebo/ensemble histories never pool across the boundary.
+            cfg.setdefault("variant", _run_variant(run_dir))
             if not _signatures_match(signature, _run_signature(cfg)):
                 continue
             prog = os.path.join(run_dir, "mobo_progress.json")
@@ -2925,7 +2938,9 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
     if share_dirs:
         try:
             with open(os.path.join(run_dir, "run_config.json")) as f:
-                shared_sig = _run_signature(json.load(f))
+                own_cfg = json.load(f)
+            own_cfg.setdefault("variant", _run_variant(run_dir))
+            shared_sig = _run_signature(own_cfg)
         except Exception as exc:
             print(f"  [share] could not read own run_config ({exc}); sharing disabled.")
             share_dirs = None
