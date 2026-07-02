@@ -121,6 +121,7 @@ from src import ZoMBIHop, LineBO
 from src.core.linebo import line_simplex_segment, zero_sum_dirs
 from src.utils.simplex import Ellipsoid, composition_to_ilr, ilr_to_composition, proj_simplex
 from synthetic_data.ackley import Ackley
+from optimize.composition_prediction import physics_simulate_line
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 COMPOSITION_COLS = ["FAPbI3", "MAPbI3", "MAPbBr3"]
@@ -468,13 +469,12 @@ def make_sim_objective(
     def sim_objective(endpoints: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         left = endpoints[0, 0].to(dtype=torch.float64)
         right = endpoints[0, 1].to(dtype=torch.float64)
-        t = torch.linspace(0.0, 1.0, NUM_EXPERIMENTS, dtype=torch.float64, device=left.device)
-        pts_t = left.unsqueeze(0) + t.unsqueeze(1) * (right - left).unsqueeze(0)  # (N, 3)
-        # Logistic-normal input noise: perturb in ILR space, invert back to simplex.
-        # Respects the Aitchison geometry; no clip/renorm needed.
-        z = composition_to_ilr(pts_t)
-        z = z + torch.randn_like(z) * NOISE_LEVEL_ILR
-        pts_t = ilr_to_composition(z, d=pts_t.shape[1])       # (N, 3) on simplex
+        # Physics-based "actual" compositions: push the requested start→end line
+        # through the deterministic hardware print model (ramp lag/overshoot +
+        # junction-volume diffusion mixing) instead of adding random ILR-space
+        # input noise.
+        pts_t = physics_simulate_line(left, right, num_points=NUM_EXPERIMENTS,
+                                      device=left.device, dtype=torch.float64)  # (N, 3)
         pts_np = pts_t.detach().cpu().numpy()                  # numpy only at sklearn boundary
         raw = torch.tensor(rf.predict(pts_np).ravel(), dtype=dtype, device=device)
         y = raw if maximize else -raw
@@ -1048,13 +1048,14 @@ def generate_init_data(
             continue
         _t_min, _t_max, x_left, x_right = seg
         t = torch.linspace(0.0, 1.0, NUM_EXPERIMENTS, dtype=torch.float64, device=device)
-        pts_t = (
+        # Clean straight segment = requested line; physics-simulated print = actual
+        # (replaces the random ILR-space input noise).
+        pts_clean = (
             x_left.to(torch.float64).unsqueeze(0)
             + t.unsqueeze(1) * (x_right - x_left).to(torch.float64).unsqueeze(0)
         )
-        z = composition_to_ilr(pts_t)
-        z = z + torch.randn_like(z) * NOISE_LEVEL_ILR
-        pts_t = ilr_to_composition(z, d=pts_t.shape[1])
+        pts_t = physics_simulate_line(x_left, x_right, num_points=NUM_EXPERIMENTS,
+                                      device=device, dtype=torch.float64)
         pts_np = pts_t.detach().cpu().numpy()
         print(f"      evaluating RF on {len(pts_np)} points …", flush=True)
         raw = torch.tensor(rf.predict(pts_np).ravel(), dtype=dtype, device=device)
@@ -1062,8 +1063,9 @@ def generate_init_data(
         print(f"      done. y range: [{y_vals.min():.4f}, {y_vals.max():.4f}]", flush=True)
         y_zombi = y_vals if maximize else -y_vals
         pts_out = pts_t.to(dtype=dtype, device=device)
+        pts_clean = pts_clean.to(dtype=dtype, device=device)
         x_actual_list.append(pts_out)
-        x_exp_list.append(pts_out)
+        x_exp_list.append(pts_clean)
         y_list.append(y_zombi)
     if not x_actual_list:
         raise RuntimeError("Could not generate any initial data lines.")

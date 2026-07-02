@@ -741,16 +741,20 @@ def gen_init_data(fn_callable, maximize: bool, dim: int):
             continue
         _, _, x_left, x_right = seg
         t = torch.linspace(0.0, 1.0, rm.NUM_EXPERIMENTS, dtype=torch.float64, device=rm.DEVICE)
-        pts_t = (x_left.to(torch.float64).unsqueeze(0)
-                 + t.unsqueeze(1) * (x_right - x_left).to(torch.float64).unsqueeze(0))
-        pts_t = rm.add_composition_noise(pts_t, rm.NOISE_LEVEL)
+        # Clean straight segment = what we "request"; physics-simulated print =
+        # what we "measure" (replaces the random add_composition_noise perturbation).
+        pts_clean = (x_left.to(torch.float64).unsqueeze(0)
+                     + t.unsqueeze(1) * (x_right - x_left).to(torch.float64).unsqueeze(0))
+        pts_t = rm.physics_simulate_line(x_left, x_right, num_points=rm.NUM_EXPERIMENTS,
+                                         device=rm.DEVICE, dtype=torch.float64)
         pts_np = pts_t.detach().cpu().numpy()
         raw = np.array([fn_callable(x) for x in pts_np], dtype=float)
         y_t = torch.tensor(raw if maximize else -raw, dtype=rm.DTYPE, device=rm.DEVICE)
         y_t = y_t + torch.randn_like(y_t) * (rm.OUTPUT_NOISE_FRAC * y_t.abs())
         pts_out = pts_t.to(dtype=rm.DTYPE, device=rm.DEVICE)
+        pts_clean = pts_clean.to(dtype=rm.DTYPE, device=rm.DEVICE)
         x_a_list.append(pts_out)
-        x_e_list.append(pts_out)
+        x_e_list.append(pts_clean)
         y_list.append(y_t)
     if not x_a_list:
         raise RuntimeError("Could not generate any initial simplex lines.")
