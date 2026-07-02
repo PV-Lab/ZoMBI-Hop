@@ -1634,6 +1634,7 @@ from eval_metrics import (  # noqa: E402  — after sys.path setup in callers
     metric_dist_to_needles,
     metric_dup_fraction,
     metric_n_points_penalty,
+    zoom_size_fraction,
     metric_pct_matched,
     metric_pct_matched_comp,
 )
@@ -1986,14 +1987,16 @@ def _activation_zoom_per_point(n_points: int, snap_records: list[tuple]) -> tupl
     """Map each stored point index → (activation, zoom) from snapshot records.
 
     snap_records is the chronological list of (cumulative_n_points, activation,
-    zoom) captured at every take_snapshot.  Points in [prev_n, n) were added by
-    that snapshot's objective call; init points fall into the first record.
+    zoom, [zoom_size]) captured at every take_snapshot.  Points in [prev_n, n) were
+    added by that snapshot's objective call; init points fall into the first record.
+    Records may carry an optional 4th element (zoom-zone size); it is ignored here.
     """
     act = np.zeros(n_points, dtype=int)
     zm  = np.zeros(n_points, dtype=int)
     prev = 0
-    for (n, a, z) in snap_records:
-        n = min(int(n), n_points)
+    for rec in snap_records:
+        n, a, z = int(rec[0]), rec[1], rec[2]
+        n = min(n, n_points)
         if n > prev:
             act[prev:n] = a
             zm[prev:n] = z
@@ -2002,6 +2005,29 @@ def _activation_zoom_per_point(n_points: int, snap_records: list[tuple]) -> tupl
         act[prev:] = snap_records[-1][1]
         zm[prev:]  = snap_records[-1][2]
     return act, zm
+
+
+def _zoom_size_per_point(n_points: int, snap_records: list[tuple]) -> np.ndarray:
+    """Per-point zoom-zone linear size ``s`` ∈ (0,1] from snapshot records.
+
+    Mirrors ``_activation_zoom_per_point``'s index bucketing but reads each
+    record's optional 4th element (the zoom-zone size captured at snapshot time;
+    see ``zoom_size_fraction``). Points before any recorded zoom, or records that
+    predate size capture, default to ``s=1`` (full domain → unscaled dup radius).
+    Fed to ``metric_dup_fraction(..., zoom_sizes=...)``.
+    """
+    s = np.ones(n_points, dtype=float)
+    prev = 0
+    for rec in snap_records:
+        n = min(int(rec[0]), n_points)
+        sz = float(rec[3]) if len(rec) > 3 else 1.0
+        if n > prev:
+            s[prev:n] = sz
+            prev = n
+    if prev < n_points and snap_records:   # tail safety
+        last = snap_records[-1]
+        s[prev:] = float(last[3]) if len(last) > 3 else 1.0
+    return s
 
 
 def write_points_csv(path: str, dh, snap_records: list[tuple], *, dim: int = 3) -> None:
@@ -2549,8 +2575,13 @@ def run_single_trial(
     def snap_wrap(*a, **k):
         orig_snap(*a, **k)
         if dh.X_all_actual is not None:
+            # Capture the current zoom zone's linear size (relative to the full
+            # [0,1]^d domain) so metric_dup_fraction can shrink the duplicate radius
+            # for points sampled inside a zoom (see _zoom_size_per_point).
+            czb = dh.current_zoom_bounds if dh.current_zoom_bounds is not None else dh.bounds
+            zoom_size = zoom_size_fraction(czb) if czb is not None else 1.0
             snap_records.append((dh.X_all_actual.shape[0],
-                                 dh.current_activation, dh.current_zoom))
+                                 dh.current_activation, dh.current_zoom, zoom_size))
     dh.take_snapshot = snap_wrap
 
     if torch.cuda.is_available():
@@ -2586,7 +2617,10 @@ def run_single_trial(
         if dh.X_all_actual is not None else np.empty((0, dim))
     )
     dist = metric_dist_to_needles(discovered, true_optima, dim=dim)
-    dup  = metric_dup_fraction(X_all_np, dim=dim)
+    # Zoom-scaled duplicate radius: points sampled inside a small zoom zone must be
+    # closer to count as duplicates, so zooming isn't penalised on the dup objective.
+    zoom_sizes = _zoom_size_per_point(X_all_np.shape[0], snap_records)
+    dup  = metric_dup_fraction(X_all_np, dim=dim, zoom_sizes=zoom_sizes)
     n_points = int(X_all_np.shape[0])
     print(f"    [trial]  iters={n_iters}  dist={dist:.4f}  dup={dup:.4f}"
           f"  t/iter={avg_time_per_iter:.3f}s  (total {runtime:.1f}s)"

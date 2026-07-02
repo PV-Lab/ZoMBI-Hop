@@ -29,6 +29,14 @@ from .simplex import (
     get_tangent_basis,
 )
 
+# Floor for the zoom-scaled point-paring radius (composition L2). The paring
+# radius is ``paring_spatial_halfnoise * input_noise`` at the full domain but
+# shrinks with the zoom-zone linear size (see DataHandler._zoom_size_factor), so
+# tightly-packed points inside a zoom aren't deduplicated away. The floor stops it
+# collapsing to ~0 at deep zooms. Kept below the paring base range so full-domain
+# behaviour is unchanged; mirrors eval_metrics.DUP_DIST_FLOOR. Tunable.
+PARE_DIST_FLOOR = 0.003
+
 
 class DataHandler:
     """
@@ -220,6 +228,9 @@ class DataHandler:
         self.bounds: Optional[torch.Tensor] = None          # (2, d) tensor
         # Tracks zoom-level trust region at the current zoom (may match self.bounds early on).
         self.current_zoom_bounds: Optional[torch.Tensor] = None  # (2, d) tensor
+        # Per-axis extent of the full (global) domain, captured at initialize(); the
+        # reference for the zoom-size factor that scales the point-paring radius.
+        self._full_extent: Optional[torch.Tensor] = None    # (d,) tensor
 
         self.needles: Optional[torch.Tensor] = None
         self.needle_vals: Optional[torch.Tensor] = None
@@ -272,6 +283,10 @@ class DataHandler:
 
         self.bounds = bounds.clone().to(device=self.device, dtype=self.dtype)
         self.current_zoom_bounds = self.bounds.clone()
+        # Reference extent for the zoom-size factor: the global domain at run start
+        # (ZoMBI passes the full [0,1]^d box here). Clamped away from zero so a
+        # degenerate axis can't blow up the ratio.
+        self._full_extent = (self.bounds[1] - self.bounds[0]).clamp(min=1e-12)
 
         if self.top_m_points is None:
             self.top_m_points = max(self.d + 1, 4)
@@ -1251,7 +1266,12 @@ class DataHandler:
         if self.X_all_actual is None or self.X_all_actual.shape[0] == 0:
             return
 
-        thresh = self.paring_spatial_halfnoise * self.input_noise
+        # Zoom-scaled paring radius (floored), matching _update_pared so relabelling
+        # smooths over the same neighbourhood the dedup used. See _zoom_size_factor.
+        thresh = max(
+            self.paring_spatial_halfnoise * self.input_noise * self._zoom_size_factor(),
+            PARE_DIST_FLOOR,
+        )
         Y_new = self.Y_pared.clone()
         changed = False
         _t0 = time.time()
@@ -1280,6 +1300,25 @@ class DataHandler:
     def get_pared_hash(self) -> int:
         """Integer version counter that increments whenever the pared dataset changes."""
         return self._pared_version
+
+    def _zoom_size_factor(self) -> float:
+        """Linear size of the current zoom zone relative to the full domain, in (0,1].
+
+        Geometric mean of the per-axis extent ratios of ``current_zoom_bounds`` vs
+        the global domain captured at ``initialize()`` (1.0 at the full domain). The
+        point-paring radius is multiplied by this so points densely packed inside a
+        zoom zone aren't deduplicated away — matching the zoom-scaled dup metric.
+        Falls back to 1.0 (no scaling) before any bounds are set, and assumes the
+        unit box if no full-domain reference was captured (e.g. a resumed run).
+        Mirrors ``eval_metrics.zoom_size_fraction``.
+        """
+        czb = self.current_zoom_bounds if self.current_zoom_bounds is not None else self.bounds
+        if czb is None:
+            return 1.0
+        ext = (czb[1] - czb[0]).clamp(min=0.0)
+        full = self._full_extent if self._full_extent is not None else torch.ones_like(ext)
+        ratio = (ext / full).clamp(min=1e-12, max=1.0)
+        return float(torch.exp(torch.log(ratio).mean()).item())
 
     def _update_pared(self, X_new: torch.Tensor, Y_new: torch.Tensor) -> None:
         """Incrementally add new UNPENALIZED points to the pared (noise-deduplicated) dataset.
@@ -1311,8 +1350,15 @@ class DataHandler:
             X_new = X_new[unpen]
             Y_new = Y_new[unpen]
 
-        # Paring thresholds (both in their natural units after normalization)
-        spatial_thresh = self.paring_spatial_halfnoise * self.input_noise
+        # Paring thresholds (both in their natural units after normalization). The
+        # spatial radius is scaled down by the current zoom-zone linear size (floored
+        # at PARE_DIST_FLOOR) so points packed inside a zoom aren't deduplicated
+        # away; at the full domain the factor is 1.0 (unchanged). See
+        # _zoom_size_factor.
+        spatial_thresh = max(
+            self.paring_spatial_halfnoise * self.input_noise * self._zoom_size_factor(),
+            PARE_DIST_FLOOR,
+        )
         y_thresh = self.paring_y_noise_multiplier * max(self._gp_output_noise, 1e-6)
 
         d = X_new.shape[1]

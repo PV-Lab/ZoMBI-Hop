@@ -17,6 +17,13 @@ MATCH_RADIUS = 0.05
 # radius; matched to the measured average input noise of data/2nd_real_run.db.
 NOISE_LEVEL = 0.064
 
+# Floor for the zoom-scaled duplicate distance (composition L2). The duplicate
+# radius is NOISE_LEVEL/2 at full domain but shrinks with the zoom-zone size (see
+# metric_dup_fraction / zoom_size_fraction), so tightly-packed points inside a zoom
+# aren't penalised — this rewards the optimiser for zooming. The floor stops it
+# collapsing to ~0 at deep zooms (below it two points are the same sample). Tunable.
+DUP_DIST_FLOOR = 0.005
+
 
 def as_numpy(x, *, dtype=float) -> np.ndarray:
     """Coerce numpy arrays or CPU/CUDA tensors to a host ndarray."""
@@ -106,24 +113,62 @@ def metric_dist_to_needles(
     return total / max(n_disc, n_opt)
 
 
+def zoom_size_fraction(zoom_bounds, full_bounds=None) -> float:
+    """Linear size of a zoom box relative to the full domain, in (0, 1].
+
+    Geometric mean of the per-axis extent ratios: ``(∏ᵢ extentᵢ_zoom /
+    extentᵢ_full)^(1/d)``. This is the *linear* scale of the zone (a distance
+    threshold scales with it), so a zoom to 1/8 of the domain *volume* gives
+    ``s≈0.5`` in 3-D. Returns 1.0 at the full domain. ``full_bounds`` defaults to
+    the unit box ``[0,1]^d`` (the ZoMBI global domain).
+    """
+    zb = as_numpy(zoom_bounds, dtype=float)          # (2, d)
+    ext = np.clip(zb[1] - zb[0], 0.0, None)
+    if full_bounds is None:
+        full_ext = np.ones_like(ext)
+    else:
+        fb = as_numpy(full_bounds, dtype=float)
+        full_ext = np.clip(fb[1] - fb[0], 1e-12, None)
+    ratio = np.clip(ext / full_ext, 1e-12, 1.0)
+    return float(np.exp(np.mean(np.log(ratio))))
+
+
 def metric_dup_fraction(
     X_all: np.ndarray,
     threshold: float | None = None,
     *,
     dim: int | None = None,
+    zoom_sizes: np.ndarray | None = None,
 ) -> float:
-    """Fraction of samples with a composition-L2 neighbour within ``dup_threshold_comp(d)``."""
+    """Fraction of samples with a composition-L2 neighbour within the dup radius.
+
+    The base radius is ``dup_threshold_comp(d)`` (= NOISE_LEVEL/2). When
+    ``zoom_sizes`` is given — a per-point array of zoom-zone linear sizes ``s`` in
+    (0,1], one per row of ``X_all`` (see ``zoom_size_fraction``) — each point uses a
+    *scaled* radius ``max(base * s, DUP_DIST_FLOOR)``, so points sampled inside a
+    small zoom zone must be much closer to count as duplicates. With ``zoom_sizes``
+    None the behaviour is the original single global radius (``s ≡ 1``).
+    """
     X_all = as_numpy(X_all, dtype=float)
     n = len(X_all)
     if n <= 1:
         return 0.0
     d = infer_metric_dim(dim, X_all)
-    thr = float(threshold if threshold is not None else dup_threshold_comp(d))
+    base = float(threshold if threshold is not None else dup_threshold_comp(d))
     # A KD-tree nearest-neighbour query is O(N log N) time / O(N) memory; the
     # naive N×N×D difference array would peak at tens of GiB for N~20k samples.
     tree = cKDTree(X_all)
     nn_dist, _ = tree.query(X_all, k=2)  # k=2: self (dist 0) + nearest other
-    return float((nn_dist[:, 1] < thr).mean())
+    nn = nn_dist[:, 1]
+    if zoom_sizes is None:
+        thr = base
+    else:
+        s = np.asarray(zoom_sizes, dtype=float).reshape(-1)
+        if s.shape[0] != n:   # length mismatch → fall back to the global radius
+            thr = base
+        else:
+            thr = np.maximum(base * s, DUP_DIST_FLOOR)
+    return float((nn < thr).mean())
 
 
 def metric_pct_matched_comp(
