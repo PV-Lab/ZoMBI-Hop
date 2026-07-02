@@ -1001,14 +1001,13 @@ def main() -> None:
     # only when EVERY collected trial recorded it, so the front never compares trials
     # on a coordinate some of them lack. A partial collection drops the axis (and the
     # 4th-objective trade-offs) with a warning rather than silently excluding trials.
-    n_with_npts = sum(r["npts_value"] is not None for r in records)
-    include_npts = n_with_npts == len(records)
-    if include_npts:
-        obj_labels.append(NPTS_KEY)
-    elif n_with_npts:
-        print(f"  [warn] {n_with_npts}/{len(records)} trials recorded {NPTS_KEY}; "
-              "the rest predate it, so it is NOT used as a 4th objective. Filter with "
-              "--only to a set of new runs to include it.")
+    # n_points_penalty was removed as an objective: it was ~redundant with
+    # dup_fraction (rank corr ≈ 0.98) and, as a sampling-cost objective, discouraged
+    # the dense local sampling needed to localise optima. Older runs still record it,
+    # but pareto never promotes it to an axis — the front is always the three live
+    # objectives (dist_to_needles, dup_fraction, avg_time_per_iter_s). The npts_value
+    # plumbing is retained but inert (kept only so old JSON still parses).
+    include_npts = False
 
     cols = [lambda r: r["metrics"][DIST_KEY], lambda r: r["metrics"][DUP_KEY],
             lambda r: r["time_value"]]

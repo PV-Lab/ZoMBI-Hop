@@ -27,13 +27,16 @@ and the full ``ensemble_configs`` list (plus per-repeat metrics) is recorded in
 ``trial_<n>/trial.json``. ``--ensemble-seed`` makes the per-trial landscape sequence
 reproducible; ``--ensemble-margin`` sets the optima/background gap.
 
-Four objectives (all minimised):
+Three objectives (all minimised):
   1. dist_to_needles    – symmetric greedy matching distance between needles and
                           true optima (no-repeat matching; both unmatched true
                           optima AND unmatched/spurious needles incur
                           UNMATCHED_PENALTY, mean over max(#needles, #optima))
-  2. dup_fraction       – fraction of sampled points whose nearest neighbour
-                          in input space is within noise/2
+  2. dup_fraction       – fraction of sampled points whose nearest neighbour in
+                          input space is within a zoom-scaled duplicate distance
+                          (noise/2 at full domain, shrinking with the zoom-zone
+                          size so tightly-packed points inside a zoom are not
+                          penalised; see eval_metrics.metric_dup_fraction)
   3. avg_time_per_iter_s  – average wall-clock seconds per ZoMBI iteration, where
                           an iteration is one LineBO main-line pick (== one
                           obj_wrapper call / one would-be plot frame): total
@@ -41,12 +44,11 @@ Four objectives (all minimised):
                           rendered AFTER the timed region so it never pollutes
                           this metric. (trial.json also records runtime_s and
                           n_iters for context.)
-  4. n_points_penalty   – penalty on the TOTAL number of points sampled across the
-                          run (== the sample count): sampling is costly, so for a
-                          fixed solution quality fewer points is better. A run that
-                          sampled nothing scores an infinite penalty and is excluded
-                          from the GP (a 0-point run means ZoMBI never picked a
-                          point — a failure, not an efficient trial).
+
+The former 4th objective (n_points_penalty) was removed: it was ~redundant with
+dup_fraction (rank corr ≈ 0.98) and, as a sampling-cost objective, discouraged the
+dense local sampling needed to localise optima. trial.json still records the raw
+n_points per repeat as a diagnostic.
 
 MOBO engine: qLogNEHVI (BoTorch, maximises negated objectives).
 
@@ -1054,18 +1056,6 @@ def _time_objective(metrics: dict) -> float:
     return float(metrics["runtime_s"])
 
 
-def _n_points_objective(metrics: dict) -> float:
-    """Fourth MOBO objective: penalty on the total number of points sampled.
-
-    Reads the stored ``n_points_penalty`` (== total sample count for a finite
-    trial). Unlike ``_time_objective`` there is no legacy fallback: this
-    objective post-dates older runs, which simply never recorded a sample count,
-    so a trial missing the key raises ``KeyError`` and is skipped when seeding the
-    GP from prior history (the crawlers already treat KeyError as "unseedable").
-    """
-    return float(metrics["n_points_penalty"])
-
-
 def _norm_x_key(x: torch.Tensor) -> tuple[int, ...]:
     """Hashable key for a normalised hparam vector (rounded to 1e-6) for dedup.
 
@@ -1096,8 +1086,7 @@ def _collect_from_progress(path: str, X_obs: list, Y_obs: list) -> int:
             x = hparams_to_norm(hp)
             y = torch.tensor([-float(m["dist_to_needles"]),
                               -float(m["dup_fraction"]),
-                              -_time_objective(m),
-                              -_n_points_objective(m)], dtype=DTYPE)
+                              -_time_objective(m)], dtype=DTYPE)
         except (KeyError, ValueError, TypeError):
             continue
         X_obs.append(x)
@@ -1236,8 +1225,7 @@ def collect_rederived_observations(runs_dir: str, new_maximize: bool,
                 x = hparams_to_norm(hp)
                 y = torch.tensor([-float(dist),
                                   -float(m["dup_fraction"]),
-                                  -_time_objective(m),
-                                  -_n_points_objective(m)], dtype=DTYPE)
+                                  -_time_objective(m)], dtype=DTYPE)
             except (KeyError, ValueError, TypeError) as exc:
                 print(f"  [resume-scratch] {run_name} trial "
                       f"{t.get('trial')}: could not build observation ({exc}); skipping.")
@@ -1429,8 +1417,7 @@ def collect_shared_observations(
                     x = hparams_to_norm(hp)
                     y = torch.tensor([-float(m["dist_to_needles"]),
                                       -float(m["dup_fraction"]),
-                                      -_time_objective(m),
-                                      -_n_points_objective(m)], dtype=DTYPE)
+                                      -_time_objective(m)], dtype=DTYPE)
                 except (KeyError, ValueError, TypeError):
                     continue
                 seen.add(key)
@@ -2808,7 +2795,6 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
             "dist_to_needles":     round(-Y_obs[i][0].item(), 6),
             "dup_fraction":        round(-Y_obs[i][1].item(), 6),
             "avg_time_per_iter_s": round(-Y_obs[i][2].item(), 4),
-            "n_points_penalty":    round(-Y_obs[i][3].item(), 4),
         }
         for i in range(n)
     ]
@@ -2835,14 +2821,12 @@ def _build_summary(X_obs: list[torch.Tensor], Y_obs: list[torch.Tensor],
     dists = [m["dist_to_needles"]     for m in metrics_all]
     dups  = [m["dup_fraction"]        for m in metrics_all]
     times = [m["avg_time_per_iter_s"] for m in metrics_all]
-    npens = [m["n_points_penalty"]    for m in metrics_all]
     return {
         "n_trials": n,
         "averages": {
             "dist_to_needles":     round(float(np.mean(dists)), 6),
             "dup_fraction":        round(float(np.mean(dups)),  6),
             "avg_time_per_iter_s": round(float(np.mean(times)), 4),
-            "n_points_penalty":    round(float(np.mean(npens)), 4),
         },
         "best_dist": {"value": round(min(dists), 6), "trial": int(np.argmin(dists)) + 1},
         "trials": trials,
@@ -2869,24 +2853,20 @@ def save_running_summary(X_obs, Y_obs, run_dir: str, n_seed: int = 0,
 def _failure_penalty_Y(prior_Y: list[torch.Tensor]) -> torch.Tensor:
     """Dominated objective vector for a hard-failed trial (0 ZoMBI iterations).
 
-    The MOBO objective is Y = (-dist, -dup, -avg_time_per_iter, -n_points_penalty),
-    maximised. A failed trial's *raw* sentinels (dist=UNMATCHED_PENALTY, dup=0,
-    time=0, n_points_penalty=inf) look GOOD on the duplicate- and time-objectives
-    — ``-0`` is the best attainable on both — and the infinite point penalty can't
-    even be standardised, so feeding them to the GP would actively reward instant
-    crashes. This instead emits a vector that is the worst attainable on every
-    objective: worst distance, full duplication, a per-iter time at least as large
-    as the slowest real trial, and a sample-count penalty at least as large as the
-    most-sampling real trial seen so far. The point is therefore Pareto-dominated
-    by any genuine measurement, so the GP learns the hyperparameter region is bad
-    and qLogNEHVI is nudged away from it — without the sentinel ever poisoning an
+    The MOBO objective is Y = (-dist, -dup, -avg_time_per_iter), maximised. A
+    failed trial's *raw* sentinels (dist=UNMATCHED_PENALTY, dup=0, time=0) look
+    GOOD on the duplicate- and time-objectives — ``-0`` is the best attainable on
+    both — so feeding them to the GP would actively reward instant crashes. This
+    instead emits a vector that is the worst attainable on every objective: worst
+    distance, full duplication, and a per-iter time at least as large as the
+    slowest real trial seen so far. The point is therefore Pareto-dominated by any
+    genuine measurement, so the GP learns the hyperparameter region is bad and
+    qLogNEHVI is nudged away from it — without the sentinel ever poisoning an
     objective or appearing on the Pareto front.
     """
     times  = [float(-y[2].item()) for y in prior_Y] if prior_Y else []
-    npens  = [float(-y[3].item()) for y in prior_Y] if prior_Y else []
     time_pen   = max(times) if times else 1.0
-    npoint_pen = max(npens) if npens else 1.0
-    return torch.tensor([-UNMATCHED_PENALTY, -1.0, -time_pen, -npoint_pen],
+    return torch.tensor([-UNMATCHED_PENALTY, -1.0, -time_pen],
                         dtype=DTYPE, device="cpu")
 
 
@@ -3067,7 +3047,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                     model = SingleTaskGP(
                         X_t, Y_t,
                         input_transform=Normalize(d=N_HPARAMS),
-                        outcome_transform=Standardize(m=4),
+                        outcome_transform=Standardize(m=3),
                     )
                     mll = ExactMarginalLogLikelihood(model.likelihood, model)
                     fit_gpytorch_mll(mll)
@@ -3160,8 +3140,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
 
                 X_obs.append(x_new.detach().cpu())
                 Y_obs.append(torch.tensor(
-                    [-res["dist"], -res["dup"], -res["avg_time_per_iter"],
-                     -metric_n_points_penalty(res["n_points"])],
+                    [-res["dist"], -res["dup"], -res["avg_time_per_iter"]],
                     dtype=DTYPE, device="cpu"))
                 save_running_summary(X_obs, Y_obs, run_dir, n_seed=n_seed, n_sobol=n_sobol)
                 log_resource_usage(f"end of trial {trial_num} ({phase})")
