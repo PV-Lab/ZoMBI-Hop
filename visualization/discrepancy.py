@@ -29,6 +29,12 @@ Two data sources, picked automatically per run
    noisy the rail was), and a banner makes clear the true requested line and the
    second rail are unavailable for these runs.
 
+3. Standalone pickle pair (``data/sent_compositions.pkl`` + ``actual_compositions.pkl``)
+   Two ``(24, 3, n)`` NumPy arrays — the sent (requested) and actual (measured)
+   lines, aligned 1:1 (line ``i`` is ``arr[:, :, i]``). Each line is shown as one
+   rail with the mean per-point ‖measured − sent‖₂. The actual array is supplied
+   externally in the identical format the recreate script writes for `sent`.
+
 A "Random line" button jumps to a random iteration. The scrollable list on the
 right shows every rail, labelled by placement order and **ranked worst-first**
 by the closeness metric; the same metric is shown beneath the ternaries.
@@ -43,8 +49,8 @@ Usage
 """
 from __future__ import annotations
 
-import csv
 import json
+import pickle
 import random
 import sys
 from pathlib import Path
@@ -66,12 +72,14 @@ RUNS_DIR    = _HERE.parent / "runs"
 DEFAULT_RUN = "run_7eb9"
 COMP_LOG    = "composition_log.jsonl"
 
-# Standalone CSV pair (see module docstring, source 3). Hardcoded paths — there is
-# only ever this one pair. `sent` is grouped by its `line` column; `actual` is a
-# wide table (one column per possible component) row-aligned 1:1 with `sent`.
-SENT_CSV    = _HERE.parent / "data" / "sent_compositions.csv"
-ACTUAL_CSV  = _HERE.parent / "data" / "actual_compositions.csv"
-CSV_RUN     = "📄 CSV: sent vs actual"
+# Standalone pickled array pair (see module docstring, source 3). Both are numpy
+# arrays of shape (24, 3, n) — the 24 points per line, 3 composition ratios, and n
+# lines — as written by visualization/recreate_composition_csvs.py (sent) and
+# produced externally in the identical format (actual). Line i is arr[:, :, i]; the
+# two arrays are aligned 1:1.
+SENT_PKL    = _HERE.parent / "data" / "sent_compositions.pkl"
+ACTUAL_PKL  = _HERE.parent / "data" / "actual_compositions.pkl"
+PKL_RUN     = "📦 PKL: sent vs actual"
 
 # Cache of loaded groups, keyed by (run, snapshot). Single-process dev server.
 _CACHE: dict[tuple[str, str], tuple] = {}
@@ -222,48 +230,75 @@ def load_legacy(run: str, snapshot: str) -> list[dict]:
     return groups
 
 
-# ── standalone CSV pair (source 3) ────────────────────────────────────────────────
+# ── standalone pickle pair (source 3) ─────────────────────────────────────────────
 
-def _read_sent_csv(path: Path = SENT_CSV) -> list[tuple[str, np.ndarray]]:
-    """Read sent_compositions.csv into ordered (line_label, (N,3) array) groups."""
-    groups: list[tuple[str, list]] = []
-    cur_label, cur = None, []
-    with open(path, newline="") as f:
-        reader = csv.reader(f)
-        next(reader, None)  # header: line,c0,c1,c2
-        for row in reader:
-            if not row:
-                continue
-            label = row[0]
-            vals = [float(x) for x in row[1:4]]
-            if label != cur_label:
-                if cur:
-                    groups.append((cur_label, cur))
-                cur_label, cur = label, []
-            cur.append(vals)
-    if cur:
-        groups.append((cur_label, cur))
-    return [(lbl, np.asarray(v, float)) for lbl, v in groups]
+def _load_pkl_array(path: Path, width: int | None = None) -> np.ndarray:
+    """Load a pickled (points, C, n) composition array; validate its shape.
+
+    `width`, when given, is the exact component count C the array must have.
+    """
+    with open(path, "rb") as f:
+        arr = np.asarray(pickle.load(f), dtype=float)
+    if arr.ndim != 3 or (width is not None and arr.shape[1] != width):
+        want = f"(points, {width}, n_lines)" if width else "(points, C, n_lines)"
+        raise ValueError(f"{path.name} must have shape {want}; got {arr.shape}.")
+    return arr
 
 
-def _read_actual_csv(path: Path = ACTUAL_CSV) -> tuple[np.ndarray, list[str]]:
-    """Read actual_compositions.csv into a wide (M, C) array (dropping the index
-    column) plus the C component-column labels from the header."""
-    with open(path, newline="") as f:
-        reader = csv.reader(f)
-        header = next(reader)
-        col_labels = header[1:]          # first header cell is the row index
-        data = [[float(x) for x in row[1:]] for row in reader if row]
-    return np.asarray(data, float), col_labels
+def _actual_wide_flat(actual: np.ndarray) -> np.ndarray:
+    """(points, C, n) → (n*points, C), line-major (line 0 point 0 first)."""
+    if actual.size == 0:
+        return np.empty((0, actual.shape[1] if actual.ndim == 3 else 0))
+    return actual.transpose(2, 0, 1).reshape(-1, actual.shape[1])
+
+
+def _load_pkl_pair() -> tuple[np.ndarray, np.ndarray, bool]:
+    """Load the sent/actual pickle pair. Returns (sent (24,3,n), actual (24,C,n), ok).
+
+    `ok` is True only when both files are present, valid and mutually consistent
+    (same point count and line count). `sent` is the requested lines (3 ratios);
+    `actual` is the measured lines embedded in the wider hardware channel space
+    (C channels, of which only 3 are active). If the sent pickle is present but the
+    actual one (obtained externally, same format) is missing or inconsistent, an
+    error is printed and `ok` is False.
+    """
+    empty3, emptyC = np.empty((0, 3, 0)), np.empty((0, 0, 0))
+    if not SENT_PKL.exists():
+        return empty3, emptyC, False
+    try:
+        sent = _load_pkl_array(SENT_PKL, width=3)
+    except (OSError, ValueError, pickle.UnpicklingError) as exc:
+        print(f"Error reading {SENT_PKL}: {exc}", file=sys.stderr)
+        return empty3, emptyC, False
+    if not ACTUAL_PKL.exists():
+        print(f"Error: found {SENT_PKL.name} but no actual pickle at {ACTUAL_PKL}. "
+              f"Provide a measured array of shape (points, C, n) in the same format "
+              f"to enable the sent-vs-actual view.", file=sys.stderr)
+        return sent, emptyC, False
+    try:
+        actual = _load_pkl_array(ACTUAL_PKL)
+    except (OSError, ValueError, pickle.UnpicklingError) as exc:
+        print(f"Error reading {ACTUAL_PKL}: {exc}", file=sys.stderr)
+        return sent, emptyC, False
+    if (sent.shape[0], sent.shape[2]) != (actual.shape[0], actual.shape[2]):
+        print(f"Error: {SENT_PKL.name} shape {sent.shape} and {ACTUAL_PKL.name} shape "
+              f"{actual.shape} disagree on points/lines; they must match 1:1.",
+              file=sys.stderr)
+        return sent, actual, False
+    if actual.shape[1] < 3:
+        print(f"Error: {ACTUAL_PKL.name} has only {actual.shape[1]} channels; "
+              f"need at least 3.", file=sys.stderr)
+        return sent, actual, False
+    return sent, actual, True
 
 
 def _auto_col_map(actual_raw: np.ndarray, anchor: np.ndarray) -> tuple[int, int, int]:
-    """Infer which 3 wide-table columns correspond to sent components x0,x1,x2.
+    """Infer which 3 wide-channel columns correspond to sent components x0,x1,x2.
 
-    The measured table stores every possible component but only three are ever
-    non-zero. The very first sent point is echoed verbatim as the first measured
-    point, so we match each sent component to the active column nearest to it at
-    that anchor row — an unambiguous, order-preserving assignment.
+    The measured array stores every hardware channel but only three are ever
+    non-zero. The very first measured point echoes the first sent point, so we
+    match each sent component to the active column nearest to it at that anchor
+    row — an unambiguous, order-preserving assignment.
     """
     active = [j for j in range(actual_raw.shape[1]) if np.abs(actual_raw[:, j]).max() > 1e-9]
     mapping, used = [], set()
@@ -276,47 +311,42 @@ def _auto_col_map(actual_raw: np.ndarray, anchor: np.ndarray) -> tuple[int, int,
     return tuple(mapping)  # type: ignore[return-value]
 
 
-# Parsed once at import; the files are tiny and never change during a session.
-try:
-    _SENT_GROUPS = _read_sent_csv()
-    _ACTUAL_RAW, _ACTUAL_COLS = _read_actual_csv()
-    _SENT_FLAT = np.vstack([a for _, a in _SENT_GROUPS])
-    _AUTO_COL_MAP = _auto_col_map(_ACTUAL_RAW, _SENT_FLAT[0])
-    _HAS_CSV = _SENT_FLAT.shape[0] == _ACTUAL_RAW.shape[0]
-except (OSError, ValueError):
-    _SENT_GROUPS, _ACTUAL_RAW, _ACTUAL_COLS = [], np.empty((0, 0)), []
-    _SENT_FLAT, _AUTO_COL_MAP, _HAS_CSV = np.empty((0, 3)), (0, 1, 2), False
+# Parsed once at import; the arrays are tiny and never change during a session.
+_SENT_ARR, _ACTUAL_ARR, _HAS_PKL = _load_pkl_pair()
+_ACTUAL_COLS = [str(j) for j in range(_ACTUAL_ARR.shape[1])] if _ACTUAL_ARR.ndim == 3 else []
+if _HAS_PKL:
+    _AUTO_COL_MAP = _auto_col_map(_actual_wide_flat(_ACTUAL_ARR), _SENT_ARR[0, :, 0])
+else:
+    _AUTO_COL_MAP = (0, 1, 2)
 
 
-def load_csv_pair(col_map: tuple[int, int, int] | None) -> list[dict]:
-    """Build groups from the sent/actual CSV pair.
+def load_pkl_pair(col_map: tuple[int, int, int] | None) -> list[dict]:
+    """Build groups from the sent/actual pickle pair — one rail per line.
 
-    Rows are aligned 1:1 in file order and segmented into rails by the sent file's
-    `line` column. `col_map` overrides which wide-table columns feed x0/x1/x2;
+    Each line's 24 points are aligned 1:1 between sent and actual (line i =
+    arr[:, :, i]). `col_map` selects which 3 wide actual-channels feed x0/x1/x2;
     when None the auto-inferred mapping is used.
     """
     cmap = list(col_map or _AUTO_COL_MAP)
-    actual_xyz = _ACTUAL_RAW[:, cmap] if _ACTUAL_RAW.size else _ACTUAL_RAW
     groups: list[dict] = []
-    pos = 0
-    for gi, (label, sent) in enumerate(_SENT_GROUPS):
-        n = len(sent)
-        act = actual_xyz[pos:pos + n]
-        pos += n
+    n = _SENT_ARR.shape[2]
+    for gi in range(n):
+        sent = _SENT_ARR[:, :, gi]              # (24, 3)
+        act  = _ACTUAL_ARR[:, cmap, gi]         # (24, 3)
+        label = f"line{gi + 1}"
         rail = _rail(label, sent, act, [], kind="sent")
-        # `init` is a scatter of seed points, not a swept line — don't connect them.
-        rail["connect"] = not label.lower().startswith("init")
+        rail["connect"] = True                  # every line is a swept 24-point gradient
         groups.append({"index": gi, "label": label, "rails": [rail]})
     return groups
 
 
 def get_groups(run: str, snapshot: str,
                col_map: tuple[int, int, int] | None = None) -> tuple[list[dict], str]:
-    """Return (groups, mode) where mode is 'csv', 'log' or 'legacy'."""
-    if run == CSV_RUN:
-        key = ("__csv__", col_map)
+    """Return (groups, mode) where mode is 'pkl', 'log' or 'legacy'."""
+    if run == PKL_RUN:
+        key = ("__pkl__", col_map)
         if key not in _CACHE:
-            _CACHE[key] = (load_csv_pair(col_map), "csv")
+            _CACHE[key] = (load_pkl_pair(col_map), "pkl")
         return _CACHE[key]
     key = (run, snapshot if not has_comp_log(run) else "__log__")
     if key not in _CACHE:
@@ -418,13 +448,13 @@ app = dash.Dash(__name__)
 app.title = "ZoMBI-Hop · Line Discrepancy"
 
 _runs         = list_runs()
-_run_options  = ([{"label": CSV_RUN, "value": CSV_RUN}] if _HAS_CSV else []) \
+_run_options  = ([{"label": PKL_RUN, "value": PKL_RUN}] if _HAS_PKL else []) \
                 + [{"label": r, "value": r} for r in _runs]
-# Default to the CSV pair when present (it's the current focus); else fall back.
-_default_run  = CSV_RUN if _HAS_CSV else \
+# Default to the pickle pair when present (it's the current focus); else fall back.
+_default_run  = PKL_RUN if _HAS_PKL else \
                 (DEFAULT_RUN if DEFAULT_RUN in _runs else (_runs[0] if _runs else None))
 
-# Options for the "which wide column feeds x0/x1/x2" override dropdowns.
+# Options for the "which wide channel feeds x0/x1/x2" override dropdowns.
 _col_options  = [{"label": f"col {name}", "value": j}
                  for j, name in enumerate(_ACTUAL_COLS)]
 
@@ -452,8 +482,8 @@ app.layout = html.Div(
                             style={"height": "38px", "cursor": "pointer"}),
             ],
         ),
-        # Column-mapping override — CSV mode only. The mapping is auto-inferred from
-        # the anchor point; these let you correct it if the guess is ever wrong.
+        # Column-mapping override — pickle mode only. The mapping is auto-inferred
+        # from the anchor point; these let you correct it if the guess is ever wrong.
         html.Div(
             id="csv-controls",
             style={"display": "flex", "gap": "10px", "alignItems": "flex-end",
@@ -524,7 +554,7 @@ def _col_map(x0, x1, x2):
 def _toggle_csv_controls(run):
     base = {"display": "flex", "gap": "10px", "alignItems": "flex-end",
             "flexWrap": "wrap", "marginBottom": "6px"}
-    return base if run == CSV_RUN else {"display": "none"}
+    return base if run == PKL_RUN else {"display": "none"}
 
 
 @app.callback(
@@ -536,8 +566,8 @@ def _toggle_csv_controls(run):
 def _update_snapshots(run):
     if not run:
         return [], None, True
-    if run == CSV_RUN:
-        return [], None, True  # CSV spans a whole fixed dataset; no snapshot axis.
+    if run == PKL_RUN:
+        return [], None, True  # the pickle pair spans a whole fixed dataset; no snapshot axis.
     snaps = list_snapshots(run)
     # In log mode the snapshot axis is irrelevant (the log spans the whole run).
     return ([{"label": s, "value": s} for s in snaps],
@@ -560,7 +590,7 @@ def _update_snapshots(run):
 def _populate(snapshot, _n_clicks, cx0, cx1, cx2, run, current_value):
     base_style = {"fontSize": "13px", "padding": "6px 10px", "borderRadius": "6px",
                   "marginBottom": "8px"}
-    if not run or (run != CSV_RUN and not snapshot):
+    if not run or (run != PKL_RUN and not snapshot):
         return [], None, "", base_style
     groups, mode = get_groups(run, snapshot, _col_map(cx0, cx1, cx2))
     if not groups:
@@ -574,10 +604,11 @@ def _populate(snapshot, _n_clicks, cx0, cx1, cx2, run, current_value):
     else:
         value = random.choice(groups)["index"]
 
-    if mode == "csv":
-        banner = ("✓ Using data/sent_compositions.csv vs. data/actual_compositions.csv "
-                  "— rows aligned 1:1 in file order, one rail per sent `line`. "
-                  "Adjust the column→component mapping above if the auto-guess is wrong.")
+    if mode == "pkl":
+        banner = ("✓ Using data/sent_compositions.pkl vs. data/actual_compositions.pkl "
+                  "— (24, 3, n) sent and (24, C, n) actual arrays aligned 1:1, one rail "
+                  "per line. Adjust the channel→component mapping above if the "
+                  "auto-guess is wrong.")
         style = {**base_style, "background": "#e6f0fb", "border": "1px solid #9bf"}
     elif mode == "log":
         banner = ("✓ Using composition_log.jsonl — true sent vs. measured "
@@ -601,7 +632,7 @@ def _populate(snapshot, _n_clicks, cx0, cx1, cx2, run, current_value):
     State("col-x2", "value"),
 )
 def _render(group_index, run, snapshot, cx0, cx1, cx2):
-    if group_index is None or not run or (run != CSV_RUN and not snapshot):
+    if group_index is None or not run or (run != PKL_RUN and not snapshot):
         return [], "Select a run and line."
     groups, _ = get_groups(run, snapshot, _col_map(cx0, cx1, cx2))
     grp = next((g for g in groups if g["index"] == group_index), None)
@@ -616,8 +647,8 @@ def _render(group_index, run, snapshot, cx0, cx1, cx2):
 
 
 if __name__ == "__main__":
-    if not _runs and not _HAS_CSV:
-        print(f"No runs found under {RUNS_DIR} and no CSV pair at "
-              f"{SENT_CSV} / {ACTUAL_CSV}", file=sys.stderr)
+    if not _runs and not _HAS_PKL:
+        print(f"No runs found under {RUNS_DIR} and no pickle pair at "
+              f"{SENT_PKL} / {ACTUAL_PKL}", file=sys.stderr)
         sys.exit(1)
     app.run(debug=True)
