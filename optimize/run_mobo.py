@@ -3054,7 +3054,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
     )
     print(f"\n{'='*70}")
     print(f"MOBO  |  {landscape.label}  |  {n_seed} re-evaluated seed(s) + "
-          f"{X_sobol.shape[0]} Sobol init, then BO until Ctrl+C")
+          f"{n_sobol} Sobol init, then BO until Ctrl+C")
     print(f"{stop_desc}    Run dir: {run_dir}")
     if n_prior:
         print(f"PRIOR HISTORY — seeding GP with {n_prior} (X,Y) pair(s) "
