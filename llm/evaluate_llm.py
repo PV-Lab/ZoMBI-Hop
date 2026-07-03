@@ -544,6 +544,9 @@ def continue_run(ckpt_dir: str, fn_callable, ref_optima,
 
     needle_t = dh.get_all_needle_locations()
     discovered = as_numpy(needle_t) if needle_t.numel() > 0 else np.empty((0, dim))
+    needle_vals_t = dh.get_all_needle_vals()
+    best_needle = (float(as_numpy(needle_vals_t).ravel().max())
+                   if needle_vals_t.numel() > 0 else float("nan"))
     X_all = as_numpy(dh.X_all_actual) if dh.X_all_actual is not None else np.empty((0, dim))
     Y_all = as_numpy(dh.Y_all).ravel() if dh.Y_all is not None else np.empty((0,))
 
@@ -581,6 +584,7 @@ def continue_run(ckpt_dir: str, fn_callable, ref_optima,
         "n_points_total": int(X_all.shape[0]),
         "n_needles": int(discovered.shape[0]),
         "best_objective": best_obj,
+        "best_needle": best_needle,
         "dist_to_ref_optima": float(dist),
         "dup_fraction": float(dup),
         "Y_all_running_best": np.maximum.accumulate(Y_all).tolist() if Y_all.size else [],
@@ -593,7 +597,7 @@ def continue_run(ckpt_dir: str, fn_callable, ref_optima,
 # ════════════════════════════════════════════════════════════════════════════════
 
 # The four scalar metrics aggregated across repeats.
-_METRIC_KEYS = ["best_objective", "n_needles", "dist_to_ref_optima", "dup_fraction"]
+_METRIC_KEYS = ["best_objective", "best_needle", "n_needles", "dist_to_ref_optima", "dup_fraction"]
 
 
 def one_continuation(snapshot_name: str, fn_callable, ref_optima,
@@ -639,6 +643,9 @@ def baseline_metrics(Xm: np.ndarray, Ym: np.ndarray, mapping: Dict[str, Any],
     # Final real-run needles (full run_7eb9).
     final_needles = needles_at_snapshot(_default_final_snapshot())
     disc = np.array([n["composition"] for n in final_needles], float) if final_needles else np.empty((0, 3))
+    needle_vals = np.array([n.get("value", np.nan) for n in final_needles], float)
+    best_needle = (float(np.nanmax(needle_vals))
+                   if needle_vals.size and np.isfinite(needle_vals).any() else float("nan"))
     dist = metric_dist_to_needles(disc, ref_optima, dim=3) if len(ref_optima) and len(disc) else float("nan")
     dup = metric_dup_fraction(Xm, dim=3) if Xm.shape[0] else float("nan")
 
@@ -649,6 +656,7 @@ def baseline_metrics(Xm: np.ndarray, Ym: np.ndarray, mapping: Dict[str, Any],
         "best_objective_at_injection": best_at_injection,
         # Keys aligned with continue_run()'s metrics so this counts as a sample.
         "best_objective": final_best,
+        "best_needle": best_needle,
         "n_needles": int(disc.shape[0]),
         "dist_to_ref_optima": float(dist),
         "dup_fraction": float(dup),
