@@ -97,6 +97,10 @@ import llm_config  # noqa: E402  (llm/ is the script dir → on sys.path)
 # ── fixed inputs ───────────────────────────────────────────────────────────────
 DB_PATH = _HERE / "data" / "campaign2_all.db"
 RUN_DIR = _ROOT / "runs" / "run_7eb9"
+# Offline MOBO hyperparameter-search run whose per-trial results (trial_*/trial.json)
+# are shown to the LLM as the hyperparameter-optimization history. Point this at the
+# full optimization run (hundreds of trials); the example below has just one.
+MOBO_RUN_DIR = _ROOT / "optimize" / "runs" / "mobo_05_06_15_32"
 COMP_COLS = ["FAPbI3", "MAPbI3", "MAPbBr3"]
 VALUE_COL = "Objective"
 MAXIMIZE = True                     # Objective is maximized
@@ -323,6 +327,78 @@ def format_current_hparams(hp: Dict[str, Any]) -> str:
     return "\n".join(f"- `{k}` = {v}" for k, v in hp.items())
 
 
+def _fmt_num(v: Any) -> str:
+    """Compact numeric formatting for the trial table."""
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        if v == int(v):
+            return str(int(v))
+        return f"{v:.5g}"
+    return str(v)
+
+
+# The three MOBO objectives recorded per trial (all MINIMIZED, lower is better).
+_MOBO_METRIC_KEYS = ("dist_to_needles", "dup_fraction", "runtime_s")
+
+
+def hparam_optimization_history(mobo_run_dir: Path = MOBO_RUN_DIR,
+                                max_trials: int = 1000) -> str:
+    """Full offline hyperparameter-search history as a compact markdown table.
+
+    Reads every ``trial_*/trial.json`` under ``mobo_run_dir`` (each holds a tried
+    hyperparameter config plus its three MOBO objective scores) and renders one
+    row per trial. The hyperparameter column order follows the run's
+    ``run_config.json['hparam_names']`` when available.
+    """
+    trial_files = sorted(
+        mobo_run_dir.glob("trial_*/trial.json"),
+        key=lambda p: int(re.search(r"trial_(\d+)", p.parent.name).group(1)),
+    )
+    if not trial_files:
+        return f"(no trials found under {mobo_run_dir})"
+
+    trials: List[Dict[str, Any]] = []
+    for tf in trial_files:
+        try:
+            trials.append(json.loads(tf.read_text()))
+        except Exception:
+            continue
+    if not trials:
+        return f"(could not read any trials under {mobo_run_dir})"
+
+    # Hyperparameter column order: prefer the run's declared order.
+    hp_order: List[str] = []
+    cfg = mobo_run_dir / "run_config.json"
+    if cfg.exists():
+        try:
+            hp_order = list(json.loads(cfg.read_text()).get("hparam_names", []))
+        except Exception:
+            hp_order = []
+    if not hp_order:
+        hp_order = list(trials[0].get("hparams", {}).keys())
+
+    header = ["trial"] + hp_order + list(_MOBO_METRIC_KEYS)
+    lines = [" | ".join(header), " | ".join("---" for _ in header)]
+
+    truncated = False
+    for t in trials[:max_trials]:
+        hp = t.get("hparams", {})
+        metrics = t.get("metrics", {})
+        row = [str(t.get("trial", ""))]
+        row += [_fmt_num(hp.get(name)) for name in hp_order]
+        row += [_fmt_num(metrics.get(k)) for k in _MOBO_METRIC_KEYS]
+        lines.append(" | ".join(row))
+    if len(trials) > max_trials:
+        truncated = True
+
+    table = "\n".join(lines)
+    prefix = f"{len(trials)} offline trials"
+    if truncated:
+        prefix += f" ({max_trials} shown)"
+    return f"{prefix}:\n\n{table}"
+
+
 def history_table(rows: List[Dict[str, Any]], injection_iter: int, max_rows: int = 800) -> str:
     """Compact table of measured points up to and including ``injection_iter``."""
     lines = ["iteration | FAPbI3 | MAPbI3 | MAPbBr3 | Objective"]
@@ -380,8 +456,10 @@ def needle_summary(needles: List[Dict[str, Any]]) -> str:
 def build_prompt(rows, Xm, Ym, its, injection_iter, mapping, run_config, needles) -> str:
     hp = current_hparams(run_config)
     return llm_config.PROMPT_TEMPLATE.format(
+        system_features=llm_config.SYSTEM_FEATURES,
         hparam_descriptions=hparam_descriptions_block(),
         current_hparams=format_current_hparams(hp),
+        hparam_search_history=hparam_optimization_history(),
         injection_iter=injection_iter,
         history_table=history_table(rows, injection_iter),
         progress_summary=progress_summary(Xm, Ym, its, injection_iter, mapping, needles),

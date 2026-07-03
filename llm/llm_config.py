@@ -41,6 +41,23 @@ USE_THINKING: bool = True
 MAX_TOKENS: int = 8000        # generous headroom for reasoning + the JSON answer
 
 
+# ── Static system-features overview ────────────────────────────────────────────
+# The per-sample feature groups Archerfish measures, mirroring the "column groups"
+# table in llm/data/campaign2_all.md. Injected into the prompt as {system_features}.
+SYSTEM_FEATURES = """\
+| Group | Fields | What it is |
+|---|---|---|
+| Composition inputs | `FAPbI3`, `MAPbI3`, `MAPbBr3`, `Module1`-`Module7` | Perovskite precursor / module fractions (the knobs being optimized) |
+| Position | `X`, `Y` | Stage coordinates of the droplet on the substrate |
+| Objectives / properties | `Bandgap` (1.45-2.59 eV), `Photoconductance` (0-1), `Stability` (0.32-1.0), `Objective` (0.28-0.86) | Measured targets and the combined `Objective` being maximized |
+| Environment | `Temperature_in/out`, `Humidity_in/out`, `Pressure_in/out`, `DMF_ppm_in/out` | Glovebox/chamber conditions & solvent vapor at start vs. end of measurement |
+| Absorption/reflectance spectrum | 462 columns `387`-`1003` | Intensity per wavelength (nm), ~UV-NIR |
+| Stability sweep | `-40_dark_1` - `40_light_2/3` (120 cols) | Signals at voltages -40..+40, dark vs. light, 3 repeats |
+| Kinetics | `k1`, `k2`, `k3` (+ `_var`) | Degradation rate constants and their variances |
+| PL spectra | `450_i_pl`-`1042_i_pl` (initial) and `..._f_pl` (final), 30 each | Photoluminescence spectra before/after a degradation study |
+| Metadata | `Timestamp` | Measurement time |"""
+
+
 # ── The prompt ─────────────────────────────────────────────────────────────────
 # Everything in {curly_braces} is filled in by evaluate_llm.build_prompt().
 SYSTEM_PROMPT = (
@@ -77,6 +94,16 @@ activation it also "zooms": it shrinks the search bounds around the best region
 to refine the optimum. The algorithm stops when the search space is mostly
 penalized or the trust regions collapse below the input-noise floor.
 
+## What the Archerfish system measures
+
+ZoMBI-Hop only optimizes over the 3 composition inputs and the `Objective`, but
+each measured droplet is a rich physical sample: Archerfish records the full
+optical spectra, environmental conditions, and degradation signals behind every
+`Objective` value. For context, these are the feature groups captured per sample
+(from the campaign database):
+
+{system_features}
+
 ## The ZoMBI-Hop hyperparameters you may tune
 
 (ranges are the allowed bounds; stay inside them)
@@ -85,6 +112,29 @@ penalized or the trust regions collapse below the input-noise floor.
 ## The current ZoMBI-Hop hyperparameters (at the injection point)
 
 {current_hparams}
+
+## Offline hyperparameter-optimization history
+
+These current defaults were chosen by a long offline multi-objective Bayesian
+optimization (MOBO) run that tuned ZoMBI-Hop's hyperparameters on a surrogate of
+this problem. Below is the FULL history of every hyperparameter configuration
+that offline search evaluated and the performance it achieved. Each row is one
+trial: its hyperparameter values followed by the three objectives it scored, all
+of which are MINIMIZED (lower is better):
+
+- `dist_to_needles`: mean distance from the needles ZoMBI-Hop found to the true
+  optima — how well it located the real needles (lower = found them better).
+- `dup_fraction`: fraction of measured points that were near-duplicates — wasted
+  budget from re-measuring the same place (lower = more efficient).
+- `runtime_s`: wall-clock seconds the run took (lower = faster).
+
+Use this to understand which hyperparameter regions the offline search found
+good vs. bad, and how each hyperparameter trades off the objectives. Note the
+offline objectives differ from your online goal (you care about the continued
+run's outcome on THIS specific real trajectory), so treat this as a strong prior,
+not a rule.
+
+{hparam_search_history}
 
 ## The measured campaign data so far
 
