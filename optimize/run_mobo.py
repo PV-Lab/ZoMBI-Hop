@@ -2510,13 +2510,17 @@ def run_single_trial(
     inner   = make_linebo_wrapper(sim_obj, dim, NUM_LINES, DEVICE, DTYPE, plot_state)
 
     # The per-iteration "heavy" payload fields (pared point cloud, per-needle
-    # penalisation matrices, bounds) are consumed ONLY by render_frame, i.e. the
-    # 3D per-iteration ternary frames. At dim ≥ 4 no frames are drawn (the 4D
-    # point cloud reads final state straight from the data handler, not payloads),
-    # so storing them every iteration just grows host RAM without bound — on a
-    # long high-dim trial that exhausts the cgroup limit and triggers an OOM kill.
-    # Keep them only when ternary frames will actually be rendered.
+    # penalisation matrices, bounds) are consumed ONLY by render_frame, and we now
+    # render just the FINAL frame per run — so only the last payload needs them.
+    # Retain them on the most-recent payload only (stripped from the previous one
+    # before each append); this bounds host RAM instead of accumulating a pared
+    # cloud every iteration, which on a long trial exhausts the cgroup limit and
+    # triggers an OOM kill. At dim ≥ 4 no frames are drawn, so heavy fields are
+    # never kept.
     keep_heavy = landscape.render_ternary
+    HEAVY_PAYLOAD_KEYS = (
+        "pared_X", "pared_Y", "needle_M_list", "needle_B", "bounds", "gp_grid_vals",
+    )
 
     def obj_wrapper(x_tell, bounds, acq_fn):
         x_req, x_act, y = inner(x_tell, bounds, acq_fn)
@@ -2534,6 +2538,10 @@ def run_single_trial(
             n_points_before=(dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0),
         )
         if keep_heavy:
+            # Drop heavy fields from the prior payload — only the final one is rendered.
+            if payloads:
+                for k in HEAVY_PAYLOAD_KEYS:
+                    payloads[-1].pop(k, None)
             xp, yp = dh.X_pared, dh.Y_pared
             if xp is not None and xp.shape[0] > 0:
                 pared_X = xp.detach().cpu().numpy()
@@ -2665,24 +2673,27 @@ def run_single_trial(
     except Exception as exc:
         print(f"    [trial] static plot failed: {exc}")
 
-    if landscape.render_ternary and grid_pts is not None and grid_vals is not None:
+    if landscape.render_ternary and grid_pts is not None and grid_vals is not None and payloads:
         plots_dir = os.path.join(trial_dir, "plots")
         os.makedirs(plots_dir, exist_ok=True)
-        print(f"    [trial] rendering {len(payloads)} ternary frames …", flush=True)
-        for p in payloads:
-            try:
-                ref_title = (
-                    "Reference: oracle landscape"
-                    if landscape.landscape == "synthetic"
-                    else "Reference: RF landscape"
-                )
-                render_frame(
-                    p, grid_pts, grid_vals, true_optima, maximize,
-                    os.path.join(plots_dir, f"iter_{p['iter_num'] - 1:04d}.png"),
-                    ref_title=ref_title,
-                )
-            except Exception as exc:
-                print(f"    [trial] frame {p['iter_num']} failed: {exc}")
+        # Only render the final iteration's frame per run — the full per-iteration
+        # sweep dominates wall-clock (each frame re-plots the accumulated cloud, so
+        # cost grows with iteration count). Videos are built separately (make_videos.py).
+        p = payloads[-1]
+        print("    [trial] rendering final ternary frame …", flush=True)
+        try:
+            ref_title = (
+                "Reference: oracle landscape"
+                if landscape.landscape == "synthetic"
+                else "Reference: RF landscape"
+            )
+            render_frame(
+                p, grid_pts, grid_vals, true_optima, maximize,
+                os.path.join(plots_dir, f"iter_{p['iter_num'] - 1:04d}.png"),
+                ref_title=ref_title,
+            )
+        except Exception as exc:
+            print(f"    [trial] frame {p['iter_num']} failed: {exc}")
 
     if dim == 4 and hasattr(fn_callable, "predict"):
         try:
