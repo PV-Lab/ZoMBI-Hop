@@ -1,3 +1,5 @@
 # Extra dependency for the LLM-in-the-loop experiment (llm/).
 # Install into the zombi-hop env:  pip install -r llm/requirements.txt
 anthropic>=0.116
+# For data_exploration.ipynb (functional PCA of spectra / sweeps)
+scikit-fda>=0.10
