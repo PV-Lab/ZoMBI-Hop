@@ -20,8 +20,46 @@ Auth: the Anthropic SDK reads ``ANTHROPIC_API_KEY`` from the environment (or an
 from __future__ import annotations
 
 import json
+import os
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+
+# ── .env loading ───────────────────────────────────────────────────────────────
+# So you never have to export ANTHROPIC_API_KEY by hand: on import we load a .env
+# file (repo root, then llm/) into the environment. A real environment variable
+# always wins over the file. Uses python-dotenv if installed, else a tiny built-in
+# parser (no dependency). See .env.example for the expected keys.
+def _load_dotenv() -> None:
+    candidates = [Path(__file__).resolve().parent.parent / ".env",   # repo root
+                  Path(__file__).resolve().parent / ".env"]          # llm/.env
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        for p in candidates:
+            if p.exists():
+                load_dotenv(p, override=False)
+        return
+    except ImportError:
+        pass
+    # Fallback: minimal KEY=VALUE parser (no python-dotenv installed).
+    for p in candidates:
+        if not p.exists():
+            continue
+        for raw in p.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            val = val.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = val
+
+
+_load_dotenv()
 
 
 # ── Model selection ────────────────────────────────────────────────────────────
