@@ -19,12 +19,30 @@ The campaign has ~640 raw columns, most of them highly redundant *curves*
 first collapse each curve group to a handful of **functional-PCA** scores
 (exactly as the notebook does), leaving ~33 informative features. Then:
 
-1.  **Conditional mean (what composition/time/iteration explain).**
-    For every feature we fit a Random-Forest regressor on
-    ``Z = (FAPbI3, MAPbBr3, time, iteration)`` and take its **out-of-bag**
-    prediction as the conditional mean.  OOB (rather than in-sample) prediction
-    is essential here: an RF fits its training rows almost perfectly, so
+1.  **Conditional mean (composition landscape vs. per-batch condition).**
+    Each feature's mean is a Random-Forest regressor whose **out-of-bag**
+    prediction we use as the conditional mean.  OOB (rather than in-sample)
+    prediction is essential: an RF fits its training rows almost perfectly, so
     in-sample residuals would badly *under*-estimate the noise we need to sample.
+
+    Two conditioning sets, by feature type:
+
+    * **Objective + material/optical/kinetic features → composition alone**
+      ``(FAPbI3, MAPbI3, MAPbBr3)``.  This makes the Objective *landscape*
+      ``E[Objective | comp]`` reproduce ``visualization/plot_run.py``'s RF
+      background, and — because every material feature shares this comp-only
+      baseline — the per-iteration *batch offsets* they carry stay in the
+      residuals, so Σ (step 3) captures the feature↔feature and feature↔objective
+      co-variation consistently.  ``_time_sec``/``Iteration`` are deliberately
+      *not* used here: they form a 41-level batch label (one timestamp per BO
+      iteration), so conditioning a material mean on them would merely memorise
+      each batch's idiosyncratic offset.
+
+    * **Environment channels → time/iteration label alone.**  These are logged
+      ambient conditions — exactly constant within an iteration and with no
+      composition signal — so they are a deterministic per-batch quantity;
+      conditioning them on composition would only inject the campaign's time
+      confound into their mean.  Their residuals are ~0 and inert in Σ.
 
 2.  **Residuals.**  ``resid = feature − OOB_mean``.  Everything the conditioning
     variables do *not* explain lives in these residuals — and, crucially, the
@@ -106,6 +124,12 @@ DEFAULT_DB = _HERE / "data" / "campaign2_all.db"
 
 COMP = ["FAPbI3", "MAPbI3", "MAPbBr3"]              # ternary simplex (sums to 1)
 COND_COLS = ["FAPbI3", "MAPbBr3", "_time_sec", "Iteration"]  # conditioning Z (MAPbI3 redundant)
+
+# The Objective's conditional mean is fit on composition ALONE (not time/iteration)
+# so its landscape reproduces visualization/plot_run.py's RF background.  That
+# module uses 500 trees, random_state=42; we mirror the tree count here (the seed
+# follows the surrogate's --seed, matching plot_run at the default seed=42).
+OBJECTIVE_MEAN_TREES = 500
 
 # scalar features kept in the joint model.  k2 is dropped: it is numerically
 # identical to Stability (Spearman rho = 1.00) and would make Σ singular.
@@ -260,6 +284,18 @@ def build_features(df: pd.DataFrame, cols: dict, verbose: bool = True):
 
 # ── step 1-2: conditional means (RF-OOB) and residuals ────────────────────────
 
+def _comp_from_Z(Z: np.ndarray) -> np.ndarray:
+    """Reconstruct the composition ``(FAPbI3, MAPbI3, MAPbBr3)`` from a
+    conditioning matrix ``Z = (FAPbI3, MAPbBr3, time, iteration)``.
+
+    The three components sum to 1, exactly the composition columns that
+    ``visualization/plot_run.py`` trains its RF background on — so an RF fit on
+    this triple reproduces that module's Objective landscape.
+    """
+    Z = np.atleast_2d(np.asarray(Z, float))
+    return np.column_stack([Z[:, 0], 1.0 - Z[:, 0] - Z[:, 1], Z[:, 1]])
+
+
 def fit_conditional_means(Z: np.ndarray, F: np.ndarray, feat_names: list[str],
                           n_estimators: int = 400, seed: int = 42, verbose: bool = True):
     """Fit an RF per feature; return (models, residuals, oob_r2).
@@ -267,20 +303,44 @@ def fit_conditional_means(Z: np.ndarray, F: np.ndarray, feat_names: list[str],
     ``residuals[i, j] = F[i, j] − OOB_prediction`` (NaN where F is NaN). The
     out-of-bag prediction is an honest held-out mean, so the residual scale is
     not deflated by the RF over-fitting its own training rows.
+
+    Conditioning set per feature (see module docstring, step 1):
+
+    * **Environment** channels are conditioned on the **time/iteration label**
+      alone — they are logged ambient conditions (constant within an iteration,
+      no composition signal), so composition would only inject the campaign's
+      time confound into their mean.
+    * **Every other feature** (the Objective and all material/optical/kinetic
+      features) is conditioned on **composition alone** (``_comp_from_Z``).  This
+      makes the Objective landscape match ``visualization/plot_run.py`` and
+      defines every material residual against the same comp-only baseline, so the
+      per-iteration batch offsets stay in the residuals and Σ captures the
+      co-variation consistently.  The Objective uses ``OBJECTIVE_MEAN_TREES``
+      trees (to mirror plot_run.py); the rest use ``n_estimators``.
     """
     n, p = F.shape
     models, resid, oob_r2 = [], np.full((n, p), np.nan), np.full(p, np.nan)
     zfinite = np.isfinite(Z).all(1)                     # Z is complete in practice
+    obj_idx = feat_names.index("Objective")
+    comp = _comp_from_Z(Z)                               # (n, 3) composition-only inputs
+    tcols = Z[:, 2:4]                                    # (_time_sec, Iteration) batch label
+    env_set = set(ENV)
     for j in range(p):
         m = zfinite & np.isfinite(F[:, j])
-        rf = RandomForestRegressor(n_estimators=n_estimators, oob_score=True,
+        if feat_names[j] in env_set:
+            Xin, ntrees, tag = tcols, n_estimators, "  (time-only)"
+        elif j == obj_idx:
+            Xin, ntrees, tag = comp, OBJECTIVE_MEAN_TREES, "  (comp-only)"
+        else:
+            Xin, ntrees, tag = comp, n_estimators, "  (comp-only)"
+        rf = RandomForestRegressor(n_estimators=ntrees, oob_score=True,
                                    n_jobs=-1, random_state=seed)
-        rf.fit(Z[m], F[m, j])
+        rf.fit(Xin[m], F[m, j])
         models.append(rf)
         resid[m, j] = F[m, j] - rf.oob_prediction_
         oob_r2[j] = rf.oob_score_
         if verbose:
-            print(f"    {feat_names[j]:18s} n={m.sum():4d}  OOB R2={rf.oob_score_:+.3f}")
+            print(f"    {feat_names[j]:18s} n={m.sum():4d}  OOB R2={rf.oob_score_:+.3f}{tag}")
     return models, resid, oob_r2
 
 
@@ -381,6 +441,8 @@ def factor_decompose(Sigma: np.ndarray, feat_names: list[str]):
 @dataclass
 class Surrogate:
     feat_names: list[str]
+    obj_index: int                     # index of "Objective" (comp-only mean model)
+    env_index: list                    # feature indices conditioned on the time/iteration label
     groups: dict
     models: list                       # RandomForestRegressor per feature
     resid_mean: np.ndarray             # (p,) OOB residual bias
@@ -427,7 +489,9 @@ class Surrogate:
                   f"{k} factors (eig>1) explain {evr[:k].sum():.2f} of residual variance")
 
         surr = cls(
-            feat_names=feat_names, groups=groups, models=models,
+            feat_names=feat_names, obj_index=feat_names.index("Objective"),
+            env_index=[i for i, nm in enumerate(feat_names) if nm in set(ENV)],
+            groups=groups, models=models,
             resid_mean=resid_mean, resid_std=resid_std, Sigma=Sigma,
             reconstructors=recon, oob_r2=oob_r2, shrink_delta=delta,
             n_factors=k, loadings=loadings, evr=evr,
@@ -450,8 +514,19 @@ class Surrogate:
         return float(time_sec), float(iteration)
 
     def _cond_means(self, Z: np.ndarray) -> np.ndarray:
-        """Conditional mean of every feature at rows Z (m×4) → (m, p)."""
-        return np.column_stack([rf.predict(Z) for rf in self.models])
+        """Conditional mean of every feature at rows Z (m×4) → (m, p).
+
+        Environment channels are conditioned on the ``(_time_sec, Iteration)``
+        batch label; every other feature (Objective + material) on composition
+        alone (see ``fit_conditional_means``), matching each RF's training set.
+        """
+        Z = np.atleast_2d(np.asarray(Z, float))
+        comp = _comp_from_Z(Z)
+        tcols = Z[:, 2:4]                                  # (_time_sec, Iteration) batch label
+        env = set(self.env_index)
+        cols = [rf.predict(tcols) if j in env else rf.predict(comp)
+                for j, rf in enumerate(self.models)]
+        return np.column_stack(cols)
 
     def _draw_resid(self, m: int, rng) -> np.ndarray:
         """m joint residual draws (m×p) in ORIGINAL feature units."""
@@ -601,7 +676,7 @@ def demo_plot(surr: Surrogate, out: Path, grid_n: int = 80):
         return np.column_stack([c[:, 1] + 0.5 * c[:, 2], _s32 * c[:, 2]])
 
     mean_df = surr.sample_grid(grid_n, stochastic=False)
-    samp_df = surr.sample_grid(grid_n // 2, stochastic=True, seed=1)
+    samp_df = surr.sample_grid(grid_n, stochastic=True, seed=1)
     gxy = to_xy(mean_df[COMP].values)
     sxy = to_xy(samp_df[COMP].values)
 
