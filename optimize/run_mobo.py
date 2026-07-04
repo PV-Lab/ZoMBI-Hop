@@ -1970,11 +1970,16 @@ def plot_convergence(path: str, dh, maximize: bool) -> None:
                    label="penalized", zorder=2)
         ax.scatter(idx[pm], Y_all[pm], s=10, alpha=0.65, color="steelblue",
                    label="valid", zorder=3)
-        running_best = np.maximum.accumulate(np.where(pm, Y_all, -np.inf))
     else:
         ax.scatter(idx, Y_all, s=10, alpha=0.65, color="steelblue",
                    label="obs", zorder=2)
-        running_best = np.maximum.accumulate(Y_all)
+
+    # Running best is over EVERY observed Y, penalized or not: a penalized point
+    # (one that landed inside an already-found needle's repulsion region) is still
+    # a real objective measurement, so it must be able to raise the best-so-far.
+    # Penalization only governs where MOBO samples next, not what counts as
+    # observed — so it must not be excluded from the convergence envelope.
+    running_best = np.maximum.accumulate(Y_all)
 
     ax.plot(idx, running_best, color="darkorange", lw=1.8,
             label="running best", zorder=4)

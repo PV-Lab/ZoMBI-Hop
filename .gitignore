@@ -70,3 +70,6 @@ test_rfs/
 *.pickle
 *.h5
 *.hdf5
+
+# babysitter runtime state (logs, crash reports, cooldown stamps, lock)
+optimize/scripts/.babysitter/
