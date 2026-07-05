@@ -195,11 +195,13 @@ def build_volume_schema(dim: int = DIM) -> Dict[str, Any]:
                     "type": "object",
                     "properties": {
                         "kind": {"type": "string", "enum": ["reward", "penalty"]},
+                        # NOTE: the Anthropic structured-output API rejects array
+                        # minItems/maxItems other than 0 or 1, so the exact length
+                        # (== dim) is enforced downstream in validate_volumes()
+                        # rather than in the schema.
                         "center": {
                             "type": "array",
                             "items": {"type": "number"},
-                            "minItems": dim,
-                            "maxItems": dim,
                         },
                         "radius": {"type": "number"},
                     },
