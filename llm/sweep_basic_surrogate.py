@@ -64,8 +64,8 @@ from __future__ import annotations
 
 # ─── HARDCODED CONFIG ──────────────────────────────────────────────────────────
 INJECTION_INTERVALS: list[int] = [1, 5, 10]   # LLM injects every k iterations
-MAX_ITERS: int = 20                            # total ZoMBI-Hop iterations per trial
-N_REPEATS: int = 5                             # trials per group (variance)
+MAX_ITERS: int = 40                            # total ZoMBI-Hop iterations per trial
+N_REPEATS: int = 3                             # trials per group (variance)
 # Cost note: cadence k does ~ceil(MAX_ITERS/k)-1 LLM calls per repeat, so with the
 # defaults k=1 ≈ 19, k=5 ≈ 3, k=10 ≈ 1 calls/repeat → ~115 LLM calls total across
 # the 5 repeats of the three cadences (the baseline calls the LLM zero times).
