@@ -453,8 +453,10 @@ def finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir: Path) -> D
     X_all = as_numpy(dh.X_all_actual) if dh.X_all_actual is not None else np.empty((0, dim))
     Y_all = as_numpy(dh.Y_all).ravel() if dh.Y_all is not None else np.empty((0,))
 
-    bx, by, _ = dh.get_best_unpenalized()
-    best_obj = float(by.item()) if by is not None else (float(Y_all.max()) if Y_all.size else float("nan"))
+    # Best Objective over ALL measured points (including points inside declared-
+    # needle penalty regions) = the endpoint of the running-best curve, so the
+    # significance test and the convergence plot are on the same quantity.
+    best_obj = float(Y_all.max()) if Y_all.size else float("nan")
     dist = metric_dist_to_needles(discovered, ref_optima, dim=dim) if len(ref_optima) else float("nan")
     dup = metric_dup_fraction(X_all, dim=dim) if X_all.shape[0] else float("nan")
 
@@ -785,6 +787,63 @@ def plot_convergence_comparison(sweep_dir: Path, out_png: Optional[Path] = None,
     return out_png
 
 
+def regenerate_summary(sweep_dir: Path, group_row=None, write=None,
+                       plot: bool = True) -> None:
+    """Rebuild sweep_summary.{json,csv} for an existing cadence sweep from each rep's
+    metrics.json, WITHOUT re-running any trials. ``best_objective`` is recomputed as
+    the max over ALL measured points (= endpoint of the stored per-droplet
+    ``Y_all_running_best``) rather than the best un-penalized point, so the summary's
+    diff_best / p-values match the convergence plot. ``group_row`` / ``write`` default
+    to this module's variants; sweep_volume_control passes its own so its extra
+    columns are preserved."""
+    group_row = group_row or _group_row
+    write = write or write_summary
+    sweep_dir = Path(sweep_dir)
+
+    groups: List[Tuple[str, Optional[int]]] = []
+    if (sweep_dir / "baseline_trial112").is_dir():
+        groups.append(("baseline_trial112", None))
+    for d in sorted(sweep_dir.glob("inject_every_*")):
+        if d.is_dir():
+            try:
+                interval: Optional[int] = int(d.name.rsplit("_", 1)[1])
+            except ValueError:
+                interval = None
+            groups.append((d.name, interval))
+    if not groups:
+        raise SystemExit(f"No group directories under {sweep_dir}")
+    print(f"Regenerating summary for {len(groups)} groups in {sweep_dir}")
+
+    rows: List[dict] = []
+    baseline_stats: Optional[Dict[str, Any]] = None
+    for group, interval in groups:
+        samples: List[Dict[str, Any]] = []
+        for rep in sorted((sweep_dir / group).glob("rep*")):
+            mp = rep / "metrics.json"
+            if not mp.exists():
+                continue
+            m = json.loads(mp.read_text())
+            rb = m.get("Y_all_running_best")
+            if rb:  # best = max over ALL measured points
+                m["best_objective"] = float(np.max(np.asarray(rb, float)))
+            samples.append(m)
+        if not samples:
+            print(f"  [skip] {group}: no rep metrics.json")
+            continue
+        stats = aggregate(samples)
+        rows.append(group_row(group, interval, stats, samples, baseline_stats))
+        if group == "baseline_trial112":
+            baseline_stats = stats
+        print(f"  {group}: best_mean={rows[-1].get('best_mean')}, "
+              f"diff={rows[-1].get('diff_best_vs_baseline')}, "
+              f"p={rows[-1].get('diff_best_p_value')}")
+
+    write(sweep_dir, rows)
+    print(f"\nWrote {sweep_dir / 'sweep_summary.csv'} and .json")
+    if plot:
+        plot_convergence_comparison(sweep_dir)
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # Orchestration
 # ════════════════════════════════════════════════════════════════════════════════
@@ -874,7 +933,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if args and args[0] in ("--plot", "-p"):
+    if args and args[0] in ("--regenerate", "-r"):
+        if len(args) < 2:
+            raise SystemExit("usage: sweep_basic_surrogate.py --regenerate <sweep_dir>")
+        regenerate_summary(Path(args[1]))
+    elif args and args[0] in ("--plot", "-p"):
         if len(args) < 2:
             raise SystemExit("usage: sweep_basic_surrogate.py --plot <sweep_dir>")
         plot_convergence_comparison(Path(args[1]))

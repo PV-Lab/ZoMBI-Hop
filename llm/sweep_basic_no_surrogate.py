@@ -496,10 +496,56 @@ def plot_convergence_comparison(sweep_dir: Path, out_png: Path | None = None) ->
     return out_png
 
 
+def _aggregate_values(values) -> dict:
+    """{mean, std, n, values} for a list of scalars (matches the sweep's stats
+    format so it can slot straight into a comparison's *_stats block)."""
+    arr = np.array([v for v in values if v is not None], float)
+    fin = arr[np.isfinite(arr)]
+    return {"mean": float(fin.mean()) if fin.size else float("nan"),
+            "std": float(fin.std(ddof=1)) if fin.size > 1 else 0.0,
+            "n": int(fin.size),
+            "values": [None if not np.isfinite(v) else float(v) for v in arr]}
+
+
+def _recompute_best_over_all(comparison: dict, inj_dir: Path) -> None:
+    """Rewrite a comparison's ``best_objective`` stats (baseline + LLM) so ``best`` is
+    the max Objective over ALL measured points (from each rep's points.csv) instead
+    of the best *un-penalized* point. The real-campaign baseline sample already uses
+    the max-over-all definition, so it is kept as-is and pooled with the recomputed
+    RF-repeat maxima. Mutates ``comparison`` in place."""
+    real_best = None
+    for s in comparison.get("baseline_samples", []):
+        if "real" in str(s.get("source", "")):
+            real_best = s.get("best_objective")
+            break
+
+    base_vals = [] if real_best is None else [real_best]
+    for r in sorted((inj_dir / "baseline_rf").glob("rep*")):
+        rb = _running_best_from_points(r / "points.csv")
+        if rb is not None:
+            base_vals.append(float(rb.max()))
+    llm_vals = []
+    for r in sorted((inj_dir / "continuation").glob("rep*")):
+        rb = _running_best_from_points(r / "points.csv")
+        if rb is not None:
+            llm_vals.append(float(rb.max()))
+
+    if base_vals:
+        comparison.setdefault("baseline_stats", {})["best_objective"] = _aggregate_values(base_vals)
+    if llm_vals:
+        comparison.setdefault("llm_stats", {})["best_objective"] = _aggregate_values(llm_vals)
+    bm = (comparison.get("baseline_stats") or {}).get("best_objective", {}).get("mean")
+    lm = (comparison.get("llm_stats") or {}).get("best_objective", {}).get("mean")
+    if bm is not None and lm is not None and np.isfinite(bm) and np.isfinite(lm):
+        comparison.setdefault("difference_llm_minus_baseline_mean", {})["best_objective"] = lm - bm
+
+
 def regenerate_summary(sweep_dir: Path) -> None:
     """Rebuild sweep_summary.{json,csv} for an existing sweep from its per-point
     ``inj_XXX/baseline_vs_llm.json`` artifacts, adding the significance and
-    best-declared-needle columns without re-running any ZoMBI-Hop continuations."""
+    best-declared-needle columns without re-running any ZoMBI-Hop continuations.
+    ``best_objective`` (hence diff_best and its p-value) is recomputed as the max
+    over ALL measured points. Also regenerates the convergence plot."""
     sweep_dir = Path(sweep_dir)
     inj_dirs = sorted(d for d in sweep_dir.glob("inj_*") if d.is_dir())
     if not inj_dirs:
@@ -514,6 +560,7 @@ def regenerate_summary(sweep_dir: Path) -> None:
             continue
         comparison = json.loads(cmp_path.read_text())
         comparison.setdefault("out_dir", str(d))  # needed for on-disk needle lookup
+        _recompute_best_over_all(comparison, d)   # best = max over ALL points
         rows.append(_flatten(comparison))
         p = rows[-1].get("diff_best_p_value")
         print(f"  {d.name}: diff_best={rows[-1].get('diff_best')}, "
@@ -522,6 +569,7 @@ def regenerate_summary(sweep_dir: Path) -> None:
     rows.sort(key=lambda r: (r.get("injection_iter") is None, r.get("injection_iter")))
     _write_summary(sweep_dir, rows)
     print(f"\nWrote {sweep_dir / 'sweep_summary.json'} and .csv")
+    plot_convergence_comparison(sweep_dir)
 
 
 if __name__ == "__main__":

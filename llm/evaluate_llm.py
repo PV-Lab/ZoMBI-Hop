@@ -628,9 +628,11 @@ def continue_run(ckpt_dir: str, fn_callable, ref_optima,
     X_all = as_numpy(dh.X_all_actual) if dh.X_all_actual is not None else np.empty((0, dim))
     Y_all = as_numpy(dh.Y_all).ravel() if dh.Y_all is not None else np.empty((0,))
 
-    # Best unpenalized objective (comparable to the baseline running best).
-    bx, by, _ = dh.get_best_unpenalized()
-    best_obj = float(by.item()) if by is not None else (float(Y_all.max()) if Y_all.size else float("nan"))
+    # Best Objective over ALL measured points (including points inside declared-
+    # needle penalty regions) = the endpoint of the running-best curve. This matches
+    # the real-run baseline (baseline_metrics uses the same max-over-all definition)
+    # and the convergence plot, so the significance test is on the same quantity.
+    best_obj = float(Y_all.max()) if Y_all.size else float("nan")
 
     dist = metric_dist_to_needles(discovered, ref_optima, dim=dim) if len(ref_optima) else float("nan")
     dup = metric_dup_fraction(X_all, dim=dim) if X_all.shape[0] else float("nan")

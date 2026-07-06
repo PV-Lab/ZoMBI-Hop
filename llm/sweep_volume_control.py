@@ -796,7 +796,12 @@ def main() -> None:
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if args and args[0] in ("--plot", "-p"):
+    if args and args[0] in ("--regenerate", "-r"):
+        if len(args) < 2:
+            raise SystemExit("usage: sweep_volume_control.py --regenerate <sweep_dir>")
+        # Reuse the shared regenerator but keep volume-control's extra summary columns.
+        SBS.regenerate_summary(Path(args[1]), group_row=_group_row, write=write_summary)
+    elif args and args[0] in ("--plot", "-p"):
         if len(args) < 2:
             raise SystemExit("usage: sweep_volume_control.py --plot <sweep_dir>")
         SBS.plot_convergence_comparison(
