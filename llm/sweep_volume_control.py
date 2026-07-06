@@ -301,7 +301,7 @@ def validate_volumes(raw_volumes: List[Dict[str, Any]], dim: int = DIM
             warnings.append(f"dropped volume #{i}: center must be {dim} finite numbers")
             continue
         # Project onto the simplex (clamp negatives, renormalise to sum 1).
-        c_proj = proj_simplex(torch.tensor(c).unsqueeze(0)).squeeze(0).numpy()
+        c_proj = proj_simplex(torch.tensor(c).unsqueeze(0)).squeeze(0).cpu().numpy()
         try:
             r = float(v.get("radius"))
         except (TypeError, ValueError):
