@@ -511,9 +511,15 @@ def run_baseline_trial(surr, base_hp, ref_optima, seed: int, trial_dir: Path) ->
 
 
 def run_llm_trial(surr, base_hp, ref_optima, interval: int, seed: int,
-                  trial_dir: Path) -> Dict[str, Any]:
+                  trial_dir: Path, prompt_builder=None) -> Dict[str, Any]:
     """One cadence-``interval`` trial: cold-start, then inject the LLM every
-    ``interval`` iterations, resuming ZoMBI-Hop's exact state each time."""
+    ``interval`` iterations, resuming ZoMBI-Hop's exact state each time.
+
+    ``prompt_builder`` builds each injection prompt; it defaults to this module's
+    feature-rich ``build_injection_prompt``. sweep_basic_surrogate_no_features passes
+    a feature-ablated builder so only the prompt changes (the surrogate draws, seeds,
+    and everything else stay identical → a clean A/B on the supplemental features)."""
+    prompt_builder = prompt_builder or build_injection_prompt
     E._seed_everything(seed)
     rng = np.random.default_rng(seed)
     fn_callable, feature_log = make_surrogate_objective(surr, rng)
@@ -545,9 +551,9 @@ def run_llm_trial(surr, base_hp, ref_optima, interval: int, seed: int,
                       f"(segment stalled)")
                 break
 
-            # Injection: show the LLM the run so far (incl. supplemental features).
-            prompt = build_injection_prompt(feature_log, dh, hp, injection_idx,
-                                            call_counter[0], MAX_ITERS, interval)
+            # Injection: show the LLM the run so far.
+            prompt = prompt_builder(feature_log, dh, hp, injection_idx,
+                                    call_counter[0], MAX_ITERS, interval)
             this_dir = inj_dir / f"inj_{injection_idx:02d}"
             this_dir.mkdir(parents=True, exist_ok=True)
             (this_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
@@ -856,9 +862,10 @@ def regenerate_summary(sweep_dir: Path, group_row=None, write=None,
 # Orchestration
 # ════════════════════════════════════════════════════════════════════════════════
 
-def main() -> None:
+def main(sweep_prefix: str = "sweep_surrogate", prompt_builder=None,
+         plot_title: Optional[str] = None) -> None:
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    sweep_dir = E.RESULTS_ROOT / f"sweep_surrogate_{ts}"
+    sweep_dir = E.RESULTS_ROOT / f"{sweep_prefix}_{ts}"
     sweep_dir.mkdir(parents=True, exist_ok=True)
     print(f"Surrogate LLM-in-the-loop sweep\n  sweep dir: {sweep_dir}")
     print(f"  cadences: {INJECTION_INTERVALS}   budget: {MAX_ITERS} iters   "
@@ -918,7 +925,8 @@ def main() -> None:
             tdir = sweep_dir / group / f"rep{rep}"
             print(f"  rep {rep} (seed {seed}) …")
             try:
-                m = run_llm_trial(surr, base_hp, ref_optima, interval, seed, tdir)
+                m = run_llm_trial(surr, base_hp, ref_optima, interval, seed, tdir,
+                                  prompt_builder=prompt_builder)
                 print(f"    best={m['best_objective']:.4f}, needles={m['n_needles']}, "
                       f"dup={m['dup_fraction']:.4f}, injections={m['n_injections']}, "
                       f"changes={m['n_changes']}")
@@ -934,7 +942,7 @@ def main() -> None:
 
     # Overlaid running-best convergence: baseline vs each cadence (mean ± 95% CI).
     print("\n[plot] convergence comparison …")
-    plot_convergence_comparison(sweep_dir)
+    plot_convergence_comparison(sweep_dir, title=plot_title)
 
     print(f"\nSweep complete → {sweep_dir / 'sweep_summary.csv'}")
 
