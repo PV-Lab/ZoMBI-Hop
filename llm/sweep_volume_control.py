@@ -55,9 +55,9 @@ The model / effort come from llm/llm_config.py (shared with evaluate_llm).
 from __future__ import annotations
 
 # ─── HARDCODED CONFIG ──────────────────────────────────────────────────────────
-INJECTION_INTERVALS: list[int] = [1, 5, 10]   # LLM places volumes every k iterations
+INJECTION_INTERVALS: list[int] = [5, 10]   # LLM places volumes every k iterations
 MAX_ITERS: int = 40                            # total ZoMBI-Hop iterations per trial
-N_REPEATS: int = 3                             # trials per group (variance)
+N_REPEATS: int = 5                             # trials per group (variance)
 SURROGATE_PICKLE: str | None = None            # reuse a fitted surrogate if set
 
 # Volume-control knobs.
@@ -384,18 +384,41 @@ Recent measured points (composition → Objective):
 
 {history_table}
 
-## Supplemental measured features so far
+## Supplemental measured features so far (GLOBAL, all {n_points} droplets)
 
 Beyond the composition and `Objective`, these interpretable per-droplet scalars
-were measured across all {n_points} droplets so far (mean [min, max], and the
-Pearson correlation of each with `Objective` — a positive corr means the feature
-tends to rise where the objective is high):
+were measured across all {n_points} droplets so far. Every number below is a
+GLOBAL statistic over ALL {n_points} droplets: the global mean, the global
+[min, max] range, and the global Pearson correlation of the feature with
+`Objective` (a positive corr means the feature tends to rise where the objective
+is high). Use these as the population baseline to compare the top-k and needle
+rows below against — e.g. if a feature's value in the top-k droplets sits near a
+tail of its global [min, max], that basin is atypical on that feature.
 
 {supplemental_summary}
 
 Best droplet so far — its supplemental features:
 
 {best_point_summary}
+
+## Top {top_k} droplets by Objective (with features)
+
+The {top_k} highest-`Objective` droplets measured so far and their supplemental
+features. Compare these against the GLOBAL table above: a feature that is high in
+the objective but sits at an unfavourable tail of its global range here signals a
+trade-off — a candidate region to steer away from with a `penalty` volume.
+
+{top_k_summary}
+
+## Declared needles (local optima) with features
+
+Each needle ZoMBI-Hop has declared, its composition and declared `Objective`
+value, plus the supplemental features of the nearest measured droplet. Spread-out
+needle compositions indicate healthy multi-basin coverage; needles clustered in
+one corner of the simplex indicate over-exploitation of a single region (a cue to
+`reward` an under-sampled region or `penalty` the crowded one).
+
+{needle_summary}
 
 ## Your task
 
@@ -443,6 +466,9 @@ def build_injection_prompt(feature_log, dh, volumes, injection_idx, iters_done,
         n_points=len(feature_log),
         supplemental_summary=SBS.supplemental_summary(feature_log),
         best_point_summary=SBS.best_point_summary(feature_log),
+        top_k=SBS.TOP_K_DROPLETS,
+        top_k_summary=SBS.top_k_summary(feature_log, SBS.TOP_K_DROPLETS),
+        needle_summary=SBS.needle_summary(feature_log, dh),
         interval=interval,
         min_radius=MIN_VOLUME_RADIUS,
         max_radius=MAX_VOLUME_RADIUS,

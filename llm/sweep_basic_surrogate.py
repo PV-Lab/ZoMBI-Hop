@@ -63,9 +63,9 @@ The model / prompt come from llm/llm_config.py (shared with evaluate_llm).
 from __future__ import annotations
 
 # ─── HARDCODED CONFIG ──────────────────────────────────────────────────────────
-INJECTION_INTERVALS: list[int] = [1, 5, 10]   # LLM injects every k iterations
+INJECTION_INTERVALS: list[int] = [5, 10]   # LLM injects every k iterations
 MAX_ITERS: int = 40                            # total ZoMBI-Hop iterations per trial
-N_REPEATS: int = 3                             # trials per group (variance)
+N_REPEATS: int = 5                             # trials per group (variance)
 # Cost note: cadence k does ~ceil(MAX_ITERS/k)-1 LLM calls per repeat, so with the
 # defaults k=1 ≈ 19, k=5 ≈ 3, k=10 ≈ 1 calls/repeat → ~115 LLM calls total across
 # the 5 repeats of the three cadences (the baseline calls the LLM zero times).
@@ -111,6 +111,7 @@ SUP_SCALARS: List[str] = list(SUBTARGETS) + list(ENV) + list(KIN)
 MAXIMIZE = True
 N_REF_OPTIMA = 3
 SIG_ALPHA = 0.05
+TOP_K_DROPLETS = 8  # how many top-Objective droplets to show with features
 
 # Split the tunable hyperparameters the same way evaluate_llm does: config-read
 # ones are applied by rewriting the resumed run's config.json, the rest are passed
@@ -221,18 +222,40 @@ Recent measured points (composition → Objective):
 
 {history_table}
 
-## Supplemental measured features so far
+## Supplemental measured features so far (GLOBAL, all {n_points} droplets)
 
 Beyond the composition and `Objective`, these interpretable per-droplet scalars
-were measured across all {n_points} droplets so far (mean [min, max], and the
-Pearson correlation of each with `Objective` — a positive corr means the feature
-tends to rise where the objective is high):
+were measured across all {n_points} droplets so far. Every number below is a
+GLOBAL statistic over ALL {n_points} droplets: the global mean, the global
+[min, max] range, and the global Pearson correlation of the feature with
+`Objective` (a positive corr means the feature tends to rise where the objective
+is high). Use these as the population baseline to compare the top-k and needle
+rows below against — e.g. if a feature's value in the top-k droplets sits near a
+tail of its global [min, max], that basin is atypical on that feature.
 
 {supplemental_summary}
 
 Best droplet so far — its supplemental features:
 
 {best_point_summary}
+
+## Top {top_k} droplets by Objective (with features)
+
+The {top_k} highest-`Objective` droplets measured so far and their supplemental
+features. Compare these against the GLOBAL table above: a feature that is high in
+the objective but sits at an unfavourable tail of its global range here signals a
+trade-off the run may be walking into.
+
+{top_k_summary}
+
+## Declared needles (local optima) with features
+
+Each needle ZoMBI-Hop has declared, its composition and declared `Objective`
+value, plus the supplemental features of the nearest measured droplet. Spread-out
+needle compositions indicate healthy multi-basin coverage; needles clustered in
+one corner of the simplex indicate over-exploitation of a single region.
+
+{needle_summary}
 
 ## Your task
 
@@ -262,7 +285,7 @@ def supplemental_summary(feature_log: List[Dict[str, Any]]) -> str:
     if not feature_log:
         return "(no measured points yet)"
     obj = np.array([r["Objective"] for r in feature_log], float)
-    lines = ["feature | mean [min, max] | corr(Objective)"]
+    lines = ["feature | global mean [global min, global max] | global corr(Objective)"]
     for nm in SUP_SCALARS:
         v = np.array([r[nm] for r in feature_log], float)
         v = v[np.isfinite(v)]
@@ -271,6 +294,55 @@ def supplemental_summary(feature_log: List[Dict[str, Any]]) -> str:
         corr = _pearson(np.array([r[nm] for r in feature_log], float), obj)
         corr_s = "n/a" if not np.isfinite(corr) else f"{corr:+.2f}"
         lines.append(f"{nm} | {v.mean():.3g} [{v.min():.3g}, {v.max():.3g}] | {corr_s}")
+    return "\n".join(lines)
+
+
+def _informative_scalars(feature_log: List[Dict[str, Any]]) -> List[str]:
+    """SUP_SCALARS that actually vary across droplets (drops the constant env
+    columns like Temperature_in), so per-droplet feature rows stay compact."""
+    out = []
+    for nm in SUP_SCALARS:
+        v = np.array([r[nm] for r in feature_log if nm in r], float)
+        v = v[np.isfinite(v)]
+        if v.size and (v.max() - v.min()) > 1e-9:
+            out.append(nm)
+    return out
+
+
+def top_k_summary(feature_log: List[Dict[str, Any]], k: int = 8) -> str:
+    if not feature_log:
+        return "(none yet)"
+    scalars = _informative_scalars(feature_log)
+    ranked = sorted(feature_log, key=lambda r: r["Objective"], reverse=True)[:k]
+    header = "rank | FAPbI3 | MAPbI3 | MAPbBr3 | Objective | " + " | ".join(scalars)
+    lines = [header]
+    for i, r in enumerate(ranked, 1):
+        feats = " | ".join(f"{r[nm]:.3g}" for nm in scalars)
+        lines.append(f"{i} | {r['FAPbI3']:.3f} | {r['MAPbI3']:.3f} | "
+                     f"{r['MAPbBr3']:.3f} | {r['Objective']:.4f} | {feats}")
+    return "\n".join(lines)
+
+
+def needle_summary(feature_log: List[Dict[str, Any]], dh) -> str:
+    needles = dh_needles(dh)
+    if not needles:
+        return "(no needles declared yet)"
+    if not feature_log:
+        return "\n".join(
+            f"needle {i} | FAPbI3={n['composition'][0]:.3f}, "
+            f"MAPbI3={n['composition'][1]:.3f}, MAPbBr3={n['composition'][2]:.3f} | "
+            f"Objective={n['value']:.4f}" for i, n in enumerate(needles, 1))
+    scalars = _informative_scalars(feature_log)
+    comps = np.array([[r["FAPbI3"], r["MAPbI3"], r["MAPbBr3"]] for r in feature_log], float)
+    header = ("needle | FAPbI3 | MAPbI3 | MAPbBr3 | declared Objective | "
+              + " | ".join(f"{nm} (nearest droplet)" for nm in scalars))
+    lines = [header]
+    for i, n in enumerate(needles, 1):
+        c = np.asarray(n["composition"], float)
+        j = int(np.argmin(np.linalg.norm(comps - c, axis=1)))  # nearest measured droplet
+        feats = " | ".join(f"{feature_log[j][nm]:.3g}" for nm in scalars)
+        lines.append(f"{i} | {c[0]:.3f} | {c[1]:.3f} | {c[2]:.3f} | "
+                     f"{n['value']:.4f} | {feats}")
     return "\n".join(lines)
 
 
@@ -318,6 +390,8 @@ def progress_summary(feature_log: List[Dict[str, Any]], dh, iters_done: int,
     b = feature_log[bi]
     return (
         f"- Measured droplets so far: {n}.\n"
+        f"- Objective range found so far (global over all droplets): "
+        f"min {obj.min():.4f}, max {obj.max():.4f}.\n"
         f"- Best Objective so far: {obj.max():.4f} at FAPbI3={b['FAPbI3']:.3f}, "
         f"MAPbI3={b['MAPbI3']:.3f}, MAPbBr3={b['MAPbBr3']:.3f}.\n"
         f"- Needles (local optima) declared so far: {len(dh_needles(dh))}.\n"
@@ -340,6 +414,9 @@ def build_injection_prompt(feature_log, dh, hp, injection_idx, iters_done, budge
         n_points=len(feature_log),
         supplemental_summary=supplemental_summary(feature_log),
         best_point_summary=best_point_summary(feature_log),
+        top_k=TOP_K_DROPLETS,
+        top_k_summary=top_k_summary(feature_log, TOP_K_DROPLETS),
+        needle_summary=needle_summary(feature_log, dh),
         interval=interval,
     )
 

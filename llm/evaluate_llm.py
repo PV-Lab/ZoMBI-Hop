@@ -341,15 +341,93 @@ def _fmt_num(v: Any) -> str:
 # The three MOBO objectives recorded per trial (all MINIMIZED, lower is better).
 _MOBO_METRIC_KEYS = ("dist_to_needles", "dup_fraction", "runtime_s")
 
+# Pareto-front selection mirrors optimize/pareto.py (the canonical definition of
+# Pareto membership across MOBO runs) — kept in sync with it. The front is over
+# three MINIMISED objectives: dist_to_needles, dup_fraction, and a time metric
+# whose key varies by run age (current runs write avg_time_per_iter_s, older ones
+# runtime_s); _trial_time_metric reads whichever is present, preferring the newer.
+_PARETO_DIST_KEY = "dist_to_needles"
+_PARETO_DUP_KEY = "dup_fraction"
+_PARETO_TIME_KEYS = ("avg_time_per_iter_s", "runtime_s")
+
+
+def _trial_time_metric(metrics: Dict[str, Any]):
+    """A trial's time objective (float), or None if it has none — mirrors
+    optimize/pareto.py:_time_metric (prefers avg_time_per_iter_s over runtime_s)."""
+    for k in _PARETO_TIME_KEYS:
+        if k in metrics:
+            try:
+                return float(metrics[k])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _pareto_mask_min(M: np.ndarray) -> np.ndarray:
+    """Boolean mask of non-dominated rows of ``M`` (all columns MINIMISED).
+
+    Row j dominates row i iff ``M[j] <= M[i]`` elementwise and ``M[j] < M[i]`` in
+    at least one objective; a row is kept iff nothing dominates it (so identical
+    objective vectors are all kept). Verbatim from optimize/pareto.py:pareto_mask_min.
+    """
+    n = len(M)
+    keep = np.ones(n, dtype=bool)
+    for i in range(n):
+        dominated = np.all(M <= M[i], axis=1) & np.any(M < M[i], axis=1)
+        dominated[i] = False
+        if dominated.any():
+            keep[i] = False
+    return keep
+
+
+def _pareto_optimal_trials(trials: List[Dict[str, Any]]):
+    """Filter ``trials`` to the Pareto-optimal set, mirroring optimize/pareto.py.
+
+    Returns ``(kept_trials, n_usable, n_failed)``. Trials missing dist_to_needles,
+    dup_fraction, or any time metric are dropped as unusable; trials whose time
+    metric is <= 0 are dropped as FAILED (a 0-iteration run whose failure-sentinel
+    scores would otherwise masquerade as Pareto-optimal, exactly as pareto.py
+    excludes them). The front is then taken over the surviving usable trials.
+    """
+    usable: List[Dict[str, Any]] = []
+    objs: List[List[float]] = []
+    n_failed = 0
+    for t in trials:
+        m = t.get("metrics", {})
+        if _PARETO_DIST_KEY not in m or _PARETO_DUP_KEY not in m:
+            continue
+        tv = _trial_time_metric(m)
+        if tv is None:
+            continue
+        if tv <= 0:
+            n_failed += 1
+            continue
+        try:
+            row = [float(m[_PARETO_DIST_KEY]), float(m[_PARETO_DUP_KEY]), tv]
+        except (TypeError, ValueError):
+            continue
+        usable.append(t)
+        objs.append(row)
+    if not usable:
+        return usable, 0, n_failed
+    mask = _pareto_mask_min(np.array(objs, float))
+    kept = [t for t, keep in zip(usable, mask) if keep]
+    return kept, len(usable), n_failed
+
 
 def hparam_optimization_history(mobo_run_dir: Path = MOBO_RUN_DIR,
-                                max_trials: int = 1000) -> str:
+                                max_trials: int = 1000,
+                                pareto_only: bool = True) -> str:
     """Full offline hyperparameter-search history as a compact markdown table.
 
     Reads every ``trial_*/trial.json`` under ``mobo_run_dir`` (each holds a tried
     hyperparameter config plus its three MOBO objective scores) and renders one
     row per trial. The hyperparameter column order follows the run's
     ``run_config.json['hparam_names']`` when available.
+
+    When ``pareto_only`` (default), only the Pareto-optimal trials over the three
+    MINIMIZED objectives are shown; dominated trials are dropped and the count of
+    survivors is reported in the header.
     """
     trial_files = sorted(
         mobo_run_dir.glob("trial_*/trial.json"),
@@ -378,6 +456,18 @@ def hparam_optimization_history(mobo_run_dir: Path = MOBO_RUN_DIR,
     if not hp_order:
         hp_order = list(trials[0].get("hparams", {}).keys())
 
+    n_total = len(trials)
+    pareto_note = ""
+    if pareto_only:
+        trials, n_usable, n_failed = _pareto_optimal_trials(trials)
+        failed_note = (f" ({n_failed} failed 0-iteration trial(s) excluded)"
+                       if n_failed else "")
+        pareto_note = (
+            f" {len(trials)} of {n_usable} usable are Pareto-optimal over the three "
+            f"MINIMIZED objectives (`dist_to_needles`, `dup_fraction`, "
+            f"`runtime_s`/`avg_time_per_iter_s`); the dominated rest are "
+            f"omitted{failed_note}.")
+
     header = ["trial"] + hp_order + list(_MOBO_METRIC_KEYS)
     lines = [" | ".join(header), " | ".join("---" for _ in header)]
 
@@ -393,10 +483,11 @@ def hparam_optimization_history(mobo_run_dir: Path = MOBO_RUN_DIR,
         truncated = True
 
     table = "\n".join(lines)
-    prefix = f"{len(trials)} offline trials"
+    prefix = f"{len(trials)} offline trials shown."
+    prefix += pareto_note
     if truncated:
         prefix += f" ({max_trials} shown)"
-    return f"{prefix}:\n\n{table}"
+    return f"{prefix}\n\n{table}"
 
 
 def history_table(rows: List[Dict[str, Any]], injection_iter: int, max_rows: int = 800) -> str:
