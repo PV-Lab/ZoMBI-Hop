@@ -548,18 +548,16 @@ def log_iteration(
         print("    line_0 right:", endpoints_top2.get("line_0_right", np.array([])).tolist())
         print("    line_1 left :", endpoints_top2.get("line_1_left", np.array([])).tolist())
         print("    line_1 right:", endpoints_top2.get("line_1_right", np.array([])).tolist())
-    print("  expected (LineBO x_requested):")
+    print("  expected / sent (LineBO x_requested — the points ZoMBI-Hop wanted):")
     x_exp = x_expected.cpu().numpy()
-    for i in range(min(3, len(x_exp))):
+    for i in range(len(x_exp)):
         print("   ", x_exp[i].tolist())
-    if len(x_exp) > 3:
-        print("    ... (%d points)" % len(x_exp))
-    print("  actual (x_actual):")
+    print(f"    ({len(x_exp)} expected points)")
+    print("  actual / received (x_actual measured by hardware):")
     x_act = x_actual.cpu().numpy()
-    for i in range(min(3, len(x_act))):
+    for i in range(len(x_act)):
         print("   ", x_act[i].tolist())
-    if len(x_act) > 3:
-        print("    ... (%d points)" % len(x_act))
+    print(f"    ({len(x_act)} received points)")
     y_flat = y.cpu().numpy().ravel()
     _tag = "measured (minimize)" if MINIMIZE_OBJECTIVE else "measured (maximize)"
     y_print = y.reshape(-1)
@@ -1278,7 +1276,12 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
         print("Mode: minimization of measured objective (set MINIMIZE_OBJECTIVE = False to maximize).")
     print("=" * 80 + "\n")
 
-    optimizer.run(max_activations=float("inf"), time_limit_hours=None)
+    # never_terminate: the campaign must not stop on its own. Any internal stop
+    # pathway (over-penalisation, activation failure, noise-floor exhaustion) is
+    # converted into "shrink all penalty volumes by 70%, reset bounds, continue".
+    # Only the user Stop button ends the run.
+    optimizer.run(max_activations=float("inf"), time_limit_hours=None,
+                  never_terminate=True)
 
 
 if __name__ == "__main__":
