@@ -46,7 +46,8 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-import evaluate_llm as E  # noqa: E402
+import evaluate_llm as E  # noqa: E402  (also sets sys.path for optimize/ + repo root)
+import run_mobo as R  # noqa: E402  (NUM_EXPERIMENTS: droplets per BO iteration)
 
 # Two-sided significance level for the diff_best hypothesis test.
 SIG_ALPHA: float = 0.05
@@ -272,6 +273,10 @@ def main() -> None:
         # Incremental write so a crash mid-sweep still leaves a usable summary.
         _write_summary(sweep_dir, rows)
 
+    # Overlaid running-best convergence: baseline vs LLM per injection iteration.
+    print("\n[plot] convergence comparison …")
+    plot_convergence_comparison(sweep_dir)
+
     print(f"\nSweep complete. Summary → {sweep_dir / 'sweep_summary.csv'}")
 
 
@@ -293,6 +298,202 @@ def _write_summary(sweep_dir: Path, rows: list) -> None:
         for r in rows:
             w.writerow(r)
     (sweep_dir / "sweep_summary.json").write_text(json.dumps(rows, indent=2))
+
+
+# ─── convergence comparison plot ─────────────────────────────────────────────────
+#
+# Unlike the cadence sweeps (sweep_basic_surrogate / sweep_volume_control), this
+# experiment sweeps the *injection iteration* rather than an injection cadence, and
+# every run shares the SAME real-campaign prefix up to its injection point (the
+# prefix is deterministic replayed data, not a fresh run). So the analogous plot is:
+#
+#   * a single BASELINE line — the real campaign trajectory itself (the true
+#     "no-LLM, original-hyperparameter" run), on which every LLM line coincides up
+#     to its injection iteration. It is one deterministic run, so it carries no CI
+#     band.
+#   * one LLM line per swept injection iteration (5, 10, … 40), each the mean±95% CI
+#     over its RF continuation repeats, drawn ONLY from its injection iteration
+#     onward — so it branches off the baseline exactly at injection and never before.
+#
+# The x-axis is the ZoMBI-Hop iteration. The real prefix records a variable number
+# of real droplets per iteration while the RF continuation adds a fixed
+# ``NUM_EXPERIMENTS`` per iteration, so cumulative droplets are NOT comparable across
+# runs — the iteration axis is. We recover it from each injection point's
+# (iteration → cumulative-points) anchor (mapping.n_points_at_injection).
+
+def _running_best_from_points(path: Path):
+    """Running-best (cumulative max) Objective from a rep's points.csv ``Y`` column.
+
+    points.csv holds the FULL trajectory from point 0 (the real-run prefix + the RF
+    continuation)."""
+    if not path.exists():
+        return None
+    ys = []
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                try:
+                    ys.append(float(r["Y"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+    except Exception:
+        return None
+    if not ys:
+        return None
+    return np.maximum.accumulate(np.asarray(ys, float))
+
+
+def _ci95_halfwidth(std, n):
+    """Half-width of the 95% CI for the mean (Student-t for small n; 1.96 fallback)."""
+    if n < 2:
+        return np.zeros_like(std)
+    try:
+        from scipy import stats
+        t = float(stats.t.ppf(0.975, n - 1))
+    except Exception:
+        t = 1.959963984540054
+    return t * std / np.sqrt(n)
+
+
+def _n_bo_iterations(rep_dir: Path):
+    """BO iterations a rep ran, from its metrics_over_time.csv (one row per
+    iteration). For a continuation this is the post-injection iteration count
+    (== budget_iterations). None if unavailable."""
+    mot = rep_dir / "metrics_over_time.csv"
+    if not mot.exists():
+        return None
+    try:
+        with open(mot, newline="", encoding="utf-8") as f:
+            return max(sum(1 for _ in csv.reader(f)) - 1, 0)
+    except Exception:
+        return None
+
+
+def _continuation_iteration_curve(rep_dir: Path, n_inj: int, batch: int):
+    """Running-best per iteration for one RF-continuation rep, indexed so element 0
+    is the injection iteration (running-best at the injection point) and element j is
+    after j post-injection iterations. The continuation adds a fixed ``batch``
+    droplets per iteration, so iteration j ends at droplet ``n_inj + j*batch``."""
+    rb = _running_best_from_points(rep_dir / "points.csv")
+    if rb is None:
+        return None
+    L = rb.size
+    n_inj = min(n_inj, L)
+    n_cont = _n_bo_iterations(rep_dir)
+    if not n_cont or n_cont <= 0:
+        n_cont = max((L - n_inj) // batch, 0)
+    idx = np.clip(n_inj + np.arange(n_cont + 1) * batch - 1, 0, L - 1)
+    return rb[idx]
+
+
+def _mean_ci_band(curves):
+    """(mean, halfwidth, n) over a list of monotone per-iteration curves. Shorter
+    curves (early-converged reps) are forward-filled with their final value to the
+    common max length, so a converged run adds a flat tail rather than dropping out."""
+    curves = [c for c in curves if c is not None and len(c)]
+    if not curves:
+        return None
+    L = max(len(c) for c in curves)
+    M = np.vstack([np.concatenate([c, np.full(L - len(c), c[-1])]) for c in curves])
+    mean = M.mean(axis=0)
+    std = M.std(axis=0, ddof=1) if M.shape[0] > 1 else np.zeros(L)
+    return mean, _ci95_halfwidth(std, M.shape[0]), M.shape[0]
+
+
+def plot_convergence_comparison(sweep_dir: Path, out_png: Path | None = None) -> Path | None:
+    """Overlay running-best-Objective convergence on a ZoMBI-Hop-iteration axis: the
+    deterministic real-campaign baseline plus one mean±95% CI LLM line per swept
+    injection iteration, each branching off the baseline exactly at its injection."""
+    import matplotlib.pyplot as plt  # Agg backend already selected via evaluate_llm
+
+    sweep_dir = Path(sweep_dir)
+    if out_png is None:
+        out_png = sweep_dir / "convergence_comparison.png"
+    inj_dirs = sorted(d for d in sweep_dir.glob("inj_*") if d.is_dir())
+    if not inj_dirs:
+        print(f"  [plot] no inj_* directories under {sweep_dir}; skipped")
+        return None
+    batch = int(R.NUM_EXPERIMENTS)
+
+    # (injection_iter, n_points_at_injection) anchors of the shared real prefix.
+    anchors = []  # (iter, cum_points)
+    inj_info = []  # (dir, iter, n_inj)
+    for d in inj_dirs:
+        cmp_path = d / "baseline_vs_llm.json"
+        if not cmp_path.exists():
+            continue
+        m = json.loads(cmp_path.read_text()).get("mapping", {})
+        it = m.get("injection_iter")
+        n_inj = m.get("n_points_at_injection")
+        if it is None or n_inj is None:
+            continue
+        anchors.append((int(it), int(n_inj)))
+        inj_info.append((d, int(it), int(n_inj)))
+    if not anchors:
+        print(f"  [plot] no injection anchors under {sweep_dir}; skipped")
+        return None
+    anchors = sorted(set(anchors))
+    anchor_iters = np.array([0] + [a[0] for a in anchors], float)
+    anchor_pts = np.array([0.0] + [a[1] for a in anchors], float)
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.0))
+
+    # ── Baseline: the real campaign run itself (deterministic; no CI) ──────────────
+    # Its running-best is the shared prefix embedded in every run; read it from the
+    # longest available prefix (the largest-iteration injection point).
+    d_max, it_max, n_max = max(inj_info, key=lambda t: t[2])
+    rb_real = None
+    for sub in ("baseline_rf", "continuation"):
+        for r in sorted((d_max / sub).glob("rep*")):
+            rb_real = _running_best_from_points(r / "points.csv")
+            if rb_real is not None:
+                break
+        if rb_real is not None:
+            break
+    if rb_real is not None:
+        base_iters = np.arange(0, it_max + 1)
+        # iteration → cumulative droplet (piecewise-linear over the real anchors).
+        base_pts = np.interp(base_iters, anchor_iters, anchor_pts)
+        base_idx = np.clip(base_pts.astype(int) - 1, 0, rb_real.size - 1)
+        ax.plot(base_iters, rb_real[base_idx], color="#111111", lw=2.4, zorder=6,
+                label="baseline: real campaign (original HPs)")
+
+    # ── One LLM line per swept injection iteration (mean ± 95% CI) ─────────────────
+    cmap = plt.cm.viridis
+    all_iters = [it for _, it, _ in inj_info]
+    lo, hi = min(all_iters), max(all_iters)
+    plotted = 0
+    for d, it, n_inj in sorted(inj_info, key=lambda t: t[1]):
+        curves = [_continuation_iteration_curve(r, n_inj, batch)
+                  for r in sorted((d / "continuation").glob("rep*"))]
+        band = _mean_ci_band(curves)
+        if band is None or band[0].size < 2:
+            continue  # nothing to draw past injection (e.g. budget 0)
+        mean, half, n = band
+        x = it + np.arange(mean.size)  # iterations from injection onward
+        color = cmap((it - lo) / (hi - lo)) if hi > lo else cmap(0.5)
+        ax.plot(x, mean, color=color, lw=1.8, zorder=5,
+                label=f"LLM inject @ iter {it} (n={n})")
+        ax.fill_between(x, mean - half, mean + half, color=color, alpha=0.14,
+                        linewidth=0, zorder=3)
+        plotted += 1
+
+    if plotted == 0 and rb_real is None:
+        plt.close(fig)
+        print(f"  [plot] no running-best curves under {sweep_dir}; skipped")
+        return None
+
+    ax.set_xlabel("ZoMBI-Hop iteration")
+    ax.set_ylabel("running-best Objective")
+    ax.set_title("Convergence: baseline vs LLM by injection iteration\n"
+                 "(LLM lines: mean ± 95% CI over RF repeats)", fontsize=11)
+    ax.legend(fontsize=8, loc="lower right", ncol=1)
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out_png}")
+    return out_png
 
 
 def regenerate_summary(sweep_dir: Path) -> None:
@@ -327,7 +528,11 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if args and args[0] in ("--regenerate", "-r"):
         if len(args) < 2:
-            raise SystemExit("usage: evaluate_llm_sweep.py --regenerate <sweep_dir>")
+            raise SystemExit("usage: sweep_basic_no_surrogate.py --regenerate <sweep_dir>")
         regenerate_summary(Path(args[1]))
+    elif args and args[0] in ("--plot", "-p"):
+        if len(args) < 2:
+            raise SystemExit("usage: sweep_basic_no_surrogate.py --plot <sweep_dir>")
+        plot_convergence_comparison(Path(args[1]))
     else:
         main()

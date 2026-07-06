@@ -784,8 +784,24 @@ def main() -> None:
         rows.append(_group_row(group, interval, stats, samples, baseline_stats))
         write_summary(sweep_dir, rows)  # incremental
 
+    # Overlaid running-best convergence: baseline vs each cadence (mean ± 95% CI).
+    print("\n[plot] convergence comparison …")
+    SBS.plot_convergence_comparison(
+        sweep_dir,
+        title=("Volume control — convergence: baseline vs LLM injection cadences\n"
+               "(mean ± 95% CI over repeats)"))
+
     print(f"\nSweep complete → {sweep_dir / 'sweep_summary.csv'}")
 
 
 if __name__ == "__main__":
-    main()
+    args = sys.argv[1:]
+    if args and args[0] in ("--plot", "-p"):
+        if len(args) < 2:
+            raise SystemExit("usage: sweep_volume_control.py --plot <sweep_dir>")
+        SBS.plot_convergence_comparison(
+            Path(args[1]),
+            title=("Volume control — convergence: baseline vs LLM injection cadences\n"
+                   "(mean ± 95% CI over repeats)"))
+    else:
+        main()

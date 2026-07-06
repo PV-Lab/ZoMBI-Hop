@@ -648,6 +648,144 @@ def write_summary(sweep_dir: Path, rows: List[dict]) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Convergence comparison plot (baseline vs each injection cadence)
+# ════════════════════════════════════════════════════════════════════════════════
+#
+# Reusable by every cadence-style sweep (this one + sweep_volume_control), since all
+# of them share the baseline_trial112 / inject_every_{01,05,10} group layout and
+# store a per-repeat ``Y_all_running_best`` in each rep's metrics.json.
+
+# (group directory, legend label, line color) — ordered baseline first.
+_CONVERGENCE_GROUPS: List[Tuple[str, str, str]] = [
+    ("baseline_trial112", "baseline (trial_112)", "#4c4c4c"),
+    ("inject_every_01",   "LLM every 1",          "#1f77b4"),
+    ("inject_every_05",   "LLM every 5",          "#ff7f0e"),
+    ("inject_every_10",   "LLM every 10",         "#2ca02c"),
+]
+
+
+def _n_bo_iterations(rep_dir: Path) -> Optional[int]:
+    """Number of ZoMBI-Hop BO iterations a rep ran, from its metrics_over_time.csv
+    (one row per iteration). None if the file is missing/unreadable."""
+    mot = rep_dir / "metrics_over_time.csv"
+    if not mot.exists():
+        return None
+    try:
+        with open(mot, newline="", encoding="utf-8") as f:
+            return max(sum(1 for _ in csv.reader(f)) - 1, 0)  # minus header
+    except Exception:
+        return None
+
+
+def _rep_iteration_curve(rep_dir: Path) -> Optional[np.ndarray]:
+    """Running-best Objective sampled at each ZoMBI-Hop *iteration* boundary
+    (index 0 = after the Sobol init, index i = after i BO iterations).
+
+    The per-droplet ``Y_all_running_best`` is stored in metrics.json; on the
+    surrogate each BO iteration measures a fixed ``NUM_EXPERIMENTS`` droplets after
+    an initial design, so iteration i ends at droplet ``len - (n_iter - i)*batch``.
+    We sample the (monotone) running-best at those boundaries so the curve lives on
+    an iteration axis that is comparable across reps of unequal droplet length."""
+    mp = rep_dir / "metrics.json"
+    if not mp.exists():
+        return None
+    try:
+        rb = np.asarray(json.loads(mp.read_text()).get("Y_all_running_best", []), float)
+    except Exception:
+        return None
+    if rb.size == 0:
+        return None
+    L = rb.size
+    batch = int(R.NUM_EXPERIMENTS)
+    n_iter = _n_bo_iterations(rep_dir)
+    if not n_iter or n_iter <= 0:
+        n_iter = max((L - 48) // batch, 0)  # fallback: 48-droplet init + batch/iter
+    idx = L - (n_iter - np.arange(n_iter + 1)) * batch - 1
+    idx = np.clip(idx, 0, L - 1)
+    return rb[idx]
+
+
+def _load_running_best_curves(group_dir: Path) -> List[np.ndarray]:
+    """Per-iteration running-best curve for every rep under a group directory."""
+    curves: List[np.ndarray] = []
+    for rep_dir in sorted(group_dir.glob("rep*")):
+        c = _rep_iteration_curve(rep_dir)
+        if c is not None and c.size:
+            curves.append(c)
+    return curves
+
+
+def _ci95_halfwidth(std: np.ndarray, n: int) -> np.ndarray:
+    """Half-width of the 95% CI for the mean, using a Student-t multiplier for the
+    small repeat counts these sweeps use (falls back to the normal 1.96 without
+    scipy)."""
+    if n < 2:
+        return np.zeros_like(std)
+    try:
+        from scipy import stats
+        t = float(stats.t.ppf(0.975, n - 1))
+    except Exception:
+        t = 1.959963984540054  # z_{0.975}
+    return t * std / np.sqrt(n)
+
+
+def plot_convergence_comparison(sweep_dir: Path, out_png: Optional[Path] = None,
+                                title: Optional[str] = None) -> Optional[Path]:
+    """Overlay the running-best-Objective convergence of the baseline and each
+    injection cadence on one axis: one line per group (its mean over repeats) with a
+    shaded 95% confidence interval — lines only, no per-point markers.
+
+    Repeats within a group can run a different number of iterations (early-converging
+    runs stop sooner). Because running-best is monotone non-decreasing, each shorter
+    curve is forward-filled with its final value to the common (max) iteration count
+    before averaging, so a converged run contributes a flat tail rather than being
+    truncated away."""
+    import matplotlib.pyplot as plt  # Agg backend already selected via evaluate_llm
+
+    sweep_dir = Path(sweep_dir)
+    if out_png is None:
+        out_png = sweep_dir / "convergence_comparison.png"
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.0))
+    plotted = 0
+    for group, label, color in _CONVERGENCE_GROUPS:
+        gdir = sweep_dir / group
+        if not gdir.is_dir():
+            continue
+        curves = _load_running_best_curves(gdir)
+        if not curves:
+            continue
+        L = max(len(c) for c in curves)
+        M = np.vstack([np.concatenate([c, np.full(L - len(c), c[-1])]) for c in curves])
+        x = np.arange(L)  # ZoMBI-Hop iteration (0 = after Sobol init)
+        mean = M.mean(axis=0)
+        std = M.std(axis=0, ddof=1) if M.shape[0] > 1 else np.zeros(L)
+        half = _ci95_halfwidth(std, M.shape[0])
+        ax.plot(x, mean, color=color, lw=2.0, zorder=5,
+                label=f"{label} (n={M.shape[0]})")
+        ax.fill_between(x, mean - half, mean + half, color=color, alpha=0.18,
+                        linewidth=0, zorder=2)
+        plotted += 1
+
+    if not plotted:
+        plt.close(fig)
+        print(f"  [plot] no group running-best data under {sweep_dir}; skipped")
+        return None
+
+    ax.set_xlabel("ZoMBI-Hop iteration")
+    ax.set_ylabel("running-best Objective")
+    ax.set_title(title or ("Convergence: baseline vs LLM injection cadences\n"
+                           "(mean ± 95% CI over repeats)"), fontsize=11)
+    ax.legend(fontsize=9, loc="lower right")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out_png}")
+    return out_png
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Orchestration
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -727,8 +865,18 @@ def main() -> None:
         rows.append(_group_row(group, interval, stats, samples, baseline_stats))
         write_summary(sweep_dir, rows)  # incremental
 
+    # Overlaid running-best convergence: baseline vs each cadence (mean ± 95% CI).
+    print("\n[plot] convergence comparison …")
+    plot_convergence_comparison(sweep_dir)
+
     print(f"\nSweep complete → {sweep_dir / 'sweep_summary.csv'}")
 
 
 if __name__ == "__main__":
-    main()
+    args = sys.argv[1:]
+    if args and args[0] in ("--plot", "-p"):
+        if len(args) < 2:
+            raise SystemExit("usage: sweep_basic_surrogate.py --plot <sweep_dir>")
+        plot_convergence_comparison(Path(args[1]))
+    else:
+        main()
