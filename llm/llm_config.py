@@ -242,8 +242,47 @@ def build_output_schema(hparam_names: List[str]) -> Dict[str, Any]:
 
 
 # ── The one LLM call ───────────────────────────────────────────────────────────
+class LLMCallError(BaseException):
+    """Raised by a caller when an LLM API call (or its JSON parse) failed and the
+    whole run must abort.
+
+    ``call_llm`` itself never raises this — it reports failures via the ``error``
+    field so a caller can first persist the failed decision for forensics, then
+    raise this to terminate. It subclasses ``BaseException`` (like ``SystemExit`` /
+    ``KeyboardInterrupt``) so the broad ``except Exception`` handlers in the sweep
+    trial loops — which otherwise log the failure and continue to the next trial —
+    do NOT swallow it: a failed LLM call ends the entire run, not just one trial."""
+    pass
+
+
+# A single logical LLM call is retried up to this many times; only after this many
+# CONSECUTIVE failures is ``error`` returned set (which makes the caller raise
+# LLMCallError and abort the run). Backoff between attempts is BACKOFF_S × attempt.
+MAX_LLM_ATTEMPTS = 3
+LLM_RETRY_BACKOFF_S = 2.0
+
+
+def _with_retries(attempt_fn):
+    """Run ``attempt_fn`` — which performs ONE LLM attempt and returns a result dict
+    carrying an ``error`` key (None on success) — up to ``MAX_LLM_ATTEMPTS`` times.
+
+    Returns the first successful result. If every attempt fails, returns the last
+    result with its ``error`` annotated as persistent, so the caller sees a set
+    ``error`` only after ``MAX_LLM_ATTEMPTS`` consecutive failures and aborts then."""
+    result: Dict[str, Any] = {}
+    for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
+        result = attempt_fn()
+        if not result.get("error"):
+            return result
+        print(f"  [llm] attempt {attempt}/{MAX_LLM_ATTEMPTS} failed: {result['error']}")
+        if attempt < MAX_LLM_ATTEMPTS:
+            time.sleep(LLM_RETRY_BACKOFF_S * attempt)
+    result["error"] = f"{result.get('error')} (after {MAX_LLM_ATTEMPTS} consecutive attempts)"
+    return result
+
+
 def call_llm(user_prompt: str, hparam_names: List[str]) -> Dict[str, Any]:
-    """Make the single hyperparameter-tuning call.
+    """Make the hyperparameter-tuning call, retrying up to ``MAX_LLM_ATTEMPTS`` times.
 
     Returns a dict with:
       ``decision``    – parsed {"reasoning", "hyperparameter_changes"} (or None on failure)
@@ -278,39 +317,42 @@ def call_llm(user_prompt: str, hparam_names: List[str]) -> Dict[str, Any]:
     if USE_THINKING:
         kwargs["thinking"] = {"type": "adaptive"}
 
-    t0 = time.time()
-    error = None
-    raw_text = ""
-    decision = None
-    usage: Dict[str, Any] = {}
-    try:
-        resp = client.messages.create(**kwargs)
-        latency_s = time.time() - t0
-        # The structured-output guarantee: the first text block is valid JSON.
-        raw_text = next((b.text for b in resp.content if b.type == "text"), "")
+    def _attempt() -> Dict[str, Any]:
+        t0 = time.time()
+        error = None
+        raw_text = ""
+        decision = None
+        usage: Dict[str, Any] = {}
         try:
-            if hasattr(resp.usage, "model_dump"):
-                usage = resp.usage.model_dump()
-            elif hasattr(resp.usage, "to_dict"):
-                usage = resp.usage.to_dict()
-            else:
-                usage = dict(resp.usage)
-        except Exception:
-            usage = {}
-        try:
-            decision = json.loads(raw_text)
-        except json.JSONDecodeError as e:
-            error = f"could not parse model JSON: {e}"
-    except Exception as e:
-        latency_s = time.time() - t0
-        error = f"LLM call failed: {e}"
+            resp = client.messages.create(**kwargs)
+            latency_s = time.time() - t0
+            # The structured-output guarantee: the first text block is valid JSON.
+            raw_text = next((b.text for b in resp.content if b.type == "text"), "")
+            try:
+                if hasattr(resp.usage, "model_dump"):
+                    usage = resp.usage.model_dump()
+                elif hasattr(resp.usage, "to_dict"):
+                    usage = resp.usage.to_dict()
+                else:
+                    usage = dict(resp.usage)
+            except Exception:
+                usage = {}
+            try:
+                decision = json.loads(raw_text)
+            except json.JSONDecodeError as e:
+                error = f"could not parse model JSON: {e}"
+        except Exception as e:
+            latency_s = time.time() - t0
+            error = f"LLM call failed: {e}"
 
-    return {
-        "decision": decision,
-        "latency_s": latency_s,
-        "raw_text": raw_text,
-        "model": MODEL,
-        "effort": EFFORT,
-        "usage": usage,
-        "error": error,
-    }
+        return {
+            "decision": decision,
+            "latency_s": latency_s,
+            "raw_text": raw_text,
+            "model": MODEL,
+            "effort": EFFORT,
+            "usage": usage,
+            "error": error,
+        }
+
+    return _with_retries(_attempt)

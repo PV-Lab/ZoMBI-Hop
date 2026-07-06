@@ -250,30 +250,35 @@ def call_volume_llm(user_prompt: str, dim: int = DIM) -> Dict[str, Any]:
     if llm_config.USE_THINKING:
         kwargs["thinking"] = {"type": "adaptive"}
 
-    t0 = time.time()
-    error, raw_text, decision, usage = None, "", None, {}
-    try:
-        resp = client.messages.create(**kwargs)
-        latency_s = time.time() - t0
-        raw_text = next((b.text for b in resp.content if b.type == "text"), "")
+    def _attempt() -> Dict[str, Any]:
+        t0 = time.time()
+        error, raw_text, decision, usage = None, "", None, {}
         try:
-            usage = (resp.usage.model_dump() if hasattr(resp.usage, "model_dump")
-                     else dict(resp.usage))
-        except Exception:
-            usage = {}
-        try:
-            decision = json.loads(raw_text)
-        except json.JSONDecodeError as e:
-            error = f"could not parse model JSON: {e}"
-    except Exception as e:
-        latency_s = time.time() - t0
-        error = f"LLM call failed: {e}"
+            resp = client.messages.create(**kwargs)
+            latency_s = time.time() - t0
+            raw_text = next((b.text for b in resp.content if b.type == "text"), "")
+            try:
+                usage = (resp.usage.model_dump() if hasattr(resp.usage, "model_dump")
+                         else dict(resp.usage))
+            except Exception:
+                usage = {}
+            try:
+                decision = json.loads(raw_text)
+            except json.JSONDecodeError as e:
+                error = f"could not parse model JSON: {e}"
+        except Exception as e:
+            latency_s = time.time() - t0
+            error = f"LLM call failed: {e}"
 
-    return {
-        "decision": decision, "latency_s": latency_s, "raw_text": raw_text,
-        "model": llm_config.MODEL, "effort": llm_config.EFFORT,
-        "usage": usage, "error": error,
-    }
+        return {
+            "decision": decision, "latency_s": latency_s, "raw_text": raw_text,
+            "model": llm_config.MODEL, "effort": llm_config.EFFORT,
+            "usage": usage, "error": error,
+        }
+
+    # Retry up to MAX_LLM_ATTEMPTS; error is set only after that many consecutive
+    # failures, which then makes run_llm_trial raise LLMCallError and abort the run.
+    return llm_config._with_retries(_attempt)
 
 
 def validate_volumes(raw_volumes: List[Dict[str, Any]], dim: int = DIM
@@ -519,7 +524,11 @@ def run_segment(ckpt_dir: Path, run_uuid: str, fresh: bool, hp: Dict[str, Any],
     dh.take_snapshot = snap_wrap
 
     try:
-        optimizer.run(max_activations=float("inf"), time_limit_hours=None)
+        # never_terminate: mirror interface/app.py — the optimiser only ends when the
+        # objective raises BudgetExhausted at ``stop_at``, so the segment runs its
+        # full iteration budget instead of converging short (see sweep_basic_surrogate).
+        optimizer.run(max_activations=float("inf"), time_limit_hours=None,
+                      never_terminate=True)
     except E.BudgetExhausted:
         pass
     except Exception as e:
@@ -625,6 +634,12 @@ def run_llm_trial(surr, base_hp, ref_optima, interval: int, seed: int,
             print(f"      inj {injection_idx} @ iter {call_counter[0]}: {summary} "
                   f"({llm_out['latency_s']:.1f}s)"
                   + (f"  [ERROR: {llm_out['error']}]" if llm_out["error"] else ""))
+            # A failed LLM call is not a legitimate decision — abort the whole run
+            # (BaseException escapes the sweep loop's except Exception).
+            if llm_out["error"]:
+                raise llm_config.LLMCallError(
+                    f"LLM call failed at injection {injection_idx} "
+                    f"(iter {call_counter[0]}): {llm_out['error']}")
             injection_idx += 1
 
         metrics = SBS.finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir)

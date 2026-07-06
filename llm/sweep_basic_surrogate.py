@@ -429,7 +429,14 @@ def run_segment(ckpt_dir: Path, run_uuid: str, fresh: bool, hp: Dict[str, Any],
     dh.take_snapshot = snap_wrap
 
     try:
-        optimizer.run(max_activations=float("inf"), time_limit_hours=None)
+        # never_terminate: mirror interface/app.py — the optimiser must not stop on
+        # its own via any internal pathway (over-penalisation, activation failure,
+        # noise-floor exhaustion). It only ends when the objective raises
+        # BudgetExhausted at ``stop_at`` — so every segment runs its full iteration
+        # budget for any dimensionality, and the baseline curve reaches the last
+        # iteration instead of converging short.
+        optimizer.run(max_activations=float("inf"), time_limit_hours=None,
+                      never_terminate=True)
     except E.BudgetExhausted:
         pass
     except Exception as e:
@@ -580,6 +587,12 @@ def run_llm_trial(surr, base_hp, ref_optima, interval: int, seed: int,
                   f"{('CHANGE ' + str(changes)) if changes else 'KEEP'} "
                   f"({llm_out['latency_s']:.1f}s)"
                   + (f"  [ERROR: {llm_out['error']}]" if llm_out["error"] else ""))
+            # A failed LLM call is not a legitimate "keep" decision — abort the whole
+            # run (BaseException escapes the sweep loop's except Exception).
+            if llm_out["error"]:
+                raise llm_config.LLMCallError(
+                    f"LLM call failed at injection {injection_idx} "
+                    f"(iter {call_counter[0]}): {llm_out['error']}")
             injection_idx += 1
 
         metrics = finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir)
@@ -751,42 +764,52 @@ def plot_convergence_comparison(sweep_dir: Path, out_png: Optional[Path] = None,
     injection cadence on one axis: one line per group (its mean over repeats) with a
     shaded 95% confidence interval — lines only, no per-point markers.
 
-    Repeats within a group can run a different number of iterations (early-converging
-    runs stop sooner). Because running-best is monotone non-decreasing, each shorter
-    curve is forward-filled with its final value to the common (max) iteration count
-    before averaging, so a converged run contributes a flat tail rather than being
-    truncated away."""
+    Repeats can run a different number of iterations (early-converging runs stop
+    sooner) — both across repeats within a group AND across groups (e.g. every
+    baseline repeat may terminate before the longest LLM cadence). Because
+    running-best is monotone non-decreasing, each shorter curve is forward-filled
+    with its final value up to the GLOBAL iteration count (the longest curve over
+    ALL groups), so a converged run — or a whole group that converged early —
+    contributes a flat tail that extends to the right edge of the plot rather than
+    stopping short. This is what keeps the baseline line running all the way to the
+    final iteration even when its trials terminated before the budget was spent."""
     import matplotlib.pyplot as plt  # Agg backend already selected via evaluate_llm
 
     sweep_dir = Path(sweep_dir)
     if out_png is None:
         out_png = sweep_dir / "convergence_comparison.png"
 
-    fig, ax = plt.subplots(figsize=(8.5, 5.0))
-    plotted = 0
+    # Pass 1: load every group's per-iteration curves so we can forward-fill them all
+    # to the same global iteration count.
+    loaded: List[Tuple[str, str, List[np.ndarray]]] = []  # (label, color, curves)
     for group, label, color in _CONVERGENCE_GROUPS:
         gdir = sweep_dir / group
         if not gdir.is_dir():
             continue
         curves = _load_running_best_curves(gdir)
-        if not curves:
-            continue
-        L = max(len(c) for c in curves)
-        M = np.vstack([np.concatenate([c, np.full(L - len(c), c[-1])]) for c in curves])
-        x = np.arange(L)  # ZoMBI-Hop iteration (0 = after Sobol init)
+        if curves:
+            loaded.append((label, color, curves))
+
+    if not loaded:
+        print(f"  [plot] no group running-best data under {sweep_dir}; skipped")
+        return None
+
+    # Global iteration count across every repeat of every group.
+    global_L = max(len(c) for _, _, curves in loaded for c in curves)
+
+    # Pass 2: forward-fill each repeat to global_L and draw one mean±CI line per group.
+    fig, ax = plt.subplots(figsize=(8.5, 5.0))
+    x = np.arange(global_L)  # ZoMBI-Hop iteration (0 = after Sobol init)
+    for label, color, curves in loaded:
+        M = np.vstack([np.concatenate([c, np.full(global_L - len(c), c[-1])])
+                       for c in curves])
         mean = M.mean(axis=0)
-        std = M.std(axis=0, ddof=1) if M.shape[0] > 1 else np.zeros(L)
+        std = M.std(axis=0, ddof=1) if M.shape[0] > 1 else np.zeros(global_L)
         half = _ci95_halfwidth(std, M.shape[0])
         ax.plot(x, mean, color=color, lw=2.0, zorder=5,
                 label=f"{label} (n={M.shape[0]})")
         ax.fill_between(x, mean - half, mean + half, color=color, alpha=0.18,
                         linewidth=0, zorder=2)
-        plotted += 1
-
-    if not plotted:
-        plt.close(fig)
-        print(f"  [plot] no group running-best data under {sweep_dir}; skipped")
-        return None
 
     ax.set_xlabel("ZoMBI-Hop iteration")
     ax.set_ylabel("running-best Objective")

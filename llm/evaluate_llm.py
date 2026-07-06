@@ -612,7 +612,11 @@ def continue_run(ckpt_dir: str, fn_callable, ref_optima,
 
     t0 = time.time()
     try:
-        optimizer.run(max_activations=float("inf"), time_limit_hours=None)
+        # never_terminate: mirror interface/app.py — the continuation only ends when
+        # the objective raises BudgetExhausted, so it runs its full iteration budget
+        # instead of stopping short via an internal convergence/failure pathway.
+        optimizer.run(max_activations=float("inf"), time_limit_hours=None,
+                      never_terminate=True)
     except BudgetExhausted:
         pass
     except Exception as e:  # match run_single_trial tolerance
@@ -867,6 +871,12 @@ def run_evaluation(injection_iter: int, out_root: Optional[Path] = None,
         "raw_response": llm_out["raw_text"],
     }
     (out_dir / "llm_decision.json").write_text(json.dumps(decision_record, indent=2))
+    # A failed LLM call is not a legitimate "keep" decision — abort the whole run
+    # (LLMCallError subclasses BaseException, so the sweep loop's except Exception
+    # does not swallow it).
+    if llm_out["error"]:
+        raise llm_config.LLMCallError(
+            f"LLM call failed at injection iter {injection_iter}: {llm_out['error']}")
     print(f"  LLM chose to {'CHANGE' if changed else 'KEEP'} hyperparameters"
           + (f": {changes}" if changed else ""))
     if decision_record["reasoning"]:
