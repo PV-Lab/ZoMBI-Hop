@@ -3348,8 +3348,13 @@ class NewRunDialog(tk.Toplevel):
                 zombi.data_handler.take_snapshot = _snap_wrap
 
                 try:
+                    # never_terminate: prevent every internal stop pathway (over-
+                    # penalisation, activation failure, noise-floor exhaustion) for
+                    # ANY dimensionality — each such stop shrinks penalty volumes and
+                    # resets bounds instead of ending. The run only ends via the Stop
+                    # button (_StopRunRequested) or a time limit.
                     zombi.run(max_activations=max_act, time_limit_hours=None,
-                              pause_event=pause_event)
+                              pause_event=pause_event, never_terminate=True)
                 except _StopRunRequested:
                     _log("Run stopped by user.", tag="done")
 
