@@ -38,10 +38,18 @@ trap on_time_limit USR1
 # correct. Keep the `mobo_` prefix so shared-history's `mobo_*` glob still sees it.
 RUN_DIR="optimize/runs/mobo_ensemble_3d_job${SLURM_JOB_ID}"
 
+# Randomize the ensemble landscape per job, but keep it STABLE across a requeue.
+# Keying the seed on SLURM_JOB_ID (like RUN_DIR above) means a `scontrol requeue`
+# — same job id — rebuilds the identical landscape so the resumed trials still
+# match, while every fresh sbatch / clean-exit resubmit gets a new id and thus a
+# new landscape. Modulo keeps it in the int32 range NumPy's RandomState accepts.
+ENSEMBLE_SEED=$(( SLURM_JOB_ID % 2147483647 ))
+
 # Seed with the archived trial_112, plus the 3 best-dist_to_needles trials from the
 # ensemble 3d shared-history pool (own + eve_lal's, ranked by pareto.py). eve_lal's
 # runs are referenced under her archived_runs, matching this account's move.
 uv run python optimize/run_mobo.py --dataset ensemble --dim 3 --time-limit 0.2 --share-history \
+    --ensemble-seed "$ENSEMBLE_SEED" \
     --start-from-best \
         optimize/runs/archived_runs/mobo_3d_05_06_15_32/trial_112 \
         optimize/runs/archived_runs/mobo_ensemble_3d_job16948629/trial_33 \
