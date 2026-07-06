@@ -70,6 +70,12 @@ N_REPEATS: int = 5                             # trials per group (variance)
 # defaults k=1 ≈ 19, k=5 ≈ 3, k=10 ≈ 1 calls/repeat → ~115 LLM calls total across
 # the 5 repeats of the three cadences (the baseline calls the LLM zero times).
 SURROGATE_PICKLE: str | None = None            # reuse a fitted surrogate if set
+# Baseline hyperparameters: point this at a MOBO ``trial_*`` directory (with a
+# trial.json holding a "hparams" block) to pin the baseline/starting hyperparameters
+# to that trial. A relative path is resolved against the repo root. Set to None to
+# instead pick the best-dist_to_needles ensemble trial (falling back to trial_112 /
+# run_7eb9).
+BASELINE_TRIAL_DIR: str | None = "optimize/runs/mobo_05_06_15_32/trial_112"
 # ───────────────────────────────────────────────────────────────────────────────
 
 import csv
@@ -962,6 +968,25 @@ def regenerate_summary(sweep_dir: Path, group_row=None, write=None,
 # Orchestration
 # ════════════════════════════════════════════════════════════════════════════════
 
+def resolve_baseline_hparams() -> Tuple[Dict[str, Any], str]:
+    """Baseline/starting hyperparameters for the sweep. If ``BASELINE_TRIAL_DIR`` is
+    set, read them from that MOBO ``trial_*`` directory's trial.json; otherwise pick
+    the best-dist_to_needles 3d ensemble MOBO trial, falling back to trial_112 /
+    run_7eb9 when no ensemble run has been synced yet."""
+    if BASELINE_TRIAL_DIR:
+        tdir = Path(BASELINE_TRIAL_DIR)
+        if not tdir.is_absolute():
+            tdir = E._ROOT / tdir
+        return E.hparams_from_trial_dir(tdir), f"trial dir {tdir.name} ({tdir})"
+    base_hp, base_desc = E.best_dist_ensemble_hparams()
+    if base_hp is None:
+        with open(E.RUN_DIR / "config.json") as f:
+            run_config = json.load(f)
+        base_hp = E.current_hparams(run_config)
+        base_desc = f"trial_112 fallback ({base_desc})"
+    return base_hp, base_desc
+
+
 def main(sweep_prefix: str = "sweep_surrogate", prompt_builder=None,
          plot_title: Optional[str] = None) -> None:
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -979,11 +1004,8 @@ def main(sweep_prefix: str = "sweep_surrogate", prompt_builder=None,
         print("  fitting generative surrogate …")
         surr = Surrogate.fit(verbose=False)
 
-    # trial_112 hyperparameters = the values run_7eb9 actually used (offline-MOBO pick).
-    with open(E.RUN_DIR / "config.json") as f:
-        run_config = json.load(f)
-    base_hp = E.current_hparams(run_config)
-    print(f"  trial_112 hyperparameters: {base_hp}")
+    base_hp, base_desc = resolve_baseline_hparams()
+    print(f"  baseline hyperparameters [{base_desc}]: {base_hp}")
 
     # True optima of the surrogate's deterministic Objective landscape (needle metric).
     predictor = _ObjMeanPredictor(surr)

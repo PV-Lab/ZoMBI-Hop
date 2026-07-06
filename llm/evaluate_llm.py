@@ -101,6 +101,10 @@ RUN_DIR = _ROOT / "runs" / "run_7eb9"
 # are shown to the LLM as the hyperparameter-optimization history. Point this at the
 # full optimization run (hundreds of trials); the example below has just one.
 MOBO_RUN_DIR = _ROOT / "optimize" / "runs" / "mobo_05_06_15_32"
+# Directory holding the synced ensemble MOBO runs (mobo_ensemble_*/mobo_progress.json,
+# pulled by optimize/sync_runs.py). The sweep baselines pick the best-dist_to_needles
+# 3d ensemble trial from here (see best_dist_ensemble_hparams).
+ENSEMBLE_RUNS_DIR = _ROOT / "optimize" / "runs"
 COMP_COLS = ["FAPbI3", "MAPbI3", "MAPbBr3"]
 VALUE_COL = "Objective"
 MAXIMIZE = True                     # Objective is maximized
@@ -307,13 +311,7 @@ def current_hparams(run_config: Dict[str, Any]) -> Dict[str, Any]:
     Config-read hyperparameters come from run_7eb9/config.json; the rest used
     ZoMBIHop's constructor defaults during the original run.
     """
-    import inspect
-    defaults = {}
-    sig = inspect.signature(ZoMBIHop.__init__)
-    for name in _CONSTRUCTOR_HPARAMS:
-        p = sig.parameters.get(name)
-        if p is not None and p.default is not inspect.Parameter.empty:
-            defaults[name] = p.default
+    defaults = _constructor_hparam_defaults()
     hp = {}
     for name in R.HPARAM_NAMES:
         if name in run_config:
@@ -321,6 +319,110 @@ def current_hparams(run_config: Dict[str, Any]) -> Dict[str, Any]:
         elif name in defaults:
             hp[name] = defaults[name]
     return hp
+
+
+def _constructor_hparam_defaults() -> Dict[str, Any]:
+    """ZoMBIHop constructor defaults for the constructor-set hyperparameters."""
+    import inspect
+    defaults: Dict[str, Any] = {}
+    sig = inspect.signature(ZoMBIHop.__init__)
+    for name in _CONSTRUCTOR_HPARAMS:
+        p = sig.parameters.get(name)
+        if p is not None and p.default is not inspect.Parameter.empty:
+            defaults[name] = p.default
+    return defaults
+
+
+def _hparams_from_trial(trial_hp: Dict[str, Any]) -> Dict[str, Any]:
+    """Map a MOBO trial's stored hyperparameters onto the tunable set, filling any
+    absent constructor-set hyperparameter from ZoMBIHop's default (mirrors
+    current_hparams, but sourced from a trial record instead of run_config)."""
+    defaults = _constructor_hparam_defaults()
+    hp: Dict[str, Any] = {}
+    for name in R.HPARAM_NAMES:
+        if name in trial_hp:
+            hp[name] = trial_hp[name]
+        elif name in defaults:
+            hp[name] = defaults[name]
+    return hp
+
+
+def hparams_from_trial_dir(trial_dir: Path) -> Dict[str, Any]:
+    """Baseline hyperparameters read from a MOBO ``trial_*`` directory's ``trial.json``
+    (its ``hparams`` block), mapped onto the tunable set with constructor defaults
+    filled in. Lets a sweep pin its baseline to a specific trial directory."""
+    trial_dir = Path(trial_dir)
+    tj = trial_dir / "trial.json"
+    if not tj.exists():
+        raise FileNotFoundError(f"no trial.json in baseline trial dir {trial_dir}")
+    trial = json.loads(tj.read_text())
+    return _hparams_from_trial(trial.get("hparams", {}))
+
+
+def best_dist_ensemble_hparams(runs_dir: Path = ENSEMBLE_RUNS_DIR, dim: int = 3):
+    """Hyperparameters of the ``dim``-D ensemble MOBO trial with the best (lowest)
+    ``dist_to_needles``, for use as a sweep baseline instead of trial_112.
+
+    Scans ``runs_dir/mobo_ensemble_*/mobo_progress.json`` (pareto.py's per-run trial
+    format), keeping runs whose ``run_config.json`` reports ``dim == dim`` (when the
+    field is absent, falls back to a ``_<dim>d_`` token in the run name, else accepts
+    the run). Skips failed trials (time metric <= 0, exactly as optimize/pareto.py
+    excludes them). Returns ``(hparams_dict, description)`` for the global argmin over
+    ``dist_to_needles``, or ``(None, reason)`` when no usable trial is found so callers
+    can fall back to trial_112.
+    """
+    progress_files = sorted(runs_dir.glob("mobo_ensemble_*/mobo_progress.json"))
+    if not progress_files:
+        return None, f"no mobo_ensemble_*/mobo_progress.json under {runs_dir}"
+
+    best = None  # (dist, run_name, trial_num, hparams)
+    n_runs_kept = 0
+    for pf in progress_files:
+        run_dir = pf.parent
+        run_name = run_dir.name
+        cfg = {}
+        cfg_path = run_dir / "run_config.json"
+        if cfg_path.exists():
+            try:
+                cfg = json.loads(cfg_path.read_text())
+            except Exception:
+                cfg = {}
+        cfg_dim = cfg.get("dim")
+        if cfg_dim is not None:
+            if int(cfg_dim) != dim:
+                continue
+        elif f"_{dim}d_" not in run_name:
+            # No dim in config and no dim token in the name → can't confirm; only
+            # accept if the name gives no *conflicting* dim token.
+            import re as _re
+            if _re.search(r"_\d+d_", run_name):
+                continue
+        try:
+            prog = json.loads(pf.read_text())
+        except Exception:
+            continue
+        n_runs_kept += 1
+        for t in prog.get("trials", []):
+            m = t.get("metrics", {})
+            if _PARETO_DIST_KEY not in m:
+                continue
+            tv = _trial_time_metric(m)
+            if tv is None or tv <= 0:   # drop failed 0-iteration trials
+                continue
+            try:
+                dist = float(m[_PARETO_DIST_KEY])
+            except (TypeError, ValueError):
+                continue
+            if best is None or dist < best[0]:
+                best = (dist, run_name, t.get("trial"), t.get("hparams", {}))
+
+    if best is None:
+        return None, (f"no usable {dim}D ensemble trial found "
+                      f"({n_runs_kept} matching run(s) scanned under {runs_dir})")
+    dist, run_name, trial_num, trial_hp = best
+    hp = _hparams_from_trial(trial_hp)
+    desc = f"{run_name} trial {trial_num} (dist_to_needles={dist:.4f})"
+    return hp, desc
 
 
 def format_current_hparams(hp: Dict[str, Any]) -> str:
