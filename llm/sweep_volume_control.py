@@ -579,11 +579,19 @@ def run_llm_trial(surr, base_hp, ref_optima, interval: int, seed: int,
         injection_idx = 0
         while call_counter[0] < MAX_ITERS:
             stop_at = min(call_counter[0] + interval, MAX_ITERS)
+            before = call_counter[0]
             dh = run_segment(tmp, "llm", fresh, base_hp, volumes, fn_callable, stop_at,
                              call_counter, payloads, snap_records)
             fresh = False
             if call_counter[0] >= MAX_ITERS:
                 break  # budget spent → no injection after the final segment
+            if call_counter[0] == before:
+                # ZoMBI-Hop returned without advancing the objective counter (early
+                # stop / caught error); resuming again would spin forever, injecting
+                # endlessly. Stop the trial here instead.
+                print(f"      [trial] no progress at iter {before}; stopping trial "
+                      f"(segment stalled)")
+                break
 
             prompt = build_injection_prompt(feature_log, dh, volumes, injection_idx,
                                             call_counter[0], MAX_ITERS, interval)
