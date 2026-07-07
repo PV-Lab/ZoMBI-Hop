@@ -1,15 +1,30 @@
 #!/bin/bash
 # =============================================================================
-# ela/scripts/run_pilot_3d.sbatch — alias for slurm/run_pilot_3d.sbatch
+# slurm/run_pilot_3d.sbatch — Muñoz S1 3D GP landscape recreation (paper mode)
 # =============================================================================
 #
-# Canonical script: slurm/run_pilot_3d.sbatch
-# Kept so older docs / muscle memory still work:
-#   sbatch ela/scripts/run_pilot_3d.sbatch
+# Submit from repo root on ORCD / Engaging:
 #
-# Prefer:
+#   cd ~/orcd/scratch/ZoMBI-Hop
 #   sbatch slurm/run_pilot_3d.sbatch
+#
+# Or:
 #   bash ela/scripts/submit_pilot_3d.sh
+#
+# Paper mode (default): ELA-only fitness on raw g(z), Muñoz 8 features, RF λ_T.
+# Campaign-twin (RMSE anchor + calibration):
+#   PILOT_CAMPAIGN_MODE=1 sbatch slurm/run_pilot_3d.sbatch
+#
+# Probe smoke test (~5 min):
+#   sbatch slurm/run_pilot_3d_probe.sbatch
+#
+# Prerequisites:
+#   data/2nd_real_run.db, data/2nd_real_run_ela_full.json
+#   conda env zombi-hop-linebo (slurm/mobo_job_common.sh)
+#
+# Outputs:
+#   ela/runs/pilot_3d_seed<SEED>_job<JOBID>/
+#   ela/scripts/logs/pilot_3d_s1_<JOBID>.{out,err}
 # =============================================================================
 
 #SBATCH --job-name=pilot_3d_s1
@@ -23,7 +38,7 @@
 
 set -euo pipefail
 
-REPO="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+REPO="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "${REPO}"
 
 # shellcheck source=/dev/null
@@ -41,6 +56,7 @@ PILOT_DB="${PILOT_DB:-data/2nd_real_run.db}"
 PILOT_TARGET="${PILOT_TARGET:-data/2nd_real_run_ela_full.json}"
 PILOT_LANDSCAPE_EVERY="${PILOT_LANDSCAPE_EVERY:-1}"
 
+# Stable run dir keyed on job id (same pattern as mobo_ensemble_*_job${SLURM_JOB_ID}).
 RUN_DIR="$(_pilot_run_dir_slurm "${PILOT_SEED}" "${PILOT_QUICK:-0}")"
 mkdir -p "${RUN_DIR}"
 

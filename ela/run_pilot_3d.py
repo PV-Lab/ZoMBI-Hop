@@ -34,7 +34,9 @@ def _configure_logging(level: str, log_file: Path | None) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="3D S1 GP landscape recreation pilot")
+    parser = argparse.ArgumentParser(
+        description="3D S1 GP landscape recreation (Muñoz S1; RF λ_T target)",
+    )
     parser.add_argument("--db", type=Path, default=DEFAULT_DB, help="Campaign SQLite DB")
     parser.add_argument(
         "--target",
@@ -52,9 +54,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--population", type=int, default=None)
     parser.add_argument("--generations", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--alpha", type=float, default=3.0, help="Subspace RMSE weight (default: 3)")
+    parser.add_argument(
+        "--campaign-mode",
+        action="store_true",
+        help="ZoMBI extensions: RMSE anchor, linear calibration, 10-feature loss",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help="Subspace RMSE weight (default: 0 paper / 3 campaign)",
+    )
     parser.add_argument("--beta", type=float, default=0.001, help="Tree complexity weight")
-    parser.add_argument("--tier1-gamma", type=float, default=5.0, help="Tier-1 ELA loss weight (default: 5)")
+    parser.add_argument(
+        "--tier1-gamma",
+        type=float,
+        default=None,
+        help="Tier-1 ELA loss scale (default: 1 paper / 5 campaign)",
+    )
     parser.add_argument("--snapshot-every", type=int, default=5)
     parser.add_argument("--n-dense", type=int, default=None, help="Dense sample size (default 4096)")
     parser.add_argument("--quick", action="store_true", help="Smoke test: small pop/gens/sample")
@@ -62,38 +79,42 @@ def main(argv: list[str] | None = None) -> int:
         "--early-reject-mult",
         type=float,
         default=None,
-        help="Skip Tier-1 when RMSE > mult×threshold (default: 0=off, 3.0 for --quick)",
+        help="Campaign mode only: skip Tier-1 when RMSE > mult×threshold",
     )
     parser.add_argument("--no-landscape-viz", action="store_true", help="Skip per-generation ternary plots")
-    parser.add_argument(
-        "--landscape-every",
-        type=int,
-        default=1,
-        help="Plot best landscape every N generations (default: 1)",
-    )
-    parser.add_argument(
-        "--landscape-grid-n",
-        type=int,
-        default=100,
-        help="Ternary resolution for per-generation plots (default: 100)",
-    )
+    parser.add_argument("--landscape-every", type=int, default=1)
+    parser.add_argument("--landscape-grid-n", type=int, default=100)
     parser.add_argument("--no-viz", action="store_true", help="Skip post-run summary visualization")
-    parser.add_argument("--grid-n", type=int, default=200, help="Ternary resolution for final viz/ folder")
+    parser.add_argument("--grid-n", type=int, default=200)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
+
+    paper_mode = not args.campaign_mode
 
     if args.quick:
         population = args.population if args.population is not None else 24
         generations = args.generations if args.generations is not None else 8
         n_dense = args.n_dense if args.n_dense is not None else 512
         snapshot_every = min(args.snapshot_every, 2)
-        early_reject_mult = 3.0
+        early_reject_mult = 0.0 if paper_mode else 3.0
     else:
-        population = args.population if args.population is not None else 120
-        generations = args.generations if args.generations is not None else 60
+        population = args.population if args.population is not None else (200 if paper_mode else 120)
+        generations = args.generations if args.generations is not None else (100 if paper_mode else 60)
         n_dense = args.n_dense
         snapshot_every = args.snapshot_every
         early_reject_mult = 0.0
+
+    if args.alpha is not None:
+        alpha = args.alpha
+    else:
+        alpha = 0.0 if paper_mode else 3.0
+
+    if args.tier1_gamma is not None:
+        tier1_gamma = args.tier1_gamma
+    else:
+        tier1_gamma = 1.0 if paper_mode else 5.0
+
+    linearity_penalty = 0.0 if paper_mode else 3.0
 
     if args.out_dir is not None:
         run_dir = args.out_dir.resolve()
@@ -105,6 +126,8 @@ def main(argv: list[str] | None = None) -> int:
     _configure_logging(args.log_level, run_dir / "pilot.log")
 
     log = logging.getLogger("ela.pilot_3d")
+    mode_label = "paper (Muñoz S1)" if paper_mode else "campaign-twin"
+    log.info("Mode: %s", mode_label)
     log.info("Building evolution context from %s", args.db)
     log.info("Target fingerprint: %s", args.target)
 
@@ -112,19 +135,24 @@ def main(argv: list[str] | None = None) -> int:
         db_path=args.db,
         target_json=args.target,
         n_dense=n_dense,
-        alpha_subspace=args.alpha,
+        alpha_subspace=alpha,
         beta_complexity=args.beta,
+        paper_mode=paper_mode,
     )
-    ctx.metadata["alpha_subspace"] = args.alpha
+    ctx.metadata["alpha_subspace"] = alpha
     ctx.metadata["beta_complexity"] = args.beta
-    ctx.metadata["tier1_gamma"] = args.tier1_gamma
+    ctx.metadata["tier1_gamma"] = tier1_gamma
+    ctx.metadata["paper_mode"] = paper_mode
+    ctx.metadata["linearity_penalty_gamma"] = linearity_penalty
 
     cfg = EvolutionConfig(
         population=population,
         generations=generations,
-        alpha_subspace=args.alpha,
+        alpha_subspace=alpha,
         beta_complexity=args.beta,
-        tier1_gamma=args.tier1_gamma,
+        tier1_gamma=tier1_gamma,
+        linearity_penalty_gamma=linearity_penalty,
+        paper_mode=paper_mode,
         snapshot_every=snapshot_every,
         seed=args.seed,
         early_reject_subspace_mult=(
@@ -136,18 +164,20 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     log.info(
-        "Starting evolution: pop=%d gens=%d n_dense=%d seed=%d -> %s",
+        "Starting evolution: mode=%s pop=%d gens=%d n_dense=%d features=%s -> %s",
+        mode_label,
         cfg.population,
         cfg.generations,
         ctx.n_dense,
-        cfg.seed,
+        list(ctx.fitness_feature_names),
         run_dir,
     )
 
     best = run_evolution(ctx, run_dir, cfg, target_source=args.target)
     log.info(
-        "Done. best fitness=%.4f rmse=%.5f accepted=%s",
+        "Done. best fitness=%.4f tier1=%.4f rmse=%.5f accepted=%s",
         best.fitness,
+        best.tier1_loss,
         best.subspace_rmse,
         best.accepted,
     )

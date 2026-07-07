@@ -15,7 +15,10 @@ from ela.features import (
     train_rf_surrogate,
 )
 from ela.tier1 import (
+    CAMPAIGN_WEIGHTS,
     DEFAULT_WEIGHTS,
+    MUNOZ_8_NAMES,
+    PAPER_WEIGHTS,
     TIER1_NAMES,
     compute_tier1,
     extract_tier1_from_characterize,
@@ -36,6 +39,8 @@ class EvolutionContext:
     subspace_rmse_threshold: float
     tier1_target: dict[str, float]
     tier1_weights: dict[str, float]
+    fitness_feature_names: tuple[str, ...]
+    paper_mode: bool
     x_dense: np.ndarray
     z_dense: np.ndarray
     y_target: np.ndarray
@@ -66,6 +71,7 @@ def build_context(
     alpha_subspace: float = 10.0,
     beta_complexity: float = 0.001,
     subspace_rmse_frac: float = 0.02,
+    paper_mode: bool = True,
 ) -> EvolutionContext:
     db_path = Path(db_path)
     x_campaign, y_campaign = load_campaign_rows(db_path, objective_column=objective_column)
@@ -113,12 +119,21 @@ def build_context(
 
     subspace_rmse_threshold = subspace_rmse_frac * max(y_range, 1e-9)
 
+    if paper_mode:
+        fitness_names = MUNOZ_8_NAMES
+        tier1_weights = dict(PAPER_WEIGHTS)
+    else:
+        fitness_names = TIER1_NAMES
+        tier1_weights = dict(CAMPAIGN_WEIGHTS)
+
     metadata: dict[str, Any] = {
         "db_path": str(db_path.resolve()),
         "objective_column": objective_column,
         "alpha_subspace": alpha_subspace,
         "beta_complexity": beta_complexity,
         "subspace_rmse_frac": subspace_rmse_frac,
+        "paper_mode": paper_mode,
+        "fitness_feature_names": list(fitness_names),
         "y_campaign_range": [float(y_campaign.min()), float(y_campaign.max())],
         "y_dense_range": [y_min, y_max],
         "n_campaign": int(x_campaign.shape[0]),
@@ -134,7 +149,9 @@ def build_context(
         y_range=y_range,
         subspace_rmse_threshold=subspace_rmse_threshold,
         tier1_target=tier1_target,
-        tier1_weights=dict(DEFAULT_WEIGHTS),
+        tier1_weights=tier1_weights,
+        fitness_feature_names=fitness_names,
+        paper_mode=paper_mode,
         x_dense=x_dense,
         z_dense=z_dense,
         y_target=y_target,
@@ -176,6 +193,8 @@ def export_run_artifacts(
         "tier1": ctx.tier1_target,
         "weights": ctx.tier1_weights,
         "tier1_names": list(TIER1_NAMES),
+        "fitness_feature_names": list(ctx.fitness_feature_names),
+        "paper_mode": ctx.paper_mode,
         "subspace_rmse_threshold": ctx.subspace_rmse_threshold,
     }
     with open(run_dir / "target.json", "w", encoding="utf-8") as f:
@@ -219,6 +238,10 @@ def load_context_from_run(run_dir: str | Path) -> EvolutionContext:
         subspace_rmse_threshold=float(target["subspace_rmse_threshold"]),
         tier1_target={k: float(target["tier1"][k]) for k in TIER1_NAMES},
         tier1_weights={k: float(target["weights"].get(k, 1.0)) for k in TIER1_NAMES},
+        fitness_feature_names=tuple(
+            target.get("fitness_feature_names", list(MUNOZ_8_NAMES))
+        ),
+        paper_mode=bool(config.get("paper_mode", target.get("paper_mode", True))),
         x_dense=data["x_dense"],
         z_dense=data["z_dense"],
         y_target=data["y_target"],

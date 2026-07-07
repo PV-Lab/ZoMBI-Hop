@@ -1,29 +1,33 @@
 #!/bin/bash
 # =============================================================================
-# ela/scripts/run_pilot_3d.sbatch — alias for slurm/run_pilot_3d.sbatch
+# slurm/run_pilot_3d_array.sbatch — paper-mode seed sweep (one landscape per task)
 # =============================================================================
 #
-# Canonical script: slurm/run_pilot_3d.sbatch
-# Kept so older docs / muscle memory still work:
-#   sbatch ela/scripts/run_pilot_3d.sbatch
+# Submit from repo root:
 #
-# Prefer:
-#   sbatch slurm/run_pilot_3d.sbatch
-#   bash ela/scripts/submit_pilot_3d.sh
+#   cd ~/orcd/scratch/ZoMBI-Hop
+#   sbatch slurm/run_pilot_3d_array.sbatch
+#
+# Or:
+#   bash ela/scripts/submit_pilot_3d.sh array
+#
+# Override array range:
+#   sbatch --array=0-9 slurm/run_pilot_3d_array.sbatch
 # =============================================================================
 
-#SBATCH --job-name=pilot_3d_s1
-#SBATCH --output=ela/scripts/logs/pilot_3d_s1_%j.out
-#SBATCH --error=ela/scripts/logs/pilot_3d_s1_%j.err
+#SBATCH --job-name=pilot_3d_s1_arr
+#SBATCH --output=ela/scripts/logs/pilot_3d_s1_arr_%A_%a.out
+#SBATCH --error=ela/scripts/logs/pilot_3d_s1_arr_%A_%a.err
 #SBATCH --partition=mit_normal
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
+#SBATCH --array=0-4
 
 set -euo pipefail
 
-REPO="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+REPO="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "${REPO}"
 
 # shellcheck source=/dev/null
@@ -34,14 +38,14 @@ source "${REPO}/slurm/pilot_job_common.sh"
 _pilot_setup_dirs
 _pilot_check_data
 
-PILOT_SEED="${PILOT_SEED:-0}"
+PILOT_SEED="${PILOT_SEED:-${SLURM_ARRAY_TASK_ID}}"
 PILOT_POPULATION="${PILOT_POPULATION:-200}"
 PILOT_GENERATIONS="${PILOT_GENERATIONS:-100}"
 PILOT_DB="${PILOT_DB:-data/2nd_real_run.db}"
 PILOT_TARGET="${PILOT_TARGET:-data/2nd_real_run_ela_full.json}"
-PILOT_LANDSCAPE_EVERY="${PILOT_LANDSCAPE_EVERY:-1}"
+PILOT_LANDSCAPE_EVERY="${PILOT_LANDSCAPE_EVERY:-5}"
 
-RUN_DIR="$(_pilot_run_dir_slurm "${PILOT_SEED}" "${PILOT_QUICK:-0}")"
+RUN_DIR="$(_pilot_run_dir_array "${PILOT_SEED}" "${PILOT_QUICK:-0}")"
 mkdir -p "${RUN_DIR}"
 
 PILOT_CMD=(
@@ -60,35 +64,26 @@ PILOT_CMD=(
 _pilot_append_mode_flags PILOT_CMD
 _pilot_append_viz_flags PILOT_CMD
 
-echo "=== ELA S1 pilot 3D ==="
+echo "=== ELA S1 pilot 3D (array) ==="
 if [[ "${PILOT_CAMPAIGN_MODE:-0}" == "1" ]]; then
-  echo "mode:       campaign-twin (RMSE + calibration)"
+  echo "mode:       campaign-twin"
 else
   echo "mode:       paper (Muñoz S1, RF λ_T)"
 fi
-echo "started:    $(date -Is)"
-echo "job_id:     ${SLURM_JOB_ID}"
-echo "partition:  ${SLURM_JOB_PARTITION:-unknown}"
-echo "hostname:   $(hostname)"
-echo "repo:       ${REPO}"
+echo "array_job:  ${SLURM_ARRAY_JOB_ID}"
+echo "task_id:    ${SLURM_ARRAY_TASK_ID}"
+echo "seed:       ${PILOT_SEED}"
 echo "run_dir:    ${RUN_DIR}"
-echo "cpus/task:  ${SLURM_CPUS_PER_TASK:-?}"
 echo ""
 printf '  %q' "${PILOT_CMD[@]}"
 echo
 echo "=== cwd: ${REPO} ==="
 echo
 
-WALL_START=$(date +%s)
 "${PILOT_CMD[@]}" &
 wait $!
 rc=$?
-WALL_END=$(date +%s)
 
-echo "wall_clock_s: $(( WALL_END - WALL_START ))"
-echo "exit_code:    ${rc}"
-echo "finished:     $(date -Is)"
-echo "artifacts:    ${RUN_DIR}"
-echo "  tail -f ${RUN_DIR}/pilot.log"
-
+echo "exit_code: ${rc}"
+echo "artifacts: ${RUN_DIR}"
 exit "${rc}"

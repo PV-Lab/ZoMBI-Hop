@@ -21,6 +21,7 @@ from ela.gp_tree import (
     evaluate_raw,
     mutate,
     predict_calibrated,
+    predict_raw_clipped,
     random_tree,
     raw_linearity_r2,
     tree_depth,
@@ -49,17 +50,18 @@ class Individual:
 
 @dataclass
 class EvolutionConfig:
-    population: int = 120
-    generations: int = 60
+    population: int = 200
+    generations: int = 100
     tournament_k: int = 5
     crossover_prob: float = 0.7
     mutation_prob: float = 0.25
     elitism: int = 2
-    max_tree_depth: int = 8
-    alpha_subspace: float = 3.0
+    max_tree_depth: int = 7
+    paper_mode: bool = True
+    alpha_subspace: float = 0.0
     beta_complexity: float = 0.001
-    tier1_gamma: float = 5.0
-    linearity_penalty_gamma: float = 3.0
+    tier1_gamma: float = 1.0
+    linearity_penalty_gamma: float = 0.0
     snapshot_every: int = 5
     seed: int = 0
     early_reject_subspace_mult: float = 0.0  # 0 = disabled; set e.g. 3.0 only for --quick
@@ -74,27 +76,38 @@ def subspace_rmse(y_pred: np.ndarray, y_ref: np.ndarray) -> float:
     return float(np.sqrt(np.mean((y_pred - y_ref) ** 2)))
 
 
+def _eval_objective(
+    tree: Node,
+    z: np.ndarray,
+    ctx: EvolutionContext,
+    cfg: EvolutionConfig,
+    *,
+    calib: tuple[float, float] | None = None,
+) -> tuple[np.ndarray, tuple[float, float]]:
+    if cfg.paper_mode:
+        return predict_raw_clipped(tree, z), (1.0, 0.0)
+    if calib is not None:
+        y, coeffs = predict_calibrated(tree, z, calib=calib)
+        return y, coeffs
+    return predict_calibrated(tree, z, y_ref=ctx.y_target)
+
+
 def evaluate_individual(
     ind: Individual,
     ctx: EvolutionContext,
     cfg: EvolutionConfig,
 ) -> Individual:
-    raw = evaluate_raw(ind.tree, ctx.z_dense)
-    lin_r2 = raw_linearity_r2(ctx.z_dense, raw)
-    y_dense, (a, b) = predict_calibrated(
-        ind.tree, ctx.z_dense, y_ref=ctx.y_target,
-    )
+    y_dense, (a, b) = _eval_objective(ind.tree, ctx.z_dense, ctx, cfg)
     ind.calib_a, ind.calib_b = a, b
     rmse = subspace_rmse(y_dense, ctx.y_target)
     ind.subspace_rmse = rmse
     ind.complexity = tree_size(ind.tree)
 
-    reject_bound = (
-        cfg.early_reject_subspace_mult * ctx.subspace_rmse_threshold
-        if cfg.early_reject_subspace_mult > 0
-        else float("inf")
-    )
-    if rmse > reject_bound:
+    if (
+        not cfg.paper_mode
+        and cfg.early_reject_subspace_mult > 0
+        and rmse > cfg.early_reject_subspace_mult * ctx.subspace_rmse_threshold
+    ):
         ind.tier1_loss = 1.0
         ind.tier1 = {}
         ind.tier1_rel_err = {n: 1.0 for n in TIER1_NAMES}
@@ -114,33 +127,47 @@ def evaluate_individual(
         ind.accepted = False
         return ind
 
-    y_campaign, _ = predict_calibrated(
-        ind.tree, ctx.z_campaign, calib=(a, b),
-    )
+    y_campaign, _ = _eval_objective(ind.tree, ctx.z_campaign, ctx, cfg, calib=(a, b))
     tier1 = compute_tier1(
         ctx.z_dense,
         y_dense,
         ctx.x_dense,
         x_campaign=ctx.x_campaign,
         y_campaign=ctx.y_campaign,
-        y_campaign_pred=y_campaign,
+        y_campaign_pred=None if cfg.paper_mode else y_campaign,
         maximize=ctx.maximize,
         seed=ctx.sample_seed,
     )
-    loss, rel = weighted_feature_loss(tier1, ctx.tier1_target, ctx.tier1_weights)
+    loss, rel = weighted_feature_loss(
+        tier1,
+        ctx.tier1_target,
+        ctx.tier1_weights,
+        feature_names=ctx.fitness_feature_names,
+    )
     ind.tier1 = tier1
     ind.tier1_rel_err = rel
     ind.tier1_loss = loss
-    linear_penalty = max(0.0, lin_r2 - 0.75)
-    if not tree_has_nonlinearity(ind.tree):
-        linear_penalty += 0.35
-    ind.fitness = (
-        cfg.tier1_gamma * loss
-        + cfg.alpha_subspace * rmse / max(ctx.y_range, 1e-9)
-        + cfg.beta_complexity * ind.complexity
-        + cfg.linearity_penalty_gamma * linear_penalty
-    )
-    ind.accepted = rmse < ctx.subspace_rmse_threshold and float(np.median(list(rel.values()))) < 0.10
+
+    fitness = cfg.tier1_gamma * loss + cfg.beta_complexity * ind.complexity
+    if not cfg.paper_mode:
+        lin_r2 = raw_linearity_r2(ctx.z_dense, evaluate_raw(ind.tree, ctx.z_dense))
+        linear_penalty = max(0.0, lin_r2 - 0.75)
+        if not tree_has_nonlinearity(ind.tree):
+            linear_penalty += 0.35
+        fitness += (
+            cfg.alpha_subspace * rmse / max(ctx.y_range, 1e-9)
+            + cfg.linearity_penalty_gamma * linear_penalty
+        )
+    ind.fitness = fitness
+
+    fit_errs = [rel[n] for n in ctx.fitness_feature_names]
+    median_rel = float(np.median(fit_errs))
+    if cfg.paper_mode:
+        ind.accepted = median_rel < 0.10
+    else:
+        ind.accepted = (
+            rmse < ctx.subspace_rmse_threshold and median_rel < 0.10
+        )
     return ind
 
 
@@ -156,6 +183,7 @@ def _init_population(rng: random.Random, ctx: EvolutionContext, cfg: EvolutionCo
             rng,
             n_vars=ctx.n_vars,
             max_depth=cfg.max_tree_depth - 1,
+            paper_mode=cfg.paper_mode,
         )
         pop.append(Individual(tree=tree))
     return pop
@@ -201,6 +229,7 @@ def _plot_generation_landscape(
     gen: int,
     best: Individual,
     landscape_cache: Any,
+    cfg: EvolutionConfig,
 ) -> None:
     land_dir = run_dir / "evolution" / "landscapes"
     png_path = land_dir / f"gen_{gen:03d}.png"
@@ -212,7 +241,8 @@ def _plot_generation_landscape(
         tier1_loss=best.tier1_loss,
         subspace_rmse=best.subspace_rmse,
         accepted=best.accepted,
-        calib=(best.calib_a, best.calib_b),
+        paper_mode=cfg.paper_mode,
+        calib=None if cfg.paper_mode else (best.calib_a, best.calib_b),
     )
     latest = land_dir / "latest.png"
     try:
@@ -291,11 +321,17 @@ def run_evolution(
     cfg.alpha_subspace = float(ctx.metadata.get("alpha_subspace", cfg.alpha_subspace))
     cfg.beta_complexity = float(ctx.metadata.get("beta_complexity", cfg.beta_complexity))
     cfg.tier1_gamma = float(ctx.metadata.get("tier1_gamma", cfg.tier1_gamma))
+    cfg.paper_mode = bool(ctx.metadata.get("paper_mode", cfg.paper_mode))
+    cfg.linearity_penalty_gamma = float(
+        ctx.metadata.get("linearity_penalty_gamma", cfg.linearity_penalty_gamma)
+    )
 
     _log_event(
         events_path,
         {
             "event": "start",
+            "paper_mode": cfg.paper_mode,
+            "fitness_features": list(ctx.fitness_feature_names),
             "population": cfg.population,
             "generations": cfg.generations,
             "seed": cfg.seed,
@@ -339,7 +375,7 @@ def run_evolution(
         if 0 % max(cfg.snapshot_every, 1) == 0:
             _write_snapshot_json(run_dir, 0, best, ctx=ctx)
         if cfg.landscape_viz and landscape_cache is not None:
-            _plot_generation_landscape(run_dir, 0, best, landscape_cache)
+            _plot_generation_landscape(run_dir, 0, best, landscape_cache, cfg)
 
         for gen in range(1, cfg.generations + 1):
             next_pop: list[Individual] = [copy.deepcopy(p) for p in pop[: cfg.elitism]]
@@ -386,7 +422,7 @@ def run_evolution(
                 and landscape_cache is not None
                 and gen % cfg.landscape_viz_every == 0
             ):
-                _plot_generation_landscape(run_dir, gen, best, landscape_cache)
+                _plot_generation_landscape(run_dir, gen, best, landscape_cache, cfg)
 
             _log_event(
                 events_path,
@@ -402,12 +438,11 @@ def run_evolution(
                 },
             )
             logger.info(
-                "gen %3d | fitness=%.4f tier1=%.4f rmse=%.5f lin=%.2f size=%d accepted=%s",
+                "gen %3d | fitness=%.4f tier1=%.4f rmse=%.5f size=%d accepted=%s",
                 gen,
                 best.fitness,
                 best.tier1_loss,
                 best.subspace_rmse,
-                raw_linearity_r2(ctx.z_dense, evaluate_raw(best.tree, ctx.z_dense)),
                 best.complexity,
                 best.accepted,
             )
@@ -429,24 +464,32 @@ def _finalize_best(
     best_dir = run_dir / "best"
     best_dir.mkdir(parents=True, exist_ok=True)
 
-    y_dense, (a, b) = predict_calibrated(best.tree, ctx.z_dense, y_ref=ctx.y_target)
-    y_campaign, _ = predict_calibrated(best.tree, ctx.z_campaign, calib=(a, b))
+    y_dense, (a, b) = _eval_objective(best.tree, ctx.z_dense, ctx, cfg)
+    y_campaign, _ = _eval_objective(best.tree, ctx.z_campaign, ctx, cfg, calib=(a, b))
     tier1 = compute_tier1(
         ctx.z_dense,
         y_dense,
         ctx.x_dense,
         x_campaign=ctx.x_campaign,
         y_campaign=ctx.y_campaign,
-        y_campaign_pred=y_campaign,
+        y_campaign_pred=None if cfg.paper_mode else y_campaign,
         maximize=ctx.maximize,
         seed=ctx.sample_seed,
     )
-    loss, rel = weighted_feature_loss(tier1, ctx.tier1_target, ctx.tier1_weights)
+    loss, rel = weighted_feature_loss(
+        tier1,
+        ctx.tier1_target,
+        ctx.tier1_weights,
+        feature_names=ctx.fitness_feature_names,
+    )
     rmse = subspace_rmse(y_dense, ctx.y_target)
-    median_rel = float(np.median(list(rel.values())))
+    fit_errs = [rel[n] for n in ctx.fitness_feature_names]
+    median_rel = float(np.median(fit_errs))
 
     metrics = {
         "fitness": best.fitness,
+        "paper_mode": cfg.paper_mode,
+        "fitness_feature_names": list(ctx.fitness_feature_names),
         "tier1_loss": loss,
         "subspace_rmse": rmse,
         "subspace_rmse_threshold": ctx.subspace_rmse_threshold,
@@ -457,24 +500,40 @@ def _finalize_best(
         "tier1_rel_err": rel,
         "tier1_achieved": tier1,
         "tier1_target": ctx.tier1_target,
-        "accepted_subspace": rmse < ctx.subspace_rmse_threshold,
+        "accepted_subspace": False if cfg.paper_mode else rmse < ctx.subspace_rmse_threshold,
         "accepted_tier1": median_rel < 0.10,
-        "accepted": rmse < ctx.subspace_rmse_threshold and median_rel < 0.10,
+        "accepted": (
+            median_rel < 0.10
+            if cfg.paper_mode
+            else rmse < ctx.subspace_rmse_threshold and median_rel < 0.10
+        ),
         "y_dense_range_achieved": [float(y_dense.min()), float(y_dense.max())],
         "campaign_r2": tier1["oob_r2"],
-        "linear_calibration": {"a": a, "b": b},
-        "raw_linearity_r2": raw_linearity_r2(ctx.z_dense, evaluate_raw(best.tree, ctx.z_dense)),
-        "has_nonlinearity": tree_has_nonlinearity(best.tree),
     }
+    if cfg.paper_mode:
+        metrics["evaluation"] = "raw_g(z)"
+    else:
+        metrics["linear_calibration"] = {"a": a, "b": b}
+        metrics["raw_linearity_r2"] = raw_linearity_r2(
+            ctx.z_dense, evaluate_raw(best.tree, ctx.z_dense)
+        )
+        metrics["has_nonlinearity"] = tree_has_nonlinearity(best.tree)
     with open(best_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
         f.write("\n")
 
+    _, rel_all = weighted_feature_loss(
+        tier1,
+        ctx.tier1_target,
+        {name: 1.0 for name in TIER1_NAMES},
+        feature_names=TIER1_NAMES,
+    )
     recovery = {
         name: {
             "target": ctx.tier1_target[name],
             "achieved": tier1[name],
-            "rel_err": rel[name],
+            "rel_err": rel_all[name],
+            "in_fitness": name in ctx.fitness_feature_names,
         }
         for name in TIER1_NAMES
     }
@@ -482,22 +541,59 @@ def _finalize_best(
         json.dump(recovery, f, indent=2)
         f.write("\n")
 
+    expr_meta: dict[str, Any] = {
+        "string": tree_to_string(best.tree),
+        "paper_mode": cfg.paper_mode,
+    }
+    if not cfg.paper_mode:
+        expr_meta["linear_calibration"] = {"a": a, "b": b}
+        expr_meta["raw_linearity_r2"] = raw_linearity_r2(
+            ctx.z_dense, evaluate_raw(best.tree, ctx.z_dense)
+        )
+        expr_meta["has_nonlinearity"] = tree_has_nonlinearity(best.tree)
     dump_expression(
         best_dir / "expression.json",
         best.tree,
-        metadata={
-            "string": tree_to_string(best.tree),
-            "linear_calibration": {"a": a, "b": b},
-            "raw_linearity_r2": raw_linearity_r2(ctx.z_dense, evaluate_raw(best.tree, ctx.z_dense)),
-            "has_nonlinearity": tree_has_nonlinearity(best.tree),
-        },
+        metadata=expr_meta,
     )
-    _write_oracle_py(best_dir / "oracle.py", ctx)
+    _write_oracle_py(best_dir / "oracle.py", paper_mode=cfg.paper_mode)
     logger.info("Best saved to %s (accepted=%s)", best_dir, metrics["accepted"])
 
 
-def _write_oracle_py(path: Path, ctx: EvolutionContext) -> None:
-    code = '''"""Evolved 3D S1 landscape oracle (auto-generated)."""
+def _write_oracle_py(path: Path, *, paper_mode: bool) -> None:
+    if paper_mode:
+        body = '''"""Evolved 3D S1 landscape oracle (Muñoz S1 paper mode — raw g(z))."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+
+from ela.features import composition_to_ilr
+from ela.gp_tree import predict_raw_clipped, tree_from_jsonable
+
+_EXPR_PATH = Path(__file__).with_name("expression.json")
+with _EXPR_PATH.open(encoding="utf-8") as _f:
+    _EXPRESSION = tree_from_jsonable(json.load(_f)["expression"])
+
+
+def predict_composition(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    if x.ndim == 1:
+        x = x.reshape(1, -1)
+    return predict_ilr(composition_to_ilr(x))
+
+
+def predict_ilr(z: np.ndarray) -> np.ndarray:
+    return predict_raw_clipped(_EXPRESSION, z)
+
+
+if __name__ == "__main__":
+    print("Paper-mode oracle: predict_composition(x) with shape (n, 3).")
+'''
+    else:
+        body = '''"""Evolved 3D S1 landscape oracle (campaign-twin mode)."""
 from __future__ import annotations
 
 import json
@@ -518,23 +614,20 @@ _CALIB_B = float(_cal.get("b", 0.0))
 
 
 def predict_composition(x: np.ndarray) -> np.ndarray:
-    """Predict objective for composition(s) on the 3-simplex."""
     x = np.asarray(x, dtype=float)
     if x.ndim == 1:
         x = x.reshape(1, -1)
-    z = composition_to_ilr(x)
-    return predict_ilr(z)
+    return predict_ilr(composition_to_ilr(x))
 
 
 def predict_ilr(z: np.ndarray) -> np.ndarray:
     z = np.asarray(z, dtype=float)
     if z.ndim == 1:
         z = z.reshape(1, -1)
-    raw = evaluate_raw(_EXPRESSION, z)
-    return apply_calibration(raw, _CALIB_A, _CALIB_B)
+    return apply_calibration(evaluate_raw(_EXPRESSION, z), _CALIB_A, _CALIB_B)
 
 
 if __name__ == "__main__":
-    print("Evolved oracle ready. Use predict_composition(x) with shape (n, 3).")
+    print("Campaign-mode oracle: predict_composition(x) with shape (n, 3).")
 '''
-    path.write_text(code, encoding="utf-8")
+    path.write_text(body, encoding="utf-8")

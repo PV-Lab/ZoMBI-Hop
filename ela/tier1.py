@@ -31,8 +31,13 @@ TIER1_NAMES: tuple[str, ...] = (
     "median_lipschitz",
 )
 
-# Feature weights for fitness (see DIGITAL_TWIN_S1.md).
-DEFAULT_WEIGHTS: dict[str, float] = {
+# Muñoz & Smith-Miles (2019) Strategy S1 — 8 clustered ELA features for fitness.
+MUNOZ_8_NAMES: tuple[str, ...] = TIER1_NAMES[:8]
+
+PAPER_WEIGHTS: dict[str, float] = {name: 1.0 for name in MUNOZ_8_NAMES}
+
+# ZoMBI campaign-twin extensions (--campaign-mode).
+CAMPAIGN_WEIGHTS: dict[str, float] = {
     "R2_Q": 1.0,
     "CN": 1.0,
     "H_Y": 1.0,
@@ -40,10 +45,13 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "gamma_Y": 1.0,
     "EL25": 1.0,
     "LQ25": 1.0,
-    "PKS": 1.5,  # multimodality — do not down-weight for haystack targets
-    "oob_r2": 0.0,  # RF OOB target ≠ campaign R² of evolved g; exclude from fitness
+    "PKS": 1.5,
+    "oob_r2": 0.0,
     "median_lipschitz": 1.0,
 }
+
+# Backward-compatible alias.
+DEFAULT_WEIGHTS = CAMPAIGN_WEIGHTS
 
 
 def feature_campaign_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -99,13 +107,16 @@ def weighted_feature_loss(
     achieved: dict[str, float],
     target: dict[str, float],
     weights: dict[str, float] | None = None,
+    *,
+    feature_names: tuple[str, ...] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Weighted RMS error per feature; returns (loss, per_feature_relative_error)."""
-    w = weights or DEFAULT_WEIGHTS
+    names = feature_names or TIER1_NAMES
+    w = weights or CAMPAIGN_WEIGHTS
     errs: dict[str, float] = {}
     sq = 0.0
     wsum = 0.0
-    for name in TIER1_NAMES:
+    for name in names:
         t = float(target[name])
         a = float(achieved[name])
         if not np.isfinite(a) or not np.isfinite(t):

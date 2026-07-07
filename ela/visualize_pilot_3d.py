@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
 
 from ela.evolve_context import EvolutionContext, load_context_from_run
 from ela.features import composition_to_ilr, train_rf_surrogate
-from ela.gp_tree import Node, predict_calibrated, predict_tree, tree_from_jsonable
+from ela.gp_tree import Node, predict_calibrated, predict_raw_clipped, predict_tree, tree_from_jsonable
 from ela.tier1 import TIER1_NAMES
 from visualization.needle_overlay import comp_to_xy, ternary_grid
 
@@ -75,11 +75,14 @@ class LandscapePlotCache:
         tier1_loss: float,
         subspace_rmse: float,
         accepted: bool,
+        paper_mode: bool = True,
         calib: tuple[float, float] | None = None,
         y_ref: np.ndarray | None = None,
     ) -> None:
-        """Triptych: RF | best GP this generation | |GP−RF| diagnostic."""
-        if calib is not None:
+        """Triptych: RF | best GP | |GP−RF| (diagnostic; RF is λ target reference only)."""
+        if paper_mode:
+            y_evolved = predict_raw_clipped(tree, self.z_grid)
+        elif calib is not None:
             y_evolved, _ = predict_calibrated(tree, self.z_grid, calib=calib)
         elif y_ref is not None:
             y_evolved, _ = predict_calibrated(tree, self.z_grid, y_ref=y_ref)
@@ -326,6 +329,7 @@ def visualize_run(
     viz_dir.mkdir(parents=True, exist_ok=True)
 
     ctx = load_context_from_run(run_dir)
+    paper_mode = bool(ctx.paper_mode)
     expr_path = run_dir / "best" / "expression.json"
     with expr_path.open(encoding="utf-8") as f:
         expr_meta = json.load(f)
@@ -333,13 +337,19 @@ def visualize_run(
     cal = expr_meta.get("linear_calibration", {})
     calib = (float(cal.get("a", 1.0)), float(cal.get("b", 0.0)))
 
-    y_evolved_dense, _ = predict_calibrated(tree, ctx.z_dense, calib=calib)
+    if paper_mode:
+        y_evolved_dense = predict_raw_clipped(tree, ctx.z_dense)
+    else:
+        y_evolved_dense, _ = predict_calibrated(tree, ctx.z_dense, calib=calib)
 
     grid_pts = ternary_grid(grid_n)
     z_grid = composition_to_ilr(grid_pts)
     rf = train_rf_surrogate(ctx.x_campaign, ctx.y_campaign)
     y_target_grid = rf.predict(grid_pts)
-    y_evolved_grid, _ = predict_calibrated(tree, z_grid, calib=calib)
+    if paper_mode:
+        y_evolved_grid = predict_raw_clipped(tree, z_grid)
+    else:
+        y_evolved_grid, _ = predict_calibrated(tree, z_grid, calib=calib)
 
     run_name = run_dir.name
     plot_ternary_triptych(

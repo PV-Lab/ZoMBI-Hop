@@ -1,6 +1,15 @@
 #!/bin/bash
 # =============================================================================
-# ela/scripts/run_pilot_3d_probe.sbatch — alias for slurm/run_pilot_3d_probe.sbatch
+# slurm/run_pilot_3d_probe.sbatch — cluster smoke test (~5 min)
+# =============================================================================
+#
+# Submit from repo root:
+#
+#   cd ~/orcd/scratch/ZoMBI-Hop
+#   sbatch slurm/run_pilot_3d_probe.sbatch
+#
+# Or:
+#   bash ela/scripts/submit_pilot_3d.sh probe
 # =============================================================================
 
 #SBATCH --job-name=pilot_3d_probe
@@ -14,7 +23,7 @@
 
 set -euo pipefail
 
-REPO="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+REPO="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "${REPO}"
 
 # shellcheck source=/dev/null

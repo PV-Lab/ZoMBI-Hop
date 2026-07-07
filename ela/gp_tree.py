@@ -32,6 +32,24 @@ DEFAULT_BINARY_WEIGHTS: dict[str, float] = {
     "div": 1.0,
 }
 
+# Muñoz-style GP operator mix (paper-faithful mode).
+PAPER_UNARY_WEIGHTS: dict[str, float] = {
+    "neg": 1.0,
+    "sin": 1.2,
+    "cos": 1.2,
+    "tanh": 1.0,
+    "sqr": 1.0,
+    "exp": 0.8,
+    "exp_neg": 0.8,
+    "abs": 0.5,
+}
+PAPER_BINARY_WEIGHTS: dict[str, float] = {
+    "add": 1.2,
+    "sub": 1.0,
+    "mul": 1.2,
+    "div": 0.5,
+}
+
 
 def _safe_div(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     denom = np.where(np.abs(b) < 1e-6, np.sign(b) * 1e-6 + 1e-6, b)
@@ -227,24 +245,28 @@ def random_tree(
     n_vars: int,
     max_depth: int = 5,
     method: str = "grow",
+    paper_mode: bool = True,
 ) -> Node:
     """Ramped half-and-half style tree generation."""
+    unary_w = PAPER_UNARY_WEIGHTS if paper_mode else DEFAULT_UNARY_WEIGHTS
+    binary_w = PAPER_BINARY_WEIGHTS if paper_mode else DEFAULT_BINARY_WEIGHTS
 
     def grow(depth: int) -> Node:
         if depth <= 0 or (method == "grow" and rng.random() < 0.35):
             return _random_terminal(rng, n_vars)
         if rng.random() < 0.45:
-            op = _weighted_choice(rng, DEFAULT_UNARY_WEIGHTS)
+            op = _weighted_choice(rng, unary_w)
             return (op, grow(depth - 1))
-        op = _weighted_choice(rng, DEFAULT_BINARY_WEIGHTS)
+        op = _weighted_choice(rng, binary_w)
         return (op, grow(depth - 1), grow(depth - 1))
 
-    depth = rng.randint(max(3, max_depth - 2), max_depth)
+    depth = rng.randint(2 if paper_mode else 3, max_depth)
+    if paper_mode:
+        return grow(depth)
     for _ in range(12):
         tree = grow(depth)
         if tree_has_nonlinearity(tree):
             return tree
-    # Fallback: wrap a nonlinear shell around a terminal
     op = _weighted_choice(rng, DEFAULT_UNARY_WEIGHTS)
     return (op, _random_terminal(rng, n_vars))
 
@@ -365,6 +387,16 @@ def apply_calibration(y_raw: np.ndarray, a: float, b: float) -> np.ndarray:
 
 def evaluate_raw(node: Node, z: np.ndarray) -> np.ndarray:
     return evaluate_tree(node, z)
+
+
+def predict_raw_clipped(node: Node, z: np.ndarray) -> np.ndarray:
+    """Paper S1: evaluate ``g(z)`` directly (no post-hoc calibration)."""
+    raw = evaluate_raw(node, z)
+    return np.clip(
+        np.nan_to_num(raw, nan=0.0, posinf=1e6, neginf=-1e6),
+        -50.0,
+        50.0,
+    )
 
 
 def predict_calibrated(
