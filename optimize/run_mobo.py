@@ -1485,7 +1485,12 @@ def load_seed_hparams(trial_paths: list[str]) -> list[torch.Tensor]:
     for p in trial_paths:
         json_path = p if p.lower().endswith(".json") else os.path.join(p, "trial.json")
         if not os.path.exists(json_path):
-            sys.exit(f"--start-from-best: no trial.json found at {json_path}")
+            # A seed dir may be absent (e.g. a collaborator's run archived away, or a
+            # path that never existed on this account). Skip it rather than aborting:
+            # the full Sobol init still runs, so a missing seed just means one fewer
+            # re-evaluated known-good point, not a dead run/requeue chain.
+            print(f"  [seed] WARNING: no trial.json found at {json_path} — skipping.")
+            continue
         try:
             with open(json_path) as f:
                 data = json.load(f)

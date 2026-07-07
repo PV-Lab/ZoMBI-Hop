@@ -1,6 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import simpson
+
+# np.trapz was removed in NumPy 2.0; np.trapezoid is its replacement.
+_trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
 from scipy import signal
 import pandas as pd
 import math
@@ -253,7 +256,7 @@ def est_composition(times,flows,junction_volume,diffusion_factor,drop_time,flow_
                 if verbose: 
                     ax.plot(x_vals,line,label=f"Module {j}") 
                 # integrate for the total volume 
-                volume = np.trapz(line, x_vals) 
+                volume = _trapz(line, x_vals) 
                 volumes.append(volume) 
             volumes_arr = np.array(volumes)
             total_volume = np.sum(volumes_arr) # Volume added by all ten modules during the diluted and new droplet volumes
@@ -306,7 +309,7 @@ def est_composition(times,flows,junction_volume,diffusion_factor,drop_time,flow_
                 if verbose: 
                     ax.plot(x_vals,line,label=f"Module {j}") 
                 # integrate for the total volume 
-                volume = np.trapz(line, x_vals) 
+                volume = _trapz(line, x_vals) 
                 volumes.append(volume) 
             volumes_arr = np.array(volumes)
             total_volume = np.sum(volumes_arr) # Volume added by all ten modules during the diluted and new droplet volumes
