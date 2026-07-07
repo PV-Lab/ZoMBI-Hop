@@ -382,7 +382,11 @@ HPARAM_SPACE: dict[str, tuple] = {
     # Acquisition function
     "ucb_beta":                    (0.001,   3.0,   "linear"),
     # Zoom / convergence
-    "max_zooms":                   (2,      10,    "int"),
+    # Lower bound is 3: a needle can only be declared at zoom level 3+
+    # (ZoMBIHop.min_zoom_for_needle), so max_zooms must allow reaching it.
+    "max_zooms":                   (3,      10,    "int"),
+    # Lower bound is 2 so at least min_iters_per_zoom (=2) lines can be sampled
+    # per zoom level before the optimiser may advance or declare a needle.
     "max_iterations":              (2,      30,    "int"),
     "top_m_points":                (2,      8,     "int"),
     "n_consecutive_converged":     (1,      5,    "int"),
