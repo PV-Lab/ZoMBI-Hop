@@ -244,27 +244,9 @@ def load_hparams_json(path: str) -> dict:
     return {k: v for k, v in hp.items() if k in _KNOWN_HPARAM_NAMES}
 
 
-# Default hyperparameters used when no JSON file is supplied. Copied verbatim
-# from optimize/runs/mobo_05_06_15_32/trial_112 (a strong MOBO result). Keep in
-# sync with DEFAULT_HW_HPARAMS in scripts/run_zombi_main.py.
-DEFAULT_HPARAMS: dict = {
-    "nat_grad_step": 0.00100187,
-    "nat_grad_max_steps": 54,
-    "n_restarts": 285,
-    "raw": 200,
-    "ucb_beta": 1.45791911,
-    "max_zooms": 3,
-    "max_iterations": 8,
-    "top_m_points": 8,
-    "n_consecutive_converged": 1,
-    "input_noise_threshold_mult": 3.98353261,
-    "output_noise_threshold_mult": 0.52251166,
-    "max_penalty_radius": 4.56475059,
-    "needle_shrink_factor": 0.637987,
-    "needle_stop_noise_multiplier": 2.81839283,
-    "paring_spatial_halfnoise": 1.21375814,
-    "paring_y_noise_multiplier": 4.19507699,
-}
+# Default hyperparameters used when no JSON file is supplied. Single source of
+# truth lives in src/default_hparams.py — edit there, not here.
+from src.default_hparams import DEFAULT_HPARAMS, DEFAULT_HPARAMS_PROVENANCE
 
 
 # ── synthetic-run helpers ─────────────────────────────────────────────────────
@@ -1938,8 +1920,18 @@ class TernaryPlotFrame(ttk.Frame):
             if key in self._accum_keys:
                 # Penalty status can flip over a run's life (e.g. once a needle is
                 # declared nearby), so refresh the flag whenever the source knows it.
+                # The index may point at a row already committed to _accum_penalized
+                # OR at one still pending in new_p (a duplicate composition within
+                # this same batch, before the vstack below). Route the write to the
+                # right place so a pending index never indexes the (possibly empty)
+                # committed array.
                 if has_p:
-                    self._accum_penalized[self._accum_index[key]] = bool(penalized[i])
+                    idx = self._accum_index[key]
+                    committed = self._accum_penalized.shape[0]
+                    if idx < committed:
+                        self._accum_penalized[idx] = bool(penalized[i])
+                    else:
+                        new_p[idx - committed] = bool(penalized[i])
                 continue
             self._accum_keys.add(key)
             self._accum_index[key] = self._accum_pts.shape[0] + len(new_pts)
@@ -3076,7 +3068,7 @@ class NewRunDialog(tk.Toplevel):
 
         row += 1
         ttk.Label(tf, text="(trial.json-style file. If blank, arbitrary defaults "
-                           "are used instead — from mobo trial_112.)",
+                           f"are used instead — from {DEFAULT_HPARAMS_PROVENANCE}.)",
                   foreground="gray").grid(row=row, column=0, columnspan=3,
                                           sticky="w", padx=8)
 
@@ -3131,7 +3123,7 @@ class NewRunDialog(tk.Toplevel):
 
         hrow += 1
         ttk.Label(hw, text="(trial.json-style file. If blank, arbitrary defaults "
-                           "are used instead — from mobo trial_112.)",
+                           f"are used instead — from {DEFAULT_HPARAMS_PROVENANCE}.)",
                   foreground="gray").grid(
             row=hrow, column=0, columnspan=2, sticky="w", padx=8)
 
@@ -3200,7 +3192,7 @@ class NewRunDialog(tk.Toplevel):
 
     def _start(self):
         try:
-            # Hyperparameters: defaults (trial_112) unless a JSON file is given.
+            # Hyperparameters: defaults (4d trial_10) unless a JSON file is given.
             hp = dict(DEFAULT_HPARAMS)
             syn_path = self._syn_hparams_var.get().strip()
             if syn_path:
@@ -3338,8 +3330,13 @@ class NewRunDialog(tk.Toplevel):
                 zombi.data_handler.take_snapshot = _snap_wrap
 
                 try:
+                    # never_terminate: prevent every internal stop pathway (over-
+                    # penalisation, activation failure, noise-floor exhaustion) for
+                    # ANY dimensionality — each such stop shrinks penalty volumes and
+                    # resets bounds instead of ending. The run only ends via the Stop
+                    # button (_StopRunRequested) or a time limit.
                     zombi.run(max_activations=max_act, time_limit_hours=None,
-                              pause_event=pause_event)
+                              pause_event=pause_event, never_terminate=True)
                 except _StopRunRequested:
                     _log("Run stopped by user.", tag="done")
 
@@ -3585,6 +3582,9 @@ class ZoMBIApp(tk.Tk):
         }
         self._pending_rd: Optional[RunData] = None
         self._dirty_tabs: set[str] = set()
+        # Set when live_plot_state.json changed while the ternary/tetra tab was
+        # not visible; the heavy 3D redraw is deferred until that tab is selected.
+        self._tern_live_dirty: bool = False
         self._nb.bind("<<NotebookTabChanged>>",
                       lambda _e: self._render_current_tab())
 
@@ -3871,12 +3871,22 @@ class ZoMBIApp(tk.Tk):
         self._render_current_tab()
 
     def _render_current_tab(self):
-        rd = self._pending_rd
-        if rd is None:
-            return
         try:
             current = str(self._nb.nametowidget(self._nb.select()))
         except Exception:
+            return
+        # Flush a deferred live-state redraw for the ternary/tetra tab now that
+        # it is (or may be) visible. Uses the live run so live overlays appear.
+        if current == str(self._tern) and self._tern_live_dirty:
+            self._tern_live_dirty = False
+            rd_live = self.current_run
+            if rd_live is not None:
+                try:
+                    self._tern.update(rd_live)
+                except Exception:
+                    pass
+        rd = self._pending_rd
+        if rd is None:
             return
         updater = self._tab_updaters.get(current)
         if updater is not None and current in self._dirty_tabs:
@@ -3906,13 +3916,27 @@ class ZoMBIApp(tk.Tk):
             except Exception:
                 pass
 
-            # Independent: check for live_plot_state.json changes (hardware runs)
+            # Independent: check for live_plot_state.json changes (hardware runs).
+            # Only rebuild the heavy 3D ternary/tetra figure when that tab is
+            # actually visible; otherwise mark it dirty so it redraws when the
+            # user selects it. On a live run the live state changes every
+            # objective call, so an unconditional replot here rebuilt the 3D
+            # figure every poll regardless of the active tab — a major latency
+            # source. (Lazy-tab pattern, mirroring _render_current_tab.)
             try:
                 if self._tern.try_reload_live_state(rd):
-                    X, n_cols, labels = self._tern._data_info()
-                    self._tern._current_labels = labels
-                    self._tern._sync_combos(labels, n_cols, rd)
-                    self._tern._replot(X, n_cols, labels)
+                    try:
+                        current = str(self._nb.nametowidget(self._nb.select()))
+                    except Exception:
+                        current = None
+                    if current == str(self._tern):
+                        X, n_cols, labels = self._tern._data_info()
+                        self._tern._current_labels = labels
+                        self._tern._sync_combos(labels, n_cols, rd)
+                        self._tern._replot(X, n_cols, labels)
+                        self._tern_live_dirty = False
+                    else:
+                        self._tern_live_dirty = True
             except Exception:
                 pass
 

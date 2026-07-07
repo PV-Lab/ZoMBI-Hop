@@ -543,9 +543,19 @@ class ZoMBIHop:
         return X_actual[penalty_mask], Y[penalty_mask]
 
     def run(self, max_activations: int = 5, time_limit_hours: float = None,
-            pause_event: Optional[threading.Event] = None):
+            pause_event: Optional[threading.Event] = None,
+            never_terminate: bool = False):
         """
         Run ZoMBI-Hop optimization.
+
+        When ``never_terminate`` is True the optimiser is prevented from stopping
+        on its own through *any* internal pathway (over-penalisation, activation
+        failure with no needles, all-axes-below-noise-floor, or exhausting
+        ``max_activations``). Whenever the algorithm *would* have stopped, it logs
+        a ``[no-stop]`` note, shrinks every needle penalty volume to 30% of its
+        size (i.e. by 70%), resets the search bounds to the full simplex, and
+        keeps sampling. The only ways to end such a run are the user Stop button
+        (``_StopRunRequested``) or the time limit, if one is set.
 
         Returns
         -------
@@ -553,6 +563,27 @@ class ZoMBIHop:
             (needles_results, needles, needle_vals, X_all_actual, Y_all)
         """
         dh = self.data_handler  # shorthand
+
+        def _keep_searching(reason: str) -> None:
+            """Anti-termination action: log, shrink all penalty volumes by 70%,
+            and reset bounds to the full simplex so sampling can continue."""
+            self._log(f"  [no-stop] {reason} — shrinking all penalty volumes by "
+                      f"70% and resetting to full bounds; continuing.")
+            try:
+                dh.shrink_all_needle_radii(0.30)
+            except Exception as _e:
+                self._log(f"  [no-stop] shrink_all_needle_radii failed: {_e}")
+            full_bounds = torch.zeros(2, self.d, device=self.device, dtype=self.dtype)
+            full_bounds[1] = 1.0
+            dh.bounds = full_bounds.clone()
+            dh.current_zoom_bounds = full_bounds.clone()
+            self.bounds = full_bounds.clone()
+
+        if never_terminate:
+            # Never exhaust activations on our own — the run only ends via the
+            # user Stop button or an explicit time limit.
+            max_activations = float("inf")
+            self._log("  [no-stop] never_terminate=True — max_activations set to ∞.")
 
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
@@ -754,7 +785,9 @@ class ZoMBIHop:
                     unpenalized_mask = dh.get_penalty_mask(test_samples)
                     penalized_pct = (1 - unpenalized_mask.float().mean().item()) * 100
                     if penalized_pct > 90:
-                        if max_activations == float("inf"):
+                        if never_terminate:
+                            _keep_searching(f"Too much area penalized: {penalized_pct:.2f}%")
+                        elif max_activations == float("inf"):
                             full_bounds = torch.zeros(2, self.d, device=self.device, dtype=self.dtype)
                             full_bounds[1] = 1.0
                             dh.bounds = full_bounds
@@ -769,6 +802,20 @@ class ZoMBIHop:
                     # Three-way failure dispatch.
                     n_needles = dh.needles.shape[0] if dh.needles is not None else 0
                     if n_needles == 0:
+                        if never_terminate:
+                            _keep_searching("Activation failed and no needles")
+                            activation_failed = False
+                            consecutive_converged = 0
+                            data_added_since_last_failure = False
+                            first_failure_handled = False
+                            bounds = dh.bounds.clone()
+                            self.bounds = bounds.clone()
+                            X, Y = dh.get_gp_data()
+                            best_f_local = Y.max().item() if Y.numel() > 0 else best_f_local
+                            if X.shape[0] >= 2:
+                                self.gp_handler.fit(X, Y)
+                            start_iteration = 0
+                            continue
                         self._log("Activation failed and no needles — stopping.")
                         finished = True
                         break
@@ -779,8 +826,12 @@ class ZoMBIHop:
                     activation_failed = False
                     consecutive_converged = 0
                     if should_stop:
-                        finished = True
-                        break
+                        if never_terminate:
+                            _keep_searching("Failure retry exhausted (all axes below noise floor)")
+                            first_failure_handled = False
+                        else:
+                            finished = True
+                            break
                     # Reload local GP data for the (possibly updated) bounds
                     bounds = dh.bounds.clone()
                     self.bounds = bounds.clone()
