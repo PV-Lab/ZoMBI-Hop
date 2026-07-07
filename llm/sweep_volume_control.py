@@ -64,7 +64,7 @@ SURROGATE_PICKLE: str | None = None            # reuse a fitted surrogate if set
 # that trial. A relative path is resolved against the repo root. Set to None to
 # instead pick the best-dist_to_needles ensemble trial (falling back to trial_112 /
 # run_7eb9).
-BASELINE_TRIAL_DIR: str | None = "optimize/runs/mobo_05_06_15_32/trial_112"
+BASELINE_TRIAL_DIR: str | None = "optimize/runs/mobo_ensemble_3d_job17147229/trial_169"
 
 # Volume-control knobs.
 VOLUME_STRENGTH_MULT: float = 1.0   # volume force = this × ZoMBI-Hop's repulsion_lambda
