@@ -1,10 +1,13 @@
 """Genetic programming evolution for S1 landscape recreation."""
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import csv
 import json
 import logging
+import multiprocessing
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -50,13 +53,16 @@ class Individual:
 
 @dataclass
 class EvolutionConfig:
-    population: int = 200
+    population: int = 400
     generations: int = 100
-    tournament_k: int = 5
-    crossover_prob: float = 0.7
-    mutation_prob: float = 0.25
-    elitism: int = 2
-    max_tree_depth: int = 7
+    tournament_k: int = 10
+    crossover_prob: float = 0.6
+    mutation_prob: float = 0.3
+    direct_transfer_prob: float = 0.1
+    elitism: int = 0  # if >0: fixed count; else use elitism_frac (paper: 10%)
+    elitism_frac: float = 0.1
+    max_tree_depth: int = 10
+    fitness_stop_threshold: float = 1e-3  # paper early stop; 0 = disabled
     paper_mode: bool = True
     alpha_subspace: float = 0.0
     beta_complexity: float = 0.001
@@ -68,6 +74,64 @@ class EvolutionConfig:
     landscape_viz: bool = True
     landscape_viz_every: int = 1
     landscape_grid_n: int = 100
+    eval_workers: int = 1
+
+
+def _elitism_count(cfg: EvolutionConfig) -> int:
+    if cfg.elitism > 0:
+        return min(cfg.elitism, cfg.population)
+    return max(1, int(round(cfg.population * cfg.elitism_frac)))
+
+
+def _spawn_offspring_trees(
+    rng: random.Random,
+    pop: list[Individual],
+    cfg: EvolutionConfig,
+    *,
+    n_vars: int,
+) -> list[Node]:
+    """Create 1–2 child trees. Paper: 60% crossover, 30% mutation, 10% direct transfer."""
+    if cfg.paper_mode:
+        r = rng.random()
+        if r < cfg.crossover_prob:
+            p1 = _tournament_select(rng, pop, cfg.tournament_k)
+            p2 = _tournament_select(rng, pop, cfg.tournament_k)
+            return list(
+                crossover(rng, p1.tree, p2.tree, max_depth=cfg.max_tree_depth)
+            )
+        if r < cfg.crossover_prob + cfg.mutation_prob:
+            parent = _tournament_select(rng, pop, cfg.tournament_k)
+            return [
+                mutate(
+                    rng,
+                    parent.tree,
+                    n_vars=n_vars,
+                    max_depth=cfg.max_tree_depth,
+                )
+            ]
+        parent = _tournament_select(rng, pop, cfg.tournament_k)
+        return [copy.deepcopy(parent.tree)]
+
+    if rng.random() < cfg.crossover_prob:
+        p1 = _tournament_select(rng, pop, cfg.tournament_k)
+        p2 = _tournament_select(rng, pop, cfg.tournament_k)
+        child_trees = list(
+            crossover(rng, p1.tree, p2.tree, max_depth=cfg.max_tree_depth)
+        )
+    else:
+        parent = _tournament_select(rng, pop, cfg.tournament_k)
+        child_trees = [parent.tree]
+
+    out: list[Node] = []
+    for tree in child_trees:
+        if rng.random() < cfg.mutation_prob:
+            tree = mutate(rng, tree, n_vars=n_vars, max_depth=cfg.max_tree_depth)
+        out.append(tree)
+    return out
+
+
+_EVAL_WORKER_CTX: EvolutionContext | None = None
+_EVAL_WORKER_CFG: EvolutionConfig | None = None
 
 
 def subspace_rmse(y_pred: np.ndarray, y_ref: np.ndarray) -> float:
@@ -171,6 +235,85 @@ def evaluate_individual(
     return ind
 
 
+def _copy_individual_eval(src: Individual, dst: Individual) -> None:
+    dst.fitness = src.fitness
+    dst.tier1_loss = src.tier1_loss
+    dst.subspace_rmse = src.subspace_rmse
+    dst.complexity = src.complexity
+    dst.calib_a = src.calib_a
+    dst.calib_b = src.calib_b
+    dst.tier1 = dict(src.tier1)
+    dst.tier1_rel_err = dict(src.tier1_rel_err)
+    dst.accepted = src.accepted
+
+
+def _eval_worker_init(
+    ctx: EvolutionContext,
+    cfg: EvolutionConfig,
+    omp_threads: int,
+) -> None:
+    global _EVAL_WORKER_CTX, _EVAL_WORKER_CFG
+    omp = str(max(1, int(omp_threads)))
+    os.environ["OMP_NUM_THREADS"] = omp
+    os.environ["MKL_NUM_THREADS"] = omp
+    os.environ["OPENBLAS_NUM_THREADS"] = omp
+    _EVAL_WORKER_CTX = ctx
+    _EVAL_WORKER_CFG = cfg
+
+
+def _eval_tree_worker(tree: Node) -> Individual:
+    if _EVAL_WORKER_CTX is None or _EVAL_WORKER_CFG is None:
+        raise RuntimeError("eval worker not initialized")
+    return evaluate_individual(Individual(tree=tree), _EVAL_WORKER_CTX, _EVAL_WORKER_CFG)
+
+
+def _evaluate_population(
+    individuals: list[Individual],
+    ctx: EvolutionContext,
+    cfg: EvolutionConfig,
+    *,
+    progress_label: str | None = None,
+) -> None:
+    if not individuals:
+        return
+    n = len(individuals)
+    workers = max(1, int(cfg.eval_workers))
+    log_step = max(1, n // 5)
+
+    if workers == 1:
+        for i, ind in enumerate(individuals):
+            evaluate_individual(ind, ctx, cfg)
+            if progress_label and (i + 1) % log_step == 0:
+                logger.info("  %s %d/%d", progress_label, i + 1, n)
+        return
+
+    workers = min(workers, n)
+    omp_threads = max(1, int(os.environ.get("OMP_NUM_THREADS", "1")))
+    logger.info(
+        "Evaluating %d individuals with ProcessPoolExecutor "
+        "(max_workers=%d, OMP=%d/worker)",
+        n,
+        workers,
+        omp_threads,
+    )
+    mp_ctx = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=mp_ctx,
+        initializer=_eval_worker_init,
+        initargs=(ctx, cfg, omp_threads),
+    ) as pool:
+        results = pool.map(
+            _eval_tree_worker,
+            [ind.tree for ind in individuals],
+            chunksize=max(1, n // (workers * 4)),
+        )
+    for ind, ev in zip(individuals, results):
+        _copy_individual_eval(ev, ind)
+    if progress_label:
+        logger.info("  %s %d/%d", progress_label, n, n)
+
+
 def _tournament_select(rng: random.Random, pop: list[Individual], k: int) -> Individual:
     contenders = rng.sample(pop, k=min(k, len(pop)))
     return min(contenders, key=lambda x: x.fitness)
@@ -178,11 +321,12 @@ def _tournament_select(rng: random.Random, pop: list[Individual], k: int) -> Ind
 
 def _init_population(rng: random.Random, ctx: EvolutionContext, cfg: EvolutionConfig) -> list[Individual]:
     pop: list[Individual] = []
+    init_depth = cfg.max_tree_depth if cfg.paper_mode else cfg.max_tree_depth - 1
     for _ in range(cfg.population):
         tree = random_tree(
             rng,
             n_vars=ctx.n_vars,
-            max_depth=cfg.max_tree_depth - 1,
+            max_depth=init_depth,
             paper_mode=cfg.paper_mode,
         )
         pop.append(Individual(tree=tree))
@@ -325,17 +469,29 @@ def run_evolution(
     cfg.linearity_penalty_gamma = float(
         ctx.metadata.get("linearity_penalty_gamma", cfg.linearity_penalty_gamma)
     )
+    cfg.eval_workers = int(ctx.metadata.get("eval_workers", cfg.eval_workers))
 
     _log_event(
         events_path,
         {
             "event": "start",
             "paper_mode": cfg.paper_mode,
+            "gp_seed": cfg.seed,
+            "gp_seed_source": ctx.metadata.get("gp_seed_source"),
+            "sample_seed": ctx.sample_seed,
             "fitness_features": list(ctx.fitness_feature_names),
             "population": cfg.population,
             "generations": cfg.generations,
             "seed": cfg.seed,
             "n_dense": ctx.n_dense,
+            "eval_workers": cfg.eval_workers,
+            "tournament_k": cfg.tournament_k,
+            "crossover_prob": cfg.crossover_prob,
+            "mutation_prob": cfg.mutation_prob,
+            "direct_transfer_prob": cfg.direct_transfer_prob,
+            "elitism": _elitism_count(cfg),
+            "max_tree_depth": cfg.max_tree_depth,
+            "fitness_stop_threshold": cfg.fitness_stop_threshold,
             "subspace_rmse_threshold": ctx.subspace_rmse_threshold,
         },
     )
@@ -349,10 +505,7 @@ def run_evolution(
         landscape_cache = LandscapePlotCache.build(ctx, grid_n=cfg.landscape_grid_n)
 
     logger.info("Evaluating initial population (%d)", len(pop))
-    for i, ind in enumerate(pop):
-        evaluate_individual(ind, ctx, cfg)
-        if (i + 1) % max(1, len(pop) // 5) == 0:
-            logger.info("  init eval %d/%d", i + 1, len(pop))
+    _evaluate_population(pop, ctx, cfg, progress_label="init eval")
 
     pop.sort(key=lambda x: x.fitness)
     best = pop[0]
@@ -378,36 +531,21 @@ def run_evolution(
             _plot_generation_landscape(run_dir, 0, best, landscape_cache, cfg)
 
         for gen in range(1, cfg.generations + 1):
-            next_pop: list[Individual] = [copy.deepcopy(p) for p in pop[: cfg.elitism]]
+            next_pop: list[Individual] = [
+                copy.deepcopy(p) for p in pop[: _elitism_count(cfg)]
+            ]
+            new_children: list[Individual] = []
 
-            while len(next_pop) < cfg.population:
-                if rng.random() < cfg.crossover_prob:
-                    p1 = _tournament_select(rng, pop, cfg.tournament_k)
-                    p2 = _tournament_select(rng, pop, cfg.tournament_k)
-                    c1, c2 = crossover(
-                        rng,
-                        p1.tree,
-                        p2.tree,
-                        max_depth=cfg.max_tree_depth,
-                    )
-                    child_trees = [c1, c2]
-                else:
-                    parent = _tournament_select(rng, pop, cfg.tournament_k)
-                    child_trees = [parent.tree]
-
-                for tree in child_trees:
-                    if len(next_pop) >= cfg.population:
+            while len(next_pop) + len(new_children) < cfg.population:
+                for tree in _spawn_offspring_trees(
+                    rng, pop, cfg, n_vars=ctx.n_vars
+                ):
+                    if len(next_pop) + len(new_children) >= cfg.population:
                         break
-                    if rng.random() < cfg.mutation_prob:
-                        tree = mutate(
-                            rng,
-                            tree,
-                            n_vars=ctx.n_vars,
-                            max_depth=cfg.max_tree_depth,
-                        )
-                    child = Individual(tree=tree)
-                    evaluate_individual(child, ctx, cfg)
-                    next_pop.append(child)
+                    new_children.append(Individual(tree=tree))
+
+            _evaluate_population(new_children, ctx, cfg)
+            next_pop.extend(new_children)
 
             pop = sorted(next_pop, key=lambda x: x.fitness)
             best = pop[0]
@@ -446,6 +584,18 @@ def run_evolution(
                 best.complexity,
                 best.accepted,
             )
+
+            if (
+                cfg.fitness_stop_threshold > 0
+                and best.tier1_loss < cfg.fitness_stop_threshold
+            ):
+                logger.info(
+                    "Early stop at gen %d: tier1_loss %.6f < %.6f",
+                    gen,
+                    best.tier1_loss,
+                    cfg.fitness_stop_threshold,
+                )
+                break
 
     _finalize_best(run_dir, best, ctx, cfg)
     if cfg.landscape_viz:

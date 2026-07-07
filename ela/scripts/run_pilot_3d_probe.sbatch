@@ -1,6 +1,15 @@
 #!/bin/bash
 # =============================================================================
-# ela/scripts/run_pilot_3d_probe.sbatch — alias for slurm/run_pilot_3d_probe.sbatch
+# ela/scripts/run_pilot_3d_probe.sbatch — cluster smoke test (~5 min)
+# =============================================================================
+#
+# Submit from repo root:
+#
+#   cd ~/orcd/scratch/ZoMBI-Hop
+#   sbatch ela/scripts/run_pilot_3d_probe.sbatch
+#
+# Or:
+#   bash ela/scripts/submit_pilot_3d.sh probe
 # =============================================================================
 
 #SBATCH --job-name=ela_3d_probe
@@ -18,11 +27,9 @@ REPO="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "${REPO}"
 
 # shellcheck source=/dev/null
-source "${REPO}/slurm/mobo_job_common.sh"
-_mobo_setup_env
-# shellcheck source=/dev/null
-source "${REPO}/slurm/pilot_job_common.sh"
-_pilot_setup_dirs
+source "${REPO}/ela/scripts/pilot_job_common.sh"
+PILOT_EVAL_WORKERS="${PILOT_EVAL_WORKERS:-2}"
+_pilot_setup_env
 _pilot_check_data
 
 RUN_DIR="$(_pilot_run_dir_slurm)"
@@ -34,9 +41,9 @@ PILOT_CMD=(
   --early-reject-mult 0
   --no-landscape-viz
   --out-dir "${RUN_DIR}"
-  --seed 0
   --population 12
   --generations 4
+  --eval-workers "${PILOT_EVAL_WORKERS}"
 )
 
 echo "=== Pilot probe ==="

@@ -1,23 +1,40 @@
 #!/bin/bash
 # =============================================================================
-# ela/scripts/run_pilot_3d.sbatch — alias for slurm/run_pilot_3d.sbatch
+# ela/scripts/run_pilot_3d.sbatch — Muñoz S1 3D GP landscape recreation
 # =============================================================================
 #
-# Canonical script: slurm/run_pilot_3d.sbatch
-# Kept so older docs / muscle memory still work:
+# Submit from repo root on ORCD / Engaging:
+#
+#   cd ~/orcd/scratch/ZoMBI-Hop
 #   sbatch ela/scripts/run_pilot_3d.sbatch
 #
-# Prefer:
-#   sbatch slurm/run_pilot_3d.sbatch
+# Or:
 #   bash ela/scripts/submit_pilot_3d.sh
+#
+# Paper mode (default): ELA-only fitness on raw g(z), Muñoz 8 features, RF λ_T.
+# Campaign-twin (RMSE anchor + calibration):
+#   PILOT_CAMPAIGN_MODE=1 sbatch ela/scripts/run_pilot_3d.sbatch
+# Fixed GP seed (optional — default is SLURM_JOB_ID on cluster, random locally):
+#   PILOT_SEED=42 sbatch ela/scripts/run_pilot_3d.sbatch
+#
+# Probe smoke test (~5 min):
+#   sbatch ela/scripts/run_pilot_3d_probe.sbatch
+#
+# Prerequisites:
+#   data/2nd_real_run.db, data/2nd_real_run_ela_full.json
+#   conda env zombi-hop-linebo (slurm/mobo_job_common.sh)
+#
+# Outputs:
+#   ela/runs/ela_3d_<JOBID>/
+#   ela/scripts/logs/ela_3d_<JOBID>.{out,err}
 # =============================================================================
 
 #SBATCH --job-name=ela_3d
 #SBATCH --output=ela/scripts/logs/ela_3d_%j.out
 #SBATCH --error=ela/scripts/logs/ela_3d_%j.err
 #SBATCH --partition=mit_normal
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=128G
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 
@@ -27,15 +44,11 @@ REPO="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "${REPO}"
 
 # shellcheck source=/dev/null
-source "${REPO}/slurm/mobo_job_common.sh"
-_mobo_setup_env
-# shellcheck source=/dev/null
-source "${REPO}/slurm/pilot_job_common.sh"
-_pilot_setup_dirs
+source "${REPO}/ela/scripts/pilot_job_common.sh"
+_pilot_setup_env
 _pilot_check_data
 
-PILOT_SEED="${PILOT_SEED:-0}"
-PILOT_POPULATION="${PILOT_POPULATION:-200}"
+PILOT_POPULATION="${PILOT_POPULATION:-400}"
 PILOT_GENERATIONS="${PILOT_GENERATIONS:-100}"
 PILOT_DB="${PILOT_DB:-data/2nd_real_run.db}"
 PILOT_TARGET="${PILOT_TARGET:-data/2nd_real_run_ela_full.json}"
@@ -49,7 +62,6 @@ PILOT_CMD=(
   --db "${PILOT_DB}"
   --target "${PILOT_TARGET}"
   --out-dir "${RUN_DIR}"
-  --seed "${PILOT_SEED}"
   --population "${PILOT_POPULATION}"
   --generations "${PILOT_GENERATIONS}"
   --landscape-every "${PILOT_LANDSCAPE_EVERY}"
@@ -59,6 +71,8 @@ PILOT_CMD=(
 
 _pilot_append_mode_flags PILOT_CMD
 _pilot_append_viz_flags PILOT_CMD
+_pilot_append_worker_flags PILOT_CMD
+_pilot_append_seed_flags PILOT_CMD
 
 echo "=== ELA S1 pilot 3D ==="
 if [[ "${PILOT_CAMPAIGN_MODE:-0}" == "1" ]]; then
@@ -73,6 +87,13 @@ echo "hostname:   $(hostname)"
 echo "repo:       ${REPO}"
 echo "run_dir:    ${RUN_DIR}"
 echo "cpus/task:  ${SLURM_CPUS_PER_TASK:-?}"
+echo "eval_workers: ${PILOT_EVAL_WORKERS}"
+echo "omp/worker: ${OMP_NUM_THREADS}"
+if [[ -v PILOT_SEED ]]; then
+  echo "gp_seed:    ${PILOT_SEED} (fixed via PILOT_SEED)"
+else
+  echo "gp_seed:    auto (SLURM_JOB_ID=${SLURM_JOB_ID})"
+fi
 echo ""
 printf '  %q' "${PILOT_CMD[@]}"
 echo

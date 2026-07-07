@@ -10,16 +10,18 @@
 #   bash ela/scripts/submit_pilot_3d.sh probe
 #   bash ela/scripts/submit_pilot_3d.sh array
 #
-# Or submit directly (same style as MOBO ensemble jobs):
-#   sbatch slurm/run_pilot_3d.sbatch
-#   sbatch slurm/run_pilot_3d_probe.sbatch
-#   sbatch slurm/run_pilot_3d_array.sbatch
+# Or submit directly:
+#   sbatch ela/scripts/run_pilot_3d.sbatch
+#   sbatch ela/scripts/run_pilot_3d_probe.sbatch
+#   sbatch ela/scripts/run_pilot_3d_array.sbatch
 #
 # Paper mode (default): Muñoz S1, ELA-only on raw g(z), RF λ_T target.
 # Campaign-twin: PILOT_CAMPAIGN_MODE=1 bash ela/scripts/submit_pilot_3d.sh
 #
 # Environment overrides:
-#   PILOT_SEED=0  PILOT_POPULATION=200  PILOT_GENERATIONS=100
+#   PILOT_POPULATION=400  PILOT_GENERATIONS=100
+#   (omit PILOT_SEED for auto: SLURM_JOB_ID on cluster, os_random locally)
+#   PILOT_EVAL_WORKERS=16  PILOT_OMP_THREADS=4  (auto: cpus/workers → 64/16=4)
 #   PILOT_CAMPAIGN_MODE=1  PILOT_ALPHA=3  PILOT_TIER1_GAMMA=5
 #   PILOT_QUICK=1  PILOT_NO_LANDSCAPE_VIZ=1  PILOT_NO_VIZ=1
 #   PILOT_RUN_ROOT=...   (default: ${REPO}/ela/runs)
@@ -29,21 +31,22 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MODE="${1:-single}"
-SLURM_DIR="${REPO}/slurm"
+SCRIPTS="${REPO}/ela/scripts"
 
 cd "${REPO}"
-mkdir -p "${REPO}/ela/scripts/logs" "${REPO}/ela/runs"
+mkdir -p "${SCRIPTS}/logs" "${REPO}/ela/runs"
 
 # shellcheck source=/dev/null
-source "${SLURM_DIR}/pilot_job_common.sh"
+source "${SCRIPTS}/pilot_job_common.sh"
 export REPO
+_pilot_configure_parallelism
 _pilot_setup_dirs
 _pilot_check_data
 
 PARTITION="${PILOT_PARTITION:-mit_normal}"
 TIME_LIMIT="${PILOT_TIME:-12:00:00}"
-CPUS="${PILOT_CPUS:-32}"
-MEM="${PILOT_MEM:-64G}"
+CPUS="${PILOT_CPUS:-64}"
+MEM="${PILOT_MEM:-128G}"
 
 sbatch_common=(
   --partition="${PARTITION}"
@@ -53,15 +56,15 @@ sbatch_common=(
 
 case "${MODE}" in
   single|"")
-    SBATCH="${SLURM_DIR}/run_pilot_3d.sbatch"
+    SBATCH="${SCRIPTS}/run_pilot_3d.sbatch"
     sbatch_common+=(--time="${TIME_LIMIT}" --job-name=ela_3d)
     ;;
   probe)
-    SBATCH="${SLURM_DIR}/run_pilot_3d_probe.sbatch"
+    SBATCH="${SCRIPTS}/run_pilot_3d_probe.sbatch"
     sbatch_common+=(--time=00:30:00 --job-name=ela_3d_probe --cpus-per-task=4 --mem=16G)
     ;;
   array)
-    SBATCH="${SLURM_DIR}/run_pilot_3d_array.sbatch"
+    SBATCH="${SCRIPTS}/run_pilot_3d_array.sbatch"
     sbatch_common+=(--time="${TIME_LIMIT}" --job-name=ela_3d_arr)
     if [[ -n "${PILOT_ARRAY:-}" ]]; then
       sbatch_common+=(--array="${PILOT_ARRAY}")
@@ -79,6 +82,7 @@ if [[ "${PILOT_CAMPAIGN_MODE:-0}" == "1" ]]; then
 else
   echo "  mode: paper (Muñoz S1)"
 fi
+echo "  eval_workers: ${PILOT_EVAL_WORKERS} (OMP=${OMP_NUM_THREADS}/worker)"
 echo "  sbatch: ${SBATCH}"
 
 job_id=$(sbatch --export=ALL "${sbatch_common[@]}" "${SBATCH}" | awk '{print $NF}')
