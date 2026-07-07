@@ -57,6 +57,12 @@ trap on_time_limit USR1
 # correct. Keep the `mobo_` prefix so shared-history's `mobo_*` glob still sees it.
 RUN_DIR="optimize/runs/mobo_ensemble_4d_job${SLURM_JOB_ID}"
 
+# Randomize the ensemble landscape per job, but keep it STABLE across a requeue.
+ENSEMBLE_SEED=$(( SLURM_JOB_ID % 2147483647 ))
+
+# Seed with archived trial_112 plus 3 best dist_to_needles trials (matches
+# optimize/scripts/ensemble_mobo_4d.sbatch; own runs relative, collaborator
+# under /home/adewinmb/.../scratch).
 MOBO_CMD=(
   python optimize/run_mobo.py
   --no-show
@@ -64,7 +70,12 @@ MOBO_CMD=(
   --dim 4
   --time-limit 0.3
   --share-history
-  --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112
+  --ensemble-seed "${ENSEMBLE_SEED}"
+  --start-from-best
+  optimize/runs/archived_runs/mobo_3d_05_06_15_32/trial_112
+  optimize/runs/archived_runs/mobo_ensemble_4d_job16861904/trial_3
+  /home/adewinmb/orcd/scratch/ZoMBI-Hop/optimize/runs/archived_runs/mobo_ensemble_4d_job16948639/trial_33
+  /home/adewinmb/orcd/scratch/ZoMBI-Hop/optimize/runs/archived_runs/mobo_ensemble_4d_job16948639/trial_19
   --run-dir "${RUN_DIR}"
 )
 

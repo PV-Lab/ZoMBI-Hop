@@ -205,6 +205,7 @@ _mobo_setup_env
 # =============================================================================
 
 RUN_DIR="optimize/runs/mobo_ensemble_3d_job${SLURM_JOB_ID}"
+ENSEMBLE_SEED=$(( SLURM_JOB_ID % 2147483647 ))
 
 MOBO_CMD=(
   python optimize/run_mobo.py
@@ -213,7 +214,12 @@ MOBO_CMD=(
   --dim 3
   --time-limit 0.2
   --share-history
-  --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112
+  --ensemble-seed "${ENSEMBLE_SEED}"
+  --start-from-best
+  optimize/runs/archived_runs/mobo_3d_05_06_15_32/trial_112
+  /home/adewinmb/orcd/scratch/ZoMBI-Hop/optimize/runs/archived_runs/mobo_ensemble_3d_job16948629/trial_33
+  optimize/runs/archived_runs/mobo_ensemble_3d_job16861902/trial_49
+  optimize/runs/archived_runs/mobo_ensemble_3d_job16954340/trial_63
   --run-dir "${RUN_DIR}"
 )
 # =============================================================================

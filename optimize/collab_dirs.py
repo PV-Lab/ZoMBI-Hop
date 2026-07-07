@@ -19,7 +19,7 @@ sync_runs.py can import it on machines that lack the heavy MOBO stack.
 from __future__ import annotations
 
 # Whether to include collaborators' dirs at all (vs. only the current user's own).
-SHARE_COLLABORATOR_HISTORY = False
+SHARE_COLLABORATOR_HISTORY = True
 
 # One runs dir per collaborating user, in preference order (this account's own dir
 # first, since run_mobo/sync operate as that user). The paths are login-node /home

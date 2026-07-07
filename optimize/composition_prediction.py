@@ -253,7 +253,7 @@ def est_composition(times,flows,junction_volume,diffusion_factor,drop_time,flow_
                 if verbose: 
                     ax.plot(x_vals,line,label=f"Module {j}") 
                 # integrate for the total volume 
-                volume = np.trapz(line, x_vals) 
+                volume = np.trapezoid(line, x_vals)
                 volumes.append(volume) 
             volumes_arr = np.array(volumes)
             total_volume = np.sum(volumes_arr) # Volume added by all ten modules during the diluted and new droplet volumes
@@ -306,7 +306,7 @@ def est_composition(times,flows,junction_volume,diffusion_factor,drop_time,flow_
                 if verbose: 
                     ax.plot(x_vals,line,label=f"Module {j}") 
                 # integrate for the total volume 
-                volume = np.trapz(line, x_vals) 
+                volume = np.trapezoid(line, x_vals)
                 volumes.append(volume) 
             volumes_arr = np.array(volumes)
             total_volume = np.sum(volumes_arr) # Volume added by all ten modules during the diluted and new droplet volumes

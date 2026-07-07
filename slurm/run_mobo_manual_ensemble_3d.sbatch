@@ -57,6 +57,16 @@ trap on_time_limit USR1
 # correct. Keep the `mobo_` prefix so shared-history's `mobo_*` glob still sees it.
 RUN_DIR="optimize/runs/mobo_ensemble_3d_job${SLURM_JOB_ID}"
 
+# Randomize the ensemble landscape per job, but keep it STABLE across a requeue.
+# Keying the seed on SLURM_JOB_ID (like RUN_DIR above) means a `scontrol requeue`
+# — same job id — rebuilds the identical landscape so the resumed trials still
+# match, while every fresh sbatch / clean-exit resubmit gets a new id and thus a
+# new landscape. Modulo keeps it in the int32 range NumPy's RandomState accepts.
+ENSEMBLE_SEED=$(( SLURM_JOB_ID % 2147483647 ))
+
+# Seed with archived trial_112 plus 3 best dist_to_needles trials (matches
+# optimize/scripts/ensemble_mobo_3d.sbatch; own runs relative, collaborator
+# under /home/adewinmb/.../scratch).
 MOBO_CMD=(
   python optimize/run_mobo.py
   --no-show
@@ -64,7 +74,12 @@ MOBO_CMD=(
   --dim 3
   --time-limit 0.2
   --share-history
-  --start-from-best optimize/runs/mobo_3d_05_06_15_32/trial_112
+  --ensemble-seed "${ENSEMBLE_SEED}"
+  --start-from-best
+  optimize/runs/archived_runs/mobo_3d_05_06_15_32/trial_112
+  /home/adewinmb/orcd/scratch/ZoMBI-Hop/optimize/runs/archived_runs/mobo_ensemble_3d_job16948629/trial_33
+  optimize/runs/archived_runs/mobo_ensemble_3d_job16861902/trial_49
+  optimize/runs/archived_runs/mobo_ensemble_3d_job16954340/trial_63
   --run-dir "${RUN_DIR}"
 )
 
