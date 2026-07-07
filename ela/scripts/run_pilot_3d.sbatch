@@ -17,26 +17,38 @@
 #
 # Outputs:
 #   ela/runs/pilot_3d_seed<SEED>_job<JOBID>/
-#   ela/scripts/logs/pilot_3d_<JOBID>.{out,err}
+#   ela/scripts/logs/pilot_3d_s1_<JOBID>.{out,err}
 # =============================================================================
 
-#SBATCH --job-name=pilot_3d_s1
-#SBATCH --output=ela/scripts/logs/pilot_3d_%j.out
-#SBATCH --error=ela/scripts/logs/pilot_3d_%j.err
+#SBATCH --job-name=ela_3d
+#SBATCH --output=ela/scripts/logs/pilot_3d_s1_%j.out
+#SBATCH --error=ela/scripts/logs/pilot_3d_s1_%j.err
 #SBATCH --partition=mit_normal
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=32G
-#SBATCH --time=08:00:00
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=64G
+#SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=/dev/null
-source "${SCRIPT_DIR}/pilot_job_common.sh"
-REPO="$(_pilot_resolve_repo "${SCRIPT_DIR}")"
+REPO="${SLURM_SUBMIT_DIR:-}"
+_search="${REPO}"
+while [[ -n "${_search}" && "${_search}" != "/" ]]; do
+  if [[ -f "${_search}/ela/scripts/pilot_job_common.sh" ]]; then
+    REPO="${_search}"
+    break
+  fi
+  _search="$(dirname "${_search}")"
+done
+if [[ ! -f "${REPO}/ela/scripts/pilot_job_common.sh" ]]; then
+  echo "FATAL: repo not found from SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-}" >&2
+  exit 1
+fi
 cd "${REPO}"
+# shellcheck source=/dev/null
+source "${REPO}/ela/scripts/pilot_job_common.sh"
 _pilot_setup_env
+_pilot_check_data
 
 PILOT_SEED="${PILOT_SEED:-0}"
 PILOT_POPULATION="${PILOT_POPULATION:-150}"
@@ -46,7 +58,8 @@ PILOT_ALPHA="${PILOT_ALPHA:-2}"
 PILOT_DB="${PILOT_DB:-data/2nd_real_run.db}"
 PILOT_TARGET="${PILOT_TARGET:-data/2nd_real_run_ela_full.json}"
 PILOT_LANDSCAPE_EVERY="${PILOT_LANDSCAPE_EVERY:-1}"
-RUN_DIR="${PILOT_RUN_ROOT}/pilot_3d_seed${PILOT_SEED}_job${SLURM_JOB_ID}"
+RUN_DIR="$(_pilot_run_dir_slurm "${PILOT_SEED}" "${PILOT_QUICK:-0}")"
+mkdir -p "${RUN_DIR}"
 
 PILOT_CMD=(
   python ela/run_pilot_3d.py

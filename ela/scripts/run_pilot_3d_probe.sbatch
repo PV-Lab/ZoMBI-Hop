@@ -3,7 +3,10 @@
 # ela/scripts/run_pilot_3d_probe.sbatch — cluster smoke test (~5 min)
 # =============================================================================
 #
-#   bash ela/scripts/submit_pilot_3d.sh probe
+#   cd ~/orcd/scratch/ZoMBI-Hop
+#   sbatch ela/scripts/run_pilot_3d_probe.sbatch
+#
+# IMPORTANT: sbatch must be run from the repo root (SLURM_SUBMIT_DIR).
 # =============================================================================
 
 #SBATCH --job-name=pilot_3d_probe
@@ -17,14 +20,29 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=/dev/null
-source "${SCRIPT_DIR}/pilot_job_common.sh"
-REPO="$(_pilot_resolve_repo "${SCRIPT_DIR}")"
+# Slurm executes a copy under /var/spool/slurmd/ — never use BASH_SOURCE for paths.
+REPO="${SLURM_SUBMIT_DIR:-}"
+_search="${REPO}"
+while [[ -n "${_search}" && "${_search}" != "/" ]]; do
+  if [[ -f "${_search}/ela/scripts/pilot_job_common.sh" ]]; then
+    REPO="${_search}"
+    break
+  fi
+  _search="$(dirname "${_search}")"
+done
+if [[ ! -f "${REPO}/ela/scripts/pilot_job_common.sh" ]]; then
+  echo "FATAL: repo not found from SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-}" >&2
+  echo "  cd ~/orcd/scratch/ZoMBI-Hop && sbatch ela/scripts/run_pilot_3d_probe.sbatch" >&2
+  exit 1
+fi
 cd "${REPO}"
+# shellcheck source=/dev/null
+source "${REPO}/ela/scripts/pilot_job_common.sh"
 _pilot_setup_env
+_pilot_check_data
 
-RUN_DIR="${PILOT_RUN_ROOT}/pilot_3d_probe_job${SLURM_JOB_ID}"
+RUN_DIR="$(_pilot_run_dir_slurm 0 1)"
+mkdir -p "${RUN_DIR}"
 
 {
   echo "=== Pilot probe ==="
@@ -33,8 +51,6 @@ RUN_DIR="${PILOT_RUN_ROOT}/pilot_3d_probe_job${SLURM_JOB_ID}"
   echo "hostname: $(hostname)"
   echo "python:   $(which python)"
   python -c "import sklearn, scipy, numpy; print('numpy', numpy.__version__, 'sklearn', sklearn.__version__)"
-  test -f "${REPO}/data/2nd_real_run.db" && echo "db: OK" || echo "db: MISSING"
-  test -f "${REPO}/data/2nd_real_run_ela_full.json" && echo "target: OK" || echo "target: MISSING"
   echo ""
 } | tee "${RUN_DIR}.probe.log"
 

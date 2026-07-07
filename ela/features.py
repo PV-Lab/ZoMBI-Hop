@@ -100,13 +100,31 @@ def load_campaign_rows(
     objective_column: str = DEFAULT_OBJECTIVE,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Load measured compositions and objective from a results DB."""
+    db_path = Path(db_path)
     comp_cols = comp_cols or list(DB_COMP_COLS)
     cols = comp_cols + [objective_column]
     con = sqlite3.connect(str(db_path))
     try:
         sel = ", ".join(f'"{c}"' for c in cols)
         where = " AND ".join(f'"{c}" IS NOT NULL' for c in cols)
-        rows = con.execute(f"SELECT {sel} FROM results WHERE {where}").fetchall()
+        try:
+            rows = con.execute(f"SELECT {sel} FROM results WHERE {where}").fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            tables = [
+                r[0]
+                for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY 1"
+                ).fetchall()
+            ]
+            raise RuntimeError(
+                f"{db_path.resolve()} has no 'results' table (found: {tables or 'none'}; "
+                f"size={db_path.stat().st_size} bytes). "
+                "data/ is gitignored — copy the real ~5.5 MB campaign DB from your workstation:\n"
+                "  rsync -av --progress data/2nd_real_run.db "
+                "eve_lal@login007:~/orcd/scratch/ZoMBI-Hop/data/"
+            ) from exc
     finally:
         con.close()
     arr = np.asarray(rows, dtype=float)

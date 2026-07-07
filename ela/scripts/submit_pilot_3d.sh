@@ -25,6 +25,10 @@ SCRIPTS="${REPO}/ela/scripts"
 cd "${REPO}"
 mkdir -p "${SCRIPTS}/logs" "${REPO}/ela/runs"
 
+# shellcheck source=/dev/null
+source "${SCRIPTS}/pilot_job_common.sh"
+_pilot_check_data
+
 PARTITION="${PILOT_PARTITION:-mit_normal}"
 TIME_LIMIT="${PILOT_TIME:-08:00:00}"
 CPUS="${PILOT_CPUS:-16}"
@@ -61,5 +65,5 @@ echo "  sbatch: ${SBATCH}"
 job_id=$(sbatch --export=ALL "${sbatch_common[@]}" "${SBATCH}" | awk '{print $NF}')
 echo "Submitted job ${job_id}"
 echo "  logs: ${SCRIPTS}/logs/"
-echo "  runs: ${PILOT_RUN_ROOT:-${REPO}/ela/runs}/"
+echo "  runs: ${PILOT_RUN_ROOT:-${REPO}/ela/runs}/pilot_3d_seed*_job*"
 echo "  squeue -j ${job_id}"

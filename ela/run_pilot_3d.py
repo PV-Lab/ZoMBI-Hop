@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -14,11 +13,12 @@ if str(ROOT) not in sys.path:
 
 from ela.evolve import EvolutionConfig, run_evolution
 from ela.evolve_context import build_context
+from ela.run_naming import default_runs_root, pilot_prefix, unique_run_dir
 from ela.visualize_pilot_3d import visualize_run
 
 DEFAULT_DB = ROOT / "data" / "2nd_real_run.db"
 DEFAULT_TARGET = ROOT / "data" / "2nd_real_run_ela_full.json"
-DEFAULT_RUNS = ROOT / "ela" / "runs"
+DEFAULT_RUNS = default_runs_root(ROOT)
 
 
 def _configure_logging(level: str, log_file: Path | None) -> None:
@@ -42,7 +42,13 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_TARGET,
         help="Tier-1 target JSON (ela_full output)",
     )
-    parser.add_argument("--out-dir", type=Path, default=None, help="Run output directory")
+    parser.add_argument(
+        "--runs-dir",
+        type=Path,
+        default=DEFAULT_RUNS,
+        help="Parent directory for auto-named runs (default: ela/runs)",
+    )
+    parser.add_argument("--out-dir", type=Path, default=None, help="Explicit run directory (Slurm: use this)")
     parser.add_argument("--population", type=int, default=None)
     parser.add_argument("--generations", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
@@ -89,10 +95,12 @@ def main(argv: list[str] | None = None) -> int:
         snapshot_every = args.snapshot_every
         early_reject_mult = 0.0
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    run_dir = args.out_dir or (DEFAULT_RUNS / f"pilot_3d_{stamp}")
-    run_dir = run_dir.resolve()
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if args.out_dir is not None:
+        run_dir = args.out_dir.resolve()
+        run_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        prefix = pilot_prefix(seed=args.seed, quick=args.quick)
+        run_dir = unique_run_dir(args.runs_dir.resolve(), prefix)
 
     _configure_logging(args.log_level, run_dir / "pilot.log")
 

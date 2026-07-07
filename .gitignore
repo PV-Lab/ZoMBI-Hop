@@ -8,6 +8,7 @@ hyperparameters/*
 htem/datasets/*
 llm/data/*
 llm/results/*
+ela/runs/*
 
 # UV artifacts
 .python-version
