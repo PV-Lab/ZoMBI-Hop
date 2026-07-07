@@ -226,13 +226,16 @@ def _flatten(comparison: dict) -> dict:
         "baseline_best_std": _ms(bstats, "best_objective", "std"),
         "baseline_needles_mean": _ms(bstats, "n_needles", "mean"),
         "baseline_dup_mean": _ms(bstats, "dup_fraction", "mean"),
+        "baseline_needle_spread_mean": _ms(bstats, "mean_pairwise_needle_dist", "mean"),
         "llm_best_mean": _ms(lstats, "best_objective", "mean"),
         "llm_best_std": _ms(lstats, "best_objective", "std"),
         "llm_needles_mean": _ms(lstats, "n_needles", "mean"),
         "llm_dup_mean": _ms(lstats, "dup_fraction", "mean"),
+        "llm_needle_spread_mean": _ms(lstats, "mean_pairwise_needle_dist", "mean"),
         "diff_best": diff.get("best_objective"),
         "diff_needles": diff.get("n_needles"),
         "diff_dup": diff.get("dup_fraction"),
+        "diff_needle_spread": diff.get("mean_pairwise_needle_dist"),
         "out_dir": comparison.get("out_dir"),
     }
 
@@ -287,10 +290,10 @@ def _write_summary(sweep_dir: Path, rows: list) -> None:
               "n_baseline_repeats", "n_llm_repeats",
               "model", "effort", "latency_s", "changed", "changes", "reasoning",
               "baseline_best_mean", "baseline_best_std", "baseline_needles_mean",
-              "baseline_dup_mean", "baseline_best_needle",
+              "baseline_dup_mean", "baseline_needle_spread_mean", "baseline_best_needle",
               "llm_best_mean", "llm_best_std", "llm_needles_mean", "llm_dup_mean",
-              "llm_best_needle",
-              "diff_best", "diff_needles", "diff_dup", "diff_best_needle",
+              "llm_needle_spread_mean", "llm_best_needle",
+              "diff_best", "diff_needles", "diff_dup", "diff_needle_spread", "diff_best_needle",
               "diff_best_p_value", "diff_best_ci95_low", "diff_best_ci95_high", "out_dir"]
     with open(sweep_dir / "sweep_summary.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")

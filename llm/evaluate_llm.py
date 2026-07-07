@@ -81,6 +81,7 @@ import torch  # noqa: E402
 import run_mobo as R  # noqa: E402  (heavy import: botorch/eval_metrics; see path hack above)
 from eval_metrics import (  # noqa: E402
     as_numpy,
+    metric_avg_pairwise_dist,
     metric_dist_to_needles,
     metric_dup_fraction,
 )
@@ -519,7 +520,8 @@ def _pareto_optimal_trials(trials: List[Dict[str, Any]]):
 
 def hparam_optimization_history(mobo_run_dir: Path = MOBO_RUN_DIR,
                                 max_trials: int = 1000,
-                                pareto_only: bool = True) -> str:
+                                pareto_only: bool = True,
+                                top_k: Optional[int] = None) -> str:
     """Full offline hyperparameter-search history as a compact markdown table.
 
     Reads every ``trial_*/trial.json`` under ``mobo_run_dir`` (each holds a tried
@@ -530,6 +532,11 @@ def hparam_optimization_history(mobo_run_dir: Path = MOBO_RUN_DIR,
     When ``pareto_only`` (default), only the Pareto-optimal trials over the three
     MINIMIZED objectives are shown; dominated trials are dropped and the count of
     survivors is reported in the header.
+
+    When ``top_k`` is set, the (Pareto-optimal) trials are further ranked by
+    ``dist_to_needles`` ascending (best needle-location first) and only the best
+    ``top_k`` are shown, in that ranked order — keeping the prompt from carrying a
+    long dense numeric dump (LLMs reason better over a short curated set).
     """
     trial_files = sorted(
         mobo_run_dir.glob("trial_*/trial.json"),
@@ -570,6 +577,21 @@ def hparam_optimization_history(mobo_run_dir: Path = MOBO_RUN_DIR,
             f"`runtime_s`/`avg_time_per_iter_s`); the dominated rest are "
             f"omitted{failed_note}.")
 
+    # Keep only the best ``top_k`` by dist_to_needles (ascending), ranked best-first.
+    topk_note = ""
+    if top_k is not None and len(trials) > top_k:
+        def _dist(t: Dict[str, Any]) -> float:
+            d = (t.get("metrics") or {}).get("dist_to_needles")
+            try:
+                d = float(d)
+            except (TypeError, ValueError):
+                return float("inf")
+            return d if np.isfinite(d) else float("inf")
+        n_before = len(trials)
+        trials = sorted(trials, key=_dist)[:top_k]
+        topk_note = (f" Showing the top {top_k} of {n_before} by lowest "
+                     f"`dist_to_needles` (ranked best-first).")
+
     header = ["trial"] + hp_order + list(_MOBO_METRIC_KEYS)
     lines = [" | ".join(header), " | ".join("---" for _ in header)]
 
@@ -587,6 +609,7 @@ def hparam_optimization_history(mobo_run_dir: Path = MOBO_RUN_DIR,
     table = "\n".join(lines)
     prefix = f"{len(trials)} offline trials shown."
     prefix += pareto_note
+    prefix += topk_note
     if truncated:
         prefix += f" ({max_trials} shown)"
     return f"{prefix}\n\n{table}"
@@ -833,6 +856,8 @@ def continue_run(ckpt_dir: str, fn_callable, ref_optima,
 
     dist = metric_dist_to_needles(discovered, ref_optima, dim=dim) if len(ref_optima) else float("nan")
     dup = metric_dup_fraction(X_all, dim=dim) if X_all.shape[0] else float("nan")
+    needle_spread = (metric_avg_pairwise_dist(discovered)
+                     if discovered.shape[0] >= 2 else float("nan"))
 
     # run_mobo-style artifacts.
     trial_dir.mkdir(parents=True, exist_ok=True)
@@ -864,6 +889,7 @@ def continue_run(ckpt_dir: str, fn_callable, ref_optima,
         "best_needle": best_needle,
         "dist_to_ref_optima": float(dist),
         "dup_fraction": float(dup),
+        "mean_pairwise_needle_dist": float(needle_spread),
         "Y_all_running_best": np.maximum.accumulate(Y_all).tolist() if Y_all.size else [],
         "ref_optima": [list(map(float, o)) for o in ref_optima],
     }
@@ -873,8 +899,9 @@ def continue_run(ckpt_dir: str, fn_callable, ref_optima,
 # Repeats: run one continuation in an isolated temp checkpoint dir
 # ════════════════════════════════════════════════════════════════════════════════
 
-# The four scalar metrics aggregated across repeats.
-_METRIC_KEYS = ["best_objective", "best_needle", "n_needles", "dist_to_ref_optima", "dup_fraction"]
+# The scalar metrics aggregated across repeats.
+_METRIC_KEYS = ["best_objective", "best_needle", "n_needles", "dist_to_ref_optima",
+                "dup_fraction", "mean_pairwise_needle_dist"]
 
 
 def one_continuation(snapshot_name: str, fn_callable, ref_optima,
@@ -925,6 +952,7 @@ def baseline_metrics(Xm: np.ndarray, Ym: np.ndarray, mapping: Dict[str, Any],
                    if needle_vals.size and np.isfinite(needle_vals).any() else float("nan"))
     dist = metric_dist_to_needles(disc, ref_optima, dim=3) if len(ref_optima) and len(disc) else float("nan")
     dup = metric_dup_fraction(Xm, dim=3) if Xm.shape[0] else float("nan")
+    needle_spread = metric_avg_pairwise_dist(disc) if len(disc) >= 2 else float("nan")
 
     return {
         "source": "campaign2_db_real",
@@ -937,6 +965,7 @@ def baseline_metrics(Xm: np.ndarray, Ym: np.ndarray, mapping: Dict[str, Any],
         "n_needles": int(disc.shape[0]),
         "dist_to_ref_optima": float(dist),
         "dup_fraction": float(dup),
+        "mean_pairwise_needle_dist": float(needle_spread),
         "running_best": running_best.tolist(),
     }
 

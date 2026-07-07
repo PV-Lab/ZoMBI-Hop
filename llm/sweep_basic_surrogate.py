@@ -47,7 +47,7 @@ stream — trajectories diverge only because of the LLM's hyperparameter edits.
 Output layout (each trial type is distinguishable by its directory title)
 ------------------------------------------------------------------------
     results/sweep_surrogate_<ts>/
-        baseline_trial112/rep0 … rep{N-1}/
+        baseline/rep0 … rep{N-1}/
         inject_every_01/rep0 … rep{N-1}/injections/inj_00 …
         inject_every_05/rep0 … rep{N-1}/…
         inject_every_10/rep0 … rep{N-1}/…
@@ -104,6 +104,7 @@ import llm_config  # noqa: E402
 import sweep_basic_no_surrogate as SW  # noqa: E402  (reuse welch_significance)
 from eval_metrics import (  # noqa: E402
     as_numpy,
+    metric_avg_pairwise_dist,
     metric_dist_to_needles,
     metric_dup_fraction,
 )
@@ -111,13 +112,78 @@ from src.core.zombihop import ZoMBIHop  # noqa: E402
 
 from surrogate import Surrogate, SUBTARGETS, ENV, KIN  # noqa: E402
 
-# Interpretable supplemental scalars shown to the LLM (no fPCA curve scores).
+# Interpretable supplemental scalars shown to the LLM. The measured CURVE groups
+# (absorption spectrum, dark/light stability voltage sweep, initial/final PL spectra)
+# are surfaced separately — see CURVE_MODE below — not lumped in here.
 SUP_SCALARS: List[str] = list(SUBTARGETS) + list(ENV) + list(KIN)
+
+# ── Curve (functional) feature rendering ────────────────────────────────────────
+# The generative surrogate compresses each measured curve group into a handful of
+# functional-PCA scores (see llm/surrogate.py); it never stores the raw curves.
+# There are two ways to surface those curves to the LLM, chosen by CURVE_MODE:
+#   "full"      — reconstruct the COMPLETE curve from its fPCA scores (via the
+#                 surrogate's FunctionalReconstructor) and print it on its native
+#                 grid (wavelength / voltage). No PCA numbers shown; token-heavy.
+#   "condensed" — show the fPCA scores themselves as extra scalar table columns (the
+#                 compact PCA representation). Used by sweep_basic_surrogate_condensed.
+# sweep_volume_control reuses these renderers, so it inherits whatever CURVE_MODE is
+# set process-wide (default "full"). The no-features ablation withholds all of it.
+CURVE_MODE: str = "full"
+
+# curve group key (surrogate reconstructor key) -> (human label, grid unit).
+_CURVE_GROUP_LABELS: Dict[str, Tuple[str, str]] = {
+    "absorption":      ("absorption spectrum",     "nm"),
+    "stability_dark":  ("stability sweep (dark)",  "V"),
+    "stability_light": ("stability sweep (light)", "V"),
+    "PL_initial":      ("PL spectrum (initial)",   "nm"),
+    "PL_final":        ("PL spectrum (final)",     "nm"),
+}
+
+# Populated from the shared surrogate on the first make_surrogate_objective() call.
+_CURVE_META: Optional[List[Dict[str, Any]]] = None   # per-group reconstruction info
+_FPCA_SCORE_NAMES: List[str] = []                     # flat list of fPCA score names
+
+
+def _init_curve_meta(surr) -> None:
+    """Cache each curve group's reconstruction metadata (fPCA score names, native
+    grid, reconstructor) and the flat list of fPCA score feature names, both derived
+    from the fitted surrogate. Idempotent; the surrogate is shared across all trials."""
+    global _CURVE_META, _FPCA_SCORE_NAMES
+    if _CURVE_META is not None:
+        return
+    meta: List[Dict[str, Any]] = []
+    for key, recon in surr.reconstructors.items():
+        label, unit = _CURVE_GROUP_LABELS.get(key, (key, ""))
+        meta.append({"key": key, "label": label, "unit": unit,
+                     "score_names": list(recon.score_names),
+                     "grid": np.asarray(recon.grid, float), "recon": recon})
+    _CURVE_META = meta
+    _FPCA_SCORE_NAMES = [nm for m in meta for nm in m["score_names"]]
+
+
+def _fpca_score_names() -> List[str]:
+    return list(_FPCA_SCORE_NAMES)
+
+
+def _table_scalar_names() -> List[str]:
+    """Feature names rendered as scalar table columns/rows. In ``condensed`` mode the
+    compact fPCA curve scores ride along as extra scalar columns; in ``full`` mode the
+    curves are shown as reconstructed-curve blocks instead, so only the physical
+    scalars appear in the scalar tables."""
+    if CURVE_MODE == "condensed":
+        return list(SUP_SCALARS) + _fpca_score_names()
+    return list(SUP_SCALARS)
+
 
 MAXIMIZE = True
 N_REF_OPTIMA = 3
 SIG_ALPHA = 0.05
-TOP_K_DROPLETS = 8  # how many top-Objective droplets to show with features
+TOP_K_DROPLETS = 16  # how many top-Objective droplets to show with features
+# How many offline MOBO hyperparameter-search trials to surface in the injection
+# prompt: the top-k Pareto-optimal trials by dist_to_needles (see
+# evaluate_llm.hparam_optimization_history). Keeps the prompt from carrying a long
+# dense numeric table — LLMs reason better over a short curated set (arXiv 2404.06290).
+MOBO_HISTORY_TOP_K = 16
 
 # Split the tunable hyperparameters the same way evaluate_llm does: config-read
 # ones are applied by rewriting the resumed run's config.json, the rest are passed
@@ -126,7 +192,7 @@ _CONFIG_READ = E._CONFIG_READ_HPARAMS
 _CONSTRUCTOR = E._CONSTRUCTOR_HPARAMS
 
 _METRIC_KEYS = ["best_objective", "best_needle", "n_needles",
-                "dist_to_ref_optima", "dup_fraction"]
+                "dist_to_ref_optima", "dup_fraction", "mean_pairwise_needle_dist"]
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -159,9 +225,14 @@ def make_surrogate_objective(surr: Surrogate, rng: np.random.Generator):
     the composition + interpretable supplemental scalars to ``feature_log`` so the
     injection prompt can report them. Draws come from ``rng`` (persistent across the
     whole trial → a reproducible but evolving noise stream)."""
+    _init_curve_meta(surr)
     oi = surr.obj_index
     t, it = surr.time_ref["max"], surr.iter_ref["max"]
-    name_idx = {nm: surr.feat_names.index(nm) for nm in ([surr.feat_names[oi]] + SUP_SCALARS)}
+    # Record the physical scalars AND the fPCA curve scores per droplet: the scores
+    # are what the "full" renderer reconstructs the curves from and what the
+    # "condensed" renderer prints directly.
+    record_names = list(SUP_SCALARS) + _fpca_score_names()
+    name_idx = {nm: surr.feat_names.index(nm) for nm in ([surr.feat_names[oi]] + record_names)}
     feature_log: List[Dict[str, Any]] = []
 
     def fn(x) -> float:
@@ -172,7 +243,7 @@ def make_surrogate_objective(surr: Surrogate, rng: np.random.Generator):
         row = (surr._cond_means(Z) + surr._draw_resid(1, rng)).ravel()
         rec: Dict[str, Any] = {"FAPbI3": comp[0], "MAPbI3": comp[1], "MAPbBr3": comp[2],
                                "Objective": float(row[oi])}
-        for nm in SUP_SCALARS:
+        for nm in record_names:
             rec[nm] = float(row[name_idx[nm]])
         feature_log.append(rec)
         return float(row[oi])
@@ -190,7 +261,7 @@ is optimizing a perovskite-materials-discovery lab over the 3-simplex compositio
 (`FAPbI3`, `MAPbI3`, `MAPbBr3`, summing to 1); the `Objective` is MAXIMIZED.
 ZoMBI-Hop is a zooming multi-basin optimizer that hunts MULTIPLE optima
 ("needles"): it fits a GP, uses an acquisition function each iteration to pick a
-LineBO line of ~24 measured droplets, declares a needle when expected improvement
+LineBO line of 24 measured droplets, declares a needle when expected improvement
 hits the output-noise floor, penalizes that region, and moves on.
 
 Unlike a normal run, every measured droplet here also reports the rich physical
@@ -224,15 +295,20 @@ This is injection #{injection_idx}. ZoMBI-Hop has completed {iters_done} of
 
 {progress_summary}
 
-Recent measured points (composition → Objective):
+## Change since the last injection
+
+{trend_summary}
+
+Recent measured points — the last 2 LineBO lines (up to 48 droplets), each shown
+with its composition, `Objective`, and supplemental features:
 
 {history_table}
 
 ## Supplemental measured features so far (GLOBAL, all {n_points} droplets)
 
-Beyond the composition and `Objective`, these interpretable per-droplet scalars
-were measured across all {n_points} droplets so far. Every number below is a
-GLOBAL statistic over ALL {n_points} droplets: the global mean, the global
+Beyond the composition and `Objective`, these per-droplet supplemental features
+were measured across all {n_points} droplets so far. Every number in the scalar
+table below is a GLOBAL statistic over ALL {n_points} droplets: the global mean, the global
 [min, max] range, and the global Pearson correlation of the feature with
 `Objective` (a positive corr means the feature tends to rise where the objective
 is high). Use these as the population baseline to compare the top-k and needle
@@ -278,6 +354,10 @@ over-exploiting (collapsing onto one needle)? Then answer through the schema:
 - `hyperparameter_changes`: a list of {{"name", "value"}} entries — ONLY the
   hyperparameters you want to change, each within its allowed range. Leave the
   list EMPTY if the current settings are already appropriate.
+
+Reason qualitatively about the trajectory's direction and the feature trade-offs
+rather than over-fitting to individual numeric rows; prefer a single well-justified
+change over many, and keep the current settings when the trend is already healthy.
 """
 
 
@@ -287,27 +367,86 @@ def _pearson(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(a, b)[0, 1])
 
 
+# ── reconstructed-curve rendering (CURVE_MODE == "full") ─────────────────────────
+
+def _fmt_grid(g: float) -> str:
+    """Compact grid label: integer wavelengths/voltages print without a decimal."""
+    return f"{int(round(g))}" if abs(g - round(g)) < 1e-6 else f"{g:.4g}"
+
+
+def _format_curve_line(grid: np.ndarray, values: np.ndarray, unit: str) -> str:
+    """One curve as ``x1unit=y1, x2unit=y2, …`` over its whole native grid."""
+    return ", ".join(f"{_fmt_grid(g)}{unit}={v:.3g}" for g, v in zip(grid, values))
+
+
+def _reconstruct_record_curve(rec: Dict[str, Any], m: Dict[str, Any]) -> Optional[np.ndarray]:
+    """Full curve for one droplet, reconstructed from its stored fPCA scores. None if
+    that curve group was not measured for this droplet (scores NaN)."""
+    scores = np.array([rec.get(nm, np.nan) for nm in m["score_names"]], float)
+    if not np.all(np.isfinite(scores)):
+        return None
+    return np.asarray(m["recon"].reconstruct(scores), float)
+
+
+def _droplet_curve_block(rec: Dict[str, Any], indent: str = "  ") -> str:
+    """Every measured curve for one droplet, each reconstructed onto its native grid.
+    Empty string unless CURVE_MODE == 'full' (condensed mode shows fPCA scores in the
+    scalar tables instead)."""
+    if CURVE_MODE != "full" or not _CURVE_META:
+        return ""
+    lines = []
+    for m in _CURVE_META:
+        vals = _reconstruct_record_curve(rec, m)
+        if vals is None:
+            continue
+        lines.append(f"{indent}{m['label']} ({len(m['grid'])} pts): "
+                     + _format_curve_line(m["grid"], vals, m["unit"]))
+    return "\n".join(lines)
+
+
+def _global_curve_block(feature_log: List[Dict[str, Any]]) -> str:
+    """Population mean curve per group over all droplets. Reconstruction is linear in
+    the fPCA scores, so the mean of the reconstructed curves equals the reconstruction
+    of the mean scores. Empty unless CURVE_MODE == 'full'."""
+    if CURVE_MODE != "full" or not _CURVE_META or not feature_log:
+        return ""
+    lines = []
+    for m in _CURVE_META:
+        S = np.array([[r.get(nm, np.nan) for nm in m["score_names"]] for r in feature_log], float)
+        ok = np.all(np.isfinite(S), axis=1)
+        if not ok.any():
+            continue
+        vals = np.asarray(m["recon"].reconstruct(S[ok].mean(0)), float)
+        lines.append(f"{m['label']} — global mean curve over {int(ok.sum())} droplets "
+                     f"({len(m['grid'])} pts): " + _format_curve_line(m["grid"], vals, m["unit"]))
+    return "\n".join(lines)
+
+
 def supplemental_summary(feature_log: List[Dict[str, Any]]) -> str:
     if not feature_log:
         return "(no measured points yet)"
     obj = np.array([r["Objective"] for r in feature_log], float)
     lines = ["feature | global mean [global min, global max] | global corr(Objective)"]
-    for nm in SUP_SCALARS:
-        v = np.array([r[nm] for r in feature_log], float)
-        v = v[np.isfinite(v)]
+    for nm in _table_scalar_names():
+        col = np.array([r.get(nm, np.nan) for r in feature_log], float)
+        v = col[np.isfinite(col)]
         if v.size == 0:
             continue
-        corr = _pearson(np.array([r[nm] for r in feature_log], float), obj)
+        corr = _pearson(col, obj)
         corr_s = "n/a" if not np.isfinite(corr) else f"{corr:+.2f}"
         lines.append(f"{nm} | {v.mean():.3g} [{v.min():.3g}, {v.max():.3g}] | {corr_s}")
-    return "\n".join(lines)
+    table = "\n".join(lines)
+    curves = _global_curve_block(feature_log)
+    return table + ("\n\nFull measured curves (population mean, reconstructed on the "
+                    "native grid):\n" + curves if curves else "")
 
 
 def _informative_scalars(feature_log: List[Dict[str, Any]]) -> List[str]:
-    """SUP_SCALARS that actually vary across droplets (drops the constant env
-    columns like Temperature_in), so per-droplet feature rows stay compact."""
+    """Scalar-table feature names that actually vary across droplets (drops the
+    constant env columns like Temperature_in), so per-droplet feature rows stay
+    compact. In condensed mode this also covers the fPCA curve scores."""
     out = []
-    for nm in SUP_SCALARS:
+    for nm in _table_scalar_names():
         v = np.array([r[nm] for r in feature_log if nm in r], float)
         v = v[np.isfinite(v)]
         if v.size and (v.max() - v.min()) > 1e-9:
@@ -320,10 +459,23 @@ def top_k_summary(feature_log: List[Dict[str, Any]], k: int = 8) -> str:
         return "(none yet)"
     scalars = _informative_scalars(feature_log)
     ranked = sorted(feature_log, key=lambda r: r["Objective"], reverse=True)[:k]
+    if CURVE_MODE == "full" and _CURVE_META:
+        # Per-droplet stanzas: a wide pipe table can't hold full curves.
+        blocks = []
+        for i, r in enumerate(ranked, 1):
+            head = (f"#{i} | FAPbI3={r['FAPbI3']:.3f} | MAPbI3={r['MAPbI3']:.3f} | "
+                    f"MAPbBr3={r['MAPbBr3']:.3f} | Objective={r['Objective']:.4f}")
+            feats = ", ".join(f"{r[nm]:.3g}" for nm in scalars)
+            entry = head + (f"\n  scalars: {feats}" if feats else "")
+            cb = _droplet_curve_block(r)
+            if cb:
+                entry += "\n" + cb
+            blocks.append(entry)
+        return "\n\n".join(blocks)
     header = "rank | FAPbI3 | MAPbI3 | MAPbBr3 | Objective | " + " | ".join(scalars)
     lines = [header]
     for i, r in enumerate(ranked, 1):
-        feats = " | ".join(f"{r[nm]:.3g}" for nm in scalars)
+        feats = " | ".join(f"{r.get(nm, float('nan')):.3g}" for nm in scalars)
         lines.append(f"{i} | {r['FAPbI3']:.3f} | {r['MAPbI3']:.3f} | "
                      f"{r['MAPbBr3']:.3f} | {r['Objective']:.4f} | {feats}")
     return "\n".join(lines)
@@ -340,13 +492,28 @@ def needle_summary(feature_log: List[Dict[str, Any]], dh) -> str:
             f"Objective={n['value']:.4f}" for i, n in enumerate(needles, 1))
     scalars = _informative_scalars(feature_log)
     comps = np.array([[r["FAPbI3"], r["MAPbI3"], r["MAPbBr3"]] for r in feature_log], float)
+    if CURVE_MODE == "full" and _CURVE_META:
+        blocks = []
+        for i, n in enumerate(needles, 1):
+            c = np.asarray(n["composition"], float)
+            j = int(np.argmin(np.linalg.norm(comps - c, axis=1)))  # nearest droplet
+            r = feature_log[j]
+            head = (f"needle {i} | FAPbI3={c[0]:.3f} | MAPbI3={c[1]:.3f} | "
+                    f"MAPbBr3={c[2]:.3f} | declared Objective={n['value']:.4f}")
+            feats = ", ".join(f"{r[nm]:.3g}" for nm in scalars)
+            entry = head + (f"\n  nearest-droplet scalars: {feats}" if feats else "")
+            cb = _droplet_curve_block(r)
+            if cb:
+                entry += "\n  nearest-droplet curves:\n" + cb
+            blocks.append(entry)
+        return "\n\n".join(blocks)
     header = ("needle | FAPbI3 | MAPbI3 | MAPbBr3 | declared Objective | "
               + " | ".join(f"{nm} (nearest droplet)" for nm in scalars))
     lines = [header]
     for i, n in enumerate(needles, 1):
         c = np.asarray(n["composition"], float)
         j = int(np.argmin(np.linalg.norm(comps - c, axis=1)))  # nearest measured droplet
-        feats = " | ".join(f"{feature_log[j][nm]:.3g}" for nm in scalars)
+        feats = " | ".join(f"{feature_log[j].get(nm, float('nan')):.3g}" for nm in scalars)
         lines.append(f"{i} | {c[0]:.3f} | {c[1]:.3f} | {c[2]:.3f} | "
                      f"{n['value']:.4f} | {feats}")
     return "\n".join(lines)
@@ -357,19 +524,53 @@ def best_point_summary(feature_log: List[Dict[str, Any]]) -> str:
         return "(none yet)"
     best = max(feature_log, key=lambda r: r["Objective"])
     comp = f"FAPbI3={best['FAPbI3']:.3f}, MAPbI3={best['MAPbI3']:.3f}, MAPbBr3={best['MAPbBr3']:.3f}"
-    feats = ", ".join(f"{nm}={best[nm]:.3g}" for nm in SUP_SCALARS if nm in best)
-    return f"- Objective {best['Objective']:.4f} at {comp}\n- {feats}"
+    feats = ", ".join(f"{nm}={best[nm]:.3g}" for nm in _table_scalar_names() if nm in best)
+    out = f"- Objective {best['Objective']:.4f} at {comp}\n- {feats}"
+    cb = _droplet_curve_block(best)
+    if cb:
+        out += "\n- full measured curves:\n" + cb
+    return out
 
 
-def recent_history_table(feature_log: List[Dict[str, Any]], max_rows: int = 40) -> str:
+def recent_history_table(feature_log: List[Dict[str, Any]], max_rows: int = 48,
+                         include_features: bool = True) -> str:
+    """The most recent ``max_rows`` droplets (default 48 ≈ the last 2 LineBO lines),
+    each shown with its composition and ``Objective``. When ``include_features``
+    (default) the interpretable supplemental features are appended too (the constant
+    env columns are dropped via ``_informative_scalars`` to keep rows compact); the
+    no-features ablation passes ``include_features=False`` so its table stays
+    composition→Objective only."""
     if not feature_log:
         return "(no measured points yet)"
+    scalars = _informative_scalars(feature_log) if include_features else []
     rows = feature_log[-max_rows:]
-    lines = ["FAPbI3 | MAPbI3 | MAPbBr3 | Objective"]
-    if len(feature_log) > max_rows:
-        lines.append(f"... ({len(feature_log) - max_rows} earlier droplets omitted)")
+    omitted = len(feature_log) - len(rows)
+    if include_features and CURVE_MODE == "full" and _CURVE_META:
+        # Per-droplet stanzas so each row can carry its full reconstructed curves.
+        blocks = []
+        if omitted > 0:
+            blocks.append(f"... ({omitted} earlier droplets omitted)")
+        for r in rows:
+            head = (f"FAPbI3={r['FAPbI3']:.3f} | MAPbI3={r['MAPbI3']:.3f} | "
+                    f"MAPbBr3={r['MAPbBr3']:.3f} | Objective={r['Objective']:.4f}")
+            feats = ", ".join(f"{r[nm]:.3g}" for nm in scalars)
+            entry = head + (f"\n  scalars: {feats}" if feats else "")
+            cb = _droplet_curve_block(r)
+            if cb:
+                entry += "\n" + cb
+            blocks.append(entry)
+        return "\n\n".join(blocks)
+    header = "FAPbI3 | MAPbI3 | MAPbBr3 | Objective"
+    if scalars:
+        header += " | " + " | ".join(scalars)
+    lines = [header]
+    if omitted > 0:
+        lines.append(f"... ({omitted} earlier droplets omitted)")
     for r in rows:
-        lines.append(f"{r['FAPbI3']:.3f} | {r['MAPbI3']:.3f} | {r['MAPbBr3']:.3f} | {r['Objective']:.4f}")
+        line = f"{r['FAPbI3']:.3f} | {r['MAPbI3']:.3f} | {r['MAPbBr3']:.3f} | {r['Objective']:.4f}"
+        if scalars:
+            line += " | " + " | ".join(f"{r.get(nm, float('nan')):.3g}" for nm in scalars)
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -405,17 +606,37 @@ def progress_summary(feature_log: List[Dict[str, Any]], dh, iters_done: int,
     )
 
 
+def trend_summary(feature_log: List[Dict[str, Any]], prev_best: Optional[float]) -> str:
+    """One-line computed signal on whether the best Objective moved since the last
+    injection, so the LLM gets an explicit trend rather than having to infer it from
+    the raw rows (LLMs reason poorly over dense numbers; arXiv 2404.06290)."""
+    if not feature_log:
+        return "(no measured points yet)"
+    cur = max(r["Objective"] for r in feature_log)
+    if prev_best is None:
+        return (f"- This is the first injection; best Objective so far is {cur:.4f}. "
+                f"No prior injection to compare against yet.")
+    delta = cur - prev_best
+    if delta > 1e-9:
+        verdict = f"IMPROVED by {delta:+.4f}"
+    else:
+        verdict = "did NOT improve (plateaued)"
+    return (f"- Best Objective at the previous injection: {prev_best:.4f}; now: "
+            f"{cur:.4f} → {verdict} since the previous injection.")
+
+
 def build_injection_prompt(feature_log, dh, hp, injection_idx, iters_done, budget,
-                           interval) -> str:
+                           interval, prev_best: Optional[float] = None) -> str:
     return SURR_PROMPT_TEMPLATE.format(
         system_features=llm_config.SYSTEM_FEATURES,
         hparam_descriptions=E.hparam_descriptions_block(),
         current_hparams=E.format_current_hparams(hp),
-        hparam_search_history=E.hparam_optimization_history(),
+        hparam_search_history=E.hparam_optimization_history(top_k=MOBO_HISTORY_TOP_K),
         injection_idx=injection_idx,
         iters_done=iters_done,
         budget=budget,
         progress_summary=progress_summary(feature_log, dh, iters_done, budget),
+        trend_summary=trend_summary(feature_log, prev_best),
         history_table=recent_history_table(feature_log),
         n_points=len(feature_log),
         supplemental_summary=supplemental_summary(feature_log),
@@ -549,6 +770,10 @@ def finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir: Path) -> D
     best_obj = float(Y_all.max()) if Y_all.size else float("nan")
     dist = metric_dist_to_needles(discovered, ref_optima, dim=dim) if len(ref_optima) else float("nan")
     dup = metric_dup_fraction(X_all, dim=dim) if X_all.shape[0] else float("nan")
+    # Average pairwise distance between declared needles (how spread out the discovered
+    # basins are); nan with fewer than 2 needles (no pair to measure).
+    needle_spread = (metric_avg_pairwise_dist(discovered)
+                     if discovered.shape[0] >= 2 else float("nan"))
 
     trial_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -571,6 +796,7 @@ def finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir: Path) -> D
         "best_needle": best_needle,
         "dist_to_ref_optima": float(dist),
         "dup_fraction": float(dup),
+        "mean_pairwise_needle_dist": float(needle_spread),
         "Y_all_running_best": np.maximum.accumulate(Y_all).tolist() if Y_all.size else [],
     }
 
@@ -594,10 +820,190 @@ def run_baseline_trial(surr, base_hp, ref_optima, seed: int, trial_dir: Path) ->
         metrics = finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    metrics["source"] = "baseline_trial112"
+    metrics["source"] = "baseline"
     metrics["n_injections"] = 0
     metrics["n_changes"] = 0
+    metrics["llm_total_latency_s"] = 0.0
+    metrics["llm_latency_per_iter_s"] = 0.0  # no LLM calls → no added latency
     return metrics
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Baseline reuse cache (skip recomputing an identical baseline rep)
+# ════════════════════════════════════════════════════════════════════════════════
+#
+# A baseline rep is a deterministic function of (baseline hyperparameters, surrogate,
+# iteration budget, seed, fixed ZoMBI config) — there is no LLM in the loop. So a
+# baseline rep already computed for that exact fingerprint in ANY prior sweep under
+# RESULTS_ROOT can be copied verbatim instead of recomputed. Because reps are keyed
+# by seed, a prior sweep that covered only SOME of the seeds still lets us reuse those
+# and only recompute the new ones ("part of the seeds or all the seeds").
+#
+# Each computed baseline rep drops a ``baseline_manifest.json`` recording its
+# fingerprint + seed; reuse matches on that. The ``impl`` tag keeps a plain-surrogate
+# baseline from being reused by the volume-control sweep (whose metrics.json carries
+# extra volume-specific keys), even though the two share the same trajectory.
+
+_BASELINE_MANIFEST = "baseline_manifest.json"
+
+
+def _canonical_hparams(hp: Dict[str, Any]) -> Dict[str, Any]:
+    """Order-independent, float-normalised view of a hyperparameter dict so equal
+    settings fingerprint identically regardless of key order or int/float typing."""
+    out: Dict[str, Any] = {}
+    for k in sorted(hp):
+        v = hp[k]
+        out[k] = float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
+    return out
+
+
+# Fixed probe compositions for the surrogate fingerprint — deterministic points that
+# exercise the conditional-mean landscape without recomputing the full ternary grid.
+_SURR_PROBE = np.array([[0.70, 0.20, 0.10], [1 / 3, 1 / 3, 1 / 3],
+                        [0.10, 0.10, 0.80], [0.50, 0.25, 0.25],
+                        [0.20, 0.50, 0.30], [0.05, 0.90, 0.05]], float)
+
+
+# Decimals to round surrogate arrays to before hashing. RandomForest.predict with
+# n_jobs=-1 is only reproducible to ~1e-12 (thread-reduction order), so an exact byte
+# hash of the predictions would differ on every fit. Rounding to 1e-6 absorbs that
+# noise while still separating any materially different surrogate (a different DB, fit
+# seed, or tree count shifts cond_means far more than 1e-6).
+_FP_ROUND = 6
+
+
+def _surrogate_fingerprint(surr: Surrogate) -> str:
+    """Short quantized hash identifying the surrogate's Objective landscape AND
+    residual-draw parameters — everything that shapes a baseline trajectory. Robust to
+    the ~1e-12 nondeterminism of parallel RF prediction (see ``_FP_ROUND``), so two
+    independent fits of the same surrogate on the same data hash identically."""
+    import hashlib
+    t, it = surr.time_ref["max"], surr.iter_ref["max"]
+    Z = np.column_stack([_SURR_PROBE[:, 0], _SURR_PROBE[:, 2],
+                         np.full(len(_SURR_PROBE), t), np.full(len(_SURR_PROBE), it)])
+    h = hashlib.sha256()
+    for arr in (surr._cond_means(Z), surr.resid_mean, surr.resid_std, surr.Sigma):
+        q = np.round(np.asarray(arr, float), _FP_ROUND) + 0.0  # +0.0 folds -0.0 → 0.0
+        h.update(np.ascontiguousarray(q).tobytes())
+    return h.hexdigest()[:16]
+
+
+def _baseline_spec() -> Dict[str, Any]:
+    """The fixed (non-hyperparameter) ZoMBI-Hop configuration a baseline trajectory
+    also depends on; drift in any of it must invalidate a cached baseline."""
+    return {
+        "zombi_fixed": json.loads(json.dumps(R.ZOMBI_FIXED, default=str)),
+        "noise_level": float(R.NOISE_LEVEL),
+        "num_lines": int(R.NUM_LINES),
+        "num_experiments": int(R.NUM_EXPERIMENTS),
+        "maximize": bool(MAXIMIZE),
+        "dim": 3,
+        "n_ref_optima": int(N_REF_OPTIMA),
+        "ternary_grid_n": int(R.TERNARY_GRID_N),
+    }
+
+
+def baseline_fingerprint(base_hp: Dict[str, Any], max_iters: int, surr: Surrogate,
+                         impl: str) -> Dict[str, Any]:
+    """The full identity of a baseline rep (minus its seed). Equal fingerprints ⇒
+    interchangeable baseline reps."""
+    return {
+        "impl": impl,
+        "base_hp": _canonical_hparams(base_hp),
+        "max_iters": int(max_iters),
+        "surrogate": _surrogate_fingerprint(surr),
+        "spec": _baseline_spec(),
+    }
+
+
+def _fp_key(fp: Dict[str, Any]) -> str:
+    return json.dumps(fp, sort_keys=True)
+
+
+def find_cached_baseline(fp: Dict[str, Any], seed: int,
+                         exclude: Optional[Path] = None) -> Optional[Path]:
+    """Search prior sweeps under RESULTS_ROOT for a completed baseline rep whose
+    manifest matches ``fp`` and ``seed``. Returns its rep directory, or None. Scoped
+    to RESULTS_ROOT with a fixed depth (never a broad filesystem scan)."""
+    want = _fp_key(fp)
+    for man in sorted(E.RESULTS_ROOT.glob(f"*/baseline*/rep*/{_BASELINE_MANIFEST}")):
+        rep_dir = man.parent
+        if exclude is not None and rep_dir.resolve() == exclude.resolve():
+            continue
+        if not (rep_dir / "metrics.json").exists():
+            continue
+        try:
+            m = json.loads(man.read_text())
+        except Exception:
+            continue
+        if int(m.get("seed", -1)) == int(seed) and _fp_key(m.get("fingerprint", {})) == want:
+            return rep_dir
+    return None
+
+
+def write_baseline_manifest(trial_dir: Path, fp: Dict[str, Any], seed: int) -> None:
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    (trial_dir / _BASELINE_MANIFEST).write_text(
+        json.dumps({"seed": int(seed), "fingerprint": fp}, indent=2))
+
+
+def _copy_rep_artifacts(src: Path, dst: Path) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in src.iterdir():
+        if item.is_file():
+            shutil.copy2(item, dst / item.name)
+
+
+def run_or_reuse_baseline(surr, base_hp, ref_optima, seed: int, trial_dir: Path,
+                          max_iters: int, runner, impl: str) -> Tuple[Dict[str, Any], bool]:
+    """Return ``(metrics, reused)`` for one baseline rep. If a byte-identical baseline
+    (same fingerprint + seed) exists in a prior sweep, copy its artifacts into
+    ``trial_dir`` and load its metrics; otherwise run ``runner`` (this or the volume
+    sweep's ``run_baseline_trial``) and drop a manifest so later sweeps can reuse it."""
+    fp = baseline_fingerprint(base_hp, max_iters, surr, impl)
+    src = find_cached_baseline(fp, seed, exclude=trial_dir)
+    if src is not None:
+        _copy_rep_artifacts(src, trial_dir)
+        write_baseline_manifest(trial_dir, fp, seed)  # normalise even if src's differed
+        metrics = json.loads((trial_dir / "metrics.json").read_text())
+        rel = src.relative_to(E.RESULTS_ROOT) if E.RESULTS_ROOT in src.parents else src
+        print(f"    reused cached baseline ← {rel} (seed {seed})")
+        return metrics, True
+    metrics = runner(surr, base_hp, ref_optima, seed, trial_dir)
+    write_baseline_manifest(trial_dir, fp, seed)
+    return metrics, False
+
+
+def backfill_baseline_manifests(sweep_dir: Path, base_hp: Dict[str, Any],
+                                max_iters: int, surr: Surrogate, impl: str) -> int:
+    """Stamp a ``baseline_manifest.json`` onto each already-computed baseline rep of an
+    EXISTING sweep, so future sweeps can reuse it. The manifest is built from the
+    CURRENT config's fingerprint, so only call this on a sweep you know was produced
+    with the current baseline hyperparameters / budget / surrogate. Rep seeds are
+    inferred as ``1000 + <rep index>`` (the sweep convention). Returns the count
+    stamped."""
+    sweep_dir = Path(sweep_dir)
+    base_dir = _find_baseline_group(sweep_dir)
+    if base_dir is None:
+        print(f"  [backfill] no baseline group under {sweep_dir}")
+        return 0
+    fp = baseline_fingerprint(base_hp, max_iters, surr, impl)
+    print(f"  [backfill] fingerprint surrogate={fp['surrogate']} max_iters={max_iters} "
+          f"impl={impl}")
+    n = 0
+    for rep_dir in sorted(base_dir.glob("rep*")):
+        if not (rep_dir / "metrics.json").exists():
+            continue
+        try:
+            seed = 1000 + int(rep_dir.name[3:])
+        except ValueError:
+            print(f"    [skip] {rep_dir.name}: cannot parse rep index → seed")
+            continue
+        write_baseline_manifest(rep_dir, fp, seed)
+        n += 1
+        print(f"    stamped {base_dir.name}/{rep_dir.name} (seed {seed})")
+    print(f"  [backfill] wrote {n} manifest(s) under {sweep_dir}")
+    return n
 
 
 def run_llm_trial(surr, base_hp, ref_optima, interval: int, seed: int,
@@ -621,6 +1027,7 @@ def run_llm_trial(surr, base_hp, ref_optima, interval: int, seed: int,
     hp = dict(base_hp)
     injections: List[Dict[str, Any]] = []
     n_changes = 0
+    prev_best: Optional[float] = None  # best Objective at the previous injection
 
     try:
         fresh = True
@@ -643,7 +1050,8 @@ def run_llm_trial(surr, base_hp, ref_optima, interval: int, seed: int,
 
             # Injection: show the LLM the run so far.
             prompt = prompt_builder(feature_log, dh, hp, injection_idx,
-                                    call_counter[0], MAX_ITERS, interval)
+                                    call_counter[0], MAX_ITERS, interval, prev_best)
+            prev_best = max((r["Objective"] for r in feature_log), default=None)
             this_dir = inj_dir / f"inj_{injection_idx:02d}"
             this_dir.mkdir(parents=True, exist_ok=True)
             (this_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
@@ -686,6 +1094,13 @@ def run_llm_trial(surr, base_hp, ref_optima, interval: int, seed: int,
     metrics["source"] = f"llm_every_{interval}"
     metrics["n_injections"] = len(injections)
     metrics["n_changes"] = n_changes
+    # Latency the LLM calls added, amortized over EVERY ZoMBI-Hop iteration in the
+    # trial (including the iterations with no injection) — the per-iteration wall-clock
+    # tax of keeping the LLM in the loop.
+    total_latency = float(sum((inj.get("latency_s") or 0.0) for inj in injections))
+    n_iters = metrics.get("n_iters") or 0
+    metrics["llm_total_latency_s"] = total_latency
+    metrics["llm_latency_per_iter_s"] = total_latency / n_iters if n_iters else 0.0
     return metrics
 
 
@@ -721,8 +1136,11 @@ def _group_row(group: str, interval: Optional[int], stats: Dict[str, Any],
         "needles_mean": m("n_needles", "mean"),
         "dist_mean": m("dist_to_ref_optima", "mean"),
         "dup_mean": m("dup_fraction", "mean"),
+        "needle_spread_mean": m("mean_pairwise_needle_dist", "mean"),
+        "needle_spread_std": m("mean_pairwise_needle_dist", "std"),
         "n_injections_mean": float(np.mean([s.get("n_injections", 0) for s in samples])) if samples else None,
         "n_changes_mean": float(np.mean([s.get("n_changes", 0) for s in samples])) if samples else None,
+        "llm_latency_per_iter_mean": float(np.mean([s.get("llm_latency_per_iter_s", 0) for s in samples])) if samples else None,
     }
     if baseline_stats is not None:
         diff = (m("best_objective", "mean") or float("nan")) - \
@@ -743,7 +1161,9 @@ def _group_row(group: str, interval: Optional[int], stats: Dict[str, Any],
 
 _SUMMARY_FIELDS = ["group", "injection_interval", "n_repeats",
                    "best_mean", "best_std", "best_needle_mean", "needles_mean",
-                   "dist_mean", "dup_mean", "n_injections_mean", "n_changes_mean",
+                   "dist_mean", "dup_mean", "needle_spread_mean", "needle_spread_std",
+                   "n_injections_mean", "n_changes_mean",
+                   "llm_latency_per_iter_mean",
                    "diff_best_vs_baseline", "diff_best_p_value",
                    "diff_best_ci95_low", "diff_best_ci95_high"]
 
@@ -764,12 +1184,12 @@ def write_summary(sweep_dir: Path, rows: List[dict]) -> None:
 # ════════════════════════════════════════════════════════════════════════════════
 #
 # Reusable by every cadence-style sweep (this one + sweep_volume_control), since all
-# of them share the baseline_trial112 / inject_every_{01,05,10} group layout and
+# of them share the baseline / inject_every_{01,05,10} group layout and
 # store a per-repeat ``Y_all_running_best`` in each rep's metrics.json.
 
 # (group directory, legend label, line color) — ordered baseline first.
 _CONVERGENCE_GROUPS: List[Tuple[str, str, str]] = [
-    ("baseline_trial112", "baseline (trial_112)", "#4c4c4c"),
+    ("baseline",          "baseline",             "#4c4c4c"),
     ("inject_every_01",   "LLM every 1",          "#1f77b4"),
     ("inject_every_05",   "LLM every 5",          "#ff7f0e"),
     ("inject_every_10",   "LLM every 10",         "#2ca02c"),
@@ -907,6 +1327,68 @@ def plot_convergence_comparison(sweep_dir: Path, out_png: Optional[Path] = None,
     return out_png
 
 
+def _find_baseline_group(sweep_dir: Path) -> Optional[Path]:
+    """Locate the baseline group directory. Newer runs name it ``baseline``; older
+    ones name it ``baseline_trial112`` (or another ``baseline_*``). Prefer an exact
+    ``baseline`` match, else the first ``baseline*`` directory."""
+    exact = sweep_dir / "baseline"
+    if exact.is_dir():
+        return exact
+    cands = sorted(d for d in sweep_dir.glob("baseline*") if d.is_dir())
+    return cands[0] if cands else None
+
+
+def plot_per_rep_vs_baseline(sweep_dir: Path) -> List[Path]:
+    """For every rep of every ``inject_every_*`` group, write a 2-line running-best
+    convergence plot (NO confidence band): that single LLM rep's curve and the
+    baseline rep's curve for the SAME seed (matched by rep index → same ``seed =
+    1000 + rep``). Saved as ``convergence_vs_baseline.png`` inside each LLM rep dir.
+
+    This is the CRN-paired per-run view: rep ``r`` of the LLM group and rep ``r`` of
+    the baseline share the seed / initial design / surrogate-noise stream, so the two
+    lines diverge ONLY because of the LLM's hyperparameter edits — no across-seed
+    spread to average over, so no CI is drawn or needed."""
+    import matplotlib.pyplot as plt  # Agg backend already selected via evaluate_llm
+
+    sweep_dir = Path(sweep_dir)
+    base_dir = _find_baseline_group(sweep_dir)
+    if base_dir is None:
+        print(f"  [per-rep] no baseline group under {sweep_dir}; skipped")
+        return []
+
+    written: List[Path] = []
+    for gdir in sorted(sweep_dir.glob("inject_every_*")):
+        if not gdir.is_dir():
+            continue
+        label = gdir.name.replace("inject_every_0", "LLM every ").replace(
+            "inject_every_", "LLM every ")
+        for rep_dir in sorted(gdir.glob("rep*")):
+            llm_curve = _rep_iteration_curve(rep_dir)
+            base_rep = base_dir / rep_dir.name          # same rep index = same seed
+            base_curve = _rep_iteration_curve(base_rep) if base_rep.is_dir() else None
+            if llm_curve is None or base_curve is None:
+                print(f"  [per-rep] missing curve for {gdir.name}/{rep_dir.name}; skipped")
+                continue
+            fig, ax = plt.subplots(figsize=(7.0, 4.5))
+            ax.plot(np.arange(len(base_curve)), base_curve, color="#4c4c4c", lw=2.0,
+                    label="baseline")
+            ax.plot(np.arange(len(llm_curve)), llm_curve, color="#1f77b4", lw=2.0,
+                    label=label)
+            ax.set_xlabel("ZoMBI-Hop iteration")
+            ax.set_ylabel("running-best Objective")
+            ax.set_title(f"{gdir.name} / {rep_dir.name} vs baseline "
+                         f"(same seed, same CRN stream)", fontsize=10)
+            ax.legend(fontsize=9, loc="lower right")
+            ax.grid(True, alpha=0.25)
+            fig.tight_layout()
+            out = rep_dir / "convergence_vs_baseline.png"
+            fig.savefig(out, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            written.append(out)
+    print(f"  wrote {len(written)} per-rep vs-baseline plot(s) under {sweep_dir}")
+    return written
+
+
 def regenerate_summary(sweep_dir: Path, group_row=None, write=None,
                        plot: bool = True) -> None:
     """Rebuild sweep_summary.{json,csv} for an existing cadence sweep from each rep's
@@ -921,8 +1403,8 @@ def regenerate_summary(sweep_dir: Path, group_row=None, write=None,
     sweep_dir = Path(sweep_dir)
 
     groups: List[Tuple[str, Optional[int]]] = []
-    if (sweep_dir / "baseline_trial112").is_dir():
-        groups.append(("baseline_trial112", None))
+    if (sweep_dir / "baseline").is_dir():
+        groups.append(("baseline", None))
     for d in sorted(sweep_dir.glob("inject_every_*")):
         if d.is_dir():
             try:
@@ -952,7 +1434,7 @@ def regenerate_summary(sweep_dir: Path, group_row=None, write=None,
             continue
         stats = aggregate(samples)
         rows.append(group_row(group, interval, stats, samples, baseline_stats))
-        if group == "baseline_trial112":
+        if group == "baseline":
             baseline_stats = stats
         print(f"  {group}: best_mean={rows[-1].get('best_mean')}, "
               f"diff={rows[-1].get('diff_best_vs_baseline')}, "
@@ -962,6 +1444,7 @@ def regenerate_summary(sweep_dir: Path, group_row=None, write=None,
     print(f"\nWrote {sweep_dir / 'sweep_summary.csv'} and .json")
     if plot:
         plot_convergence_comparison(sweep_dir)
+        plot_per_rep_vs_baseline(sweep_dir)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1017,24 +1500,26 @@ def main(sweep_prefix: str = "sweep_surrogate", prompt_builder=None,
     rows: List[dict] = []
 
     # ── Baseline group ───────────────────────────────────────────────────────────
-    print(f"\n[baseline_trial112] {N_REPEATS} repeats")
+    print(f"\n[baseline] {N_REPEATS} repeats")
     baseline_samples: List[Dict[str, Any]] = []
     for rep in range(N_REPEATS):
         seed = 1000 + rep
-        tdir = sweep_dir / "baseline_trial112" / f"rep{rep}"
+        tdir = sweep_dir / "baseline" / f"rep{rep}"
         print(f"  rep {rep} (seed {seed}) …")
         try:
-            m = run_baseline_trial(surr, base_hp, ref_optima, seed, tdir)
+            m, reused = run_or_reuse_baseline(surr, base_hp, ref_optima, seed, tdir,
+                                              MAX_ITERS, run_baseline_trial,
+                                              impl="surrogate")
             print(f"    best={m['best_objective']:.4f}, needles={m['n_needles']}, "
-                  f"dup={m['dup_fraction']:.4f}")
+                  f"dup={m['dup_fraction']:.4f}" + ("  [reused]" if reused else ""))
         except Exception as e:
             print(f"    FAILED: {e}")
             traceback.print_exc()
-            m = {"source": "baseline_trial112", "n_injections": 0, "n_changes": 0}
+            m = {"source": "baseline", "n_injections": 0, "n_changes": 0}
         baseline_samples.append(m)
         (tdir / "metrics.json").write_text(json.dumps(m, indent=2))
     baseline_stats = aggregate(baseline_samples)
-    rows.append(_group_row("baseline_trial112", None, baseline_stats, baseline_samples, None))
+    rows.append(_group_row("baseline", None, baseline_stats, baseline_samples, None))
     write_summary(sweep_dir, rows)
 
     # ── LLM cadence groups ───────────────────────────────────────────────────────
@@ -1065,6 +1550,8 @@ def main(sweep_prefix: str = "sweep_surrogate", prompt_builder=None,
     # Overlaid running-best convergence: baseline vs each cadence (mean ± 95% CI).
     print("\n[plot] convergence comparison …")
     plot_convergence_comparison(sweep_dir, title=plot_title)
+    # Per-rep seed-matched view: each LLM rep vs its CRN baseline (2 lines, no CI).
+    plot_per_rep_vs_baseline(sweep_dir)
 
     print(f"\nSweep complete → {sweep_dir / 'sweep_summary.csv'}")
 
@@ -1079,5 +1566,20 @@ if __name__ == "__main__":
         if len(args) < 2:
             raise SystemExit("usage: sweep_basic_surrogate.py --plot <sweep_dir>")
         plot_convergence_comparison(Path(args[1]))
+        plot_per_rep_vs_baseline(Path(args[1]))
+    elif args and args[0] in ("--per-rep",):
+        if len(args) < 2:
+            raise SystemExit("usage: sweep_basic_surrogate.py --per-rep <sweep_dir>")
+        plot_per_rep_vs_baseline(Path(args[1]))
+    elif args and args[0] in ("--backfill-baselines",):
+        if len(args) < 2:
+            raise SystemExit("usage: sweep_basic_surrogate.py --backfill-baselines <sweep_dir>")
+        _surr = (Surrogate.load(SURROGATE_PICKLE)
+                 if SURROGATE_PICKLE and Path(SURROGATE_PICKLE).exists()
+                 else Surrogate.fit(verbose=False))
+        _bhp, _desc = resolve_baseline_hparams()
+        print(f"baseline hyperparameters [{_desc}]: {_bhp}")
+        backfill_baseline_manifests(Path(args[1]), _bhp, MAX_ITERS, _surr,
+                                    impl="surrogate")
     else:
         main()

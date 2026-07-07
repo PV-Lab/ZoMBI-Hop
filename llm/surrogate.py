@@ -54,10 +54,10 @@ first collapse each curve group to a handful of **functional-PCA** scores
     (PL, kinetics variances) are only measured on ~247 / 953 rows, Σ is estimated
     by **EM for a multivariate Gaussian with missing data** — this uses *every*
     row for the blocks it observed, instead of throwing away 2/3 of the data to
-    complete-case.  Σ is then regularised with **diagonal (Ledoit-Wolf-style)
-    shrinkage** so it is well-conditioned and positive-definite, and its leading
-    eigen-structure is reported as the shared **factors** that drive the
-    co-variation.
+    complete-case.  Σ is then lightly regularised with **diagonal (Ledoit-Wolf-
+    style) shrinkage** to trim its condition number (it is already positive-
+    definite out of EM — see the note below), and its leading eigen-structure is
+    reported as the shared **factors** that drive the co-variation.
 
 4.  **Sampling.**  Given any ``(composition, time, iteration)`` we predict each
     feature's conditional mean with its RF, draw a joint residual vector from
@@ -66,13 +66,24 @@ first collapse each curve group to a handful of **functional-PCA** scores
 
 Why a factor / shrunk-covariance model (not plain sample covariance)?
     With ~33 features and as few as ~230 jointly-observed rows for the sparse
-    blocks, the raw empirical covariance is noisy and can be near-singular —
-    Cholesky (needed to sample) would fail and the sampled correlations would be
-    over-fit to noise.  Shrinking toward the diagonal guarantees a valid,
-    stable Σ and is the standard robust estimator in the p-not-≪-n regime; the
+    blocks, the raw empirical covariance is noisy, and shrinking toward the
+    diagonal is the standard robust estimator in the p-not-≪-n regime.  The
     eigen-factors give the same "shared latent drivers" interpretation you asked
     for from a factor model, with none of the fragility of fitting a fixed
     factor count to incomplete data.
+
+    Empirically (measured on ``campaign2_all.db``: 953 rows, p=33, with the PL
+    and kinetics-variance blocks observed on only 247 rows and 231 rows
+    complete-case), the EM Σ is *not* near-singular: it is positive-definite
+    with condition number ≈ 3e3, and ``cholesky(Σ)`` succeeds *before* any
+    shrinkage.  (The EM ridge on line ~392 and EM's conditional-variance
+    correction keep it PD; even the naive complete-case sample covariance is
+    Choleskyable here, since 231 rows > 33 features.)  So shrinkage is a
+    precaution, not a rescue: its role is to trim the condition number (≈3e3 →
+    ≈3e2 at δ=0.01) so the sampled correlations are less over-fit to noise.  On
+    this data ``shrink_to_psd`` picks δ=0.01, triggered by the eigenvalue *floor*
+    (λ_min dips just below ``floor·λ_max``), not by a Cholesky failure or the
+    condition-number cap.
 
 Usage
 -----

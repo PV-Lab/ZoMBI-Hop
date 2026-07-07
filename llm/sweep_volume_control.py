@@ -17,8 +17,8 @@ The volumes are added on top of ZoMBI-Hop's existing acquisition (its
 ``c`` with radius ``r`` and a query point ``x`` at Euclidean distance
 ``dist = ||x - c||``:
 
-    violation = max(0, r - dist)          # smoothed: 0 at the edge, r at the centre
-    term      = strength * violation**2
+    violation = max(0, 1 - dist / r)      # normalized hat: 1 at the centre, 0 at the edge
+    term      = base_strength * g * violation**2   # g = per-volume strength, 0–3
 
 * **Penalization volume** — SUBTRACTS ``term`` from the acquisition, exactly like a
   needle penalty ellipsoid, but constrained to a hypersphere (isotropic) so the LLM
@@ -28,12 +28,18 @@ The volumes are added on top of ZoMBI-Hop's existing acquisition (its
 * **Reward volume** — ADDS ``term`` instead, making the algorithm MORE likely to
   sample inside the ball.
 
-``strength`` is tied to ZoMBI-Hop's own auto-computed ``repulsion_lambda`` (the same
-scale it uses to penalize needles), times ``VOLUME_STRENGTH_MULT``, so a volume is
-comparable in force to a needle penalty.
+``base_strength`` is tied to ZoMBI-Hop's own auto-computed ``repulsion_lambda`` (the
+same scale it uses to penalize needles), times ``VOLUME_STRENGTH_MULT``. Because the
+violation is normalized to peak at 1 at the centre, a volume's peak force is exactly
+``base_strength * g`` regardless of its radius. With ``VOLUME_STRENGTH_MULT == 1`` a
+volume of strength ``g == 1`` therefore matches one of ZoMBI-Hop's own needle
+penalties (whose Mahalanobis violation also peaks at 1); ``g`` up to 3 lets the LLM
+push up to three needles' worth. The radius sets only how much of the simplex the
+volume covers, not how hard it pushes.
 
-The LLM only chooses, per volume, its ``kind`` (reward / penalty), ``center`` (a
-composition), and ``radius``. Each injection it specifies the COMPLETE set of
+The LLM chooses, per volume, its ``kind`` (reward / penalty), ``center`` (a
+composition), ``radius``, and ``strength`` (``g`` ∈ [0, 3]). Each injection it
+specifies the COMPLETE set of
 volumes that should be in effect going forward — the returned list REPLACES the
 previous set (so it can add, remove, resize, or move volumes freely). Every
 injection prompt shows the LLM the volumes currently in effect; to leave the
@@ -67,9 +73,11 @@ SURROGATE_PICKLE: str | None = None            # reuse a fitted surrogate if set
 BASELINE_TRIAL_DIR: str | None = "optimize/runs/mobo_ensemble_3d_job17147229/trial_169"
 
 # Volume-control knobs.
-VOLUME_STRENGTH_MULT: float = 1.0   # volume force = this × ZoMBI-Hop's repulsion_lambda
+VOLUME_STRENGTH_MULT: float = 1.0   # global scale: 1 ⇒ per-volume strength 1 == one needle penalty
 MIN_VOLUME_RADIUS: float = 0.02     # composition-distance units (≈ input noise scale)
 MAX_VOLUME_RADIUS: float = 0.60     # keep a single ball from covering the whole simplex
+MIN_VOLUME_STRENGTH: float = 0.0    # per-volume strength the LLM chooses (0 == no-op)
+MAX_VOLUME_STRENGTH: float = 3.0    # 1 == one needle penalty; cap at 3 needle penalties
 MAX_VOLUMES_PER_INJECTION: int = 8  # guard against a runaway list in one call
 # ───────────────────────────────────────────────────────────────────────────────
 
@@ -119,12 +127,16 @@ _METRIC_KEYS = SBS._METRIC_KEYS
 class VolumeControlAcquisition(nn.Module):
     """Wrap ZoMBI-Hop's acquisition and add the LLM's reward/penalty hyperspheres.
 
-    For each volume (centre ``c``, radius ``r``, sign ``s`` = +1 reward / −1 penalty):
-        violation = max(0, r − ||x − c||)     # smoothed to 0 at the ball's edge
-        acq(x)   += s · strength · violation²
+    For each volume (centre ``c``, radius ``r``, per-volume strength ``g`` ∈ [0, 3],
+    sign ``s`` = +1 reward / −1 penalty):
+        violation = max(0, 1 − ||x − c|| / r)   # 1 at the centre, 0 at the ball's edge
+        acq(x)   += s · g · base_strength · violation²
 
-    ``strength`` is ZoMBI-Hop's own ``repulsion_lambda`` (matched to how hard it
-    penalizes needles) scaled by ``strength_mult``. ``.base`` is exposed as the wrapped
+    ``base_strength`` is ZoMBI-Hop's own ``repulsion_lambda`` (matched to how hard it
+    penalizes needles) scaled by the global ``strength_mult`` (default 1). With
+    ``strength_mult == 1`` a volume of per-volume strength ``g == 1`` peaks at exactly
+    one needle penalty's force; ``g == 3`` is three needles, ``g == 0`` is a no-op.
+    ``.base`` is exposed as the wrapped
     acquisition's own clean base so ``determine_penalty_ellipsoid`` (which reads
     ``acq_fn.base`` for uncontaminated needle curvature) is unaffected by the volumes.
     """
@@ -137,7 +149,10 @@ class VolumeControlAcquisition(nn.Module):
         self.base = getattr(wrapped, "base", wrapped)
         self.proj_fn = proj_fn
         base_lambda = float(getattr(wrapped, "repulsion_lambda", 1000.0) or 1000.0)
-        self.strength = base_lambda * float(strength_mult)
+        # Base force, matched to a needle penalty and scaled by the global knob. Each
+        # volume's own per-volume ``strength`` (0–3, LLM-chosen) multiplies this, so
+        # with strength_mult == 1 a volume of strength 1 peaks at exactly one needle.
+        self.base_strength = base_lambda * float(strength_mult)
 
         centers = torch.tensor([v["center"] for v in volumes], device=device, dtype=dtype)
         self.register_buffer("centers", centers)                                  # (K, d)
@@ -146,6 +161,10 @@ class VolumeControlAcquisition(nn.Module):
         self.register_buffer(
             "signs",
             torch.tensor([1.0 if v["kind"] == "reward" else -1.0 for v in volumes],
+                         device=device, dtype=dtype))
+        self.register_buffer(
+            "strengths",
+            torch.tensor([float(v.get("strength", 1.0)) for v in volumes],
                          device=device, dtype=dtype))
 
     def forward(self, Xq: torch.Tensor) -> torch.Tensor:
@@ -158,9 +177,18 @@ class VolumeControlAcquisition(nn.Module):
 
         # (B, K) Euclidean distance to every volume centre.
         dist = torch.cdist(X_flat, self.centers)                                 # (B, K)
-        violation = torch.clamp(self.radii.unsqueeze(0) - dist, min=0.0)         # (B, K)
-        contrib = (self.signs.unsqueeze(0) * violation ** 2).sum(dim=1)          # (B,)
-        extra = self.strength * contrib
+        # Normalized "hat" violation: 1 at the centre, 0 at the ball's edge. This
+        # makes a volume's PEAK force radius-independent and equal to ``strength``
+        # (== repulsion_lambda × strength_mult), matching a needle penalty whose
+        # Mahalanobis violation likewise peaks at 1. The old raw ``radius - dist``
+        # instead peaked at ``radius``, so the peak force was λ·radius² — up to ~⅓
+        # of a needle at the max radius and negligible for small volumes. Radii are
+        # clamped to ≥ MIN_VOLUME_RADIUS > 0 in validate_volumes(), so this is safe.
+        violation = torch.clamp(1.0 - dist / self.radii.unsqueeze(0), min=0.0)   # (B, K)
+        # Each volume weighted by its own per-volume strength (0–3, 1 == one needle).
+        contrib = (self.signs.unsqueeze(0) * self.strengths.unsqueeze(0)
+                   * violation ** 2).sum(dim=1)                                   # (B,)
+        extra = self.base_strength * contrib
         return base_val + extra.view(base_val.shape)
 
 
@@ -210,8 +238,9 @@ def build_volume_schema(dim: int = DIM) -> Dict[str, Any]:
                             "items": {"type": "number"},
                         },
                         "radius": {"type": "number"},
+                        "strength": {"type": "number"},
                     },
-                    "required": ["kind", "center", "radius"],
+                    "required": ["kind", "center", "radius", "strength"],
                     "additionalProperties": False,
                 },
             },
@@ -326,8 +355,22 @@ def validate_volumes(raw_volumes: List[Dict[str, Any]], dim: int = DIM
             warnings.append(
                 f"clamped volume #{i} radius {r} → {r_clamped} "
                 f"[{MIN_VOLUME_RADIUS}, {MAX_VOLUME_RADIUS}]")
+        s_raw = v.get("strength", 1.0)
+        try:
+            s = float(s_raw)
+        except (TypeError, ValueError):
+            warnings.append(f"volume #{i}: non-numeric strength {s_raw!r} → default 1.0")
+            s = 1.0
+        if not np.isfinite(s):
+            warnings.append(f"volume #{i}: non-finite strength → default 1.0")
+            s = 1.0
+        s_clamped = float(min(max(s, MIN_VOLUME_STRENGTH), MAX_VOLUME_STRENGTH))
+        if s_clamped != s:
+            warnings.append(
+                f"clamped volume #{i} strength {s} → {s_clamped} "
+                f"[{MIN_VOLUME_STRENGTH}, {MAX_VOLUME_STRENGTH}]")
         out.append({"kind": kind, "center": [float(x) for x in c_proj],
-                    "radius": r_clamped})
+                    "radius": r_clamped, "strength": s_clamped})
     return out, warnings
 
 
@@ -341,7 +384,7 @@ optimizing a perovskite-materials-discovery lab over the 3-simplex composition
 (`FAPbI3`, `MAPbI3`, `MAPbBr3`, which always sum to 1); the `Objective` is
 MAXIMIZED. ZoMBI-Hop is a zooming multi-basin optimizer that hunts MULTIPLE optima
 ("needles"): it fits a GP, uses an acquisition function each iteration to pick a
-LineBO line of ~24 measured droplets, declares a needle when expected improvement
+LineBO line of 24 measured droplets, declares a needle when expected improvement
 hits the output-noise floor, penalizes that region, and moves on.
 
 Unlike a normal run, every measured droplet here also reports the rich physical
@@ -359,9 +402,15 @@ the input/measurement noise scale is ~0.06, and a radius near {max_radius} alrea
 covers a large fraction of the space). Radii are clamped to
 [{min_radius}, {max_radius}].
 
-For a query composition `x` at Euclidean distance `d = ||x - center||`, a volume
-contributes `strength * max(0, radius - d)**2` to the acquisition — a smooth bump
-that is strongest at the center and decays to exactly zero at the edge of the ball:
+Each volume also carries a `strength` in [{min_strength}, {max_strength}] that YOU
+choose. For a query composition `x` at Euclidean distance `d = ||x - center||`, a
+volume contributes `strength * max(0, 1 - d/radius)**2` to the acquisition — a smooth
+bump that is strongest at the center and decays to exactly zero at the edge of the
+ball. At the center the bump's force equals `strength` needle-penalties:
+**`strength = 1` is exactly as strong as one of ZoMBI-Hop's own needle penalties**,
+`strength = {max_strength}` is {max_strength}× that, and `strength = 0` is a no-op.
+The PEAK force depends only on `strength`, NOT on the radius — the radius only sets
+how much of the simplex the bump covers, not how hard it pushes:
 
 - A **`penalty`** volume SUBTRACTS that bump, so ZoMBI-Hop becomes LESS likely to
   sample inside the ball (just like the penalty regions around declared needles, but
@@ -386,7 +435,12 @@ This is injection #{injection_idx}. ZoMBI-Hop has completed {iters_done} of
 
 {progress_summary}
 
-Recent measured points (composition → Objective):
+## Change since the last injection
+
+{trend_summary}
+
+Recent measured points — the last 2 LineBO lines (up to 48 droplets), each shown
+with its composition, `Objective`, and supplemental features:
 
 {history_table}
 
@@ -439,28 +493,35 @@ deserves a `penalty` volume? Are any existing volumes no longer useful and worth
 dropping or moving? Then answer through the schema:
 
 - `reasoning`: a concise, quantitative justification (2-6 sentences) grounded in the
-  specific numbers above (name the compositions and radii you chose and why).
-- `volumes`: the FULL list of {{"kind", "center", "radius"}} entries to be active
-  now (not just newly added ones). `kind` is `"reward"` or `"penalty"`, `center` is
-  a 3-number composition, `radius` is within [{min_radius}, {max_radius}]. To keep
-  the current landscape unchanged, re-list exactly the volumes shown above. Return an
-  EMPTY list to clear all volumes (a valid, deliberate choice — e.g. to hand full
-  control back to ZoMBI-Hop's own acquisition).
+  specific numbers above (name the compositions, radii, and strengths you chose and why).
+- `volumes`: the FULL list of {{"kind", "center", "radius", "strength"}} entries to be
+  active now (not just newly added ones). `kind` is `"reward"` or `"penalty"`, `center`
+  is a 3-number composition, `radius` is within [{min_radius}, {max_radius}], and
+  `strength` is within [{min_strength}, {max_strength}] (1 == the force of one of
+  ZoMBI-Hop's own needle penalties). To keep the current landscape unchanged, re-list
+  exactly the volumes shown above. Return an EMPTY list to clear all volumes (a valid,
+  deliberate choice — e.g. to hand full control back to ZoMBI-Hop's own acquisition).
+
+Reason qualitatively about the trajectory's direction and the feature trade-offs
+rather than over-fitting to individual numeric rows; prefer a small, well-justified
+set of volumes over many, and leave the landscape unchanged when the trend is
+already healthy.
 """
 
 
 def format_active_volumes(volumes: List[Dict[str, Any]]) -> str:
     if not volumes:
         return "(none — the acquisition landscape is currently unmodified)"
-    lines = ["kind | center (FAPbI3, MAPbI3, MAPbBr3) | radius"]
+    lines = ["kind | center (FAPbI3, MAPbI3, MAPbBr3) | radius | strength"]
     for v in volumes:
         c = v["center"]
-        lines.append(f"{v['kind']} | ({c[0]:.3f}, {c[1]:.3f}, {c[2]:.3f}) | {v['radius']:.3f}")
+        lines.append(f"{v['kind']} | ({c[0]:.3f}, {c[1]:.3f}, {c[2]:.3f}) | "
+                     f"{v['radius']:.3f} | {v.get('strength', 1.0):.2f}")
     return "\n".join(lines)
 
 
 def build_injection_prompt(feature_log, dh, volumes, injection_idx, iters_done,
-                           budget, interval) -> str:
+                           budget, interval, prev_best: Optional[float] = None) -> str:
     return VOLUME_PROMPT_TEMPLATE.format(
         system_features=llm_config.SYSTEM_FEATURES,
         active_volumes=format_active_volumes(volumes),
@@ -468,6 +529,7 @@ def build_injection_prompt(feature_log, dh, volumes, injection_idx, iters_done,
         iters_done=iters_done,
         budget=budget,
         progress_summary=SBS.progress_summary(feature_log, dh, iters_done, budget),
+        trend_summary=SBS.trend_summary(feature_log, prev_best),
         history_table=SBS.recent_history_table(feature_log),
         n_points=len(feature_log),
         supplemental_summary=SBS.supplemental_summary(feature_log),
@@ -478,6 +540,8 @@ def build_injection_prompt(feature_log, dh, volumes, injection_idx, iters_done,
         interval=interval,
         min_radius=MIN_VOLUME_RADIUS,
         max_radius=MAX_VOLUME_RADIUS,
+        min_strength=MIN_VOLUME_STRENGTH,
+        max_strength=MAX_VOLUME_STRENGTH,
     )
 
 
@@ -588,12 +652,14 @@ def run_baseline_trial(surr, base_hp, ref_optima, seed: int, trial_dir: Path) ->
         metrics = SBS.finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    metrics["source"] = "baseline_trial112"
+    metrics["source"] = "baseline"
     metrics["n_injections"] = 0
     metrics["n_volumes_final"] = 0
     metrics["n_volumes_total"] = 0
     metrics["n_reward_final"] = 0
     metrics["n_penalty_final"] = 0
+    metrics["llm_total_latency_s"] = 0.0
+    metrics["llm_latency_per_iter_s"] = 0.0  # no LLM calls → no added latency
     return metrics
 
 
@@ -614,6 +680,7 @@ def run_llm_trial(surr, base_hp, ref_optima, interval: int, seed: int,
     volumes: List[Dict[str, Any]] = []          # the active set (replaced each injection)
     total_volumes_placed = 0                     # cumulative count across all injections
     injections: List[Dict[str, Any]] = []
+    prev_best: Optional[float] = None            # best Objective at the previous injection
 
     try:
         fresh = True
@@ -635,7 +702,8 @@ def run_llm_trial(surr, base_hp, ref_optima, interval: int, seed: int,
                 break
 
             prompt = build_injection_prompt(feature_log, dh, volumes, injection_idx,
-                                            call_counter[0], MAX_ITERS, interval)
+                                            call_counter[0], MAX_ITERS, interval, prev_best)
+            prev_best = max((r["Objective"] for r in feature_log), default=None)
             this_dir = inj_dir / f"inj_{injection_idx:02d}"
             this_dir.mkdir(parents=True, exist_ok=True)
             (this_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
@@ -685,6 +753,13 @@ def run_llm_trial(surr, base_hp, ref_optima, interval: int, seed: int,
     metrics["n_volumes_total"] = total_volumes_placed  # summed over all injections
     metrics["n_reward_final"] = sum(v["kind"] == "reward" for v in volumes)
     metrics["n_penalty_final"] = sum(v["kind"] == "penalty" for v in volumes)
+    # Latency the LLM calls added, amortized over EVERY ZoMBI-Hop iteration in the
+    # trial (including the iterations with no injection) — the per-iteration wall-clock
+    # tax of keeping the LLM in the loop.
+    total_latency = float(sum((inj.get("latency_s") or 0.0) for inj in injections))
+    n_iters = metrics.get("n_iters") or 0
+    metrics["llm_total_latency_s"] = total_latency
+    metrics["llm_latency_per_iter_s"] = total_latency / n_iters if n_iters else 0.0
     return metrics
 
 
@@ -710,11 +785,14 @@ def _group_row(group: str, interval: Optional[int], stats: Dict[str, Any],
         "needles_mean": m("n_needles", "mean"),
         "dist_mean": m("dist_to_ref_optima", "mean"),
         "dup_mean": m("dup_fraction", "mean"),
+        "needle_spread_mean": m("mean_pairwise_needle_dist", "mean"),
+        "needle_spread_std": m("mean_pairwise_needle_dist", "std"),
         "n_injections_mean": mean_of("n_injections"),
         "n_volumes_final_mean": mean_of("n_volumes_final"),
         "n_volumes_total_mean": mean_of("n_volumes_total"),
         "n_reward_final_mean": mean_of("n_reward_final"),
         "n_penalty_final_mean": mean_of("n_penalty_final"),
+        "llm_latency_per_iter_mean": mean_of("llm_latency_per_iter_s"),
     }
     if baseline_stats is not None:
         diff = (m("best_objective", "mean") or float("nan")) - \
@@ -735,9 +813,11 @@ def _group_row(group: str, interval: Optional[int], stats: Dict[str, Any],
 
 _SUMMARY_FIELDS = ["group", "injection_interval", "n_repeats",
                    "best_mean", "best_std", "best_needle_mean", "needles_mean",
-                   "dist_mean", "dup_mean", "n_injections_mean",
+                   "dist_mean", "dup_mean", "needle_spread_mean", "needle_spread_std",
+                   "n_injections_mean",
                    "n_volumes_final_mean", "n_volumes_total_mean",
                    "n_reward_final_mean", "n_penalty_final_mean",
+                   "llm_latency_per_iter_mean",
                    "diff_best_vs_baseline", "diff_best_p_value",
                    "diff_best_ci95_low", "diff_best_ci95_high"]
 
@@ -808,25 +888,27 @@ def main() -> None:
     rows: List[dict] = []
 
     # ── Baseline group ───────────────────────────────────────────────────────────
-    print(f"\n[baseline_trial112] {N_REPEATS} repeats")
+    print(f"\n[baseline] {N_REPEATS} repeats")
     baseline_samples: List[Dict[str, Any]] = []
     for rep in range(N_REPEATS):
         seed = 1000 + rep
-        tdir = sweep_dir / "baseline_trial112" / f"rep{rep}"
+        tdir = sweep_dir / "baseline" / f"rep{rep}"
         print(f"  rep {rep} (seed {seed}) …")
         try:
-            m = run_baseline_trial(surr, base_hp, ref_optima, seed, tdir)
+            m, reused = SBS.run_or_reuse_baseline(surr, base_hp, ref_optima, seed,
+                                                  tdir, MAX_ITERS, run_baseline_trial,
+                                                  impl="volume")
             print(f"    best={m['best_objective']:.4f}, needles={m['n_needles']}, "
-                  f"dup={m['dup_fraction']:.4f}")
+                  f"dup={m['dup_fraction']:.4f}" + ("  [reused]" if reused else ""))
         except Exception as e:
             print(f"    FAILED: {e}")
             traceback.print_exc()
-            m = {"source": "baseline_trial112", "n_injections": 0, "n_volumes_final": 0,
+            m = {"source": "baseline", "n_injections": 0, "n_volumes_final": 0,
                  "n_volumes_total": 0, "n_reward_final": 0, "n_penalty_final": 0}
         baseline_samples.append(m)
         (tdir / "metrics.json").write_text(json.dumps(m, indent=2))
     baseline_stats = SBS.aggregate(baseline_samples)
-    rows.append(_group_row("baseline_trial112", None, baseline_stats, baseline_samples, None))
+    rows.append(_group_row("baseline", None, baseline_stats, baseline_samples, None))
     write_summary(sweep_dir, rows)
 
     # ── LLM volume-control cadence groups ────────────────────────────────────────
@@ -862,6 +944,8 @@ def main() -> None:
         sweep_dir,
         title=("Volume control — convergence: baseline vs LLM injection cadences\n"
                "(mean ± 95% CI over repeats)"))
+    # Per-rep seed-matched view: each LLM rep vs its CRN baseline (2 lines, no CI).
+    SBS.plot_per_rep_vs_baseline(sweep_dir)
 
     print(f"\nSweep complete → {sweep_dir / 'sweep_summary.csv'}")
 
@@ -880,5 +964,16 @@ if __name__ == "__main__":
             Path(args[1]),
             title=("Volume control — convergence: baseline vs LLM injection cadences\n"
                    "(mean ± 95% CI over repeats)"))
+        SBS.plot_per_rep_vs_baseline(Path(args[1]))
+    elif args and args[0] in ("--backfill-baselines",):
+        if len(args) < 2:
+            raise SystemExit("usage: sweep_volume_control.py --backfill-baselines <sweep_dir>")
+        _surr = (SBS.Surrogate.load(SURROGATE_PICKLE)
+                 if SURROGATE_PICKLE and Path(SURROGATE_PICKLE).exists()
+                 else SBS.Surrogate.fit(verbose=False))
+        _bhp, _desc = resolve_baseline_hparams()
+        print(f"baseline hyperparameters [{_desc}]: {_bhp}")
+        SBS.backfill_baseline_manifests(Path(args[1]), _bhp, MAX_ITERS, _surr,
+                                        impl="volume")
     else:
         main()
