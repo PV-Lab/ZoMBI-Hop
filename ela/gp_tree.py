@@ -52,8 +52,10 @@ PAPER_BINARY_WEIGHTS: dict[str, float] = {
 
 
 def _safe_div(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    denom = np.where(np.abs(b) < 1e-6, np.sign(b) * 1e-6 + 1e-6, b)
-    return a / denom
+    # Use a signed floor so tiny negative divisors cannot cancel to zero.
+    denom = np.where(np.abs(b) < 1e-6, np.copysign(1e-6, b + 1e-30), b)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.divide(a, denom, out=np.full_like(a, np.nan, dtype=float), where=denom != 0)
 
 
 def _apply_unary(op: str, x: np.ndarray) -> np.ndarray:

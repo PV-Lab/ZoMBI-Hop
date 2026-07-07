@@ -23,13 +23,13 @@
 #   conda env zombi-hop-linebo (slurm/mobo_job_common.sh)
 #
 # Outputs:
-#   ela/runs/pilot_3d_seed<SEED>_job<JOBID>/
-#   ela/scripts/logs/pilot_3d_s1_<JOBID>.{out,err}
+#   ela/runs/ela_3d_<JOBID>/
+#   ela/scripts/logs/ela_3d_<JOBID>.{out,err}
 # =============================================================================
 
-#SBATCH --job-name=pilot_3d_s1
-#SBATCH --output=ela/scripts/logs/pilot_3d_s1_%j.out
-#SBATCH --error=ela/scripts/logs/pilot_3d_s1_%j.err
+#SBATCH --job-name=ela_3d
+#SBATCH --output=ela/scripts/logs/ela_3d_%j.out
+#SBATCH --error=ela/scripts/logs/ela_3d_%j.err
 #SBATCH --partition=mit_normal
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
@@ -57,7 +57,7 @@ PILOT_TARGET="${PILOT_TARGET:-data/2nd_real_run_ela_full.json}"
 PILOT_LANDSCAPE_EVERY="${PILOT_LANDSCAPE_EVERY:-1}"
 
 # Stable run dir keyed on job id (same pattern as mobo_ensemble_*_job${SLURM_JOB_ID}).
-RUN_DIR="$(_pilot_run_dir_slurm "${PILOT_SEED}" "${PILOT_QUICK:-0}")"
+RUN_DIR="$(_pilot_run_dir_slurm)"
 mkdir -p "${RUN_DIR}"
 
 PILOT_CMD=(

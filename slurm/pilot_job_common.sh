@@ -9,28 +9,15 @@ _pilot_setup_dirs() {
   mkdir -p "${PILOT_RUN_ROOT}" "${PILOT_LOG_DIR}" "${REPO}/ela/runs"
 }
 
-# Run dirs — mirror optimize/run_mobo.py naming:
-#   local:  pilot_3d_seed0_DD_MM_HH_MM_SS_<pid>
-#   slurm:  pilot_3d_seed0_job<SLURM_JOB_ID>
-#   array:  pilot_3d_seed0_job<ARRAY_JOB_ID>_task<TASK_ID>
+# Run dirs — Slurm jobs use stable names keyed on SLURM_JOB_ID:
+#   slurm:  ela/runs/ela_3d_<SLURM_JOB_ID>
+#   local:  ela/runs/pilot_3d_seed0_DD_MM_HH_MM_SS_<pid>  (run_pilot_3d.py --out-dir)
 _pilot_run_dir_slurm() {
-  local seed="${1:-0}"
-  local quick="${2:-0}"
-  if [[ "${quick}" == "1" ]]; then
-    echo "${PILOT_RUN_ROOT}/pilot_3d_quick_seed${seed}_job${SLURM_JOB_ID}"
-  else
-    echo "${PILOT_RUN_ROOT}/pilot_3d_seed${seed}_job${SLURM_JOB_ID}"
-  fi
+  echo "${PILOT_RUN_ROOT}/ela_3d_${SLURM_JOB_ID}"
 }
 
 _pilot_run_dir_array() {
-  local seed="${1:-0}"
-  local quick="${2:-0}"
-  if [[ "${quick}" == "1" ]]; then
-    echo "${PILOT_RUN_ROOT}/pilot_3d_quick_seed${seed}_job${SLURM_ARRAY_JOB_ID}_task${SLURM_ARRAY_TASK_ID}"
-  else
-    echo "${PILOT_RUN_ROOT}/pilot_3d_seed${seed}_job${SLURM_ARRAY_JOB_ID}_task${SLURM_ARRAY_TASK_ID}"
-  fi
+  echo "${PILOT_RUN_ROOT}/ela_3d_${SLURM_JOB_ID}"
 }
 
 _pilot_check_data() {

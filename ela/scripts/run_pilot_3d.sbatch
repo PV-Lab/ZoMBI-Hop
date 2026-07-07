@@ -12,9 +12,9 @@
 #   bash ela/scripts/submit_pilot_3d.sh
 # =============================================================================
 
-#SBATCH --job-name=pilot_3d_s1
-#SBATCH --output=ela/scripts/logs/pilot_3d_s1_%j.out
-#SBATCH --error=ela/scripts/logs/pilot_3d_s1_%j.err
+#SBATCH --job-name=ela_3d
+#SBATCH --output=ela/scripts/logs/ela_3d_%j.out
+#SBATCH --error=ela/scripts/logs/ela_3d_%j.err
 #SBATCH --partition=mit_normal
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
@@ -41,7 +41,7 @@ PILOT_DB="${PILOT_DB:-data/2nd_real_run.db}"
 PILOT_TARGET="${PILOT_TARGET:-data/2nd_real_run_ela_full.json}"
 PILOT_LANDSCAPE_EVERY="${PILOT_LANDSCAPE_EVERY:-1}"
 
-RUN_DIR="$(_pilot_run_dir_slurm "${PILOT_SEED}" "${PILOT_QUICK:-0}")"
+RUN_DIR="$(_pilot_run_dir_slurm)"
 mkdir -p "${RUN_DIR}"
 
 PILOT_CMD=(

@@ -12,9 +12,9 @@
 #   bash ela/scripts/submit_pilot_3d.sh probe
 # =============================================================================
 
-#SBATCH --job-name=pilot_3d_probe
-#SBATCH --output=ela/scripts/logs/pilot_3d_probe_%j.out
-#SBATCH --error=ela/scripts/logs/pilot_3d_probe_%j.err
+#SBATCH --job-name=ela_3d_probe
+#SBATCH --output=ela/scripts/logs/ela_3d_%j.out
+#SBATCH --error=ela/scripts/logs/ela_3d_%j.err
 #SBATCH --partition=mit_normal
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
@@ -34,7 +34,7 @@ source "${REPO}/slurm/pilot_job_common.sh"
 _pilot_setup_dirs
 _pilot_check_data
 
-RUN_DIR="$(_pilot_run_dir_slurm 0 1)"
+RUN_DIR="$(_pilot_run_dir_slurm)"
 mkdir -p "${RUN_DIR}"
 
 PILOT_CMD=(

@@ -54,15 +54,15 @@ sbatch_common=(
 case "${MODE}" in
   single|"")
     SBATCH="${SLURM_DIR}/run_pilot_3d.sbatch"
-    sbatch_common+=(--time="${TIME_LIMIT}" --job-name=pilot_3d_s1)
+    sbatch_common+=(--time="${TIME_LIMIT}" --job-name=ela_3d)
     ;;
   probe)
     SBATCH="${SLURM_DIR}/run_pilot_3d_probe.sbatch"
-    sbatch_common+=(--time=00:30:00 --job-name=pilot_3d_probe --cpus-per-task=4 --mem=16G)
+    sbatch_common+=(--time=00:30:00 --job-name=ela_3d_probe --cpus-per-task=4 --mem=16G)
     ;;
   array)
     SBATCH="${SLURM_DIR}/run_pilot_3d_array.sbatch"
-    sbatch_common+=(--time="${TIME_LIMIT}" --job-name=pilot_3d_s1_arr)
+    sbatch_common+=(--time="${TIME_LIMIT}" --job-name=ela_3d_arr)
     if [[ -n "${PILOT_ARRAY:-}" ]]; then
       sbatch_common+=(--array="${PILOT_ARRAY}")
     fi
@@ -83,6 +83,6 @@ echo "  sbatch: ${SBATCH}"
 
 job_id=$(sbatch --export=ALL "${sbatch_common[@]}" "${SBATCH}" | awk '{print $NF}')
 echo "Submitted job ${job_id}"
-echo "  logs: ${REPO}/ela/scripts/logs/"
-echo "  runs: ${PILOT_RUN_ROOT}/pilot_3d_seed*_job*"
+echo "  logs: ${REPO}/ela/scripts/logs/ela_3d_${job_id}.{out,err}"
+echo "  runs: ${PILOT_RUN_ROOT}/ela_3d_${job_id}"
 echo "  squeue -j ${job_id}"

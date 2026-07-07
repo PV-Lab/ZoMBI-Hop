@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy import linalg
 from scipy.spatial.distance import pdist, squareform
 from scipy.stats import gaussian_kde, pearsonr
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
@@ -127,22 +128,29 @@ def calculate_ela_level(
         else:
             y_quant = np.quantile(y, prob)
             y_class = (y < y_quant).astype(int)
-        if y_class.sum() in (0, len(y_class)) or y_class.sum() < n_splits:
+        class_counts = np.bincount(y_class)
+        min_class = int(class_counts.min()) if len(class_counts) > 1 else 0
+        if min_class == 0 or min_class < 2:
             for k in el:
                 el[k].append(float("nan"))
             continue
-        kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        n_folds = min(n_splits, min_class)
+        kf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
         acc = {"lda": [], "qda": [], "cart": []}
         for train, test in kf.split(X, y_class):
             for name, clf in (
-                ("lda", LinearDiscriminantAnalysis()),
-                ("qda", QuadraticDiscriminantAnalysis()),
+                ("lda", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
+                ("qda", QuadraticDiscriminantAnalysis(reg_param=0.1)),
                 ("cart", DecisionTreeClassifier(random_state=42)),
             ):
-                clf.fit(X.iloc[train], y_class[train])
-                acc[name].append(float((y_class[test] == clf.predict(X.iloc[test])).mean()))
+                try:
+                    clf.fit(X.iloc[train], y_class[train])
+                    pred = clf.predict(X.iloc[test])
+                except (linalg.LinAlgError, ValueError):
+                    continue
+                acc[name].append(float((y_class[test] == pred).mean()))
         for name in el:
-            el[name].append(float(np.mean(acc[name])))
+            el[name].append(float(np.mean(acc[name])) if acc[name] else float("nan"))
 
     out: dict[str, float] = {}
     for i, prob in enumerate(quantiles):
