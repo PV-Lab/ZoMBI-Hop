@@ -1,0 +1,42 @@
+{
+  "name": "probe-smoke",
+  "description": "Fast cluster smoke test (~5 min). Use: sbatch ela/scripts/run_pilot_3d_probe.sbatch",
+
+  "mode": "anchored",
+
+  "data": {
+    "db": "data/2nd_real_run.db",
+    "target": "data/2nd_real_run_ela_full.json"
+  },
+
+  "fitness": {
+    "alpha_subspace": 3.0,
+    "beta_complexity": 0.001,
+    "tier1_gamma": 1.0,
+    "linearity_penalty_gamma": 0.0,
+    "subspace_rmse_frac": 0.02,
+    "tier1_acceptance_median_rel": 0.1
+  },
+
+  "ga": {
+    "population": 12,
+    "generations": 4,
+    "early_reject_subspace_mult": 0.0
+  },
+
+  "sampling": {
+    "n_dense": 512
+  },
+
+  "viz": {
+    "snapshot_every": 2,
+    "landscape_viz": false,
+    "post_viz": false
+  },
+
+  "runtime": {
+    "eval_workers": 2,
+    "log_level": "INFO",
+    "quick": true
+  }
+}

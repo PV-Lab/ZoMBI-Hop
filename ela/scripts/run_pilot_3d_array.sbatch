@@ -19,7 +19,7 @@
 #SBATCH --output=ela/scripts/logs/ela_3d_%j.out
 #SBATCH --error=ela/scripts/logs/ela_3d_%j.err
 #SBATCH --partition=mit_normal
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
@@ -35,38 +35,23 @@ source "${REPO}/ela/scripts/pilot_job_common.sh"
 _pilot_setup_env
 _pilot_check_data
 
-PILOT_POPULATION="${PILOT_POPULATION:-400}"
-PILOT_GENERATIONS="${PILOT_GENERATIONS:-100}"
-PILOT_DB="${PILOT_DB:-data/2nd_real_run.db}"
-PILOT_TARGET="${PILOT_TARGET:-data/2nd_real_run_ela_full.json}"
-PILOT_LANDSCAPE_EVERY="${PILOT_LANDSCAPE_EVERY:-5}"
-
 RUN_DIR="$(_pilot_run_dir_array)"
 mkdir -p "${RUN_DIR}"
 
 PILOT_CMD=(
   python ela/run_pilot_3d.py
-  --db "${PILOT_DB}"
-  --target "${PILOT_TARGET}"
   --out-dir "${RUN_DIR}"
-  --population "${PILOT_POPULATION}"
-  --generations "${PILOT_GENERATIONS}"
-  --landscape-every "${PILOT_LANDSCAPE_EVERY}"
-  --grid-n 200
-  --landscape-grid-n 100
 )
 
+_pilot_append_config_flags PILOT_CMD
 _pilot_append_mode_flags PILOT_CMD
+_pilot_append_population_flags PILOT_CMD
 _pilot_append_viz_flags PILOT_CMD
 _pilot_append_worker_flags PILOT_CMD
 _pilot_append_seed_flags PILOT_CMD
 
 echo "=== ELA S1 pilot 3D (array) ==="
-if [[ "${PILOT_CAMPAIGN_MODE:-0}" == "1" ]]; then
-  echo "mode:       campaign-twin"
-else
-  echo "mode:       paper (Muñoz S1, RF λ_T)"
-fi
+_pilot_log_config_summary
 echo "array_job:  ${SLURM_ARRAY_JOB_ID}"
 echo "task_id:    ${SLURM_ARRAY_TASK_ID}"
 if [[ -v PILOT_SEED ]]; then

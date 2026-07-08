@@ -47,7 +47,7 @@ CAMPAIGN_WEIGHTS: dict[str, float] = {
     "LQ25": 1.0,
     "PKS": 1.5,
     "oob_r2": 0.0,
-    "median_lipschitz": 1.0,
+    "median_lipschitz": 0.0,
 }
 
 # Backward-compatible alias.

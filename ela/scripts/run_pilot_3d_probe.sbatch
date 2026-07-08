@@ -8,8 +8,7 @@
 #   cd ~/orcd/scratch/ZoMBI-Hop
 #   sbatch ela/scripts/run_pilot_3d_probe.sbatch
 #
-# Or:
-#   bash ela/scripts/submit_pilot_3d.sh probe
+# Uses ela/pilot_config_probe.json by default.
 # =============================================================================
 
 #SBATCH --job-name=ela_3d_probe
@@ -28,6 +27,7 @@ cd "${REPO}"
 
 # shellcheck source=/dev/null
 source "${REPO}/ela/scripts/pilot_job_common.sh"
+export PILOT_CONFIG="${PILOT_CONFIG:-${REPO}/ela/pilot_config_probe.json}"
 PILOT_EVAL_WORKERS="${PILOT_EVAL_WORKERS:-2}"
 _pilot_setup_env
 _pilot_check_data
@@ -37,17 +37,16 @@ mkdir -p "${RUN_DIR}"
 
 PILOT_CMD=(
   python ela/run_pilot_3d.py
-  --quick
-  --early-reject-mult 0
-  --no-landscape-viz
   --out-dir "${RUN_DIR}"
-  --population 12
-  --generations 4
   --eval-workers "${PILOT_EVAL_WORKERS}"
 )
 
+_pilot_append_config_flags PILOT_CMD
+_pilot_append_mode_flags PILOT_CMD
+_pilot_append_seed_flags PILOT_CMD
+
 echo "=== Pilot probe ==="
-echo "mode:       paper (Muñoz S1, RF λ_T)"
+_pilot_log_config_summary
 echo "job_id:     ${SLURM_JOB_ID}"
 echo "repo:       ${REPO}"
 echo "hostname:   $(hostname)"

@@ -1,0 +1,54 @@
+{
+  "name": "campaign-twin",
+  "description": "ZoMBI campaign-twin: 10 weighted features, linearity penalty, smaller GA. Use: PILOT_CONFIG=ela/pilot_config_campaign.json sbatch ela/scripts/run_pilot_3d.sbatch",
+
+  "mode": "campaign",
+
+  "data": {
+    "db": "data/2nd_real_run.db",
+    "target": "data/2nd_real_run_ela_full.json"
+  },
+
+  "fitness": {
+    "alpha_subspace": 3.0,
+    "beta_complexity": 0.001,
+    "tier1_gamma": 5.0,
+    "linearity_penalty_gamma": 3.0,
+    "subspace_rmse_frac": 0.02,
+    "tier1_acceptance_median_rel": 0.1,
+    "tier1_weights": {
+      "R2_Q": 1.0,
+      "CN": 1.0,
+      "H_Y": 1.0,
+      "xi_1": 0.5,
+      "gamma_Y": 1.0,
+      "EL25": 1.0,
+      "LQ25": 1.0,
+      "PKS": 1.5,
+      "oob_r2": 0.0,
+      "median_lipschitz": 1.0
+    }
+  },
+
+  "ga": {
+    "population": 120,
+    "generations": 60,
+    "early_reject_subspace_mult": 0.0
+  },
+
+  "viz": {
+    "snapshot_every": 5,
+    "landscape_viz": true,
+    "landscape_every": 5,
+    "landscape_grid_n": 100,
+    "post_viz": true,
+    "grid_n": 200
+  },
+
+  "runtime": {
+    "eval_workers": null,
+    "log_level": "INFO",
+    "seed": null,
+    "quick": false
+  }
+}

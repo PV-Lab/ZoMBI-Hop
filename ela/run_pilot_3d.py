@@ -16,6 +16,13 @@ if str(ROOT) not in sys.path:
 
 from ela.evolve import EvolutionConfig, _elitism_count, run_evolution
 from ela.evolve_context import build_context
+from ela.pilot_config import (
+    DEFAULT_CONFIG_PATH,
+    ResolvedPilotConfig,
+    load_pilot_config,
+    resolve_pilot_config,
+    write_resolved_config,
+)
 from ela.run_manifest import (
     append_manifest,
     build_finish_manifest,
@@ -26,8 +33,6 @@ from ela.run_manifest import (
 from ela.run_naming import default_runs_root, pilot_prefix, unique_run_dir
 from ela.visualize_pilot_3d import visualize_run
 
-DEFAULT_DB = ROOT / "data" / "2nd_real_run.db"
-DEFAULT_TARGET = ROOT / "data" / "2nd_real_run_ela_full.json"
 DEFAULT_RUNS = default_runs_root(ROOT)
 
 
@@ -53,15 +58,47 @@ def _configure_logging(level: str, log_file: Path | None) -> None:
     )
 
 
+def _cli_overrides(args: argparse.Namespace) -> dict:
+    return {
+        "db": args.db,
+        "target": args.target,
+        "mode": None,
+        "campaign_mode": args.campaign_mode,
+        "pure_paper": args.pure_paper,
+        "no_calibrate": args.no_calibrate,
+        "no_require_subspace_rmse": args.no_require_subspace_rmse,
+        "alpha": args.alpha,
+        "beta": args.beta,
+        "tier1_gamma": args.tier1_gamma,
+        "linearity_penalty": args.linearity_penalty,
+        "population": args.population,
+        "generations": args.generations,
+        "n_dense": args.n_dense,
+        "quick": args.quick,
+        "early_reject_mult": args.early_reject_mult,
+        "no_landscape_viz": args.no_landscape_viz,
+        "no_viz": args.no_viz,
+        "eval_workers": args.eval_workers,
+        "seed": args.seed,
+        "log_level": args.log_level,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="3D S1 GP landscape recreation (Muñoz S1; RF λ_T target)",
     )
-    parser.add_argument("--db", type=Path, default=DEFAULT_DB, help="Campaign SQLite DB")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help=f"Pilot config JSON (default: {DEFAULT_CONFIG_PATH.relative_to(ROOT)})",
+    )
+    parser.add_argument("--db", type=Path, default=None, help="Campaign SQLite DB")
     parser.add_argument(
         "--target",
         type=Path,
-        default=DEFAULT_TARGET,
+        default=None,
         help="Tier-1 target JSON (ela_full output)",
     )
     parser.add_argument(
@@ -82,176 +119,194 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--campaign-mode",
         action="store_true",
-        help="ZoMBI extensions: RMSE anchor, linear calibration, 10-feature loss",
+        help="Override config mode → campaign-twin",
+    )
+    parser.add_argument(
+        "--pure-paper",
+        action="store_true",
+        help="Override config mode → Muñoz S1 ablation",
+    )
+    parser.add_argument(
+        "--no-calibrate",
+        action="store_true",
+        help="Disable linear a·g+b calibration (raw g(z) evaluation)",
+    )
+    parser.add_argument(
+        "--no-require-subspace-rmse",
+        action="store_true",
+        help="Accept on Tier-1 only (skip subspace RMSE gate)",
     )
     parser.add_argument(
         "--alpha",
         type=float,
         default=None,
-        help="Subspace RMSE weight (default: 0 paper / 3 campaign)",
+        help="Subspace RMSE weight (overrides config)",
     )
-    parser.add_argument("--beta", type=float, default=0.001, help="Tree complexity weight")
+    parser.add_argument("--beta", type=float, default=None, help="Tree complexity weight")
     parser.add_argument(
         "--tier1-gamma",
         type=float,
         default=None,
-        help="Tier-1 ELA loss scale (default: 1 paper / 5 campaign)",
+        help="Tier-1 ELA loss scale (overrides config)",
     )
-    parser.add_argument("--snapshot-every", type=int, default=5)
+    parser.add_argument(
+        "--linearity-penalty",
+        type=float,
+        default=None,
+        help="Penalty for near-linear trees (overrides config)",
+    )
+    parser.add_argument("--snapshot-every", type=int, default=None)
     parser.add_argument("--n-dense", type=int, default=None, help="Dense sample size (default 4096)")
-    parser.add_argument("--quick", action="store_true", help="Smoke test: small pop/gens/sample")
+    parser.add_argument("--quick", action="store_true", help="Smoke test (overrides config runtime.quick)")
     parser.add_argument(
         "--early-reject-mult",
         type=float,
         default=None,
-        help="Campaign mode only: skip Tier-1 when RMSE > mult×threshold",
+        help="Skip Tier-1 when RMSE > mult×threshold",
     )
     parser.add_argument("--no-landscape-viz", action="store_true", help="Skip per-generation ternary plots")
-    parser.add_argument("--landscape-every", type=int, default=1)
-    parser.add_argument("--landscape-grid-n", type=int, default=100)
+    parser.add_argument("--landscape-every", type=int, default=None)
+    parser.add_argument("--landscape-grid-n", type=int, default=None)
     parser.add_argument("--no-viz", action="store_true", help="Skip post-run summary visualization")
-    parser.add_argument("--grid-n", type=int, default=200)
+    parser.add_argument("--grid-n", type=int, default=None)
     parser.add_argument(
         "--eval-workers",
         type=int,
         default=None,
         help="Parallel fitness eval processes (default: SLURM_CPUS/4 or local cpus/4)",
     )
-    parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--log-level", default=None)
     args = parser.parse_args(argv)
 
-    paper_mode = not args.campaign_mode
+    if args.campaign_mode and args.pure_paper:
+        parser.error("use at most one of --campaign-mode and --pure-paper")
 
-    if args.quick:
-        population = args.population if args.population is not None else 24
-        generations = args.generations if args.generations is not None else 8
-        n_dense = args.n_dense if args.n_dense is not None else 512
-        snapshot_every = min(args.snapshot_every, 2)
-        early_reject_mult = 0.0 if paper_mode else 3.0
-    else:
-        population = args.population if args.population is not None else (400 if paper_mode else 120)
-        generations = args.generations if args.generations is not None else (100 if paper_mode else 60)
-        n_dense = args.n_dense
-        snapshot_every = args.snapshot_every
-        early_reject_mult = 0.0
+    config_path = args.config or DEFAULT_CONFIG_PATH
+    if not config_path.is_absolute():
+        config_path = (ROOT / config_path).resolve()
+    raw = load_pilot_config(config_path)
+    cfg_resolved = resolve_pilot_config(raw, repo_root=ROOT, cli=_cli_overrides(args))
 
-    if args.alpha is not None:
-        alpha = args.alpha
-    else:
-        alpha = 0.0 if paper_mode else 3.0
+    if args.snapshot_every is not None:
+        cfg_resolved.snapshot_every = args.snapshot_every
+    if args.landscape_every is not None:
+        cfg_resolved.landscape_every = max(1, args.landscape_every)
+    if args.landscape_grid_n is not None:
+        cfg_resolved.landscape_grid_n = args.landscape_grid_n
+    if args.grid_n is not None:
+        cfg_resolved.grid_n = args.grid_n
 
-    if args.tier1_gamma is not None:
-        tier1_gamma = args.tier1_gamma
-    else:
-        tier1_gamma = 1.0 if paper_mode else 5.0
-
-    linearity_penalty = 0.0 if paper_mode else 3.0
     eval_workers = (
-        args.eval_workers if args.eval_workers is not None else _default_eval_workers()
+        cfg_resolved.eval_workers
+        if cfg_resolved.eval_workers is not None
+        else _default_eval_workers()
     )
     eval_workers = max(1, int(eval_workers))
-    gp_seed, gp_seed_source = resolve_gp_seed(args.seed)
+    gp_seed, gp_seed_source = resolve_gp_seed(cfg_resolved.seed)
 
     if args.out_dir is not None:
         run_dir = args.out_dir.resolve()
         run_dir.mkdir(parents=True, exist_ok=True)
     else:
-        prefix = pilot_prefix(seed=gp_seed, quick=args.quick)
+        prefix = pilot_prefix(seed=gp_seed, quick=cfg_resolved.quick)
         run_dir = unique_run_dir(args.runs_dir.resolve(), prefix)
 
     manifest_path = run_dir / "run_manifest.json"
-    _configure_logging(args.log_level, run_dir / "pilot.log")
+    _configure_logging(cfg_resolved.log_level, run_dir / "pilot.log")
 
     log = logging.getLogger("ela.pilot_3d")
-    mode_label = "paper (Muñoz S1)" if paper_mode else "campaign-twin"
-    log.info("Mode: %s", mode_label)
+    resolved_path = write_resolved_config(run_dir, cfg_resolved)
+    log.info("Config: %s", config_path)
+    log.info("Resolved config: %s", resolved_path)
+    log.info("Mode: %s (%s)", cfg_resolved.mode_label, cfg_resolved.mode)
     log.info("GP seed: %d (source=%s)", gp_seed, gp_seed_source)
-    log.info("Building evolution context from %s", args.db)
-    log.info("Target fingerprint: %s", args.target)
+    log.info("Building evolution context from %s", cfg_resolved.db)
+    log.info("Target fingerprint: %s", cfg_resolved.target)
+    log.info("Pilot parameters:\n%s", json.dumps(cfg_resolved.to_log_dict(), indent=2))
 
     ctx = build_context(
-        db_path=args.db,
-        target_json=args.target,
-        n_dense=n_dense,
-        alpha_subspace=alpha,
-        beta_complexity=args.beta,
-        paper_mode=paper_mode,
+        db_path=cfg_resolved.db,
+        target_json=cfg_resolved.target,
+        n_dense=cfg_resolved.n_dense,
+        alpha_subspace=cfg_resolved.alpha_subspace,
+        beta_complexity=cfg_resolved.beta_complexity,
+        subspace_rmse_frac=cfg_resolved.subspace_rmse_frac,
+        munoz_8_fitness=cfg_resolved.munoz_8_fitness,
+        linear_calibration=cfg_resolved.linear_calibration,
+        paper_ga=cfg_resolved.paper_ga,
+        tier1_weights=cfg_resolved.tier1_weights,
     )
     log.info(
-        "λ_T sample_seed=%d (fixed) n_dense=%d eval_workers=%d",
+        "λ_T sample_seed=%d (fixed) n_dense=%d eval_workers=%d subspace_threshold=%.5f",
         ctx.sample_seed,
         ctx.n_dense,
         eval_workers,
+        ctx.subspace_rmse_threshold,
     )
 
     ctx.metadata["gp_seed"] = gp_seed
     ctx.metadata["gp_seed_source"] = gp_seed_source
-    ctx.metadata["alpha_subspace"] = alpha
-    ctx.metadata["beta_complexity"] = args.beta
-    ctx.metadata["tier1_gamma"] = tier1_gamma
-    ctx.metadata["paper_mode"] = paper_mode
-    ctx.metadata["linearity_penalty_gamma"] = linearity_penalty
+    ctx.metadata["pilot_config_source"] = str(config_path)
+    ctx.metadata["pilot_config_resolved"] = str(resolved_path)
+    ctx.metadata["tier1_gamma"] = cfg_resolved.tier1_gamma
+    ctx.metadata["linearity_penalty_gamma"] = cfg_resolved.linearity_penalty_gamma
+    ctx.metadata["tier1_acceptance_median_rel"] = cfg_resolved.tier1_acceptance_median_rel
+    ctx.metadata["require_subspace_rmse"] = cfg_resolved.require_subspace_rmse
     ctx.metadata["eval_workers"] = eval_workers
-    ctx.metadata["population"] = population
-    ctx.metadata["generations"] = generations
+    ctx.metadata["population"] = cfg_resolved.population
+    ctx.metadata["generations"] = cfg_resolved.generations
 
     manifest = build_start_manifest(
         gp_seed=gp_seed,
         gp_seed_source=gp_seed_source,
         run_dir=run_dir,
-        args=args,
-        paper_mode=paper_mode,
-        population=population,
-        generations=generations,
-        n_dense=n_dense,
+        pilot_config=cfg_resolved,
+        population=cfg_resolved.population,
+        generations=cfg_resolved.generations,
+        n_dense=cfg_resolved.n_dense,
         eval_workers=eval_workers,
-        alpha=alpha,
-        tier1_gamma=tier1_gamma,
-        linearity_penalty=linearity_penalty,
         sample_seed=ctx.sample_seed,
+        config_path=config_path,
+        resolved_config_path=resolved_path,
     )
 
-    cfg = EvolutionConfig(
-        population=population,
-        generations=generations,
-        alpha_subspace=alpha,
-        beta_complexity=args.beta,
-        tier1_gamma=tier1_gamma,
-        linearity_penalty_gamma=linearity_penalty,
-        paper_mode=paper_mode,
-        snapshot_every=snapshot_every,
+    evo_cfg = EvolutionConfig(
+        population=cfg_resolved.population,
+        generations=cfg_resolved.generations,
+        alpha_subspace=cfg_resolved.alpha_subspace,
+        beta_complexity=cfg_resolved.beta_complexity,
+        tier1_gamma=cfg_resolved.tier1_gamma,
+        tier1_acceptance_median_rel=cfg_resolved.tier1_acceptance_median_rel,
+        linearity_penalty_gamma=cfg_resolved.linearity_penalty_gamma,
+        linear_calibration=cfg_resolved.linear_calibration,
+        require_subspace_rmse=cfg_resolved.require_subspace_rmse,
+        paper_ga=cfg_resolved.paper_ga,
+        paper_mode=cfg_resolved.paper_ga,
+        snapshot_every=cfg_resolved.snapshot_every,
         seed=gp_seed,
-        early_reject_subspace_mult=(
-            args.early_reject_mult if args.early_reject_mult is not None else early_reject_mult
-        ),
-        landscape_viz=not args.no_landscape_viz,
-        landscape_viz_every=max(1, args.landscape_every),
-        landscape_grid_n=args.landscape_grid_n,
+        early_reject_subspace_mult=cfg_resolved.early_reject_subspace_mult,
+        landscape_viz=cfg_resolved.landscape_viz,
+        landscape_viz_every=cfg_resolved.landscape_every,
+        landscape_grid_n=cfg_resolved.landscape_grid_n,
         eval_workers=eval_workers,
-        **(
-            {}
-            if paper_mode
-            else dict(
-                tournament_k=5,
-                crossover_prob=0.7,
-                mutation_prob=0.25,
-                direct_transfer_prob=0.0,
-                elitism=2,
-                elitism_frac=0.0,
-                max_tree_depth=7,
-                fitness_stop_threshold=0.0,
-            )
-        ),
+        tournament_k=cfg_resolved.tournament_k,
+        crossover_prob=cfg_resolved.crossover_prob,
+        mutation_prob=cfg_resolved.mutation_prob,
+        direct_transfer_prob=cfg_resolved.direct_transfer_prob,
+        elitism=cfg_resolved.elitism,
+        elitism_frac=cfg_resolved.elitism_frac,
+        max_tree_depth=cfg_resolved.max_tree_depth,
+        fitness_stop_threshold=cfg_resolved.fitness_stop_threshold,
     )
 
     manifest["hyperparameters"]["ga"] = {
-        "tournament_k": cfg.tournament_k,
-        "crossover_prob": cfg.crossover_prob,
-        "mutation_prob": cfg.mutation_prob,
-        "direct_transfer_prob": cfg.direct_transfer_prob,
-        "elitism": _elitism_count(cfg),
-        "max_tree_depth": cfg.max_tree_depth,
-        "fitness_stop_threshold": cfg.fitness_stop_threshold,
+        "tournament_k": evo_cfg.tournament_k,
+        "crossover_prob": evo_cfg.crossover_prob,
+        "mutation_prob": evo_cfg.mutation_prob,
+        "direct_transfer_prob": evo_cfg.direct_transfer_prob,
+        "elitism": _elitism_count(evo_cfg),
+        "max_tree_depth": evo_cfg.max_tree_depth,
+        "fitness_stop_threshold": evo_cfg.fitness_stop_threshold,
     }
     write_manifest(manifest_path, manifest)
     log.info("Run manifest: %s", manifest_path)
@@ -259,23 +314,32 @@ def main(argv: list[str] | None = None) -> int:
 
     log.info(
         "Starting evolution: mode=%s seed=%d (%s) pop=%d gens=%d n_dense=%d "
-        "eval_workers=%d tournament_k=%d elite=%d depth=%d stop=%.0e -> %s",
-        mode_label,
+        "features=%s calibrate=%s require_rmse=%s eval_workers=%d "
+        "α=%.3f β=%.4f γ=%.2f linearity=%.2f "
+        "tournament_k=%d elite=%d depth=%d stop=%.0e -> %s",
+        cfg_resolved.mode_label,
         gp_seed,
         gp_seed_source,
-        cfg.population,
-        cfg.generations,
+        evo_cfg.population,
+        evo_cfg.generations,
         ctx.n_dense,
-        cfg.eval_workers,
-        cfg.tournament_k,
-        _elitism_count(cfg),
-        cfg.max_tree_depth,
-        cfg.fitness_stop_threshold,
+        list(ctx.fitness_feature_names),
+        evo_cfg.linear_calibration,
+        evo_cfg.require_subspace_rmse,
+        evo_cfg.eval_workers,
+        evo_cfg.alpha_subspace,
+        evo_cfg.beta_complexity,
+        evo_cfg.tier1_gamma,
+        evo_cfg.linearity_penalty_gamma,
+        evo_cfg.tournament_k,
+        _elitism_count(evo_cfg),
+        evo_cfg.max_tree_depth,
+        evo_cfg.fitness_stop_threshold,
         run_dir,
     )
 
     t0 = time.monotonic()
-    best = run_evolution(ctx, run_dir, cfg, target_source=args.target)
+    best = run_evolution(ctx, run_dir, evo_cfg, target_source=cfg_resolved.target)
     wall_s = time.monotonic() - t0
     append_manifest(
         manifest_path,
@@ -298,9 +362,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     log.info("Artifacts: %s", run_dir)
 
-    if not args.no_viz:
+    if cfg_resolved.post_viz:
         try:
-            viz_dir = visualize_run(run_dir, grid_n=args.grid_n)
+            viz_dir = visualize_run(run_dir, grid_n=cfg_resolved.grid_n)
             log.info("Visualization: %s", viz_dir)
         except Exception:
             log.exception("Visualization failed")

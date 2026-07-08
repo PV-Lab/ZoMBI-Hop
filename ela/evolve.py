@@ -63,10 +63,14 @@ class EvolutionConfig:
     elitism_frac: float = 0.1
     max_tree_depth: int = 10
     fitness_stop_threshold: float = 1e-3  # paper early stop; 0 = disabled
-    paper_mode: bool = True
-    alpha_subspace: float = 0.0
+    linear_calibration: bool = True
+    require_subspace_rmse: bool = True
+    paper_ga: bool = True  # Muñoz GP operators + 60/30/10 offspring
+    paper_mode: bool = True  # legacy alias for paper_ga (gp_tree / viz)
+    alpha_subspace: float = 3.0
     beta_complexity: float = 0.001
     tier1_gamma: float = 1.0
+    tier1_acceptance_median_rel: float = 0.10
     linearity_penalty_gamma: float = 0.0
     snapshot_every: int = 5
     seed: int = 0
@@ -91,7 +95,7 @@ def _spawn_offspring_trees(
     n_vars: int,
 ) -> list[Node]:
     """Create 1–2 child trees. Paper: 60% crossover, 30% mutation, 10% direct transfer."""
-    if cfg.paper_mode:
+    if cfg.paper_ga:
         r = rng.random()
         if r < cfg.crossover_prob:
             p1 = _tournament_select(rng, pop, cfg.tournament_k)
@@ -148,7 +152,7 @@ def _eval_objective(
     *,
     calib: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, tuple[float, float]]:
-    if cfg.paper_mode:
+    if not cfg.linear_calibration:
         return predict_raw_clipped(tree, z), (1.0, 0.0)
     if calib is not None:
         y, coeffs = predict_calibrated(tree, z, calib=calib)
@@ -168,7 +172,7 @@ def evaluate_individual(
     ind.complexity = tree_size(ind.tree)
 
     if (
-        not cfg.paper_mode
+        cfg.alpha_subspace > 0
         and cfg.early_reject_subspace_mult > 0
         and rmse > cfg.early_reject_subspace_mult * ctx.subspace_rmse_threshold
     ):
@@ -198,7 +202,7 @@ def evaluate_individual(
         ctx.x_dense,
         x_campaign=ctx.x_campaign,
         y_campaign=ctx.y_campaign,
-        y_campaign_pred=None if cfg.paper_mode else y_campaign,
+        y_campaign_pred=y_campaign if cfg.linear_calibration else None,
         maximize=ctx.maximize,
         seed=ctx.sample_seed,
     )
@@ -213,25 +217,23 @@ def evaluate_individual(
     ind.tier1_loss = loss
 
     fitness = cfg.tier1_gamma * loss + cfg.beta_complexity * ind.complexity
-    if not cfg.paper_mode:
+    if cfg.alpha_subspace > 0:
+        fitness += cfg.alpha_subspace * rmse / max(ctx.y_range, 1e-9)
+    if cfg.linearity_penalty_gamma > 0:
         lin_r2 = raw_linearity_r2(ctx.z_dense, evaluate_raw(ind.tree, ctx.z_dense))
         linear_penalty = max(0.0, lin_r2 - 0.75)
         if not tree_has_nonlinearity(ind.tree):
             linear_penalty += 0.35
-        fitness += (
-            cfg.alpha_subspace * rmse / max(ctx.y_range, 1e-9)
-            + cfg.linearity_penalty_gamma * linear_penalty
-        )
+        fitness += cfg.linearity_penalty_gamma * linear_penalty
     ind.fitness = fitness
 
     fit_errs = [rel[n] for n in ctx.fitness_feature_names]
     median_rel = float(np.median(fit_errs))
-    if cfg.paper_mode:
-        ind.accepted = median_rel < 0.10
+    tier1_ok = median_rel < cfg.tier1_acceptance_median_rel
+    if cfg.require_subspace_rmse:
+        ind.accepted = rmse < ctx.subspace_rmse_threshold and tier1_ok
     else:
-        ind.accepted = (
-            rmse < ctx.subspace_rmse_threshold and median_rel < 0.10
-        )
+        ind.accepted = tier1_ok
     return ind
 
 
@@ -321,13 +323,13 @@ def _tournament_select(rng: random.Random, pop: list[Individual], k: int) -> Ind
 
 def _init_population(rng: random.Random, ctx: EvolutionContext, cfg: EvolutionConfig) -> list[Individual]:
     pop: list[Individual] = []
-    init_depth = cfg.max_tree_depth if cfg.paper_mode else cfg.max_tree_depth - 1
+    init_depth = cfg.max_tree_depth if cfg.paper_ga else cfg.max_tree_depth - 1
     for _ in range(cfg.population):
         tree = random_tree(
             rng,
             n_vars=ctx.n_vars,
             max_depth=init_depth,
-            paper_mode=cfg.paper_mode,
+            paper_mode=cfg.paper_ga,
         )
         pop.append(Individual(tree=tree))
     return pop
@@ -385,8 +387,8 @@ def _plot_generation_landscape(
         tier1_loss=best.tier1_loss,
         subspace_rmse=best.subspace_rmse,
         accepted=best.accepted,
-        paper_mode=cfg.paper_mode,
-        calib=None if cfg.paper_mode else (best.calib_a, best.calib_b),
+        paper_mode=not cfg.linear_calibration,
+        calib=None if not cfg.linear_calibration else (best.calib_a, best.calib_b),
     )
     latest = land_dir / "latest.png"
     try:
@@ -465,7 +467,14 @@ def run_evolution(
     cfg.alpha_subspace = float(ctx.metadata.get("alpha_subspace", cfg.alpha_subspace))
     cfg.beta_complexity = float(ctx.metadata.get("beta_complexity", cfg.beta_complexity))
     cfg.tier1_gamma = float(ctx.metadata.get("tier1_gamma", cfg.tier1_gamma))
-    cfg.paper_mode = bool(ctx.metadata.get("paper_mode", cfg.paper_mode))
+    cfg.linear_calibration = bool(
+        ctx.metadata.get("linear_calibration", cfg.linear_calibration)
+    )
+    cfg.require_subspace_rmse = bool(
+        ctx.metadata.get("require_subspace_rmse", cfg.require_subspace_rmse)
+    )
+    cfg.paper_ga = bool(ctx.metadata.get("paper_ga", cfg.paper_ga))
+    cfg.paper_mode = cfg.paper_ga
     cfg.linearity_penalty_gamma = float(
         ctx.metadata.get("linearity_penalty_gamma", cfg.linearity_penalty_gamma)
     )
@@ -475,7 +484,10 @@ def run_evolution(
         events_path,
         {
             "event": "start",
-            "paper_mode": cfg.paper_mode,
+            "paper_mode": cfg.paper_ga,
+            "linear_calibration": cfg.linear_calibration,
+            "require_subspace_rmse": cfg.require_subspace_rmse,
+            "paper_ga": cfg.paper_ga,
             "gp_seed": cfg.seed,
             "gp_seed_source": ctx.metadata.get("gp_seed_source"),
             "sample_seed": ctx.sample_seed,
@@ -622,7 +634,7 @@ def _finalize_best(
         ctx.x_dense,
         x_campaign=ctx.x_campaign,
         y_campaign=ctx.y_campaign,
-        y_campaign_pred=None if cfg.paper_mode else y_campaign,
+        y_campaign_pred=y_campaign if cfg.linear_calibration else None,
         maximize=ctx.maximize,
         seed=ctx.sample_seed,
     )
@@ -638,7 +650,9 @@ def _finalize_best(
 
     metrics = {
         "fitness": best.fitness,
-        "paper_mode": cfg.paper_mode,
+        "linear_calibration": cfg.linear_calibration,
+        "require_subspace_rmse": cfg.require_subspace_rmse,
+        "paper_ga": cfg.paper_ga,
         "fitness_feature_names": list(ctx.fitness_feature_names),
         "tier1_loss": loss,
         "subspace_rmse": rmse,
@@ -650,20 +664,23 @@ def _finalize_best(
         "tier1_rel_err": rel,
         "tier1_achieved": tier1,
         "tier1_target": ctx.tier1_target,
-        "accepted_subspace": False if cfg.paper_mode else rmse < ctx.subspace_rmse_threshold,
+        "accepted_subspace": (
+            rmse < ctx.subspace_rmse_threshold if cfg.require_subspace_rmse else None
+        ),
         "accepted_tier1": median_rel < 0.10,
         "accepted": (
-            median_rel < 0.10
-            if cfg.paper_mode
-            else rmse < ctx.subspace_rmse_threshold and median_rel < 0.10
+            rmse < ctx.subspace_rmse_threshold and median_rel < 0.10
+            if cfg.require_subspace_rmse
+            else median_rel < 0.10
         ),
         "y_dense_range_achieved": [float(y_dense.min()), float(y_dense.max())],
         "campaign_r2": tier1["oob_r2"],
     }
-    if cfg.paper_mode:
-        metrics["evaluation"] = "raw_g(z)"
+    if cfg.linear_calibration:
+        metrics["calibration"] = {"a": a, "b": b}
     else:
-        metrics["linear_calibration"] = {"a": a, "b": b}
+        metrics["evaluation"] = "raw_g(z)"
+    if cfg.linearity_penalty_gamma > 0:
         metrics["raw_linearity_r2"] = raw_linearity_r2(
             ctx.z_dense, evaluate_raw(best.tree, ctx.z_dense)
         )
@@ -693,10 +710,12 @@ def _finalize_best(
 
     expr_meta: dict[str, Any] = {
         "string": tree_to_string(best.tree),
-        "paper_mode": cfg.paper_mode,
+        "linear_calibration": cfg.linear_calibration,
+        "paper_ga": cfg.paper_ga,
     }
-    if not cfg.paper_mode:
+    if cfg.linear_calibration:
         expr_meta["linear_calibration"] = {"a": a, "b": b}
+    if cfg.linearity_penalty_gamma > 0:
         expr_meta["raw_linearity_r2"] = raw_linearity_r2(
             ctx.z_dense, evaluate_raw(best.tree, ctx.z_dense)
         )
@@ -706,12 +725,12 @@ def _finalize_best(
         best.tree,
         metadata=expr_meta,
     )
-    _write_oracle_py(best_dir / "oracle.py", paper_mode=cfg.paper_mode)
+    _write_oracle_py(best_dir / "oracle.py", linear_calibration=cfg.linear_calibration)
     logger.info("Best saved to %s (accepted=%s)", best_dir, metrics["accepted"])
 
 
-def _write_oracle_py(path: Path, *, paper_mode: bool) -> None:
-    if paper_mode:
+def _write_oracle_py(path: Path, *, linear_calibration: bool) -> None:
+    if not linear_calibration:
         body = '''"""Evolved 3D S1 landscape oracle (Muñoz S1 paper mode — raw g(z))."""
 from __future__ import annotations
 

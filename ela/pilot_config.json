@@ -1,0 +1,58 @@
+{
+  "name": "anchored-default",
+  "description": "Default ZoMBI anchored twin: Muñoz 8 + linear calibration + subspace RMSE. Edit this file, then sbatch ela/scripts/run_pilot_3d.sbatch",
+
+  "mode": "anchored",
+
+  "data": {
+    "db": "data/2nd_real_run.db",
+    "target": "data/2nd_real_run_ela_full.json"
+  },
+
+  "fitness": {
+    "alpha_subspace": 3.0,
+    "beta_complexity": 0.001,
+    "tier1_gamma": 5.0,
+    "linearity_penalty_gamma": 3.0,
+    "subspace_rmse_frac": 0.02,
+    "tier1_acceptance_median_rel": 0.1,
+    "linear_calibration": null,
+    "require_subspace_rmse": null,
+    "munoz_8_fitness": null,
+    "tier1_weights": null
+  },
+
+  "ga": {
+    "paper_ga": null,
+    "population": 400,
+    "generations": 100,
+    "tournament_k": 10,
+    "crossover_prob": 0.6,
+    "mutation_prob": 0.3,
+    "direct_transfer_prob": 0.1,
+    "elitism_frac": 0.1,
+    "max_tree_depth": 10,
+    "fitness_stop_threshold": 0.001,
+    "early_reject_subspace_mult": 0.0
+  },
+
+  "sampling": {
+    "n_dense": null
+  },
+
+  "viz": {
+    "snapshot_every": 5,
+    "landscape_viz": true,
+    "landscape_every": 1,
+    "landscape_grid_n": 100,
+    "post_viz": true,
+    "grid_n": 200
+  },
+
+  "runtime": {
+    "eval_workers": null,
+    "log_level": "INFO",
+    "seed": null,
+    "quick": false
+  }
+}

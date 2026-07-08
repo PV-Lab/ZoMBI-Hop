@@ -3,6 +3,10 @@
 #   source "${REPO}/ela/scripts/pilot_job_common.sh"
 #   _pilot_setup_env
 
+_pilot_default_config() {
+  echo "${PILOT_CONFIG:-${REPO}/ela/pilot_config.json}"
+}
+
 _pilot_setup_dirs() {
   export PILOT_RUN_ROOT="${PILOT_RUN_ROOT:-${REPO}/ela/runs}"
   export PILOT_LOG_DIR="${PILOT_LOG_DIR:-${REPO}/ela/scripts/logs}"
@@ -102,16 +106,37 @@ print(f"target OK: {target.name}")
 PY
 }
 
+_pilot_append_config_flags() {
+  local -n _cmd=$1
+  local cfg
+  cfg="$(_pilot_default_config)"
+  if [[ ! -f "${cfg}" ]]; then
+    echo "FATAL: pilot config missing: ${cfg}" >&2
+    return 1
+  fi
+  _cmd+=(--config "${cfg}")
+}
+
 _pilot_append_mode_flags() {
   local -n _cmd=$1
+  # Legacy env overrides still work; they beat config file mode at runtime.
   if [[ "${PILOT_CAMPAIGN_MODE:-0}" == "1" ]]; then
     _cmd+=(--campaign-mode)
-    if [[ -n "${PILOT_ALPHA:-}" ]]; then
-      _cmd+=(--alpha "${PILOT_ALPHA}")
-    fi
-    if [[ -n "${PILOT_TIER1_GAMMA:-}" ]]; then
-      _cmd+=(--tier1-gamma "${PILOT_TIER1_GAMMA}")
-    fi
+  fi
+  if [[ "${PILOT_PURE_PAPER:-0}" == "1" ]]; then
+    _cmd+=(--pure-paper)
+  fi
+  if [[ -n "${PILOT_ALPHA:-}" ]]; then
+    _cmd+=(--alpha "${PILOT_ALPHA}")
+  fi
+  if [[ -n "${PILOT_TIER1_GAMMA:-}" ]]; then
+    _cmd+=(--tier1-gamma "${PILOT_TIER1_GAMMA}")
+  fi
+  if [[ -n "${PILOT_BETA:-}" ]]; then
+    _cmd+=(--beta "${PILOT_BETA}")
+  fi
+  if [[ -n "${PILOT_LINEARITY_PENALTY:-}" ]]; then
+    _cmd+=(--linearity-penalty "${PILOT_LINEARITY_PENALTY}")
   fi
 }
 
@@ -126,6 +151,9 @@ _pilot_append_viz_flags() {
   if [[ "${PILOT_NO_VIZ:-0}" == "1" ]]; then
     _cmd+=(--no-viz)
   fi
+  if [[ -n "${PILOT_LANDSCAPE_EVERY:-}" ]]; then
+    _cmd+=(--landscape-every "${PILOT_LANDSCAPE_EVERY}")
+  fi
 }
 
 _pilot_append_worker_flags() {
@@ -137,5 +165,44 @@ _pilot_append_seed_flags() {
   local -n _cmd=$1
   if [[ -v PILOT_SEED ]]; then
     _cmd+=(--seed "${PILOT_SEED}")
+  fi
+}
+
+_pilot_append_population_flags() {
+  local -n _cmd=$1
+  if [[ -n "${PILOT_POPULATION:-}" ]]; then
+    _cmd+=(--population "${PILOT_POPULATION}")
+  fi
+  if [[ -n "${PILOT_GENERATIONS:-}" ]]; then
+    _cmd+=(--generations "${PILOT_GENERATIONS}")
+  fi
+}
+
+_pilot_log_config_summary() {
+  local cfg
+  cfg="$(_pilot_default_config)"
+  echo "pilot_config: ${cfg}"
+  if [[ -f "${cfg}" ]]; then
+    python - "${cfg}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+cfg = json.loads(Path(sys.argv[1]).read_text())
+print(f"  name: {cfg.get('name', '?')}")
+print(f"  mode: {cfg.get('mode', '?')}")
+fit = cfg.get("fitness", {})
+ga = cfg.get("ga", {})
+print(
+    "  fitness: "
+    f"α={fit.get('alpha_subspace')} "
+    f"β={fit.get('beta_complexity')} "
+    f"γ={fit.get('tier1_gamma')} "
+    f"linearity={fit.get('linearity_penalty_gamma')} "
+    f"calibrate={fit.get('linear_calibration')} "
+    f"rmse_frac={fit.get('subspace_rmse_frac')}"
+)
+print(f"  ga: pop={ga.get('population')} gens={ga.get('generations')}")
+PY
   fi
 }

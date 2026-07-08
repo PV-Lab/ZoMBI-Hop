@@ -40,7 +40,8 @@ class EvolutionContext:
     tier1_target: dict[str, float]
     tier1_weights: dict[str, float]
     fitness_feature_names: tuple[str, ...]
-    paper_mode: bool
+    linear_calibration: bool
+    paper_mode: bool  # legacy: paper GA operators (gp_tree)
     x_dense: np.ndarray
     z_dense: np.ndarray
     y_target: np.ndarray
@@ -71,7 +72,10 @@ def build_context(
     alpha_subspace: float = 10.0,
     beta_complexity: float = 0.001,
     subspace_rmse_frac: float = 0.02,
-    paper_mode: bool = True,
+    munoz_8_fitness: bool = True,
+    linear_calibration: bool = True,
+    paper_ga: bool = True,
+    tier1_weights: dict[str, float] | None = None,
 ) -> EvolutionContext:
     db_path = Path(db_path)
     x_campaign, y_campaign = load_campaign_rows(db_path, objective_column=objective_column)
@@ -119,12 +123,18 @@ def build_context(
 
     subspace_rmse_threshold = subspace_rmse_frac * max(y_range, 1e-9)
 
-    if paper_mode:
+    if munoz_8_fitness:
         fitness_names = MUNOZ_8_NAMES
-        tier1_weights = dict(PAPER_WEIGHTS)
+        resolved_weights = dict(PAPER_WEIGHTS)
     else:
         fitness_names = TIER1_NAMES
-        tier1_weights = dict(CAMPAIGN_WEIGHTS)
+        resolved_weights = dict(CAMPAIGN_WEIGHTS)
+    if tier1_weights is not None:
+        resolved_weights = {
+            name: float(tier1_weights.get(name, resolved_weights.get(name, 1.0)))
+            for name in fitness_names
+        }
+    tier1_weights = resolved_weights
 
     metadata: dict[str, Any] = {
         "db_path": str(db_path.resolve()),
@@ -132,7 +142,10 @@ def build_context(
         "alpha_subspace": alpha_subspace,
         "beta_complexity": beta_complexity,
         "subspace_rmse_frac": subspace_rmse_frac,
-        "paper_mode": paper_mode,
+        "munoz_8_fitness": munoz_8_fitness,
+        "linear_calibration": linear_calibration,
+        "paper_ga": paper_ga,
+        "paper_mode": paper_ga,
         "fitness_feature_names": list(fitness_names),
         "y_campaign_range": [float(y_campaign.min()), float(y_campaign.max())],
         "y_dense_range": [y_min, y_max],
@@ -151,7 +164,8 @@ def build_context(
         tier1_target=tier1_target,
         tier1_weights=tier1_weights,
         fitness_feature_names=fitness_names,
-        paper_mode=paper_mode,
+        linear_calibration=linear_calibration,
+        paper_mode=paper_ga,
         x_dense=x_dense,
         z_dense=z_dense,
         y_target=y_target,
@@ -194,6 +208,9 @@ def export_run_artifacts(
         "weights": ctx.tier1_weights,
         "tier1_names": list(TIER1_NAMES),
         "fitness_feature_names": list(ctx.fitness_feature_names),
+        "linear_calibration": ctx.linear_calibration,
+        "munoz_8_fitness": ctx.metadata.get("munoz_8_fitness", True),
+        "paper_ga": ctx.metadata.get("paper_ga", ctx.paper_mode),
         "paper_mode": ctx.paper_mode,
         "subspace_rmse_threshold": ctx.subspace_rmse_threshold,
     }
@@ -241,7 +258,10 @@ def load_context_from_run(run_dir: str | Path) -> EvolutionContext:
         fitness_feature_names=tuple(
             target.get("fitness_feature_names", list(MUNOZ_8_NAMES))
         ),
-        paper_mode=bool(config.get("paper_mode", target.get("paper_mode", True))),
+        linear_calibration=bool(
+            config.get("linear_calibration", target.get("linear_calibration", True))
+        ),
+        paper_mode=bool(config.get("paper_ga", config.get("paper_mode", True))),
         x_dense=data["x_dense"],
         z_dense=data["z_dense"],
         y_target=data["y_target"],

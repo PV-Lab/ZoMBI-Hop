@@ -329,7 +329,7 @@ def visualize_run(
     viz_dir.mkdir(parents=True, exist_ok=True)
 
     ctx = load_context_from_run(run_dir)
-    paper_mode = bool(ctx.paper_mode)
+    linear_calibration = bool(ctx.linear_calibration)
     expr_path = run_dir / "best" / "expression.json"
     with expr_path.open(encoding="utf-8") as f:
         expr_meta = json.load(f)
@@ -337,19 +337,19 @@ def visualize_run(
     cal = expr_meta.get("linear_calibration", {})
     calib = (float(cal.get("a", 1.0)), float(cal.get("b", 0.0)))
 
-    if paper_mode:
-        y_evolved_dense = predict_raw_clipped(tree, ctx.z_dense)
-    else:
+    if linear_calibration:
         y_evolved_dense, _ = predict_calibrated(tree, ctx.z_dense, calib=calib)
+    else:
+        y_evolved_dense = predict_raw_clipped(tree, ctx.z_dense)
 
     grid_pts = ternary_grid(grid_n)
     z_grid = composition_to_ilr(grid_pts)
     rf = train_rf_surrogate(ctx.x_campaign, ctx.y_campaign)
     y_target_grid = rf.predict(grid_pts)
-    if paper_mode:
-        y_evolved_grid = predict_raw_clipped(tree, z_grid)
-    else:
+    if linear_calibration:
         y_evolved_grid, _ = predict_calibrated(tree, z_grid, calib=calib)
+    else:
+        y_evolved_grid = predict_raw_clipped(tree, z_grid)
 
     run_name = run_dir.name
     plot_ternary_triptych(

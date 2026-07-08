@@ -15,14 +15,21 @@
 #   sbatch ela/scripts/run_pilot_3d_probe.sbatch
 #   sbatch ela/scripts/run_pilot_3d_array.sbatch
 #
-# Paper mode (default): Muñoz S1, ELA-only on raw g(z), RF λ_T target.
-# Campaign-twin: PILOT_CAMPAIGN_MODE=1 bash ela/scripts/submit_pilot_3d.sh
+# Edit parameters in ela/pilot_config.json (default), then submit:
+#   bash ela/scripts/submit_pilot_3d.sh
+#   sbatch ela/scripts/run_pilot_3d.sbatch
 #
-# Environment overrides:
+# Preset configs:
+#   PILOT_CONFIG=ela/pilot_config_campaign.json bash ela/scripts/submit_pilot_3d.sh
+#   PILOT_CONFIG=ela/pilot_config_pure_paper.json sbatch ela/scripts/run_pilot_3d.sbatch
+#
+# Environment overrides (optional; beat config file at runtime):
+#   PILOT_CONFIG=ela/pilot_config.json
 #   PILOT_POPULATION=400  PILOT_GENERATIONS=100
+#   PILOT_ALPHA=3  PILOT_TIER1_GAMMA=5  PILOT_BETA=0.001
+#   PILOT_CAMPAIGN_MODE=1  PILOT_PURE_PAPER=1
 #   (omit PILOT_SEED for auto: SLURM_JOB_ID on cluster, os_random locally)
-#   PILOT_EVAL_WORKERS=16  PILOT_OMP_THREADS=4  (auto: cpus/workers → 64/16=4)
-#   PILOT_CAMPAIGN_MODE=1  PILOT_ALPHA=3  PILOT_TIER1_GAMMA=5
+#   PILOT_EVAL_WORKERS=16  PILOT_OMP_THREADS=2
 #   PILOT_QUICK=1  PILOT_NO_LANDSCAPE_VIZ=1  PILOT_NO_VIZ=1
 #   PILOT_RUN_ROOT=...   (default: ${REPO}/ela/runs)
 #   PILOT_PARTITION=mit_normal  PILOT_TIME=12:00:00
@@ -45,7 +52,7 @@ _pilot_check_data
 
 PARTITION="${PILOT_PARTITION:-mit_normal}"
 TIME_LIMIT="${PILOT_TIME:-12:00:00}"
-CPUS="${PILOT_CPUS:-64}"
+CPUS="${PILOT_CPUS:-32}"
 MEM="${PILOT_MEM:-128G}"
 
 sbatch_common=(
@@ -77,11 +84,7 @@ case "${MODE}" in
 esac
 
 echo "Submitting pilot (${MODE}) from ${REPO}"
-if [[ "${PILOT_CAMPAIGN_MODE:-0}" == "1" ]]; then
-  echo "  mode: campaign-twin"
-else
-  echo "  mode: paper (Muñoz S1)"
-fi
+_pilot_log_config_summary
 echo "  eval_workers: ${PILOT_EVAL_WORKERS} (OMP=${OMP_NUM_THREADS}/worker)"
 echo "  sbatch: ${SBATCH}"
 
