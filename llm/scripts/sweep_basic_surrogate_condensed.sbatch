@@ -11,4 +11,4 @@
 
 # Single 12-hour run — no requeue, no auto-continue. The sweep must finish within
 # the wall-time limit; if it doesn't, the job is killed and NOT resubmitted.
-uv run python llm/sweep_basic_surrogate_condensed.py
+uv run python -u llm/sweep_basic_surrogate_condensed.py --resume

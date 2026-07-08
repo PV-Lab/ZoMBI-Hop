@@ -61,7 +61,7 @@ The model / effort come from llm/llm_config.py (shared with evaluate_llm).
 from __future__ import annotations
 
 # ─── HARDCODED CONFIG ──────────────────────────────────────────────────────────
-INJECTION_INTERVALS: list[int] = [5, 10]   # LLM places volumes every k iterations
+INJECTION_INTERVALS: list[int] = [10]   # LLM places volumes every k iterations
 MAX_ITERS: int = 40                            # total ZoMBI-Hop iterations per trial
 N_REPEATS: int = 5                             # trials per group (variance)
 SURROGATE_PICKLE: str | None = None            # reuse a fitted surrogate if set
@@ -70,7 +70,7 @@ SURROGATE_PICKLE: str | None = None            # reuse a fitted surrogate if set
 # that trial. A relative path is resolved against the repo root. Set to None to
 # instead pick the best-dist_to_needles ensemble trial (falling back to trial_112 /
 # run_7eb9).
-BASELINE_TRIAL_DIR: str | None = "optimize/runs/mobo_ensemble_3d_job17147229/trial_169"
+BASELINE_TRIAL_DIR: str | None = "optimize/runs/archived_runs/mobo_ensemble_3d_job17147229/trial_169"
 
 # Volume-control knobs.
 VOLUME_STRENGTH_MULT: float = 1.0   # global scale: 1 ⇒ per-volume strength 1 == one needle penalty
@@ -856,11 +856,21 @@ def resolve_baseline_hparams() -> Tuple[Dict[str, Any], str]:
     return base_hp, base_desc
 
 
-def main() -> None:
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    sweep_dir = E.RESULTS_ROOT / f"sweep_volume_{ts}"
-    sweep_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Volume-control LLM-in-the-loop sweep\n  sweep dir: {sweep_dir}")
+_VOL_PLOT_TITLE = ("Volume control — convergence: baseline vs LLM injection cadences\n"
+                   "(mean ± 95% CI over repeats)")
+
+
+def main(resume_dir: Optional[Path] = None) -> None:
+    resume = resume_dir is not None
+    if resume:
+        sweep_dir = Path(resume_dir)
+        sweep_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Volume-control LLM-in-the-loop sweep [RESUME]\n  sweep dir: {sweep_dir}")
+    else:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        sweep_dir = E.RESULTS_ROOT / f"sweep_volume_{ts}"
+        sweep_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Volume-control LLM-in-the-loop sweep\n  sweep dir: {sweep_dir}")
     print(f"  cadences: {INJECTION_INTERVALS}   budget: {MAX_ITERS} iters   "
           f"repeats: {N_REPEATS}")
     print(f"  volume strength ×{VOLUME_STRENGTH_MULT}, radius "
@@ -893,6 +903,11 @@ def main() -> None:
     for rep in range(N_REPEATS):
         seed = 1000 + rep
         tdir = sweep_dir / "baseline" / f"rep{rep}"
+        cached = SBS._load_completed_rep(tdir) if resume else None
+        if cached is not None:
+            print(f"  rep {rep} (seed {seed}) … [resume: already complete, skipping]")
+            baseline_samples.append(cached)
+            continue
         print(f"  rep {rep} (seed {seed}) …")
         try:
             m, reused = SBS.run_or_reuse_baseline(surr, base_hp, ref_optima, seed,
@@ -919,6 +934,11 @@ def main() -> None:
         for rep in range(N_REPEATS):
             seed = 1000 + rep   # common random numbers with the baseline rep
             tdir = sweep_dir / group / f"rep{rep}"
+            cached = SBS._load_completed_rep(tdir) if resume else None
+            if cached is not None:
+                print(f"  rep {rep} (seed {seed}) … [resume: already complete, skipping]")
+                samples.append(cached)
+                continue
             print(f"  rep {rep} (seed {seed}) …")
             try:
                 m = run_llm_trial(surr, base_hp, ref_optima, interval, seed, tdir)
@@ -938,12 +958,19 @@ def main() -> None:
         rows.append(_group_row(group, interval, stats, samples, baseline_stats))
         write_summary(sweep_dir, rows)  # incremental
 
+    if resume:
+        # Rebuild the summary from EVERY group on disk (not only the cadences in this
+        # resume run) so cadences already finished in an earlier run keep their rows
+        # (e.g. resuming a [5, 10] sweep with just [10] preserves the every-5 /
+        # baseline rows). Keep volume-control's extra summary columns via _group_row /
+        # write_summary; plot=False so the custom title below is used for the plot.
+        print("\n[resume] rebuilding summary from all groups on disk …")
+        SBS.regenerate_summary(sweep_dir, group_row=_group_row, write=write_summary,
+                               plot=False)
+
     # Overlaid running-best convergence: baseline vs each cadence (mean ± 95% CI).
     print("\n[plot] convergence comparison …")
-    SBS.plot_convergence_comparison(
-        sweep_dir,
-        title=("Volume control — convergence: baseline vs LLM injection cadences\n"
-               "(mean ± 95% CI over repeats)"))
+    SBS.plot_convergence_comparison(sweep_dir, title=_VOL_PLOT_TITLE)
     # Per-rep seed-matched view: each LLM rep vs its CRN baseline (2 lines, no CI).
     SBS.plot_per_rep_vs_baseline(sweep_dir)
 
@@ -960,10 +987,7 @@ if __name__ == "__main__":
     elif args and args[0] in ("--plot", "-p"):
         if len(args) < 2:
             raise SystemExit("usage: sweep_volume_control.py --plot <sweep_dir>")
-        SBS.plot_convergence_comparison(
-            Path(args[1]),
-            title=("Volume control — convergence: baseline vs LLM injection cadences\n"
-                   "(mean ± 95% CI over repeats)"))
+        SBS.plot_convergence_comparison(Path(args[1]), title=_VOL_PLOT_TITLE)
         SBS.plot_per_rep_vs_baseline(Path(args[1]))
     elif args and args[0] in ("--backfill-baselines",):
         if len(args) < 2:
@@ -975,5 +999,10 @@ if __name__ == "__main__":
         print(f"baseline hyperparameters [{_desc}]: {_bhp}")
         SBS.backfill_baseline_manifests(Path(args[1]), _bhp, MAX_ITERS, _surr,
                                         impl="volume")
+    elif args and args[0] in ("--resume",):
+        # Resume an existing sweep: skip reps already finished, run the rest. Pass a
+        # sweep dir, or omit it to resume the most recent sweep_volume_* run.
+        main(resume_dir=SBS.resolve_resume_dir(args[1] if len(args) > 1 else None,
+                                               "sweep_volume"))
     else:
         main()

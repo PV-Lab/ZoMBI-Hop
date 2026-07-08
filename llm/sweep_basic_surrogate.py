@@ -63,7 +63,7 @@ The model / prompt come from llm/llm_config.py (shared with evaluate_llm).
 from __future__ import annotations
 
 # ─── HARDCODED CONFIG ──────────────────────────────────────────────────────────
-INJECTION_INTERVALS: list[int] = [5, 10]   # LLM injects every k iterations
+INJECTION_INTERVALS: list[int] = [10]   # LLM injects every k iterations
 MAX_ITERS: int = 40                            # total ZoMBI-Hop iterations per trial
 N_REPEATS: int = 5                             # trials per group (variance)
 # Cost note: cadence k does ~ceil(MAX_ITERS/k)-1 LLM calls per repeat, so with the
@@ -75,7 +75,7 @@ SURROGATE_PICKLE: str | None = None            # reuse a fitted surrogate if set
 # to that trial. A relative path is resolved against the repo root. Set to None to
 # instead pick the best-dist_to_needles ensemble trial (falling back to trial_112 /
 # run_7eb9).
-BASELINE_TRIAL_DIR: str | None = "optimize/runs/mobo_ensemble_3d_job17147229/trial_169"
+BASELINE_TRIAL_DIR: str | None = "optimize/runs/archived_runs/mobo_ensemble_3d_job17147229/trial_169"
 # ───────────────────────────────────────────────────────────────────────────────
 
 import csv
@@ -1470,12 +1470,68 @@ def resolve_baseline_hparams() -> Tuple[Dict[str, Any], str]:
     return base_hp, base_desc
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# Resume support (skip reps already finished on disk)
+# ════════════════════════════════════════════════════════════════════════════════
+#
+# A rep is the atomic unit that persists (its metrics.json). Its ZoMBI-Hop checkpoint
+# lives in a tempdir that is deleted when the trial ends, so a trial killed midway
+# leaves no resumable state — the finest safe granularity is the rep. On --resume we
+# re-open the SAME sweep dir and skip every rep already finished, so a run killed by
+# an out-of-credits LLM error (or any interruption) re-spends API tokens / compute
+# only on the reps that had not completed. Because we iterate the CURRENT
+# INJECTION_INTERVALS over that existing dir, resuming a [5, 10] sweep with just [10]
+# simply finishes the every-10 group; the summary is rebuilt from ALL groups on disk
+# at the end so the untouched every-5 / baseline rows are preserved.
+
+
+def _load_completed_rep(rep_dir: Path) -> Optional[Dict[str, Any]]:
+    """Metrics for a rep that FINISHED successfully, else None. A rep is complete iff
+    its metrics.json has a real ``best_objective`` — the failure/kill stub written by
+    the orchestration loops lacks that key, so a killed rep is retried on resume."""
+    mp = rep_dir / "metrics.json"
+    if not mp.exists():
+        return None
+    try:
+        m = json.loads(mp.read_text())
+    except Exception:
+        return None
+    return m if isinstance(m, dict) and "best_objective" in m else None
+
+
+def resolve_resume_dir(arg: Optional[str], sweep_prefix: str) -> Path:
+    """Resolve the sweep dir to resume: an explicit path (absolute, or relative to CWD
+    then to RESULTS_ROOT), or — when omitted — the most recent ``<prefix>_<ts>`` sweep
+    under RESULTS_ROOT (timestamp names sort chronologically)."""
+    if arg:
+        p = Path(arg)
+        if not p.is_dir() and not p.is_absolute():
+            p = E.RESULTS_ROOT / arg
+        if not p.is_dir():
+            raise SystemExit(f"--resume: no such sweep dir {p}")
+        return p
+    # Only match ``<prefix>_<timestamp>`` dirs: the timestamp segment always starts
+    # with a digit, so this rejects longer-prefixed siblings (e.g. prefix
+    # "sweep_surrogate" must NOT swallow "sweep_surrogate_condensed_*", which would
+    # otherwise sort last and be picked, colliding two jobs in one sweep dir).
+    cands = sorted(d for d in E.RESULTS_ROOT.glob(f"{sweep_prefix}_[0-9]*") if d.is_dir())
+    if not cands:
+        raise SystemExit(f"--resume: no {sweep_prefix}_<timestamp> sweep under {E.RESULTS_ROOT}")
+    return cands[-1]
+
+
 def main(sweep_prefix: str = "sweep_surrogate", prompt_builder=None,
-         plot_title: Optional[str] = None) -> None:
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    sweep_dir = E.RESULTS_ROOT / f"{sweep_prefix}_{ts}"
-    sweep_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Surrogate LLM-in-the-loop sweep\n  sweep dir: {sweep_dir}")
+         plot_title: Optional[str] = None, resume_dir: Optional[Path] = None) -> None:
+    resume = resume_dir is not None
+    if resume:
+        sweep_dir = Path(resume_dir)
+        sweep_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Surrogate LLM-in-the-loop sweep [RESUME]\n  sweep dir: {sweep_dir}")
+    else:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        sweep_dir = E.RESULTS_ROOT / f"{sweep_prefix}_{ts}"
+        sweep_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Surrogate LLM-in-the-loop sweep\n  sweep dir: {sweep_dir}")
     print(f"  cadences: {INJECTION_INTERVALS}   budget: {MAX_ITERS} iters   "
           f"repeats: {N_REPEATS}")
 
@@ -1505,6 +1561,11 @@ def main(sweep_prefix: str = "sweep_surrogate", prompt_builder=None,
     for rep in range(N_REPEATS):
         seed = 1000 + rep
         tdir = sweep_dir / "baseline" / f"rep{rep}"
+        cached = _load_completed_rep(tdir) if resume else None
+        if cached is not None:
+            print(f"  rep {rep} (seed {seed}) … [resume: already complete, skipping]")
+            baseline_samples.append(cached)
+            continue
         print(f"  rep {rep} (seed {seed}) …")
         try:
             m, reused = run_or_reuse_baseline(surr, base_hp, ref_optima, seed, tdir,
@@ -1530,6 +1591,11 @@ def main(sweep_prefix: str = "sweep_surrogate", prompt_builder=None,
         for rep in range(N_REPEATS):
             seed = 1000 + rep   # common random numbers with the baseline rep
             tdir = sweep_dir / group / f"rep{rep}"
+            cached = _load_completed_rep(tdir) if resume else None
+            if cached is not None:
+                print(f"  rep {rep} (seed {seed}) … [resume: already complete, skipping]")
+                samples.append(cached)
+                continue
             print(f"  rep {rep} (seed {seed}) …")
             try:
                 m = run_llm_trial(surr, base_hp, ref_optima, interval, seed, tdir,
@@ -1546,6 +1612,15 @@ def main(sweep_prefix: str = "sweep_surrogate", prompt_builder=None,
         stats = aggregate(samples)
         rows.append(_group_row(group, interval, stats, samples, baseline_stats))
         write_summary(sweep_dir, rows)  # incremental
+
+    if resume:
+        # Rebuild the summary from EVERY group on disk (not only the cadences in this
+        # resume run), so cadences already finished in an earlier run keep their rows
+        # and the plots cover all of them (e.g. resuming a [5, 10] sweep with just [10]
+        # preserves the every-5 and baseline rows). plot=False so we can keep the
+        # caller's custom plot_title below.
+        print("\n[resume] rebuilding summary from all groups on disk …")
+        regenerate_summary(sweep_dir, plot=False)
 
     # Overlaid running-best convergence: baseline vs each cadence (mean ± 95% CI).
     print("\n[plot] convergence comparison …")
@@ -1571,6 +1646,11 @@ if __name__ == "__main__":
         if len(args) < 2:
             raise SystemExit("usage: sweep_basic_surrogate.py --per-rep <sweep_dir>")
         plot_per_rep_vs_baseline(Path(args[1]))
+    elif args and args[0] in ("--resume",):
+        # Resume an existing sweep: skip reps already finished, run the rest. Pass a
+        # sweep dir, or omit it to resume the most recent sweep_surrogate_* run.
+        main(resume_dir=resolve_resume_dir(args[1] if len(args) > 1 else None,
+                                           "sweep_surrogate"))
     elif args and args[0] in ("--backfill-baselines",):
         if len(args) < 2:
             raise SystemExit("usage: sweep_basic_surrogate.py --backfill-baselines <sweep_dir>")

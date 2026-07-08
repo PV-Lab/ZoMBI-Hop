@@ -48,13 +48,14 @@ if str(_HERE) not in sys.path:
 import sweep_basic_surrogate as SBS  # noqa: E402  (reuse all machinery)
 
 
-def main() -> None:
+def main(resume_dir=None) -> None:
     # Show the measured curves as their compact fPCA scores rather than the full
     # reconstructed spectra/sweeps. This flag is read by every renderer in SBS.
     SBS.CURVE_MODE = "condensed"
     SBS.main(sweep_prefix="sweep_surrogate_condensed",
              plot_title=("Convergence (condensed fPCA curve features): baseline vs "
-                         "LLM injection cadences\n(mean ± 95% CI over repeats)"))
+                         "LLM injection cadences\n(mean ± 95% CI over repeats)"),
+             resume_dir=resume_dir)
 
 
 if __name__ == "__main__":
@@ -69,5 +70,10 @@ if __name__ == "__main__":
             raise SystemExit("usage: sweep_basic_surrogate_condensed.py "
                              "--plot <sweep_dir>")
         SBS.plot_convergence_comparison(Path(args[1]))
+    elif args and args[0] in ("--resume",):
+        # Resume an existing sweep: skip reps already finished, run the rest. Pass a
+        # sweep dir, or omit it to resume the most recent sweep_surrogate_condensed_*.
+        main(resume_dir=SBS.resolve_resume_dir(args[1] if len(args) > 1 else None,
+                                               "sweep_surrogate_condensed"))
     else:
         main()
