@@ -170,29 +170,11 @@ def log_compositions(
         print(f"[comp-log] WARNING: failed to build composition record: {exc}")
 
 # Built-in (arbitrary) ZoMBI-Hop hyperparameters used when no --hparams JSON file
-# is supplied. Copied verbatim from optimize/runs/mobo_05_06_15_32/trial_112.
-# Keep in sync with DEFAULT_HPARAMS in interface/app.py.
-DEFAULT_HW_HPARAMS: Dict[str, Any] = {
-    "nat_grad_step": 0.00100187,
-    "nat_grad_max_steps": 54,
-    "n_restarts": 285,
-    "raw": 200,
-    "ucb_beta": 1.45791911,
-    "max_zooms": 3,
-    "max_iterations": 8,
-    "top_m_points": 8,
-    "n_consecutive_converged": 1,
-    # Known physical input noise (per-component composition std), measured as the
-    # average input noise of data/2nd_real_run.db (see visualization/input_noise.py).
-    "input_noise": 0.064,
-    "input_noise_threshold_mult": 3.98353261,
-    "output_noise_threshold_mult": 0.52251166,
-    "max_penalty_radius": 4.56475059,
-    "needle_shrink_factor": 0.637987,
-    "needle_stop_noise_multiplier": 2.81839283,
-    "paring_spatial_halfnoise": 1.21375814,
-    "paring_y_noise_multiplier": 4.19507699,
-}
+# is supplied. Single source of truth lives in src/default_hparams.py — edit
+# there, not here. The hardware runner folds in the measured physical input
+# noise (not a tuned hyperparameter, so kept out of DEFAULT_HPARAMS).
+from src.default_hparams import DEFAULT_HPARAMS, DEFAULT_INPUT_NOISE
+DEFAULT_HW_HPARAMS: Dict[str, Any] = {**DEFAULT_HPARAMS, "input_noise": DEFAULT_INPUT_NOISE}
 
 # ZoMBIHop tunable kwargs that may be set from a hyperparameter JSON file.
 _VALID_HPARAM_KEYS = {

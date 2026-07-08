@@ -244,27 +244,9 @@ def load_hparams_json(path: str) -> dict:
     return {k: v for k, v in hp.items() if k in _KNOWN_HPARAM_NAMES}
 
 
-# Default hyperparameters used when no JSON file is supplied. Copied verbatim
-# from optimize/runs/mobo_05_06_15_32/trial_112 (a strong MOBO result). Keep in
-# sync with DEFAULT_HW_HPARAMS in scripts/run_zombi_main.py.
-DEFAULT_HPARAMS: dict = {
-    "nat_grad_step": 0.00100187,
-    "nat_grad_max_steps": 54,
-    "n_restarts": 285,
-    "raw": 200,
-    "ucb_beta": 1.45791911,
-    "max_zooms": 3,
-    "max_iterations": 8,
-    "top_m_points": 8,
-    "n_consecutive_converged": 1,
-    "input_noise_threshold_mult": 3.98353261,
-    "output_noise_threshold_mult": 0.52251166,
-    "max_penalty_radius": 4.56475059,
-    "needle_shrink_factor": 0.637987,
-    "needle_stop_noise_multiplier": 2.81839283,
-    "paring_spatial_halfnoise": 1.21375814,
-    "paring_y_noise_multiplier": 4.19507699,
-}
+# Default hyperparameters used when no JSON file is supplied. Single source of
+# truth lives in src/default_hparams.py — edit there, not here.
+from src.default_hparams import DEFAULT_HPARAMS, DEFAULT_HPARAMS_PROVENANCE
 
 
 # ── synthetic-run helpers ─────────────────────────────────────────────────────
@@ -3086,7 +3068,7 @@ class NewRunDialog(tk.Toplevel):
 
         row += 1
         ttk.Label(tf, text="(trial.json-style file. If blank, arbitrary defaults "
-                           "are used instead — from mobo trial_112.)",
+                           f"are used instead — from {DEFAULT_HPARAMS_PROVENANCE}.)",
                   foreground="gray").grid(row=row, column=0, columnspan=3,
                                           sticky="w", padx=8)
 
@@ -3141,7 +3123,7 @@ class NewRunDialog(tk.Toplevel):
 
         hrow += 1
         ttk.Label(hw, text="(trial.json-style file. If blank, arbitrary defaults "
-                           "are used instead — from mobo trial_112.)",
+                           f"are used instead — from {DEFAULT_HPARAMS_PROVENANCE}.)",
                   foreground="gray").grid(
             row=hrow, column=0, columnspan=2, sticky="w", padx=8)
 
@@ -3210,7 +3192,7 @@ class NewRunDialog(tk.Toplevel):
 
     def _start(self):
         try:
-            # Hyperparameters: defaults (trial_112) unless a JSON file is given.
+            # Hyperparameters: defaults (4d trial_10) unless a JSON file is given.
             hp = dict(DEFAULT_HPARAMS)
             syn_path = self._syn_hparams_var.get().strip()
             if syn_path:
