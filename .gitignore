@@ -32,6 +32,7 @@ __pycache__/
 
 # Unit test / coverage reports
 .pytest_cache/
+.tmp/
 .coverage
 htmlcov/
 
@@ -56,6 +57,7 @@ sql/*.db
 
 # Checkpoints / runs (runtime artifacts)
 actual_runs/
+benchmark_runs/
 old_stuff/
 results_2000/
 test_rfs/

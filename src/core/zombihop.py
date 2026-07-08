@@ -540,7 +540,9 @@ class ZoMBIHop:
         return X_actual[penalty_mask], Y[penalty_mask]
 
     def run(self, max_activations: int = 5, time_limit_hours: float = None,
-            pause_event: Optional[threading.Event] = None):
+            pause_event: Optional[threading.Event] = None,
+            max_objective_calls: Optional[int] = None,
+            objective_call_callback=None):
         """
         Run ZoMBI-Hop optimization.
 
@@ -561,6 +563,7 @@ class ZoMBIHop:
         activation, zoom, iteration, _ = dh.get_iteration_state()
         start_activation = activation
         global_iteration = 0
+        objective_calls = 0
 
         while activation < max_activations and not finished:
             self._log(f"\n{'='*50}")
@@ -671,6 +674,25 @@ class ZoMBIHop:
                     unpenalized_X, unpenalized_Y = self._objective_wrapper(
                         candidate, bounds, self.gp_handler.acq_fn
                     )
+                    objective_calls += 1
+                    line_budget_reached = (
+                        max_objective_calls is not None
+                        and objective_calls >= int(max_objective_calls)
+                    )
+                    if objective_call_callback is not None:
+                        objective_call_callback(
+                            {
+                                "objective_calls": objective_calls,
+                                "activation": activation,
+                                "zoom": zoom,
+                                "iteration": iteration,
+                                "global_iteration": global_iteration,
+                                "candidate": candidate.detach().clone(),
+                                "bounds": bounds.detach().clone(),
+                                "n_returned_points": int(unpenalized_Y.shape[0]),
+                                "line_budget_reached": line_budget_reached,
+                            }
+                        )
                     global_iteration += 1
                     data_added_since_last_failure = True
                     if self.verbose:
@@ -697,6 +719,13 @@ class ZoMBIHop:
                     best_f_local = Y.max().item() if Y.numel() > 0 else best_f_local
                     self.gp_handler.fit(X, Y)
                     self._log(f"  [time] post-obj GP refit: {time.time()-_t0:.2f}s  ({X.shape[0]} pts)")
+
+                    if line_budget_reached:
+                        self._log(
+                            f"Objective-call budget reached ({objective_calls}/{max_objective_calls}). Stopping."
+                        )
+                        finished = True
+                        break
 
                     if unpenalized_Y.shape[0] == 0:
                         self._log("No unpenalized Y values, breaking — every point in this batch "

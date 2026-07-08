@@ -1,0 +1,87 @@
+experiment:
+  name: milestone1a_synthetic_3d_line_with_hebo
+  mode: line
+  seeds: [0, 1, 2]
+  output_root: benchmark_runs
+
+objective:
+  kind: synthetic_simplex
+  name: synthetic_3d_planted
+  n_components: 3
+  maximize: true
+  params:
+    n_needles: 4
+    basin_width: 20.0
+    noise_std: 0.0
+    seed: 123
+    match_radius_ilr: 0.25
+
+budget:
+  n_init: 8
+  n_lines: 5
+  points_per_line: 24
+
+line_mode:
+  n_line_candidates: 64
+  score: mean_acq
+  include_endpoints: true
+
+metrics:
+  duplicate_radius_ilr: 0.03
+  match_radius_ilr: 0.25
+
+optimizers:
+  - kind: random_simplex
+    line_score: random
+    params: {}
+  - kind: gp_ard_ei
+    line_score: mean_acq
+    params:
+      candidate_pool_size: 1024
+      xi: 0.01
+      device: cpu
+      dtype: float64
+  - kind: gp_ard_ucb
+    line_score: mean_acq
+    params:
+      candidate_pool_size: 1024
+      ucb_beta: 0.2
+      device: cpu
+      dtype: float64
+  - kind: rf_bo
+    line_score: mean_acq
+    params:
+      candidate_pool_size: 1024
+      n_estimators: 100
+      acquisition: ucb
+      ucb_beta: 0.2
+      n_jobs: -1
+  - kind: zombihop
+    params:
+      device: cpu
+      dtype: float64
+      max_activations: 10
+      max_zooms: 1
+      max_iterations: 10
+      n_restarts: 3
+      raw: 32
+      max_gp_points: 128
+      acquisition_type: ucb
+      ucb_beta: 0.1
+      num_lines: 8
+      checkpoint_subdir: checkpoints
+  - kind: hebo
+    params:
+      internal_space: ilr
+      line_adapter: anchor_chord
+      ilr_bounds:
+        method: candidate_pool_quantile
+        n_candidates: 4096
+        lower_quantile: 0.005
+        upper_quantile: 0.995
+      candidate_repair:
+        clip_min: 1.0e-12
+        renormalize: true
+      objective_sign:
+        hebo_internal: minimize
+        benchmark_external: maximize

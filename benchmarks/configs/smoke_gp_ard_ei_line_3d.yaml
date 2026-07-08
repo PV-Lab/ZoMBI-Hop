@@ -1,0 +1,40 @@
+experiment:
+  name: smoke_gp_ard_ei_line_3d
+  mode: line
+  seeds: [0]
+  output_root: benchmark_runs
+
+objective:
+  kind: synthetic_simplex
+  name: synthetic_3d_planted
+  n_components: 3
+  maximize: true
+  params:
+    n_needles: 4
+    basin_width: 20.0
+    noise_std: 0.0
+    seed: 123
+    match_radius_ilr: 0.25
+
+optimizer:
+  kind: gp_ard_ei
+  line_score: mean_acq
+  params:
+    candidate_pool_size: 256
+    xi: 0.01
+    device: cpu
+    dtype: float64
+
+budget:
+  n_init: 8
+  n_lines: 3
+  points_per_line: 8
+
+line_mode:
+  n_line_candidates: 64
+  score: mean_acq
+  include_endpoints: true
+
+metrics:
+  duplicate_radius_ilr: 0.03
+  match_radius_ilr: 0.25

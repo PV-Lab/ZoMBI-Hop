@@ -1,0 +1,36 @@
+experiment:
+  name: smoke_random_line_3d
+  mode: line
+  seeds: [0]
+  output_root: benchmark_runs
+
+objective:
+  kind: synthetic_simplex
+  name: synthetic_3d_planted
+  n_components: 3
+  maximize: true
+  params:
+    n_needles: 4
+    basin_width: 20.0
+    noise_std: 0.0
+    seed: 123
+    match_radius_ilr: 0.25
+
+optimizer:
+  kind: random_simplex
+  line_score: random
+  params: {}
+
+budget:
+  n_init: 8
+  n_lines: 3
+  points_per_line: 8
+
+line_mode:
+  n_line_candidates: 64
+  score: random
+  include_endpoints: true
+
+metrics:
+  duplicate_radius_ilr: 0.03
+  match_radius_ilr: 0.25

@@ -1,0 +1,40 @@
+name: milestone1a_synthetic_real
+output_root: benchmark_runs/reports
+
+inputs:
+  - label: synthetic_3d_point
+    objective_family: synthetic
+    suite_config: benchmarks/configs/suite_milestone1a_synthetic_3d.yaml
+    aggregate_dir: benchmark_runs/milestone1a_synthetic_3d_point/aggregate
+  - label: synthetic_3d_line
+    objective_family: synthetic
+    suite_config: benchmarks/configs/suite_milestone1a_synthetic_3d_line_with_zombihop.yaml
+    aggregate_dir: benchmark_runs/milestone1a_synthetic_3d_line_with_zombihop/aggregate
+  - label: real_rf_3d_point
+    objective_family: real_rf
+    suite_config: benchmarks/configs/suite_milestone1a_real_rf_3d_point.yaml
+    aggregate_dir: benchmark_runs/milestone1a_real_rf_3d_point/aggregate
+  - label: real_rf_3d_line
+    objective_family: real_rf
+    suite_config: benchmarks/configs/suite_milestone1a_real_rf_3d_line_with_zombihop.yaml
+    aggregate_dir: benchmark_runs/milestone1a_real_rf_3d_line_with_zombihop/aggregate
+
+metrics:
+  higher_is_better:
+    - best_y_so_far
+    - pct_matched
+    - line_best_y
+    - line_best_y_max
+    - line_best_y_mean
+  lower_is_better:
+    - dist_to_needles
+    - dup_fraction
+    - runtime_s
+    - line_length_l2
+    - line_length_ilr
+
+plots:
+  include_seed_traces: true
+  include_iqr_band: true
+  include_simplex_coverage: false
+  dpi: 160

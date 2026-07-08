@@ -1,0 +1,44 @@
+experiment:
+  name: smoke_zombihop_3d
+  mode: line
+  seeds: [0]
+  output_root: benchmark_runs
+
+objective:
+  kind: synthetic_simplex
+  name: synthetic_3d_planted
+  n_components: 3
+  maximize: true
+  params:
+    n_needles: 4
+    basin_width: 20.0
+    noise_std: 0.0
+    seed: 123
+    match_radius_ilr: 0.25
+
+optimizer:
+  kind: zombihop
+  params:
+    device: cpu
+    dtype: float64
+    max_activations: 1
+    max_zooms: 1
+    max_iterations: 2
+    n_restarts: 3
+    raw: 32
+    max_gp_points: 128
+    acquisition_type: ucb
+    ucb_beta: 0.1
+    num_points_per_line: 5
+    num_lines: 5
+    checkpoint_subdir: checkpoints
+
+budget:
+  n_init: 5
+  n_steps: 2
+  n_line_points: 5
+
+metrics:
+  duplicate_radius_ilr: 0.03
+  match_radius_ilr: 0.25
+

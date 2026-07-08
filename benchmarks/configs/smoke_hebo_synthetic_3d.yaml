@@ -1,0 +1,41 @@
+experiment:
+  name: smoke_hebo_synthetic_3d
+  mode: point
+  seeds: [0]
+  output_root: benchmark_runs
+
+objective:
+  kind: synthetic_simplex
+  name: synthetic_3d_planted
+  n_components: 3
+  maximize: true
+  params:
+    n_needles: 4
+    basin_width: 20.0
+    noise_std: 0.0
+    seed: 123
+    match_radius_ilr: 0.25
+
+optimizer:
+  kind: hebo
+  params:
+    internal_space: ilr
+    ilr_bounds:
+      method: candidate_pool_quantile
+      n_candidates: 4096
+      lower_quantile: 0.005
+      upper_quantile: 0.995
+    candidate_repair:
+      clip_min: 1.0e-12
+      renormalize: true
+    objective_sign:
+      hebo_internal: minimize
+      benchmark_external: maximize
+
+budget:
+  n_init: 5
+  n_steps: 5
+
+metrics:
+  duplicate_radius_ilr: 0.03
+  match_radius_ilr: 0.25

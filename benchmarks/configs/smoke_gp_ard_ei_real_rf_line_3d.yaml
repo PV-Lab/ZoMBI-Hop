@@ -1,0 +1,53 @@
+experiment:
+  name: smoke_gp_ard_ei_real_rf_line_3d
+  mode: line
+  seeds: [0]
+  output_root: benchmark_runs
+
+objective:
+  kind: real_rf_surrogate
+  name: real_3d_perovskite_rf
+  n_components: 3
+  maximize: true
+  params:
+    data_path: data/campaign1a.csv
+    component_labels: [FAPbI3, MAPbI3, MAPbBr3]
+    composition_columns: [FAPbI3, MAPbI3, MAPbBr3]
+    target_column: Objective
+    feature_transform: raw_composition
+    true_needles_path: optimize/reference_optima/mobo_05_06_15_32_campaign1a.json
+    train_surrogate:
+      enabled: true
+      n_estimators: 50
+      random_state: 42
+      min_samples_leaf: 1
+      n_jobs: -1
+    needle_detection:
+      method: grid_local_maxima
+      grid_resolution: 51
+      top_k: 20
+      min_separation_ilr: 0.08
+      match_radius_ilr: 0.25
+
+optimizer:
+  kind: gp_ard_ei
+  line_score: mean_acq
+  params:
+    candidate_pool_size: 256
+    xi: 0.01
+    device: cpu
+    dtype: float64
+
+budget:
+  n_init: 8
+  n_lines: 3
+  points_per_line: 8
+
+line_mode:
+  n_line_candidates: 64
+  score: mean_acq
+  include_endpoints: true
+
+metrics:
+  duplicate_radius_ilr: 0.03
+  match_radius_ilr: 0.25

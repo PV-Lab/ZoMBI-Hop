@@ -1,0 +1,82 @@
+experiment:
+  name: milestone1a_synthetic_3d_point_with_hebo_turbo
+  mode: point
+  seeds: [0, 1, 2]
+  output_root: benchmark_runs
+
+objective:
+  kind: synthetic_simplex
+  name: synthetic_3d_planted
+  n_components: 3
+  maximize: true
+  params:
+    n_needles: 4
+    basin_width: 20.0
+    noise_std: 0.0
+    seed: 123
+    match_radius_ilr: 0.25
+
+budget:
+  n_init: 5
+  n_steps: 20
+  n_line_points: 24
+
+metrics:
+  duplicate_radius_ilr: 0.03
+  match_radius_ilr: 0.25
+
+optimizers:
+  - kind: random_simplex
+    params: {}
+  - kind: gp_ard_ei
+    params:
+      candidate_pool_size: 2048
+      xi: 0.01
+      device: cpu
+      dtype: float64
+  - kind: gp_ard_ucb
+    params:
+      candidate_pool_size: 2048
+      ucb_beta: 0.2
+      device: cpu
+      dtype: float64
+  - kind: rf_bo
+    params:
+      candidate_pool_size: 2048
+      n_estimators: 100
+      acquisition: ucb
+      ucb_beta: 0.2
+      n_jobs: -1
+  - kind: hebo
+    params:
+      internal_space: ilr
+      ilr_bounds:
+        method: candidate_pool_quantile
+        n_candidates: 4096
+        lower_quantile: 0.005
+        upper_quantile: 0.995
+      candidate_repair:
+        clip_min: 1.0e-12
+        renormalize: true
+      objective_sign:
+        hebo_internal: minimize
+        benchmark_external: maximize
+  - kind: turbo
+    params:
+      internal_space: ilr
+      acquisition: log_ei
+      candidate_pool_size: 2048
+      min_tr_candidates: 64
+      ilr_bounds:
+        method: candidate_pool_quantile
+        n_candidates: 4096
+        lower_quantile: 0.005
+        upper_quantile: 0.995
+      trust_region:
+        initial_length: 0.8
+        min_length: 0.01
+        max_length: 1.6
+        success_tolerance: 3
+        failure_tolerance: 3
+      device: cpu
+      dtype: float64
