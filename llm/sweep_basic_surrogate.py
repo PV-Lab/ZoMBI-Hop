@@ -749,10 +749,145 @@ def run_segment(ckpt_dir: Path, run_uuid: str, fresh: bool, hp: Dict[str, Any],
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Needles-on-surrogate ternary plot
+# ════════════════════════════════════════════════════════════════════════════════
+#
+# One plot per rep: the surrogate's deterministic Objective landscape drawn as a
+# filled ternary contour, with the run's FINAL declared needles overlaid as red
+# stars. The landscape is a pure function of the shared surrogate, so it is computed
+# once and cached per surrogate object across every trial in a sweep.
+
+# Barycentric (FAPbI3, MAPbI3, MAPbBr3) → 2-D cartesian for an equilateral triangle,
+# matching scripts/interactive_testing_3d.py's convention.
+_TERNARY_VERTS = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, np.sqrt(3.0) / 2.0]])
+_TERNARY_LABELS = ("FAPbI3", "MAPbI3", "MAPbBr3")
+_LANDSCAPE_CACHE: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+
+
+def _bary_to_cart(pts) -> np.ndarray:
+    return np.atleast_2d(np.asarray(pts, float)) @ _TERNARY_VERTS
+
+
+def _surrogate_landscape(surr: Surrogate) -> Tuple[np.ndarray, np.ndarray]:
+    """(grid_pts, grid_vals) for the surrogate's deterministic mean-Objective over the
+    ternary render grid; cached per surrogate object (shared across all trials)."""
+    key = id(surr)
+    cached = _LANDSCAPE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    predictor = _ObjMeanPredictor(surr)
+    grid_pts = R.ternary_grid(R.TERNARY_GRID_N)
+    grid_vals = predictor.predict(grid_pts)
+    _LANDSCAPE_CACHE[key] = (grid_pts, grid_vals)
+    return grid_pts, grid_vals
+
+
+def plot_needles_on_surrogate(out_png: Path, needles: np.ndarray, surr: Surrogate,
+                              ref_optima: Optional[List[np.ndarray]] = None,
+                              title: Optional[str] = None) -> Optional[Path]:
+    """Draw the surrogate Objective landscape as a filled ternary contour and overlay
+    the FINAL declared needles as red stars. ``needles`` is a (K, 3) composition array
+    (FAPbI3, MAPbI3, MAPbBr3); an empty array just draws the background."""
+    if surr is None:
+        return None
+    import matplotlib.pyplot as plt  # Agg backend already selected via evaluate_llm
+
+    grid_pts, grid_vals = _surrogate_landscape(surr)
+    xy = _bary_to_cart(grid_pts)
+
+    fig, ax = plt.subplots(figsize=(6.4, 5.6))
+    tcf = ax.tricontourf(xy[:, 0], xy[:, 1], np.asarray(grid_vals, float),
+                         levels=24, cmap="viridis")
+    fig.colorbar(tcf, ax=ax, shrink=0.82, label="surrogate Objective (mean)")
+
+    # Triangle outline + corner labels.
+    tri = np.vstack([_TERNARY_VERTS, _TERNARY_VERTS[:1]])
+    ax.plot(tri[:, 0], tri[:, 1], "k-", lw=1.4, zorder=3)
+    offsets = [(-0.06, -0.05), (1.06, -0.05), (0.5, np.sqrt(3.0) / 2.0 + 0.05)]
+    for lab, (ox, oy) in zip(_TERNARY_LABELS, offsets):
+        ax.text(ox, oy, lab, ha="center", va="center", fontsize=10, fontweight="bold")
+
+    # Reference optima (true surrogate peaks) as faint hollow rings for context.
+    if ref_optima is not None and len(ref_optima):
+        rc = _bary_to_cart(np.asarray(ref_optima, float))
+        ax.scatter(rc[:, 0], rc[:, 1], marker="o", s=90, facecolors="none",
+                   edgecolors="white", linewidths=1.4, zorder=4,
+                   label="reference optima")
+
+    needles = np.atleast_2d(np.asarray(needles, float)) if needles is not None else np.empty((0, 3))
+    if needles.size and needles.shape[0]:
+        nc = _bary_to_cart(needles)
+        ax.scatter(nc[:, 0], nc[:, 1], marker="*", s=260, c="red",
+                   edgecolors="white", linewidths=1.0, zorder=5,
+                   label=f"final needles (n={needles.shape[0]})")
+
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title(title or "Final needles on surrogate Objective landscape", fontsize=11)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8, loc="upper right", framealpha=0.85)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def _read_needles_csv(path: Path) -> np.ndarray:
+    """(K, 3) composition array (FAPbI3, MAPbI3, MAPbBr3) from a trial's needles.csv.
+    Columns are written by run_mobo.write_needles_csv as FA / MA / Br. Empty (0, 3)
+    array if the file is missing/empty."""
+    if not path.exists():
+        return np.empty((0, 3))
+    try:
+        import pandas as pd
+        df = pd.read_csv(path)
+    except Exception:
+        return np.empty((0, 3))
+    cols = [c for c in ("FA", "MA", "Br") if c in df.columns]
+    if len(cols) != 3 or df.empty:
+        return np.empty((0, 3))
+    return df[["FA", "MA", "Br"]].to_numpy(float)
+
+
+def regenerate_needle_plots(sweep_dir: Path, surr: Optional[Surrogate] = None,
+                            groups: Optional[List[str]] = None) -> List[Path]:
+    """Regenerate the ``needles_on_surrogate.png`` for every rep of the requested
+    groups (default: all groups) of an EXISTING sweep, reading each rep's needles.csv.
+    Refits the shared surrogate if one isn't passed (deterministic → same landscape)."""
+    sweep_dir = Path(sweep_dir)
+    if surr is None:
+        surr = (Surrogate.load(SURROGATE_PICKLE)
+                if SURROGATE_PICKLE and Path(SURROGATE_PICKLE).exists()
+                else Surrogate.fit(verbose=False))
+    # Reference optima for the context rings (same detection main() uses).
+    grid_pts, grid_vals = _surrogate_landscape(surr)
+    ref_optima = R.auto_detect_rf_optima(_ObjMeanPredictor(surr), grid_pts, grid_vals,
+                                         maximize=MAXIMIZE, n_peaks=N_REF_OPTIMA)
+    if groups is None:
+        group_dirs = ([d for d in [sweep_dir / "baseline"] if d.is_dir()]
+                      + sorted(d for d in sweep_dir.glob("inject_every_*") if d.is_dir()))
+    else:
+        group_dirs = [sweep_dir / g for g in groups if (sweep_dir / g).is_dir()]
+
+    written: List[Path] = []
+    for gdir in group_dirs:
+        for rep_dir in sorted(gdir.glob("rep*")):
+            needles = _read_needles_csv(rep_dir / "needles.csv")
+            out = plot_needles_on_surrogate(
+                rep_dir / "needles_on_surrogate.png", needles, surr, ref_optima,
+                title=f"{gdir.name} / {rep_dir.name} — final needles on surrogate")
+            if out is not None:
+                written.append(out)
+    print(f"  wrote {len(written)} needle-on-surrogate plot(s) under {sweep_dir}")
+    return written
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Final metrics + artifacts for a finished trial
 # ════════════════════════════════════════════════════════════════════════════════
 
-def finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir: Path) -> Dict[str, Any]:
+def finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir: Path,
+                   surr: Optional[Surrogate] = None) -> Dict[str, Any]:
     """Extract the scalar metrics from the final DataHandler and write run_mobo-style
     artifacts (mirrors evaluate_llm.continue_run's tail)."""
     dim = 3
@@ -787,6 +922,13 @@ def finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir: Path) -> D
         R.plot_convergence(str(trial_dir / "convergence.png"), dh, MAXIMIZE)
     except Exception as e:
         print(f"      [finalize] plot failed: {e}")
+    # Final needles overlaid on the surrogate Objective landscape (one per rep).
+    if surr is not None:
+        try:
+            plot_needles_on_surrogate(trial_dir / "needles_on_surrogate.png",
+                                      discovered, surr, ref_optima)
+        except Exception as e:
+            print(f"      [finalize] needle-on-surrogate plot failed: {e}")
 
     return {
         "n_iters": len(payloads),
@@ -817,7 +959,8 @@ def run_baseline_trial(surr, base_hp, ref_optima, seed: int, trial_dir: Path) ->
     try:
         dh = run_segment(tmp, "base", True, base_hp, fn_callable, MAX_ITERS,
                          call_counter, payloads, snap_records)
-        metrics = finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir)
+        metrics = finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir,
+                                 surr=surr)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     metrics["source"] = "baseline"
@@ -1086,7 +1229,8 @@ def run_llm_trial(surr, base_hp, ref_optima, interval: int, seed: int,
                     f"(iter {call_counter[0]}): {llm_out['error']}")
             injection_idx += 1
 
-        metrics = finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir)
+        metrics = finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir,
+                                 surr=surr)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1646,6 +1790,14 @@ if __name__ == "__main__":
         if len(args) < 2:
             raise SystemExit("usage: sweep_basic_surrogate.py --per-rep <sweep_dir>")
         plot_per_rep_vs_baseline(Path(args[1]))
+    elif args and args[0] in ("--needle-plots",):
+        # Regenerate needles-on-surrogate plots for an existing sweep. Optional extra
+        # args restrict to specific group dirs (e.g. inject_every_10); default = all.
+        if len(args) < 2:
+            raise SystemExit("usage: sweep_basic_surrogate.py --needle-plots "
+                             "<sweep_dir> [group ...]")
+        regenerate_needle_plots(Path(args[1]),
+                                groups=(args[2:] or None))
     elif args and args[0] in ("--resume",):
         # Resume an existing sweep: skip reps already finished, run the rest. Pass a
         # sweep dir, or omit it to resume the most recent sweep_surrogate_* run.

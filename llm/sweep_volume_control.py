@@ -649,7 +649,8 @@ def run_baseline_trial(surr, base_hp, ref_optima, seed: int, trial_dir: Path) ->
     try:
         dh = run_segment(tmp, "base", True, base_hp, [], fn_callable, MAX_ITERS,
                          call_counter, payloads, snap_records)
-        metrics = SBS.finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir)
+        metrics = SBS.finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir,
+                                     surr=surr)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     metrics["source"] = "baseline"
@@ -742,7 +743,8 @@ def run_llm_trial(surr, base_hp, ref_optima, interval: int, seed: int,
                     f"(iter {call_counter[0]}): {llm_out['error']}")
             injection_idx += 1
 
-        metrics = SBS.finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir)
+        metrics = SBS.finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir,
+                                     surr=surr)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -989,6 +991,11 @@ if __name__ == "__main__":
             raise SystemExit("usage: sweep_volume_control.py --plot <sweep_dir>")
         SBS.plot_convergence_comparison(Path(args[1]), title=_VOL_PLOT_TITLE)
         SBS.plot_per_rep_vs_baseline(Path(args[1]))
+    elif args and args[0] in ("--needle-plots",):
+        if len(args) < 2:
+            raise SystemExit("usage: sweep_volume_control.py --needle-plots "
+                             "<sweep_dir> [group ...]")
+        SBS.regenerate_needle_plots(Path(args[1]), groups=(args[2:] or None))
     elif args and args[0] in ("--backfill-baselines",):
         if len(args) < 2:
             raise SystemExit("usage: sweep_volume_control.py --backfill-baselines <sweep_dir>")

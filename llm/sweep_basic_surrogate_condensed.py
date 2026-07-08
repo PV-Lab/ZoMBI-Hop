@@ -70,6 +70,11 @@ if __name__ == "__main__":
             raise SystemExit("usage: sweep_basic_surrogate_condensed.py "
                              "--plot <sweep_dir>")
         SBS.plot_convergence_comparison(Path(args[1]))
+    elif args and args[0] in ("--needle-plots",):
+        if len(args) < 2:
+            raise SystemExit("usage: sweep_basic_surrogate_condensed.py "
+                             "--needle-plots <sweep_dir> [group ...]")
+        SBS.regenerate_needle_plots(Path(args[1]), groups=(args[2:] or None))
     elif args and args[0] in ("--resume",):
         # Resume an existing sweep: skip reps already finished, run the rest. Pass a
         # sweep dir, or omit it to resume the most recent sweep_surrogate_condensed_*.
