@@ -81,6 +81,7 @@ BASELINE_TRIAL_DIR: str | None = "optimize/runs/archived_runs/mobo_ensemble_3d_j
 import csv
 import datetime
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -762,6 +763,7 @@ def run_segment(ckpt_dir: Path, run_uuid: str, fresh: bool, hp: Dict[str, Any],
 _TERNARY_VERTS = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, np.sqrt(3.0) / 2.0]])
 _TERNARY_LABELS = ("FAPbI3", "MAPbI3", "MAPbBr3")
 _LANDSCAPE_CACHE: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+_NOISY_LANDSCAPE_CACHE: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
 
 
 def _bary_to_cart(pts) -> np.ndarray:
@@ -770,7 +772,10 @@ def _bary_to_cart(pts) -> np.ndarray:
 
 def _surrogate_landscape(surr: Surrogate) -> Tuple[np.ndarray, np.ndarray]:
     """(grid_pts, grid_vals) for the surrogate's deterministic mean-Objective over the
-    ternary render grid; cached per surrogate object (shared across all trials)."""
+    ternary render grid; cached per surrogate object (shared across all trials).
+
+    This is the RF conditional mean only — the true, noise-free peak structure — and
+    is what auto_detect_rf_optima runs on to find the reference optima."""
     key = id(surr)
     cached = _LANDSCAPE_CACHE.get(key)
     if cached is not None:
@@ -782,23 +787,50 @@ def _surrogate_landscape(surr: Surrogate) -> Tuple[np.ndarray, np.ndarray]:
     return grid_pts, grid_vals
 
 
+def _surrogate_landscape_noisy(surr: Surrogate, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+    """(grid_pts, grid_vals) for a single noisy REALIZATION of the surrogate Objective:
+    the RF conditional mean plus one joint residual draw per grid point on the objective
+    channel — i.e. what ZoMBI-Hop actually measures (surrogate.sample_at draws
+    ``_cond_means + _draw_resid`` per point), rather than the noise-free mean.
+
+    The residual is spatially independent per point (the surrogate adds i.i.d. noise to
+    every droplet), so the realization is grainy by construction. Cached per
+    (surrogate, seed); a fixed seed makes each rep's plot reproducible across regens."""
+    key = (id(surr), int(seed))
+    cached = _NOISY_LANDSCAPE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    grid_pts, mean_vals = _surrogate_landscape(surr)
+    rng = np.random.default_rng(seed)
+    resid = surr._draw_resid(len(grid_pts), rng)[:, surr.obj_index]
+    grid_vals = np.asarray(mean_vals, float) + resid
+    _NOISY_LANDSCAPE_CACHE[key] = (grid_pts, grid_vals)
+    return grid_pts, grid_vals
+
+
 def plot_needles_on_surrogate(out_png: Path, needles: np.ndarray, surr: Surrogate,
                               ref_optima: Optional[List[np.ndarray]] = None,
-                              title: Optional[str] = None) -> Optional[Path]:
+                              title: Optional[str] = None,
+                              noise_seed: int = 0) -> Optional[Path]:
     """Draw the surrogate Objective landscape as a filled ternary contour and overlay
     the FINAL declared needles as red stars. ``needles`` is a (K, 3) composition array
-    (FAPbI3, MAPbI3, MAPbBr3); an empty array just draws the background."""
+    (FAPbI3, MAPbI3, MAPbBr3); an empty array just draws the background.
+
+    The background is a noisy REALIZATION of the surrogate (RF mean + a per-point
+    residual draw, seeded by ``noise_seed``) — the landscape ZoMBI-Hop actually sees,
+    not the noise-free mean. The reference-optima rings still mark the true mean peaks."""
     if surr is None:
         return None
     import matplotlib.pyplot as plt  # Agg backend already selected via evaluate_llm
 
-    grid_pts, grid_vals = _surrogate_landscape(surr)
+    grid_pts, grid_vals = _surrogate_landscape_noisy(surr, noise_seed)
     xy = _bary_to_cart(grid_pts)
 
     fig, ax = plt.subplots(figsize=(6.4, 5.6))
     tcf = ax.tricontourf(xy[:, 0], xy[:, 1], np.asarray(grid_vals, float),
                          levels=24, cmap="viridis")
-    fig.colorbar(tcf, ax=ax, shrink=0.82, label="surrogate Objective (mean)")
+    fig.colorbar(tcf, ax=ax, shrink=0.82,
+                 label="surrogate Objective (mean + residual noise)")
 
     # Triangle outline + corner labels.
     tri = np.vstack([_TERNARY_VERTS, _TERNARY_VERTS[:1]])
@@ -830,6 +862,13 @@ def plot_needles_on_surrogate(out_png: Path, needles: np.ndarray, surr: Surrogat
     fig.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out_png
+
+
+def _rep_noise_seed(rep_dir: Path) -> int:
+    """Stable, distinct noise seed per rep so each rep's needle plot shows a different
+    (but reproducible) surrogate realization. Uses the trailing digits of ``rep<N>``."""
+    m = re.search(r"(\d+)$", rep_dir.name)
+    return int(m.group(1)) if m else 0
 
 
 def _read_needles_csv(path: Path) -> np.ndarray:
@@ -875,7 +914,8 @@ def regenerate_needle_plots(sweep_dir: Path, surr: Optional[Surrogate] = None,
             needles = _read_needles_csv(rep_dir / "needles.csv")
             out = plot_needles_on_surrogate(
                 rep_dir / "needles_on_surrogate.png", needles, surr, ref_optima,
-                title=f"{gdir.name} / {rep_dir.name} — final needles on surrogate")
+                title=f"{gdir.name} / {rep_dir.name} — final needles on surrogate",
+                noise_seed=_rep_noise_seed(rep_dir))
             if out is not None:
                 written.append(out)
     print(f"  wrote {len(written)} needle-on-surrogate plot(s) under {sweep_dir}")
@@ -926,7 +966,8 @@ def finalize_trial(dh, ref_optima, payloads, snap_records, trial_dir: Path,
     if surr is not None:
         try:
             plot_needles_on_surrogate(trial_dir / "needles_on_surrogate.png",
-                                      discovered, surr, ref_optima)
+                                      discovered, surr, ref_optima,
+                                      noise_seed=_rep_noise_seed(trial_dir))
         except Exception as e:
             print(f"      [finalize] needle-on-surrogate plot failed: {e}")
 
@@ -1665,7 +1706,8 @@ def resolve_resume_dir(arg: Optional[str], sweep_prefix: str) -> Path:
 
 
 def main(sweep_prefix: str = "sweep_surrogate", prompt_builder=None,
-         plot_title: Optional[str] = None, resume_dir: Optional[Path] = None) -> None:
+         plot_title: Optional[str] = None, resume_dir: Optional[Path] = None,
+         baseline_impl: str = "surrogate") -> None:
     resume = resume_dir is not None
     if resume:
         sweep_dir = Path(resume_dir)
@@ -1714,7 +1756,7 @@ def main(sweep_prefix: str = "sweep_surrogate", prompt_builder=None,
         try:
             m, reused = run_or_reuse_baseline(surr, base_hp, ref_optima, seed, tdir,
                                               MAX_ITERS, run_baseline_trial,
-                                              impl="surrogate")
+                                              impl=baseline_impl)
             print(f"    best={m['best_objective']:.4f}, needles={m['n_needles']}, "
                   f"dup={m['dup_fraction']:.4f}" + ("  [reused]" if reused else ""))
         except Exception as e:

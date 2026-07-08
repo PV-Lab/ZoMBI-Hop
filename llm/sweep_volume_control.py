@@ -862,7 +862,8 @@ _VOL_PLOT_TITLE = ("Volume control — convergence: baseline vs LLM injection ca
                    "(mean ± 95% CI over repeats)")
 
 
-def main(resume_dir: Optional[Path] = None) -> None:
+def main(resume_dir: Optional[Path] = None, sweep_prefix: str = "sweep_volume",
+         baseline_impl: str = "volume", plot_title: str = _VOL_PLOT_TITLE) -> None:
     resume = resume_dir is not None
     if resume:
         sweep_dir = Path(resume_dir)
@@ -870,7 +871,7 @@ def main(resume_dir: Optional[Path] = None) -> None:
         print(f"Volume-control LLM-in-the-loop sweep [RESUME]\n  sweep dir: {sweep_dir}")
     else:
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        sweep_dir = E.RESULTS_ROOT / f"sweep_volume_{ts}"
+        sweep_dir = E.RESULTS_ROOT / f"{sweep_prefix}_{ts}"
         sweep_dir.mkdir(parents=True, exist_ok=True)
         print(f"Volume-control LLM-in-the-loop sweep\n  sweep dir: {sweep_dir}")
     print(f"  cadences: {INJECTION_INTERVALS}   budget: {MAX_ITERS} iters   "
@@ -914,7 +915,7 @@ def main(resume_dir: Optional[Path] = None) -> None:
         try:
             m, reused = SBS.run_or_reuse_baseline(surr, base_hp, ref_optima, seed,
                                                   tdir, MAX_ITERS, run_baseline_trial,
-                                                  impl="volume")
+                                                  impl=baseline_impl)
             print(f"    best={m['best_objective']:.4f}, needles={m['n_needles']}, "
                   f"dup={m['dup_fraction']:.4f}" + ("  [reused]" if reused else ""))
         except Exception as e:
@@ -972,7 +973,7 @@ def main(resume_dir: Optional[Path] = None) -> None:
 
     # Overlaid running-best convergence: baseline vs each cadence (mean ± 95% CI).
     print("\n[plot] convergence comparison …")
-    SBS.plot_convergence_comparison(sweep_dir, title=_VOL_PLOT_TITLE)
+    SBS.plot_convergence_comparison(sweep_dir, title=plot_title)
     # Per-rep seed-matched view: each LLM rep vs its CRN baseline (2 lines, no CI).
     SBS.plot_per_rep_vs_baseline(sweep_dir)
 
