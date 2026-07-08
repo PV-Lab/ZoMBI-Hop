@@ -1473,27 +1473,40 @@ def load_seed_hparams(trial_paths: list[str]) -> list[torch.Tensor]:
     stored metrics are ignored. Each becomes a normalised design point that the
     run RE-EVALUATES as a real initial trial (alongside — not instead of — the
     full Sobol init), so the GP learns these known-good configs under the current
-    objective/dataset rather than trusting a copied score. Trials whose hparams
-    don't cover the current HPARAM_SPACE abort the run (stale hyperparameter set).
+    objective/dataset rather than trusting a copied score. Seed dirs that are
+    missing, unreadable, or don't cover the current HPARAM_SPACE (stale set) are
+    skipped with a warning rather than aborting the run; if none survive, the run
+    proceeds with pure Sobol init.
     Returns a list of normalised [0,1] hyperparameter vectors.
     """
     X_seed: list[torch.Tensor] = []
     for p in trial_paths:
         json_path = p if p.lower().endswith(".json") else os.path.join(p, "trial.json")
+        # A seed dir that no longer exists, is unreadable, or predates the current
+        # HPARAM_SPACE is an ops artifact (archived runs get cleaned off scratch),
+        # not a reason to kill the run. Skip it with a warning and keep the rest —
+        # aborting here would exit rc=1, which the fleet babysitter treats as a
+        # fatal crash and stops resubmitting, taking the whole dim's chain down.
         if not os.path.exists(json_path):
-            sys.exit(f"--start-from-best: no trial.json found at {json_path}")
+            print(f"  [seed] WARNING: no trial.json at {json_path} — skipping.")
+            continue
         try:
             with open(json_path) as f:
                 data = json.load(f)
         except Exception as exc:
-            sys.exit(f"--start-from-best: {json_path} unreadable ({exc}).")
+            print(f"  [seed] WARNING: {json_path} unreadable ({exc}) — skipping.")
+            continue
         hp = data.get("hparams", {})
         missing = [name for name in HPARAM_NAMES if name not in hp]
         if missing:
-            sys.exit(f"--start-from-best: {json_path} is missing hparams {missing} "
-                     f"(stale hyperparameter set?).")
+            print(f"  [seed] WARNING: {json_path} is missing hparams {missing} "
+                  f"(stale hyperparameter set?) — skipping.")
+            continue
         X_seed.append(hparams_to_norm(hp))
         print(f"  [seed] {p}  (trial {data.get('trial', '?')}) — will be re-evaluated")
+    if trial_paths and not X_seed:
+        print("  [seed] WARNING: none of the requested seed trials were usable; "
+              "falling back to pure Sobol initialisation.")
     return X_seed
 
 
