@@ -10,16 +10,17 @@
   },
 
   "fitness": {
-    "alpha_subspace": 3.0,
+    "fitness_features": null,
+    "tier1_weights": null,
+    "alpha_subspace": 0.5,
     "beta_complexity": 0.001,
-    "tier1_gamma": 5.0,
+    "tier1_gamma": 1.0,
     "linearity_penalty_gamma": 3.0,
     "subspace_rmse_frac": 0.02,
     "tier1_acceptance_median_rel": 0.1,
-    "linear_calibration": null,
-    "require_subspace_rmse": null,
-    "munoz_8_fitness": null,
-    "tier1_weights": null
+    "linear_calibration": false,
+    "require_subspace_rmse": false,
+    "munoz_8_fitness": null
   },
 
   "ga": {

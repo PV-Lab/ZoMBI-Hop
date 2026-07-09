@@ -8,7 +8,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ela.tier1 import CAMPAIGN_WEIGHTS, MUNOZ_8_NAMES, PAPER_WEIGHTS, TIER1_NAMES
+from ela.tier1 import (
+    CAMPAIGN_WEIGHTS,
+    MUNOZ_8_NAMES,
+    PAPER_WEIGHTS,
+    TIER1_NAMES,
+    resolve_fitness_weights,
+    validate_fitness_features,
+)
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "pilot_config.json"
 PROBE_CONFIG_PATH = Path(__file__).resolve().parent / "pilot_config_probe.json"
@@ -80,7 +87,8 @@ class ResolvedPilotConfig:
     linearity_penalty_gamma: float
     subspace_rmse_frac: float
     tier1_acceptance_median_rel: float
-    tier1_weights: dict[str, float] | None
+    fitness_feature_names: tuple[str, ...]
+    tier1_weights: dict[str, float]
 
     population: int
     generations: int
@@ -124,6 +132,7 @@ class ResolvedPilotConfig:
                 "linearity_penalty_gamma": self.linearity_penalty_gamma,
                 "subspace_rmse_frac": self.subspace_rmse_frac,
                 "tier1_acceptance_median_rel": self.tier1_acceptance_median_rel,
+                "fitness_features": list(self.fitness_feature_names),
                 "linear_calibration": self.linear_calibration,
                 "require_subspace_rmse": self.require_subspace_rmse,
                 "munoz_8_fitness": self.munoz_8_fitness,
@@ -190,15 +199,20 @@ def _coalesce(preset: dict[str, Any], section: dict[str, Any], key: str, default
 
 
 def _normalize_tier1_weights(
-    weights: dict[str, float] | None,
+    weights: dict[str, float] | str | None,
+    feature_names: tuple[str, ...],
     *,
-    munoz_8_fitness: bool,
-) -> dict[str, float] | None:
-    if weights is None:
-        return None
-    names = MUNOZ_8_NAMES if munoz_8_fitness else TIER1_NAMES
-    out = {name: float(weights.get(name, 1.0)) for name in names}
-    return out
+    fallback: dict[str, float] | None = None,
+) -> dict[str, float]:
+    return resolve_fitness_weights(feature_names, weights, fallback=fallback)
+
+
+def _default_feature_names(*, munoz_8: bool) -> tuple[str, ...]:
+    return MUNOZ_8_NAMES if munoz_8 else TIER1_NAMES
+
+
+def _default_weight_fallback(*, munoz_8: bool) -> dict[str, float]:
+    return dict(PAPER_WEIGHTS) if munoz_8 else dict(CAMPAIGN_WEIGHTS)
 
 
 def resolve_pilot_config(
@@ -273,12 +287,22 @@ def resolve_pilot_config(
     subspace_frac = float(fitness.get("subspace_rmse_frac", 0.02))
     tier1_accept = float(fitness.get("tier1_acceptance_median_rel", 0.10))
 
+    fitness_features_raw = fitness.get("fitness_features")
+    if fitness_features_raw is not None:
+        fitness_names = validate_fitness_features(list(fitness_features_raw))
+        weight_fallback = _default_weight_fallback(munoz_8=munoz_8)
+    else:
+        fitness_names = _default_feature_names(munoz_8=munoz_8)
+        weight_fallback = _default_weight_fallback(munoz_8=munoz_8)
+
     tier1_weights_raw = fitness.get("tier1_weights")
-    if tier1_weights_raw is None and not munoz_8:
+    if tier1_weights_raw is None and fitness_features_raw is None and not munoz_8:
         tier1_weights_raw = dict(CAMPAIGN_WEIGHTS)
-    elif tier1_weights_raw is None and munoz_8:
-        tier1_weights_raw = None
-    tier1_weights = _normalize_tier1_weights(tier1_weights_raw, munoz_8_fitness=munoz_8)
+    tier1_weights = _normalize_tier1_weights(
+        tier1_weights_raw,
+        fitness_names,
+        fallback=weight_fallback,
+    )
 
     quick = bool(cli.get("quick") or runtime.get("quick", False))
 
@@ -364,6 +388,7 @@ def resolve_pilot_config(
         linearity_penalty_gamma=linearity,
         subspace_rmse_frac=subspace_frac,
         tier1_acceptance_median_rel=tier1_accept,
+        fitness_feature_names=fitness_names,
         tier1_weights=tier1_weights,
         population=population,
         generations=generations,

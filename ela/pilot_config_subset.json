@@ -1,0 +1,36 @@
+{
+  "name": "subset-multimodal",
+  "description": "Example: arbitrary feature subset with custom weights. PILOT_CONFIG=ela/pilot_config_subset.json sbatch ela/scripts/run_pilot_3d.sbatch",
+
+  "mode": "anchored",
+
+  "data": {
+    "db": "data/2nd_real_run.db",
+    "target": "data/2nd_real_run_ela_full.json"
+  },
+
+  "fitness": {
+    "fitness_features": ["R2_Q", "PKS", "EL25", "median_lipschitz"],
+    "tier1_weights": {
+      "R2_Q": 1.0,
+      "PKS": 2.0,
+      "EL25": 1.5,
+      "median_lipschitz": 1.0
+    },
+    "alpha_subspace": 3.0,
+    "beta_complexity": 0.001,
+    "tier1_gamma": 1.0,
+    "linearity_penalty_gamma": 0.0,
+    "subspace_rmse_frac": 0.02,
+    "tier1_acceptance_median_rel": 0.1
+  },
+
+  "ga": {
+    "population": 400,
+    "generations": 100
+  },
+
+  "runtime": {
+    "log_level": "INFO"
+  }
+}

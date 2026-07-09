@@ -54,6 +54,46 @@ CAMPAIGN_WEIGHTS: dict[str, float] = {
 DEFAULT_WEIGHTS = CAMPAIGN_WEIGHTS
 
 
+def validate_fitness_features(names: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    """Validate and dedupe fitness feature names (order preserved)."""
+    if not names:
+        raise ValueError(
+            f"fitness_features must not be empty; choose from {list(TIER1_NAMES)}"
+        )
+    unknown = [n for n in names if n not in TIER1_NAMES]
+    if unknown:
+        raise ValueError(
+            f"unknown fitness features {unknown}; allowed: {list(TIER1_NAMES)}"
+        )
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return tuple(out)
+
+
+def resolve_fitness_weights(
+    feature_names: tuple[str, ...],
+    weights: dict[str, float] | str | None,
+    *,
+    fallback: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """
+    Build per-feature weights for the active fitness subset.
+
+  ``None`` or ``"uniform"`` → weight 1.0 on every selected feature.
+    """
+    if weights in (None, "uniform"):
+        fb = fallback or {}
+        return {name: float(fb.get(name, 1.0)) for name in feature_names}
+    return {
+        name: float(weights.get(name, (fallback or {}).get(name, 1.0)))
+        for name in feature_names
+    }
+
+
 def feature_campaign_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """In-sample R² of evolved landscape on measured campaign rows."""
     y_true = np.asarray(y_true, dtype=float).ravel()

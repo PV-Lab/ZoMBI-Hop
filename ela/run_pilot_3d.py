@@ -234,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
         munoz_8_fitness=cfg_resolved.munoz_8_fitness,
         linear_calibration=cfg_resolved.linear_calibration,
         paper_ga=cfg_resolved.paper_ga,
+        fitness_feature_names=cfg_resolved.fitness_feature_names,
         tier1_weights=cfg_resolved.tier1_weights,
     )
     log.info(

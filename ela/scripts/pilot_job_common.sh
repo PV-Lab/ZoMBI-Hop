@@ -193,6 +193,14 @@ print(f"  name: {cfg.get('name', '?')}")
 print(f"  mode: {cfg.get('mode', '?')}")
 fit = cfg.get("fitness", {})
 ga = cfg.get("ga", {})
+features = fit.get("fitness_features")
+if features:
+    print(f"  fitness_features: {features}")
+weights = fit.get("tier1_weights")
+if weights:
+    print(f"  tier1_weights: {weights}")
+elif features:
+    print("  tier1_weights: uniform (1.0)")
 print(
     "  fitness: "
     f"α={fit.get('alpha_subspace')} "

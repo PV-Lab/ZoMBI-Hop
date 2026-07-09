@@ -16,14 +16,15 @@ from ela.features import (
 )
 from ela.tier1 import (
     CAMPAIGN_WEIGHTS,
-    DEFAULT_WEIGHTS,
     MUNOZ_8_NAMES,
     PAPER_WEIGHTS,
     TIER1_NAMES,
     compute_tier1,
     extract_tier1_from_characterize,
     load_target_json,
+    resolve_fitness_weights,
     save_tier1_target,
+    validate_fitness_features,
 )
 
 
@@ -75,7 +76,8 @@ def build_context(
     munoz_8_fitness: bool = True,
     linear_calibration: bool = True,
     paper_ga: bool = True,
-    tier1_weights: dict[str, float] | None = None,
+    fitness_feature_names: tuple[str, ...] | list[str] | None = None,
+    tier1_weights: dict[str, float] | str | None = None,
 ) -> EvolutionContext:
     db_path = Path(db_path)
     x_campaign, y_campaign = load_campaign_rows(db_path, objective_column=objective_column)
@@ -123,18 +125,20 @@ def build_context(
 
     subspace_rmse_threshold = subspace_rmse_frac * max(y_range, 1e-9)
 
-    if munoz_8_fitness:
+    if fitness_feature_names is not None:
+        fitness_names = validate_fitness_features(list(fitness_feature_names))
+        fallback = dict(PAPER_WEIGHTS) if munoz_8_fitness else dict(CAMPAIGN_WEIGHTS)
+    elif munoz_8_fitness:
         fitness_names = MUNOZ_8_NAMES
-        resolved_weights = dict(PAPER_WEIGHTS)
+        fallback = dict(PAPER_WEIGHTS)
     else:
         fitness_names = TIER1_NAMES
-        resolved_weights = dict(CAMPAIGN_WEIGHTS)
-    if tier1_weights is not None:
-        resolved_weights = {
-            name: float(tier1_weights.get(name, resolved_weights.get(name, 1.0)))
-            for name in fitness_names
-        }
-    tier1_weights = resolved_weights
+        fallback = dict(CAMPAIGN_WEIGHTS)
+    tier1_weights = resolve_fitness_weights(
+        fitness_names,
+        tier1_weights,
+        fallback=fallback,
+    )
 
     metadata: dict[str, Any] = {
         "db_path": str(db_path.resolve()),

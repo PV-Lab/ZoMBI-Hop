@@ -113,6 +113,7 @@ def build_start_manifest(
             "linearity_penalty_gamma": cfg_log["fitness"]["linearity_penalty_gamma"],
             "subspace_rmse_frac": cfg_log["fitness"]["subspace_rmse_frac"],
             "tier1_acceptance_median_rel": cfg_log["fitness"]["tier1_acceptance_median_rel"],
+            "fitness_features": cfg_log["fitness"].get("fitness_features"),
             "tier1_weights": cfg_log["fitness"]["tier1_weights"],
             "snapshot_every": cfg_log["viz"]["snapshot_every"],
             "landscape_every": cfg_log["viz"]["landscape_every"],
