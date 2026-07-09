@@ -22,6 +22,7 @@ class ObjectiveInfo:
     true_needles: np.ndarray | None = None
     y_star: float | None = None
     match_radius_ilr: float | None = None
+    match_radius_comp: float | None = None
 
 
 class BenchmarkObjective(Protocol):

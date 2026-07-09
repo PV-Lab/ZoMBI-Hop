@@ -23,12 +23,29 @@ except ModuleNotFoundError:
     plt = None
 
 
-CONVERGENCE_METRICS = ["best_y_so_far", "dist_to_needles", "pct_matched", "dup_fraction"]
+CONVERGENCE_METRICS = [
+    "best_y_so_far",
+    "dist_to_needles_ilr",
+    "pct_matched_ilr",
+    "dup_fraction_ilr",
+    "dist_to_needles_comp",
+    "pct_matched_comp",
+    "dup_fraction_comp",
+    "dup_fraction_comp_cross_line",
+]
 FINAL_METRICS = [
     "final_best_y_so_far",
     "final_dist_to_needles",
     "final_pct_matched",
     "final_dup_fraction",
+    "final_dist_to_needles_ilr",
+    "final_pct_matched_ilr",
+    "final_dup_fraction_ilr",
+    "final_dist_to_needles_comp",
+    "final_pct_matched_comp",
+    "final_dup_fraction_comp",
+    "final_dup_fraction_comp_all_points",
+    "final_dup_fraction_comp_cross_line",
     "final_runtime_s",
     "num_points",
     "num_lines",
@@ -42,6 +59,14 @@ RANK_METRICS = {
     "final_dist_to_needles": "lower",
     "final_pct_matched": "higher",
     "final_dup_fraction": "lower",
+    "final_dist_to_needles_ilr": "lower",
+    "final_pct_matched_ilr": "higher",
+    "final_dup_fraction_ilr": "lower",
+    "final_dist_to_needles_comp": "lower",
+    "final_pct_matched_comp": "higher",
+    "final_dup_fraction_comp": "lower",
+    "final_dup_fraction_comp_all_points": "lower",
+    "final_dup_fraction_comp_cross_line": "lower",
     "final_runtime_s": "lower",
 }
 RUN_KEYS = ["report_label", "optimizer", "seed", "run_dir"]
@@ -56,6 +81,7 @@ class LoadedAggregate:
     objective: str
     objective_kind: str
     objective_family: str
+    n_components: int | None
     mode: str
     summary: dict[str, Any]
     run_index: pd.DataFrame
@@ -76,28 +102,38 @@ def run_report(config: dict[str, Any], repo_root: Path) -> Path:
 
     final_by_run = build_final_metrics_by_run(loaded)
     final_by_optimizer = summarize_final_metrics(final_by_run, ["optimizer"])
-    final_by_detail = summarize_final_metrics(
-        final_by_run,
-        ["objective_family", "objective_kind", "objective", "mode", "optimizer"],
-    )
+    detail_group_cols = ["objective_family", "objective_kind", "objective", "mode", "optimizer"]
+    if "n_components" in final_by_run.columns:
+        detail_group_cols.insert(3, "n_components")
+    final_by_detail = summarize_final_metrics(final_by_run, detail_group_cols)
     auc_by_run = compute_auc_metrics_by_run(loaded)
     transfer_rank_delta = compute_transfer_rank_delta(final_by_run, config.get("metrics", {}))
+    dimension_rank_delta = compute_dimension_rank_delta(final_by_run, config)
+    dimension_metric_delta = compute_dimension_metric_delta(final_by_run, config)
+    rank_delta_for_plots = dimension_rank_delta if not dimension_rank_delta.empty else transfer_rank_delta
 
     final_by_run.to_csv(report_dir / "final_metrics_by_run.csv", index=False)
     final_by_optimizer.to_csv(report_dir / "final_metrics_by_optimizer.csv", index=False)
     final_by_detail.to_csv(report_dir / "final_metrics_by_optimizer_objective_mode.csv", index=False)
     auc_by_run.to_csv(report_dir / "auc_metrics_by_run.csv", index=False)
     transfer_rank_delta.to_csv(report_dir / "transfer_rank_delta.csv", index=False)
+    if not dimension_rank_delta.empty or str(config.get("comparison_axis", "")).lower() == "n_components":
+        dimension_rank_delta.to_csv(report_dir / "dimension_rank_delta.csv", index=False)
+        dimension_metric_delta.to_csv(report_dir / "dimension_metric_delta.csv", index=False)
 
     write_yaml(report_dir / "report_config_resolved.yaml", config)
-    plot_paths = generate_plots(report_dir / "plots", loaded, final_by_run, transfer_rank_delta, config)
+    plot_paths = generate_plots(report_dir / "plots", loaded, final_by_run, rank_delta_for_plots, config)
     manifest = build_manifest(config, loaded, report_dir, plot_paths)
     write_json(report_dir / "report_manifest.json", manifest)
     write_report_markdown(
         report_dir / "report.md",
+        config,
         loaded,
+        final_by_run,
         final_by_detail,
         transfer_rank_delta,
+        dimension_rank_delta,
+        dimension_metric_delta,
         manifest,
         plot_paths,
     )
@@ -124,6 +160,9 @@ def load_aggregate(input_cfg: dict[str, Any], repo_root: Path) -> LoadedAggregat
     objective = str(input_cfg.get("objective") or objective_cfg.get("name") or _infer_objective(label))
     objective_kind = str(input_cfg.get("objective_kind") or objective_cfg.get("kind") or _infer_objective_kind(label))
     objective_family = str(input_cfg.get("objective_family") or _infer_objective_family(label, objective_kind))
+    n_components = _coerce_optional_int(
+        input_cfg.get("n_components", objective_cfg.get("n_components", _infer_n_components(label, objective)))
+    )
 
     run_index = _annotate(
         _read_csv(aggregate_dir / "run_index.csv"),
@@ -132,6 +171,7 @@ def load_aggregate(input_cfg: dict[str, Any], repo_root: Path) -> LoadedAggregat
         objective,
         objective_kind,
         objective_family,
+        n_components,
         mode,
         aggregate_dir,
     )
@@ -142,6 +182,7 @@ def load_aggregate(input_cfg: dict[str, Any], repo_root: Path) -> LoadedAggregat
         objective,
         objective_kind,
         objective_family,
+        n_components,
         mode,
         aggregate_dir,
     )
@@ -152,6 +193,7 @@ def load_aggregate(input_cfg: dict[str, Any], repo_root: Path) -> LoadedAggregat
         objective,
         objective_kind,
         objective_family,
+        n_components,
         mode,
         aggregate_dir,
     )
@@ -162,6 +204,7 @@ def load_aggregate(input_cfg: dict[str, Any], repo_root: Path) -> LoadedAggregat
         objective,
         objective_kind,
         objective_family,
+        n_components,
         mode,
         aggregate_dir,
     )
@@ -174,6 +217,7 @@ def load_aggregate(input_cfg: dict[str, Any], repo_root: Path) -> LoadedAggregat
         objective=objective,
         objective_kind=objective_kind,
         objective_family=objective_family,
+        n_components=n_components,
         mode=mode,
         summary=summary,
         run_index=run_index,
@@ -197,6 +241,14 @@ def build_final_metrics_by_run(loaded: list[LoadedAggregate]) -> pd.DataFrame:
         "dist_to_needles": "final_dist_to_needles",
         "pct_matched": "final_pct_matched",
         "dup_fraction": "final_dup_fraction",
+        "dist_to_needles_ilr": "final_dist_to_needles_ilr",
+        "pct_matched_ilr": "final_pct_matched_ilr",
+        "dup_fraction_ilr": "final_dup_fraction_ilr",
+        "dist_to_needles_comp": "final_dist_to_needles_comp",
+        "pct_matched_comp": "final_pct_matched_comp",
+        "dup_fraction_comp": "final_dup_fraction_comp",
+        "dup_fraction_comp_all_points": "final_dup_fraction_comp_all_points",
+        "dup_fraction_comp_cross_line": "final_dup_fraction_comp_cross_line",
         "runtime_s": "final_runtime_s",
     }
     final = final.rename(columns={key: value for key, value in rename.items() if key in final.columns})
@@ -261,10 +313,30 @@ def build_final_metrics_by_run(loaded: list[LoadedAggregate]) -> pd.DataFrame:
                 final[col] = final[col].combine_first(final[line_col])
                 final = final.drop(columns=[line_col])
 
+    final = _enrich_with_run_summary(final)
+
     for col in FINAL_METRICS:
         if col in final.columns:
             final[col] = pd.to_numeric(final[col], errors="coerce")
-    for col in ["seed", "num_points", "num_lines"]:
+    for col in [
+        "seed",
+        "n_components",
+        "num_points",
+        "num_lines",
+        "n_optima",
+        "basin_width",
+        "noise_freq",
+        "noise_amp",
+        "num_true_needles",
+        "true_needle_best_y",
+        "true_needle_worst_y",
+        "y_star",
+        "saasbo_fit_calls",
+        "saasbo_fit_time_s_total",
+        "saasbo_acq_time_s_total",
+        "saasbo_median_lengthscale_min",
+        "saasbo_median_lengthscale_max",
+    ]:
         if col in final.columns:
             final[col] = pd.to_numeric(final[col], errors="coerce")
 
@@ -273,6 +345,7 @@ def build_final_metrics_by_run(loaded: list[LoadedAggregate]) -> pd.DataFrame:
         "objective_family",
         "objective_kind",
         "objective",
+        "n_components",
         "mode",
         "optimizer",
         "optimizer_kind",
@@ -283,6 +356,14 @@ def build_final_metrics_by_run(loaded: list[LoadedAggregate]) -> pd.DataFrame:
         "final_dist_to_needles",
         "final_pct_matched",
         "final_dup_fraction",
+        "final_dist_to_needles_ilr",
+        "final_pct_matched_ilr",
+        "final_dup_fraction_ilr",
+        "final_dist_to_needles_comp",
+        "final_pct_matched_comp",
+        "final_dup_fraction_comp",
+        "final_dup_fraction_comp_all_points",
+        "final_dup_fraction_comp_cross_line",
         "final_runtime_s",
         "num_points",
         "num_lines",
@@ -290,11 +371,89 @@ def build_final_metrics_by_run(loaded: list[LoadedAggregate]) -> pd.DataFrame:
         "line_best_y_max",
         "line_length_l2_mean",
         "line_length_ilr_mean",
+        "n_optima",
+        "basin_width",
+        "noise_freq",
+        "noise_amp",
+        "num_true_needles",
+        "true_needle_best_y",
+        "true_needle_worst_y",
+        "y_star",
+        "synthetic_role",
+        "saasbo_dependency_available",
+        "saasbo_fit_calls",
+        "saasbo_fit_time_s_total",
+        "saasbo_acq_time_s_total",
+        "saasbo_median_lengthscale_min",
+        "saasbo_median_lengthscale_max",
+        "saasbo_median_lengthscale_values",
+        "saasbo_warmup_steps",
+        "saasbo_num_samples",
+        "saasbo_thinning",
         "run_dir",
         "suite_name",
         "aggregate_dir",
     ]
     return _order_columns(final, preferred)
+
+
+def _enrich_with_run_summary(final: pd.DataFrame) -> pd.DataFrame:
+    if final.empty or "run_dir" not in final.columns:
+        return final
+
+    rows: list[dict[str, Any]] = []
+    for run_dir in final["run_dir"].dropna().astype(str).unique():
+        if not run_dir:
+            continue
+        summary = _read_json(Path(run_dir) / "summary.json")
+        if not summary:
+            continue
+        state = summary.get("optimizer_state") or {}
+        if isinstance(state, dict) and isinstance(state.get("base_optimizer_state"), dict):
+            state = state["base_optimizer_state"]
+        row: dict[str, Any] = {
+            "run_dir": run_dir,
+            "summary_n_components": summary.get("n_components"),
+            "n_optima": summary.get("n_optima"),
+            "basin_width": summary.get("basin_width"),
+            "noise_freq": summary.get("noise_freq"),
+            "noise_amp": summary.get("noise_amp"),
+            "num_true_needles": summary.get("num_true_needles"),
+            "true_needle_best_y": summary.get("true_needle_best_y"),
+            "true_needle_worst_y": summary.get("true_needle_worst_y"),
+            "y_star": summary.get("y_star"),
+            "synthetic_role": summary.get("synthetic_role"),
+        }
+        if isinstance(state, dict) and state.get("name") == "saasbo":
+            row.update(
+                {
+                    "saasbo_dependency_available": state.get("dependency_available"),
+                    "saasbo_fit_calls": state.get("fit_calls"),
+                    "saasbo_fit_time_s_total": state.get("fit_time_s_total"),
+                    "saasbo_acq_time_s_total": state.get("acq_time_s_total"),
+                    "saasbo_median_lengthscale_min": state.get("median_lengthscale_min"),
+                    "saasbo_median_lengthscale_max": state.get("median_lengthscale_max"),
+                    "saasbo_median_lengthscale_values": _json_or_empty(state.get("median_lengthscale_values")),
+                    "saasbo_warmup_steps": state.get("warmup_steps"),
+                    "saasbo_num_samples": state.get("num_samples"),
+                    "saasbo_thinning": state.get("thinning"),
+                }
+            )
+        rows.append(row)
+
+    if not rows:
+        return final
+    diagnostics = pd.DataFrame(rows)
+    enriched = final.merge(diagnostics, on="run_dir", how="left")
+    if "summary_n_components" in enriched.columns:
+        if "n_components" in enriched.columns:
+            enriched["n_components"] = pd.to_numeric(enriched["n_components"], errors="coerce").combine_first(
+                pd.to_numeric(enriched["summary_n_components"], errors="coerce")
+            )
+        else:
+            enriched["n_components"] = pd.to_numeric(enriched["summary_n_components"], errors="coerce")
+        enriched = enriched.drop(columns=["summary_n_components"])
+    return enriched
 
 
 def summarize_final_metrics(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
@@ -336,6 +495,7 @@ def compute_auc_metrics_by_run(loaded: list[LoadedAggregate]) -> pd.DataFrame:
             "objective_family": group["objective_family"].iloc[0],
             "objective_kind": group["objective_kind"].iloc[0],
             "objective": group["objective"].iloc[0],
+            "n_components": group["n_components"].iloc[0] if "n_components" in group else np.nan,
             "mode": mode,
             "optimizer": optimizer,
             "optimizer_kind": group["optimizer_kind"].iloc[0] if "optimizer_kind" in group else "",
@@ -346,6 +506,119 @@ def compute_auc_metrics_by_run(loaded: list[LoadedAggregate]) -> pd.DataFrame:
         for metric in CONVERGENCE_METRICS:
             row[f"auc_{metric}"] = _normalized_auc(group, axis_col, metric)
         rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def compute_dimension_rank_delta(final_by_run: pd.DataFrame, config: dict[str, Any] | None = None) -> pd.DataFrame:
+    if final_by_run.empty or "n_components" not in final_by_run.columns:
+        return pd.DataFrame()
+    if str((config or {}).get("comparison_axis", "")).lower() != "n_components":
+        return pd.DataFrame()
+
+    directions = _rank_directions((config or {}).get("metrics", {}))
+    rank_metrics = [metric for metric in RANK_METRICS if metric in final_by_run.columns]
+    success = final_by_run[final_by_run.get("status", "success").fillna("success") == "success"].copy()
+    success["n_components"] = pd.to_numeric(success["n_components"], errors="coerce")
+    success = success.dropna(subset=["n_components"])
+    if success.empty:
+        return pd.DataFrame()
+
+    grouped = (
+        success.groupby(["objective_family", "mode", "n_components", "optimizer"], dropna=False)[rank_metrics]
+        .mean(numeric_only=True)
+        .reset_index()
+    )
+    rows: list[dict[str, Any]] = []
+    for (objective_family, mode), mode_df in grouped.groupby(["objective_family", "mode"], dropna=False):
+        dims = sorted(float(x) for x in mode_df["n_components"].dropna().unique())
+        if len(dims) < 2:
+            continue
+        base_dim = dims[0]
+        target_dim = dims[-1]
+        base = mode_df[mode_df["n_components"] == base_dim]
+        target = mode_df[mode_df["n_components"] == target_dim]
+        for metric in rank_metrics:
+            direction = directions.get(metric, RANK_METRICS.get(metric, "higher"))
+            ascending = direction == "lower"
+            base_metric = base[["optimizer", metric]].dropna().rename(columns={metric: "base_value"})
+            target_metric = target[["optimizer", metric]].dropna().rename(columns={metric: "target_value"})
+            merged = base_metric.merge(target_metric, on="optimizer", how="inner")
+            if merged.empty:
+                continue
+            merged["base_rank"] = merged["base_value"].rank(ascending=ascending, method="min")
+            merged["target_rank"] = merged["target_value"].rank(ascending=ascending, method="min")
+            merged["rank_delta"] = merged["target_rank"] - merged["base_rank"]
+            for _, row in merged.sort_values(["rank_delta", "optimizer"]).iterrows():
+                rows.append(
+                    {
+                        "objective_family": objective_family,
+                        "mode": mode,
+                        "metric": metric,
+                        "direction": direction,
+                        "optimizer": row["optimizer"],
+                        "base_n_components": int(base_dim),
+                        "target_n_components": int(target_dim),
+                        "base_value": row["base_value"],
+                        "target_value": row["target_value"],
+                        "value_delta": row["target_value"] - row["base_value"],
+                        "base_rank": int(row["base_rank"]),
+                        "target_rank": int(row["target_rank"]),
+                        "rank_delta": int(row["rank_delta"]),
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def compute_dimension_metric_delta(final_by_run: pd.DataFrame, config: dict[str, Any] | None = None) -> pd.DataFrame:
+    if final_by_run.empty or "n_components" not in final_by_run.columns:
+        return pd.DataFrame()
+    if str((config or {}).get("comparison_axis", "")).lower() != "n_components":
+        return pd.DataFrame()
+
+    metric_cols = [metric for metric in FINAL_METRICS if metric in final_by_run.columns]
+    success = final_by_run[final_by_run.get("status", "success").fillna("success") == "success"].copy()
+    success["n_components"] = pd.to_numeric(success["n_components"], errors="coerce")
+    success = success.dropna(subset=["n_components"])
+    if success.empty:
+        return pd.DataFrame()
+
+    grouped = (
+        success.groupby(["objective_family", "mode", "n_components", "optimizer"], dropna=False)[metric_cols]
+        .mean(numeric_only=True)
+        .reset_index()
+    )
+    rows: list[dict[str, Any]] = []
+    for (objective_family, mode), mode_df in grouped.groupby(["objective_family", "mode"], dropna=False):
+        dims = sorted(float(x) for x in mode_df["n_components"].dropna().unique())
+        if len(dims) < 2:
+            continue
+        base_dim = dims[0]
+        target_dim = dims[-1]
+        base = mode_df[mode_df["n_components"] == base_dim]
+        target = mode_df[mode_df["n_components"] == target_dim]
+        for metric in metric_cols:
+            base_metric = base[["optimizer", metric]].dropna().rename(columns={metric: "base_value"})
+            target_metric = target[["optimizer", metric]].dropna().rename(columns={metric: "target_value"})
+            merged = base_metric.merge(target_metric, on="optimizer", how="inner")
+            for _, row in merged.sort_values("optimizer").iterrows():
+                base_value = float(row["base_value"])
+                target_value = float(row["target_value"])
+                rows.append(
+                    {
+                        "objective_family": objective_family,
+                        "mode": mode,
+                        "metric": metric,
+                        "optimizer": row["optimizer"],
+                        "base_n_components": int(base_dim),
+                        "target_n_components": int(target_dim),
+                        "base_value": base_value,
+                        "target_value": target_value,
+                        "value_delta": target_value - base_value,
+                        "relative_delta": np.nan
+                        if base_value == 0.0 or np.isnan(base_value)
+                        else (target_value - base_value) / abs(base_value),
+                    }
+                )
     return pd.DataFrame(rows)
 
 
@@ -439,8 +712,11 @@ def generate_plots(
                 paths.append(path)
 
     if not transfer_rank_delta.empty:
-        path = plot_dir / "synthetic_real_rank_delta.png"
-        _plot_rank_delta(transfer_rank_delta, path, dpi)
+        dimension_plot = str(config.get("comparison_axis", "")).lower() == "n_components"
+        path = plot_dir / ("dimension_rank_delta.png" if dimension_plot else "synthetic_real_rank_delta.png")
+        title = "3D-to-4D rank delta" if dimension_plot else "Synthetic-to-real rank delta"
+        colorbar_label = "4D rank - 3D rank" if dimension_plot else "real rank - synthetic rank"
+        _plot_rank_delta(transfer_rank_delta, path, dpi, title=title, colorbar_label=colorbar_label)
         paths.append(path)
 
     return paths
@@ -469,8 +745,8 @@ def _generate_placeholder_plots(
             _write_placeholder_png(path, name)
             paths.append(path)
     if not transfer_rank_delta.empty:
-        path = plot_dir / "synthetic_real_rank_delta.png"
-        _write_placeholder_png(path, "synthetic_real_rank_delta")
+        path = plot_dir / "rank_delta.png"
+        _write_placeholder_png(path, "rank_delta")
         paths.append(path)
     return paths
 
@@ -519,6 +795,7 @@ def build_manifest(
                 "objective_family": item.objective_family,
                 "objective_kind": item.objective_kind,
                 "objective": item.objective,
+                "n_components": item.n_components,
                 "mode": item.mode,
                 "num_runs": int(len(run_index)),
                 "num_success": int((statuses == "success").sum()),
@@ -540,23 +817,84 @@ def build_manifest(
             ),
             "auc_metrics_by_run": str(report_dir / "auc_metrics_by_run.csv"),
             "transfer_rank_delta": str(report_dir / "transfer_rank_delta.csv"),
+            "dimension_rank_delta": str(report_dir / "dimension_rank_delta.csv"),
+            "dimension_metric_delta": str(report_dir / "dimension_metric_delta.csv"),
             "plots": [str(path) for path in plot_paths],
         },
     }
 
 
+def _saasbo_diagnostics_table(final_by_run: pd.DataFrame) -> pd.DataFrame:
+    if final_by_run.empty or "optimizer" not in final_by_run.columns:
+        return pd.DataFrame()
+    if "saasbo_fit_time_s_total" not in final_by_run.columns:
+        return pd.DataFrame()
+    df = final_by_run[
+        (final_by_run["optimizer"] == "saasbo")
+        & (final_by_run.get("status", "success").fillna("success") == "success")
+    ].copy()
+    if df.empty:
+        return pd.DataFrame()
+    group_cols = [col for col in ["objective", "n_components", "mode"] if col in df.columns]
+    rows: list[dict[str, Any]] = []
+    for keys, group in df.groupby(group_cols, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = {col: value for col, value in zip(group_cols, keys)}
+        row["n_success"] = int(len(group))
+        for col in [
+            "saasbo_fit_calls",
+            "saasbo_fit_time_s_total",
+            "saasbo_acq_time_s_total",
+            "saasbo_median_lengthscale_min",
+            "saasbo_median_lengthscale_max",
+            "final_runtime_s",
+        ]:
+            if col in group.columns:
+                values = pd.to_numeric(group[col], errors="coerce").dropna()
+                row[f"{col}_mean"] = float(values.mean()) if len(values) else np.nan
+                row[f"{col}_median"] = float(values.median()) if len(values) else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(group_cols).reset_index(drop=True)
+
+
 def write_report_markdown(
     path: Path,
+    config: dict[str, Any],
     loaded: list[LoadedAggregate],
+    final_by_run: pd.DataFrame,
     final_by_detail: pd.DataFrame,
     transfer_rank_delta: pd.DataFrame,
+    dimension_rank_delta: pd.DataFrame,
+    dimension_metric_delta: pd.DataFrame,
     manifest: dict[str, Any],
     plot_paths: list[Path],
 ) -> None:
+    dimension_report = str(config.get("comparison_axis", "")).lower() == "n_components"
     status_rows = pd.DataFrame(manifest["inputs"])
+    objective_rows = pd.DataFrame(
+        [
+            {
+                "label": item.label,
+                "objective_family": item.objective_family,
+                "objective_kind": item.objective_kind,
+                "objective": item.objective,
+                "n_components": item.n_components,
+                "mode": item.mode,
+                "suite_config": "" if item.suite_config_path is None else str(item.suite_config_path),
+            }
+            for item in loaded
+        ]
+    )
+    optimizer_rows = (
+        final_by_detail[["mode", "optimizer"]].drop_duplicates().sort_values(["mode", "optimizer"])
+        if not final_by_detail.empty and {"mode", "optimizer"}.issubset(final_by_detail.columns)
+        else pd.DataFrame()
+    )
     status_cols = [
         "label",
         "objective_family",
+        "n_components",
         "mode",
         "num_runs",
         "num_success",
@@ -565,13 +903,19 @@ def write_report_markdown(
     ]
     headline_cols = [
         "objective_family",
+        "objective",
+        "n_components",
         "mode",
         "optimizer",
         "n_success",
         "final_best_y_so_far_mean",
-        "final_dist_to_needles_mean",
-        "final_pct_matched_mean",
-        "final_dup_fraction_mean",
+        "final_dist_to_needles_ilr_mean",
+        "final_pct_matched_ilr_mean",
+        "final_dup_fraction_ilr_mean",
+        "final_dist_to_needles_comp_mean",
+        "final_pct_matched_comp_mean",
+        "final_dup_fraction_comp_mean",
+        "final_dup_fraction_comp_cross_line_mean",
         "final_runtime_s_mean",
         "line_best_y_max_mean",
         "line_length_ilr_mean_mean",
@@ -586,32 +930,123 @@ def write_report_markdown(
         "synthetic_value",
         "real_value",
     ]
+    dimension_rank_cols = [
+        "objective_family",
+        "mode",
+        "metric",
+        "optimizer",
+        "base_n_components",
+        "target_n_components",
+        "base_rank",
+        "target_rank",
+        "rank_delta",
+        "base_value",
+        "target_value",
+    ]
+    dimension_metric_cols = [
+        "objective_family",
+        "mode",
+        "metric",
+        "optimizer",
+        "base_n_components",
+        "target_n_components",
+        "base_value",
+        "target_value",
+        "value_delta",
+        "relative_delta",
+    ]
+    saasbo_diag = _saasbo_diagnostics_table(final_by_run)
+
+    if dimension_report:
+        title = "# Milestone 1B 3D-to-4D Synthetic Transfer Report"
+        description = (
+            "This report compares realistic Ackley simplex benchmark outputs between 3D and 4D, "
+            "across point and fair line mode."
+        )
+        objective_note = (
+            "The 3D synthetic objective uses 20 optima, basin width 86, noise frequency 9, and noise amplitude 400. "
+            "The 4D synthetic objective uses 30 optima, basin width 65, noise frequency 9, and noise amplitude 300."
+        )
+        rank_heading = "## 3D-to-4D Rank Deltas"
+        rank_note = "Negative rank deltas mean an optimizer ranked better in 4D than in 3D; positive values mean it ranked worse."
+    else:
+        title = "# Milestone 1A Synthetic-to-Real Report"
+        description = "This report compares synthetic 3D simplex and real 3D RF-surrogate benchmark outputs across point and line mode."
+        objective_note = (
+            "The synthetic headline objective is `realistic_ackley_3d`, a Brianna-realistic Ackley landscape "
+            "rather than the older planted-bump smoke fixture."
+        )
+        rank_heading = "## Synthetic-to-Real Rank Deltas"
+        rank_note = "Negative rank deltas mean an optimizer ranked better on the real RF surrogate than on synthetic; positive values mean it ranked worse."
 
     lines = [
-        "# Milestone 1A Synthetic-to-Real Report",
+        title,
         "",
-        "This report compares synthetic 3D simplex and real 3D RF-surrogate benchmark outputs across point and line mode.",
+        description,
         "",
         "## Loaded Suites",
         "",
         _markdown_table(status_rows[[col for col in status_cols if col in status_rows.columns]]),
         "",
+        "## Objectives",
+        "",
+        _markdown_table(objective_rows),
+        "",
+        objective_note,
+        "",
+        "## Optimizers",
+        "",
+        _markdown_table(optimizer_rows, max_rows=40),
+        "",
+        "## Metric Coordinate Systems",
+        "",
+        "- `_ilr` metrics use ILR/Aitchison distances.",
+        "- `_comp` metrics use raw composition-L2 distances with match radius 0.05 and duplicate radius 0.032 unless overridden by the suite config.",
+        "- Legacy `dist_to_needles`, `pct_matched`, and `dup_fraction` remain ILR aliases for backward compatibility.",
+        "- `dup_fraction_comp_cross_line` ignores duplicate pairs within the same printed line, while `dup_fraction_comp` keeps the all-points definition.",
+        "",
         "## Final Metrics by Optimizer, Objective, and Mode",
         "",
         _markdown_table(final_by_detail[[col for col in headline_cols if col in final_by_detail.columns]], max_rows=40),
         "",
-        "## Synthetic-to-Real Rank Deltas",
+        rank_heading,
         "",
-        "Negative rank deltas mean an optimizer ranked better on the real RF surrogate than on synthetic; positive values mean it ranked worse.",
+        rank_note,
         "",
         _markdown_table(
-            transfer_rank_delta[[col for col in rank_cols if col in transfer_rank_delta.columns]],
+            (
+                dimension_rank_delta[[col for col in dimension_rank_cols if col in dimension_rank_delta.columns]]
+                if dimension_report
+                else transfer_rank_delta[[col for col in rank_cols if col in transfer_rank_delta.columns]]
+            ),
             max_rows=80,
         ),
         "",
-        "## Plots",
-        "",
     ]
+    if dimension_report:
+        lines.extend(
+            [
+                "## 3D-to-4D Metric Deltas",
+                "",
+                _markdown_table(
+                    dimension_metric_delta[
+                        [col for col in dimension_metric_cols if col in dimension_metric_delta.columns]
+                    ],
+                    max_rows=80,
+                ),
+                "",
+            ]
+        )
+    if not saasbo_diag.empty:
+        lines.extend(
+            [
+                "## SAASBO Diagnostics",
+                "",
+                _markdown_table(saasbo_diag, max_rows=30),
+                "",
+            ]
+        )
+    lines.extend(["## Plots", ""])
     for plot_path in plot_paths:
         rel = plot_path.relative_to(path.parent).as_posix()
         title = plot_path.stem.replace("_", " ")
@@ -622,9 +1057,16 @@ def write_report_markdown(
             "## Caveats",
             "",
             "- The real RF objective is a surrogate benchmark, not hardware validation.",
+            "- The synthetic objective labeled `realistic_ackley_3d` uses Brianna's `Ackley('realistic')` generator with 20 optima, basin width 86, noise frequency 9, and noise amplitude 400.",
+            "- The synthetic objective labeled `realistic_ackley_4d` uses Brianna's dimension-scaled realistic Ackley settings with 30 optima, basin width 65, noise frequency 9, and noise amplitude 300.",
+            "- 4D realistic Ackley is still synthetic, not real 4D hardware validation; real 4D RF-surrogate benchmarking is deferred until campaign data or a vetted surrogate is available.",
+            "- `pct_matched` can drop from 3D to 4D because the number of true optima rises from 20 to 30.",
             "- The default real RF configs use `data/campaign1a.csv`, target `Objective`, components `[FAPbI3, MAPbI3, MAPbBr3]`, and the bundled reference optima JSON when present.",
-            "- ZoMBI-Hop line mode uses internal candidate-anchor plus LineBO, while GP/RF/random use benchmark-local line wrappers.",
+            "- Metrics with `_ilr` use ILR/Aitchison distances; metrics with `_comp` use raw composition-L2 distances. The legacy `dist_to_needles`, `pct_matched`, and `dup_fraction` columns remain ILR aliases for backward compatibility.",
+            "- ZoMBI-Hop line mode uses internal candidate-anchor plus LineBO. HEBO line mode uses `hebo_anchor_chord`; TuRBO line mode uses `turbo_acq_line`; SAASBO line mode, when included, uses `saasbo_acq_line` with benchmark-local mean acquisition scoring.",
+            "- SAASBO median lengthscales, when present in run summaries, are in the normalized ILR coordinate system used by the adapter and should not be read as direct raw component importance.",
             "- All line methods share the same line budget, points per line, initial design convention, objective, seed convention, and batched within-line update rule.",
+            "- This report keeps the benchmarking-pinned ZoMBI-Hop core unless a separate branch-sync note states otherwise; full core sync from `brianna-compositional` is deferred when merge conflicts are nontrivial.",
             "- Plot PNGs are generated with matplotlib when it is installed; otherwise placeholder PNGs are written and the CSV tables remain the source of record.",
             "",
         ]
@@ -636,11 +1078,12 @@ def _plot_convergence(metrics: pd.DataFrame, metric: str, path: Path, plots_cfg:
     df = metrics.copy()
     df[metric] = pd.to_numeric(df[metric], errors="coerce")
     combos = _objective_mode_combos(df)
+    group_col = _plot_group_column(df)
     fig, axes = _subplots_for_combos(combos)
     include_seed_traces = bool(plots_cfg.get("include_seed_traces", True))
     include_iqr = bool(plots_cfg.get("include_iqr_band", True))
-    for ax, (objective_family, mode) in zip(axes, combos):
-        subset = df[(df["objective_family"] == objective_family) & (df["mode"] == mode)].copy()
+    for ax, (plot_group, mode) in zip(axes, combos):
+        subset = df[(df[group_col] == plot_group) & (df["mode"] == mode)].copy()
         axis_col = _axis_column(subset, str(mode))
         subset[axis_col] = pd.to_numeric(subset[axis_col], errors="coerce")
         subset = subset.dropna(subset=[axis_col, metric])
@@ -663,7 +1106,7 @@ def _plot_convergence(metrics: pd.DataFrame, metric: str, path: Path, plots_cfg:
                 q25 = grouped.quantile(0.25)
                 q75 = grouped.quantile(0.75)
                 ax.fill_between(median.index, q25.values, q75.values, alpha=0.12)
-        ax.set_title(f"{objective_family} / {mode}")
+        ax.set_title(f"{plot_group} / {mode}")
         ax.set_xlabel(axis_col)
         ax.set_ylabel(metric)
         ax.grid(alpha=0.25)
@@ -678,14 +1121,15 @@ def _plot_runtime_summary(final_by_run: pd.DataFrame, path: Path, dpi: int) -> N
     df = final_by_run[final_by_run.get("status", "success").fillna("success") == "success"].copy()
     df["final_runtime_s"] = pd.to_numeric(df["final_runtime_s"], errors="coerce")
     combos = _objective_mode_combos(df)
+    group_col = _plot_group_column(df)
     fig, axes = _subplots_for_combos(combos)
-    for ax, (objective_family, mode) in zip(axes, combos):
-        subset = df[(df["objective_family"] == objective_family) & (df["mode"] == mode)].dropna(
+    for ax, (plot_group, mode) in zip(axes, combos):
+        subset = df[(df[group_col] == plot_group) & (df["mode"] == mode)].dropna(
             subset=["final_runtime_s"]
         )
         grouped = subset.groupby("optimizer")["final_runtime_s"].mean().sort_values()
         ax.bar(grouped.index.astype(str), grouped.values)
-        ax.set_title(f"{objective_family} / {mode}")
+        ax.set_title(f"{plot_group} / {mode}")
         ax.set_ylabel("runtime_s")
         ax.tick_params(axis="x", rotation=35)
         ax.grid(axis="y", alpha=0.25)
@@ -700,15 +1144,16 @@ def _plot_line_metric(line_metrics: pd.DataFrame, metric: str, path: Path, dpi: 
     df[metric] = pd.to_numeric(df[metric], errors="coerce")
     df["line_index"] = pd.to_numeric(df["line_index"], errors="coerce")
     combos = _objective_mode_combos(df)
+    group_col = _plot_group_column(df)
     fig, axes = _subplots_for_combos(combos)
-    for ax, (objective_family, mode) in zip(axes, combos):
-        subset = df[(df["objective_family"] == objective_family) & (df["mode"] == mode)].dropna(
+    for ax, (plot_group, mode) in zip(axes, combos):
+        subset = df[(df[group_col] == plot_group) & (df["mode"] == mode)].dropna(
             subset=["line_index", metric]
         )
         for optimizer, opt_df in subset.groupby("optimizer"):
             grouped = opt_df.groupby("line_index")[metric].median()
             ax.plot(grouped.index, grouped.values, marker="o", label=str(optimizer))
-        ax.set_title(f"{objective_family} / {mode}")
+        ax.set_title(f"{plot_group} / {mode}")
         ax.set_xlabel("line_index")
         ax.set_ylabel(metric)
         ax.grid(alpha=0.25)
@@ -723,10 +1168,11 @@ def _plot_line_distribution(line_metrics: pd.DataFrame, metric: str, path: Path,
     df = line_metrics.copy()
     df[metric] = pd.to_numeric(df[metric], errors="coerce")
     df = df.dropna(subset=[metric])
+    group_col = _plot_group_column(df)
     labels = []
     values = []
-    for (objective_family, optimizer), group in df.groupby(["objective_family", "optimizer"], dropna=False):
-        labels.append(f"{objective_family}\n{optimizer}")
+    for (plot_group, optimizer), group in df.groupby([group_col, "optimizer"], dropna=False):
+        labels.append(f"{plot_group}\n{optimizer}")
         values.append(group[metric].to_numpy(dtype=float))
     fig, ax = plt.subplots(figsize=(max(7, len(labels) * 0.7), 4.5))
     if values:
@@ -746,7 +1192,13 @@ def _boxplot_with_labels(ax, values, labels) -> None:
         ax.boxplot(values, labels=labels, showfliers=False)
 
 
-def _plot_rank_delta(rank_delta: pd.DataFrame, path: Path, dpi: int) -> None:
+def _plot_rank_delta(
+    rank_delta: pd.DataFrame,
+    path: Path,
+    dpi: int,
+    title: str = "Synthetic-to-real rank delta",
+    colorbar_label: str = "real rank - synthetic rank",
+) -> None:
     df = rank_delta.copy()
     df["row"] = df["mode"].astype(str) + " / " + df["optimizer"].astype(str)
     pivot = df.pivot_table(index="row", columns="metric", values="rank_delta", aggfunc="mean")
@@ -756,7 +1208,7 @@ def _plot_rank_delta(rank_delta: pd.DataFrame, path: Path, dpi: int) -> None:
         max_abs = np.nanmax(np.abs(data)) if not np.isnan(data).all() else 1.0
         max_abs = max(max_abs, 1.0)
         image = ax.imshow(data, cmap="coolwarm", vmin=-max_abs, vmax=max_abs, aspect="auto")
-        fig.colorbar(image, ax=ax, label="real rank - synthetic rank")
+        fig.colorbar(image, ax=ax, label=colorbar_label)
         ax.set_xticks(np.arange(len(pivot.columns)), labels=pivot.columns, rotation=35, ha="right")
         ax.set_yticks(np.arange(len(pivot.index)), labels=pivot.index)
         for i in range(pivot.shape[0]):
@@ -764,7 +1216,7 @@ def _plot_rank_delta(rank_delta: pd.DataFrame, path: Path, dpi: int) -> None:
                 value = data[i, j]
                 if not np.isnan(value):
                     ax.text(j, i, f"{value:.0f}", ha="center", va="center", fontsize=7)
-    ax.set_title("Synthetic-to-real rank delta")
+    ax.set_title(title)
     fig.tight_layout()
     fig.savefig(path, dpi=dpi)
     plt.close(fig)
@@ -786,6 +1238,15 @@ def _read_json(path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def _json_or_empty(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        return json.dumps(value)
+    except Exception:
+        return str(value)
+
+
 def _annotate(
     df: pd.DataFrame,
     label: str,
@@ -793,6 +1254,7 @@ def _annotate(
     objective: str,
     objective_kind: str,
     objective_family: str,
+    n_components: int | None,
     mode: str,
     aggregate_dir: Path,
 ) -> pd.DataFrame:
@@ -803,13 +1265,21 @@ def _annotate(
         ("objective", objective),
         ("objective_kind", objective_kind),
         ("objective_family", objective_family),
+        ("n_components", n_components),
         ("mode", mode),
         ("aggregate_dir", str(aggregate_dir)),
     ]:
+        if value is None:
+            continue
         if col in df.columns:
             df[col] = df[col].fillna(value)
         else:
             df[col] = value
+    plot_group = _plot_group_label(objective_family, n_components)
+    if "plot_group" in df.columns:
+        df["plot_group"] = df["plot_group"].fillna(plot_group)
+    else:
+        df["plot_group"] = plot_group
     return df
 
 
@@ -840,6 +1310,33 @@ def _infer_objective_family(label: str, objective_kind: str) -> str:
     if "real_rf" in objective_kind or "real" in label or "rf" in label:
         return "real_rf"
     return "synthetic"
+
+
+def _infer_n_components(label: str, objective: str) -> int | None:
+    text = f"{label} {objective}".lower()
+    if "4d" in text or "_4d" in text:
+        return 4
+    if "3d" in text or "_3d" in text:
+        return 3
+    return None
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _plot_group_label(objective_family: str, n_components: int | None) -> str:
+    return objective_family if n_components is None else f"{objective_family}_{int(n_components)}d"
 
 
 def _concat(frames: list[pd.DataFrame]) -> pd.DataFrame:
@@ -910,12 +1407,17 @@ def _final_metric_name(metric: str) -> str:
 def _objective_mode_combos(df: pd.DataFrame) -> list[tuple[str, str]]:
     if df.empty:
         return []
-    combos = df[["objective_family", "mode"]].drop_duplicates()
-    order = {"synthetic": 0, "real_rf": 1, "point": 0, "line": 1}
+    group_col = _plot_group_column(df)
+    combos = df[[group_col, "mode"]].drop_duplicates()
+    order = {"synthetic": 0, "synthetic_3d": 0, "synthetic_4d": 1, "real_rf": 2, "point": 0, "line": 1}
     return sorted(
-        [(str(row.objective_family), str(row.mode)) for row in combos.itertuples()],
+        [(str(getattr(row, group_col)), str(row.mode)) for row in combos.itertuples()],
         key=lambda item: (order.get(item[0], 99), order.get(item[1], 99), item[0], item[1]),
     )
+
+
+def _plot_group_column(df: pd.DataFrame) -> str:
+    return "plot_group" if "plot_group" in df.columns else "objective_family"
 
 
 def _subplots_for_combos(combos: list[tuple[str, str]]):

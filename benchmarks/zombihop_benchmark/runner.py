@@ -49,6 +49,14 @@ METRIC_FIELDS = [
     "dist_to_needles",
     "pct_matched",
     "dup_fraction",
+    "dist_to_needles_ilr",
+    "pct_matched_ilr",
+    "dup_fraction_ilr",
+    "dist_to_needles_comp",
+    "pct_matched_comp",
+    "dup_fraction_comp",
+    "dup_fraction_comp_all_points",
+    "dup_fraction_comp_cross_line",
     "runtime_s",
     "num_points",
     "num_lines",
@@ -148,6 +156,13 @@ def run_trial(config: dict[str, Any], seed: int, repo_root: Path) -> Path:
     objective_needle_rows = _objective_needle_rows(objective)
     if objective_needle_rows:
         write_csv(run_dir / "objective_needles.csv", objective_needle_rows, _fieldnames(objective_needle_rows))
+    objective_distribution_rows = _objective_distribution_rows(objective)
+    if objective_distribution_rows:
+        fields = _fieldnames(objective_distribution_rows)
+        write_csv(run_dir / "objective_distribution.csv", objective_distribution_rows, fields)
+        n_components = objective_metadata.get("n_components")
+        if n_components:
+            write_csv(run_dir / f"objective_distribution_{int(n_components)}d.csv", objective_distribution_rows, fields)
 
     n_init = int(budget.get("n_init", 5))
     X_init = objective.initial_design(n_init, seed)
@@ -170,16 +185,17 @@ def run_trial(config: dict[str, Any], seed: int, repo_root: Path) -> Path:
     next_point_index = len(init_obs.y)
     all_X = init_obs.X_actual.copy()
     all_y = init_obs.y.copy()
+    all_line_group_ids: list[str] = [f"init_{i}" for i in range(len(init_obs.y))]
     metric_rows = [
         _metric_row(
-            compute_metrics(
+            _compute_metrics_with_config(
                 all_X,
                 all_y,
                 objective.info,
-                duplicate_radius_ilr=float(metrics_cfg.get("duplicate_radius_ilr", 0.03)),
-                match_radius_ilr=metrics_cfg.get("match_radius_ilr", objective.info.match_radius_ilr),
-                runtime_s=0.0,
-                step=0,
+                metrics_cfg,
+                0.0,
+                0,
+                all_line_group_ids,
             ),
             line_index=None,
             point_index_in_line=None,
@@ -221,16 +237,17 @@ def run_trial(config: dict[str, Any], seed: int, repo_root: Path) -> Path:
                 next_point_index += len(obs.y)
                 all_X = np.vstack([all_X, obs.X_actual])
                 all_y = np.concatenate([all_y, obs.y])
+                all_line_group_ids.extend(f"point_{step}_{i}" for i in range(len(obs.y)))
                 metric_rows.append(
                     _metric_row(
-                        compute_metrics(
+                        _compute_metrics_with_config(
                             all_X,
                             all_y,
                             objective.info,
-                            duplicate_radius_ilr=float(metrics_cfg.get("duplicate_radius_ilr", 0.03)),
-                            match_radius_ilr=metrics_cfg.get("match_radius_ilr", objective.info.match_radius_ilr),
-                            runtime_s=elapsed,
-                            step=step,
+                            metrics_cfg,
+                            elapsed,
+                            step,
+                            all_line_group_ids,
                         ),
                         line_index=None,
                         point_index_in_line=None,
@@ -257,8 +274,6 @@ def run_trial(config: dict[str, Any], seed: int, repo_root: Path) -> Path:
                 "line_budget_reached": bool(result.get("line_budget_reached", False)),
                 "zombihop_internal_linebo": True,
             }
-            duplicate_radius = float(metrics_cfg.get("duplicate_radius_ilr", 0.03))
-            match_radius = metrics_cfg.get("match_radius_ilr", objective.info.match_radius_ilr)
             line_observations = result.get("line_observations", [])
             for line_record, obs in zip(result.get("line_records", []), line_observations):
                 line_index = int(line_record["line_index"])
@@ -286,19 +301,22 @@ def run_trial(config: dict[str, Any], seed: int, repo_root: Path) -> Path:
 
                 X_before_line = all_X
                 y_before_line = all_y
+                groups_before_line = list(all_line_group_ids)
+                line_group_id = str(line_metadata.get("line_id") or f"zombihop_line_{line_index}")
                 for point_index_in_line in range(len(obs.y)):
                     X_prefix = np.vstack([X_before_line, obs.X_actual[: point_index_in_line + 1]])
                     y_prefix = np.concatenate([y_before_line, obs.y[: point_index_in_line + 1]])
+                    group_prefix = groups_before_line + [line_group_id] * (point_index_in_line + 1)
                     metric_rows.append(
                         _metric_row(
-                            compute_metrics(
+                            _compute_metrics_with_config(
                                 X_prefix,
                                 y_prefix,
                                 objective.info,
-                                duplicate_radius_ilr=duplicate_radius,
-                                match_radius_ilr=match_radius,
-                                runtime_s=line_elapsed,
-                                step=line_index,
+                                metrics_cfg,
+                                line_elapsed,
+                                line_index,
+                                group_prefix,
                             ),
                             line_index=line_index,
                             point_index_in_line=point_index_in_line,
@@ -308,6 +326,7 @@ def run_trial(config: dict[str, Any], seed: int, repo_root: Path) -> Path:
 
                 all_X = np.vstack([all_X, obs.X_actual])
                 all_y = np.concatenate([all_y, obs.y])
+                all_line_group_ids.extend([line_group_id] * len(obs.y))
                 line_rows.append(line_record)
             write_json(run_dir / "zombihop_result.json", result)
         elif mode == "line":
@@ -315,8 +334,6 @@ def run_trial(config: dict[str, Any], seed: int, repo_root: Path) -> Path:
                 raise RuntimeError(f"Optimizer {optimizer.name} does not support line mode")
             if n_lines <= 0:
                 raise ValueError("line mode requires budget.n_lines or line_mode.n_lines to be positive")
-            duplicate_radius = float(metrics_cfg.get("duplicate_radius_ilr", 0.03))
-            match_radius = metrics_cfg.get("match_radius_ilr", objective.info.match_radius_ilr)
             for line_index in range(1, n_lines + 1):
                 line_start = time.time()
                 line = optimizer.suggest_line()
@@ -349,19 +366,22 @@ def run_trial(config: dict[str, Any], seed: int, repo_root: Path) -> Path:
 
                 X_before_line = all_X
                 y_before_line = all_y
+                groups_before_line = list(all_line_group_ids)
+                line_group_id = str(line_metadata.get("line_id") or f"line_{line_index}")
                 for point_index_in_line in range(len(obs.y)):
                     X_prefix = np.vstack([X_before_line, obs.X_actual[: point_index_in_line + 1]])
                     y_prefix = np.concatenate([y_before_line, obs.y[: point_index_in_line + 1]])
+                    group_prefix = groups_before_line + [line_group_id] * (point_index_in_line + 1)
                     metric_rows.append(
                         _metric_row(
-                            compute_metrics(
+                            _compute_metrics_with_config(
                                 X_prefix,
                                 y_prefix,
                                 objective.info,
-                                duplicate_radius_ilr=duplicate_radius,
-                                match_radius_ilr=match_radius,
-                                runtime_s=elapsed,
-                                step=line_index,
+                                metrics_cfg,
+                                elapsed,
+                                line_index,
+                                group_prefix,
                             ),
                             line_index=line_index,
                             point_index_in_line=point_index_in_line,
@@ -371,6 +391,7 @@ def run_trial(config: dict[str, Any], seed: int, repo_root: Path) -> Path:
 
                 all_X = np.vstack([all_X, obs.X_actual])
                 all_y = np.concatenate([all_y, obs.y])
+                all_line_group_ids.extend([line_group_id] * len(obs.y))
                 line_rows.append(
                     {
                         "line_index": line_index,
@@ -445,6 +466,29 @@ def _metric_row(
     return out
 
 
+def _compute_metrics_with_config(
+    X: np.ndarray,
+    y: np.ndarray,
+    objective_info,
+    metrics_cfg: dict[str, Any],
+    runtime_s: float,
+    step: int,
+    line_group_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    return compute_metrics(
+        X,
+        y,
+        objective_info,
+        duplicate_radius_ilr=float(metrics_cfg.get("duplicate_radius_ilr", 0.03)),
+        match_radius_ilr=metrics_cfg.get("match_radius_ilr", objective_info.match_radius_ilr),
+        runtime_s=runtime_s,
+        step=step,
+        duplicate_radius_comp=float(metrics_cfg.get("duplicate_radius_comp", 0.032)),
+        match_radius_comp=metrics_cfg.get("match_radius_comp", objective_info.match_radius_comp),
+        line_group_ids=line_group_ids,
+    )
+
+
 def _observation_with_metadata(obs: BatchObservation, extra_metadata: dict[str, Any]) -> BatchObservation:
     metadata = dict(obs.metadata)
     metadata.update(extra_metadata)
@@ -476,6 +520,14 @@ def _objective_metadata(objective) -> dict[str, Any]:
 def _objective_needle_rows(objective) -> list[dict[str, Any]]:
     if hasattr(objective, "true_needle_rows"):
         rows = objective.true_needle_rows()
+        if isinstance(rows, list):
+            return rows
+    return []
+
+
+def _objective_distribution_rows(objective) -> list[dict[str, Any]]:
+    if hasattr(objective, "objective_distribution_rows"):
+        rows = objective.objective_distribution_rows()
         if isinstance(rows, list):
             return rows
     return []

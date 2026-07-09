@@ -4,6 +4,7 @@ from typing import Any
 
 from ..types import BenchmarkObjective
 from .real_rf_surrogate import RealRFSurrogateObjective
+from .realistic_ackley import RealisticAckleySimplexObjective
 from .synthetic import SyntheticSimplexObjective
 from .tabular import TabularObjective
 
@@ -30,6 +31,13 @@ def build_objective(config: dict[str, Any]) -> BenchmarkObjective:
         )
     if kind == "real_rf_surrogate":
         return RealRFSurrogateObjective(
+            name=name,
+            n_components=n_components,
+            maximize=maximize,
+            **params,
+        )
+    if kind in {"realistic_ackley_simplex", "brianna_realistic_ackley"}:
+        return RealisticAckleySimplexObjective(
             name=name,
             n_components=n_components,
             maximize=maximize,

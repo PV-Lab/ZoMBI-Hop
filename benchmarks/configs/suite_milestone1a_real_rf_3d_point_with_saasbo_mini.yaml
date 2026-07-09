@@ -1,0 +1,109 @@
+experiment:
+  name: milestone1a_real_rf_3d_point_with_saasbo_mini
+  mode: point
+  seeds: [0, 1, 2]
+  output_root: benchmark_runs
+
+objective:
+  kind: real_rf_surrogate
+  name: real_3d_perovskite_rf
+  n_components: 3
+  maximize: true
+  params:
+    data_path: data/campaign1a.csv
+    component_labels: [FAPbI3, MAPbI3, MAPbBr3]
+    composition_columns: [FAPbI3, MAPbI3, MAPbBr3]
+    target_column: Objective
+    feature_transform: raw_composition
+    true_needles_path: optimize/reference_optima/mobo_05_06_15_32_campaign1a.json
+    train_surrogate:
+      enabled: true
+      n_estimators: 100
+      random_state: 42
+      min_samples_leaf: 1
+      n_jobs: -1
+    needle_detection:
+      method: grid_local_maxima
+      grid_resolution: 101
+      top_k: 20
+      min_separation_ilr: 0.08
+      match_radius_ilr: 0.25
+      match_radius_comp: 0.05
+
+budget:
+  n_init: 8
+  n_steps: 10
+
+metrics:
+  duplicate_radius_ilr: 0.03
+  match_radius_ilr: 0.25
+  duplicate_radius_comp: 0.032
+  match_radius_comp: 0.05
+
+optimizers:
+  - kind: random_simplex
+    params: {}
+  - kind: gp_ard_ei
+    params:
+      candidate_pool_size: 512
+      xi: 0.01
+      device: cpu
+      dtype: float64
+  - kind: gp_ard_ucb
+    params:
+      candidate_pool_size: 512
+      ucb_beta: 0.2
+      device: cpu
+      dtype: float64
+  - kind: rf_bo
+    params:
+      candidate_pool_size: 512
+      n_estimators: 100
+      acquisition: ucb
+      ucb_beta: 0.2
+      n_jobs: -1
+  - kind: hebo
+    params:
+      internal_space: ilr
+      ilr_bounds:
+        method: candidate_pool_quantile
+        n_candidates: 2048
+        lower_quantile: 0.005
+        upper_quantile: 0.995
+      candidate_repair:
+        clip_min: 1.0e-12
+        renormalize: true
+      objective_sign:
+        hebo_internal: minimize
+        benchmark_external: maximize
+  - kind: turbo
+    params:
+      internal_space: ilr
+      acquisition: log_ei
+      candidate_pool_size: 512
+      min_tr_candidates: 32
+      ilr_bounds:
+        method: candidate_pool_quantile
+        n_candidates: 2048
+        lower_quantile: 0.005
+        upper_quantile: 0.995
+      trust_region:
+        initial_length: 0.8
+        min_length: 0.01
+        max_length: 1.6
+        success_tolerance: 3
+        failure_tolerance: 3
+      device: cpu
+      dtype: float64
+  - kind: saasbo
+    params:
+      candidate_pool_size: 512
+      warmup_steps: 64
+      num_samples: 32
+      thinning: 16
+      train_yvar: 1.0e-6
+      max_train_points: 160
+      refit_every: 2
+      device: cpu
+      dtype: float64
+      acquisition: log_ei

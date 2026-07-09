@@ -19,6 +19,7 @@ class SyntheticSimplexObjective:
     noise_std: float = 0.0
     seed: int = 123
     match_radius_ilr: float | None = 0.25
+    match_radius_comp: float | None = 0.05
 
     def __post_init__(self) -> None:
         if self.n_components < 3:
@@ -33,6 +34,7 @@ class SyntheticSimplexObjective:
             true_needles=self.true_needles.copy(),
             y_star=1.0,
             match_radius_ilr=self.match_radius_ilr,
+            match_radius_comp=self.match_radius_comp,
         )
 
     def initial_design(self, n: int, seed: int) -> np.ndarray:

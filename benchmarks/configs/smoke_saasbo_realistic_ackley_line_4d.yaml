@@ -1,0 +1,52 @@
+experiment:
+  name: smoke_saasbo_realistic_ackley_line_4d
+  mode: line
+  seeds: [0]
+  output_root: benchmark_runs
+
+objective:
+  kind: realistic_ackley_simplex
+  name: realistic_ackley_4d
+  n_components: 4
+  maximize: true
+  params:
+    n_optima: 30
+    basin_width: 65.0
+    noise_freq: 9.0
+    noise_amp: 300.0
+    peak_seed: 0
+    noise_seed: 42
+    match_radius_ilr: 0.25
+    match_radius_comp: 0.05
+
+budget:
+  n_init: 8
+  n_lines: 2
+  points_per_line: 12
+
+line_mode:
+  n_line_candidates: 16
+  score: mean_acq
+  include_endpoints: true
+
+metrics:
+  duplicate_radius_ilr: 0.03
+  match_radius_ilr: 0.25
+  duplicate_radius_comp: 0.032
+  match_radius_comp: 0.05
+
+optimizer:
+  kind: saasbo
+  line_score: mean_acq
+  params:
+    candidate_pool_size: 256
+    warmup_steps: 16
+    num_samples: 8
+    thinning: 4
+    train_yvar: 1.0e-6
+    max_train_points: 80
+    refit_every: 1
+    device: cpu
+    dtype: float64
+    acquisition: log_ei
+    line_adapter_label: saasbo_acq_line

@@ -7,6 +7,7 @@ import yaml
 
 from benchmarks.zombihop_benchmark.report import (
     build_final_metrics_by_run,
+    compute_dimension_rank_delta,
     compute_transfer_rank_delta,
     load_aggregate,
     run_report,
@@ -110,6 +111,57 @@ def test_transfer_rank_delta_uses_metric_directionality(tmp_path):
     assert best_y["rank_delta"] == 1
 
 
+def test_dimension_report_writes_3d_to_4d_delta_tables(tmp_path):
+    inputs = []
+    for label, n_components, values in [
+        ("realistic_ackley_3d_point", 3, (0.9, 0.8)),
+        ("realistic_ackley_4d_point", 4, (0.7, 0.95)),
+    ]:
+        aggregate_dir = _write_aggregate(tmp_path, label, mode="point", family="synthetic", values=values)
+        suite_config = _write_suite_config(
+            tmp_path,
+            label,
+            mode="point",
+            kind="realistic_ackley_simplex",
+            n_components=n_components,
+        )
+        inputs.append(
+            {
+                "label": label,
+                "objective_family": "synthetic",
+                "objective_kind": "realistic_ackley_simplex",
+                "objective": f"realistic_ackley_{n_components}d",
+                "n_components": n_components,
+                "suite_config": str(suite_config),
+                "aggregate_dir": str(aggregate_dir),
+            }
+        )
+    loaded = [load_aggregate(input_cfg, repo_root=Path.cwd()) for input_cfg in inputs]
+    final_by_run = build_final_metrics_by_run(loaded)
+
+    delta = compute_dimension_rank_delta(final_by_run, {"comparison_axis": "n_components"})
+    best_y = delta[(delta["metric"] == "final_best_y_so_far") & (delta["optimizer"] == "random_simplex")].iloc[0]
+    assert best_y["base_n_components"] == 3
+    assert best_y["target_n_components"] == 4
+    assert best_y["base_rank"] == 1
+    assert best_y["target_rank"] == 2
+
+    report_dir = run_report(
+        {
+            "name": "test_dimension_report",
+            "output_root": str(tmp_path / "reports"),
+            "comparison_axis": "n_components",
+            "inputs": inputs,
+            "plots": {"include_seed_traces": False, "include_iqr_band": True, "dpi": 80},
+        },
+        repo_root=Path.cwd(),
+    )
+
+    assert (report_dir / "dimension_rank_delta.csv").exists()
+    assert (report_dir / "dimension_metric_delta.csv").exists()
+    assert "3D-to-4D" in (report_dir / "report.md").read_text(encoding="utf-8")
+
+
 def test_report_cli_core_writes_markdown_csvs_and_plots(tmp_path):
     configs_dir = tmp_path / "configs"
     configs_dir.mkdir()
@@ -146,14 +198,14 @@ def test_report_cli_core_writes_markdown_csvs_and_plots(tmp_path):
     assert list((report_dir / "plots").glob("*.png"))
 
 
-def _write_suite_config(tmp_path: Path, name: str, mode: str, kind: str) -> Path:
+def _write_suite_config(tmp_path: Path, name: str, mode: str, kind: str, n_components: int = 3) -> Path:
     path = tmp_path / f"{name}_suite.yaml"
-    objective_name = "real_3d_perovskite_rf" if kind == "real_rf_surrogate" else "synthetic_3d_planted"
+    objective_name = "real_3d_perovskite_rf" if kind == "real_rf_surrogate" else f"realistic_ackley_{n_components}d"
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(
             {
                 "experiment": {"name": name, "mode": mode},
-                "objective": {"kind": kind, "name": objective_name},
+                "objective": {"kind": kind, "name": objective_name, "n_components": n_components},
             },
             f,
         )

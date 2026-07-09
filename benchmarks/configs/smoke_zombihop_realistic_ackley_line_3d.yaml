@@ -1,0 +1,52 @@
+experiment:
+  name: smoke_zombihop_realistic_ackley_line_3d
+  mode: line
+  seeds: [0]
+  output_root: benchmark_runs
+
+objective:
+  kind: realistic_ackley_simplex
+  name: realistic_ackley_3d
+  n_components: 3
+  maximize: true
+  params:
+    n_optima: 20
+    basin_width: 86.0
+    noise_freq: 9.0
+    noise_amp: 400.0
+    peak_seed: 0
+    noise_seed: 42
+    match_radius_ilr: 0.25
+    match_radius_comp: 0.05
+
+budget:
+  n_init: 5
+  n_lines: 1
+  points_per_line: 12
+
+line_mode:
+  n_line_candidates: 16
+  score: mean_acq
+  include_endpoints: true
+
+metrics:
+  duplicate_radius_ilr: 0.03
+  match_radius_ilr: 0.25
+  duplicate_radius_comp: 0.032
+  match_radius_comp: 0.05
+
+optimizer:
+  kind: zombihop
+  params:
+    device: cpu
+    dtype: float64
+    max_activations: 5
+    max_zooms: 1
+    max_iterations: 5
+    n_restarts: 2
+    raw: 16
+    max_gp_points: 64
+    acquisition_type: ucb
+    ucb_beta: 0.1
+    num_lines: 4
+    checkpoint_subdir: checkpoints

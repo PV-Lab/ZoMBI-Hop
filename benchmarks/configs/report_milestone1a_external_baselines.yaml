@@ -1,0 +1,43 @@
+name: milestone1a_external_baselines
+output_root: benchmark_runs/reports
+
+inputs:
+  - label: realistic_ackley_3d_point_external
+    objective_family: synthetic
+    suite_config: benchmarks/configs/suite_milestone1a_realistic_ackley_3d_point_external.yaml
+    aggregate_dir: benchmark_runs/milestone1a_realistic_ackley_3d_point_external/aggregate
+  - label: realistic_ackley_3d_line_external
+    objective_family: synthetic
+    suite_config: benchmarks/configs/suite_milestone1a_realistic_ackley_3d_line_external.yaml
+    aggregate_dir: benchmark_runs/milestone1a_realistic_ackley_3d_line_external/aggregate
+  - label: real_rf_3d_point_external
+    objective_family: real_rf
+    suite_config: benchmarks/configs/suite_milestone1a_real_rf_3d_point_external.yaml
+    aggregate_dir: benchmark_runs/milestone1a_real_rf_3d_point_external/aggregate
+  - label: real_rf_3d_line_external
+    objective_family: real_rf
+    suite_config: benchmarks/configs/suite_milestone1a_real_rf_3d_line_external.yaml
+    aggregate_dir: benchmark_runs/milestone1a_real_rf_3d_line_external/aggregate
+
+metrics:
+  higher_is_better:
+    - best_y_so_far
+    - pct_matched_ilr
+    - pct_matched_comp
+    - line_best_y
+    - line_best_y_max
+    - line_best_y_mean
+  lower_is_better:
+    - dist_to_needles_ilr
+    - dist_to_needles_comp
+    - dup_fraction_ilr
+    - dup_fraction_comp
+    - runtime_s
+    - line_length_l2
+    - line_length_ilr
+
+plots:
+  include_seed_traces: true
+  include_iqr_band: true
+  include_simplex_coverage: false
+  dpi: 160

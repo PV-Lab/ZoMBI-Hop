@@ -8,6 +8,7 @@ from .gp_botorch import GPBoTorchOptimizer
 from .hebo_optimizer import HEBOOptimizer
 from .random_simplex import RandomSimplexOptimizer
 from .rf_bo import RFBOOptimizer
+from .saasbo_optimizer import SAASBOOptimizer
 from .turbo_optimizer import TuRBOOptimizer
 from .zombihop_adapter import ZoMBIHopAdapter
 
@@ -29,7 +30,9 @@ def build_optimizer(config: dict[str, Any]) -> BenchmarkOptimizer:
         return HEBOOptimizer(**params)
     if kind in {"turbo", "turbo_1"}:
         return TuRBOOptimizer(**params)
-    if kind in {"saasbo"}:
+    if kind in {"saasbo", "saas_bo"}:
+        return SAASBOOptimizer(**params)
+    if kind in {"saasbo_external"}:
         return ExternalOptimizer(kind=kind, **params)
     raise ValueError(f"Unknown optimizer kind: {kind!r}")
 

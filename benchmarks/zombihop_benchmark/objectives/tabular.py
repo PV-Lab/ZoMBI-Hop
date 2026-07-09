@@ -17,6 +17,7 @@ class TabularObjective:
     target_column: str
     maximize: bool = True
     match_radius_ilr: float | None = None
+    match_radius_comp: float | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -38,6 +39,7 @@ class TabularObjective:
             true_needles=None,
             y_star=float(np.max(self.y)),
             match_radius_ilr=self.match_radius_ilr,
+            match_radius_comp=self.match_radius_comp,
         )
 
     def initial_design(self, n: int, seed: int) -> np.ndarray:

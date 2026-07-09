@@ -59,6 +59,7 @@ class RealRFSurrogateObjective:
             true_needles=self.true_needles.copy(),
             y_star=float(np.max(self._true_needle_y)) if len(self._true_needle_y) else None,
             match_radius_ilr=self.needle_detection.get("match_radius_ilr", 0.25),
+            match_radius_comp=self.needle_detection.get("match_radius_comp", 0.05),
         )
 
     def initial_design(self, n: int, seed: int) -> np.ndarray:

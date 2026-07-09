@@ -8,6 +8,7 @@ other optimization methods on simplex-valued materials objectives.
 - Shared objective and optimizer protocols.
 - NumPy simplex utilities and ILR/Aitchison distance metrics.
 - Deterministic planted synthetic simplex objective.
+- Brianna-realistic Ackley simplex objective using `synthetic_data.ackley.Ackley("realistic")`.
 - Point-mode random/simplex-uniform baseline.
 - Point-mode `GP-ARD-EI` and `GP-ARD-UCB` baselines using BoTorch on ILR inputs.
 - Point-mode `RF-BO` baseline using scikit-learn random forests on ILR inputs.
@@ -19,8 +20,15 @@ other optimization methods on simplex-valued materials objectives.
   package is installed.
 - Benchmark-local finite-pool TuRBO-1 adapter using BoTorch/GPyTorch in
   normalized ILR coordinates with valid raw-simplex candidate pools.
+- Optional SAASBO adapter using BoTorch's fully Bayesian SAAS GP on normalized
+  ILR coordinates with finite valid raw-simplex candidate pools.
 - Line-metadata sanity audit columns for endpoint validity, endpoint minima, and
   explicit raw-simplex vs ILR length coordinate systems.
+- Explicit ILR and composition-L2 metric columns:
+  `dist_to_needles_ilr`, `pct_matched_ilr`, `dup_fraction_ilr`,
+  `dist_to_needles_comp`, `pct_matched_comp`, and `dup_fraction_comp`.
+- Line-aware composition duplicate diagnostic: `dup_fraction_comp_cross_line`,
+  which ignores duplicate pairs from the same printed line.
 - Reproducible CSV/JSON outputs.
 - Suite runner with point-level and line-level aggregate CSV summaries.
 
@@ -105,6 +113,104 @@ Line-mode TuRBO smokes are:
 .\.venv\Scripts\python -m benchmarks.zombihop_benchmark.runner --config benchmarks/configs/smoke_turbo_line_3d.yaml
 .\.venv\Scripts\python -m benchmarks.zombihop_benchmark.runner --config benchmarks/configs/smoke_turbo_real_rf_line_3d.yaml
 ```
+
+## SAASBO Baseline
+
+`optimizer.kind: saasbo` is an optional SAASBO adapter for BoTorch's fully
+Bayesian sparse-axis-aligned GP. It stores raw simplex observations, transforms
+them to ILR coordinates, normalizes ILR coordinates to deterministic
+candidate-pool quantile bounds, fits `SaasFullyBayesianSingleTaskGP` with
+`fit_fully_bayesian_model_nuts`, and selects only from finite valid raw-simplex
+candidate pools.
+
+SAASBO is most scientifically useful for later 4D/10D work. In 3D simplex
+benchmarks there are only two ILR axes, so Step 10 treats it mainly as a
+compatibility and reporting baseline.
+
+This adapter does not silently fall back to a standard GP. If BoTorch's fully
+Bayesian optional dependencies are missing, `optimizer.kind: saasbo` fails with
+a dependency message. In BoTorch 0.18.x those extras include `jax`, `jaxlib`,
+and `numpyro`; install with:
+
+```powershell
+.\.venv\Scripts\python -m pip install "botorch[fully_bayesian]"
+```
+
+SAASBO line mode uses the existing fair line wrapper through
+`score_candidates(...)` and labels line metadata with:
+
+```text
+line_adapter: saasbo_acq_line
+```
+
+Each SAASBO optimizer state records dependency status, HMC/NUTS settings,
+candidate-pool size, normalized ILR bounds source, fit/acquisition timing, and
+median lengthscale diagnostics.
+
+The median lengthscales are reported in the normalized ILR coordinate system
+used by the adapter. They are useful as SAASBO sparsity diagnostics, especially
+for later 4D/10D suites, but should not be read as direct raw component
+importance without mapping back through the composition transform.
+
+SAASBO smoke configs are:
+
+```powershell
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.runner --config benchmarks/configs/smoke_saasbo_realistic_ackley_3d.yaml
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.runner --config benchmarks/configs/smoke_saasbo_real_rf_3d.yaml
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.runner --config benchmarks/configs/smoke_saasbo_realistic_ackley_line_3d.yaml
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.runner --config benchmarks/configs/smoke_saasbo_real_rf_line_3d.yaml
+```
+
+## Realistic Ackley Synthetic Objective
+
+`objective.kind: realistic_ackley_simplex` is the Milestone 1A headline
+synthetic objective. It wraps Brianna's `Ackley("realistic", dim=3)` generator
+from `synthetic_data/ackley.py` with defaults from
+`synthetic_data/defaults/ackley.json`:
+
+```text
+n_optima: 20
+basin_width: 86.0
+noise_freq: 9.0
+noise_amp: 400.0
+```
+
+The older `synthetic_3d_planted` objective remains available as a lightweight
+smoke fixture.
+
+## Milestone 1B: 4D Realistic Ackley
+
+Step 11 expands the headline synthetic benchmark to 4D before any 10D work.
+The goal is to test whether optimizer rankings and behavior from realistic 3D
+Ackley transfer to a modestly higher-dimensional realistic Ackley landscape.
+Brianna's notes make 4D the safer next bridge: the 3D/4D synthetic scaling is
+more plausible, while 10D remains manually tuned and scientifically uncertain.
+
+The 4D objective uses the same `objective.kind: realistic_ackley_simplex`
+wrapper with:
+
+```text
+n_components: 4
+n_optima: 30
+basin_width: 65.0
+noise_freq: 9.0
+noise_amp: 300.0
+```
+
+The 3D configs are unchanged. Each realistic Ackley run writes
+`objective_metadata.json`, `objective_needles.csv`, and a lightweight
+`objective_distribution_<dim>d.csv` diagnostic summarizing a deterministic
+random sample of the objective values.
+
+4D is still synthetic, not real hardware validation. Real 4D RF-surrogate
+benchmarking is deferred until campaign data or a vetted surrogate is available;
+do not fabricate a 4D real-data objective.
+
+For line-mode duplicate behavior, prefer `dup_fraction_comp_cross_line` as the
+headline redundancy metric. The all-points `dup_fraction_comp` remains useful as
+a diagnostic, but it can be inflated by adjacent points along the same printed
+line. Also note that `pct_matched` can drop from 3D to 4D because the known
+optima count rises from 20 to 30.
 
 ## Line Metadata Audit
 
@@ -249,6 +355,49 @@ Run milestone suites with HEBO and TuRBO:
 .\.venv\Scripts\python -m benchmarks.zombihop_benchmark.suite --config benchmarks/configs/suite_milestone1a_real_rf_3d_line_with_hebo_turbo.yaml
 ```
 
+Run Step 9 external-baseline suites with realistic Ackley and real RF:
+
+```powershell
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.suite --config benchmarks/configs/suite_milestone1a_realistic_ackley_3d_point_external.yaml
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.suite --config benchmarks/configs/suite_milestone1a_realistic_ackley_3d_line_external.yaml
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.suite --config benchmarks/configs/suite_milestone1a_real_rf_3d_point_external.yaml
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.suite --config benchmarks/configs/suite_milestone1a_real_rf_3d_line_external.yaml
+```
+
+Run Step 10 SAASBO mini-suites after fully Bayesian dependencies are available:
+
+```powershell
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.suite --config benchmarks/configs/suite_milestone1a_realistic_ackley_3d_point_with_saasbo_mini.yaml
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.suite --config benchmarks/configs/suite_milestone1a_realistic_ackley_3d_line_with_saasbo_mini.yaml
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.suite --config benchmarks/configs/suite_milestone1a_real_rf_3d_point_with_saasbo_mini.yaml
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.suite --config benchmarks/configs/suite_milestone1a_real_rf_3d_line_with_saasbo_mini.yaml
+```
+
+Run Step 11 4D realistic Ackley smokes:
+
+```powershell
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.runner --config benchmarks/configs/smoke_realistic_ackley_4d.yaml
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.runner --config benchmarks/configs/smoke_realistic_ackley_line_4d.yaml
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.runner --config benchmarks/configs/smoke_zombihop_realistic_ackley_line_4d.yaml
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.runner --config benchmarks/configs/smoke_saasbo_realistic_ackley_4d.yaml
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.runner --config benchmarks/configs/smoke_saasbo_realistic_ackley_line_4d.yaml
+```
+
+Run Step 11 4D mini-suites before full 10-seed suites:
+
+```powershell
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.suite --config benchmarks/configs/suite_milestone1b_realistic_ackley_4d_point_external_mini.yaml
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.suite --config benchmarks/configs/suite_milestone1b_realistic_ackley_4d_line_external_mini.yaml
+```
+
+Run the full 4D suites only after mini-suite runtime and SAASBO diagnostics look
+manageable:
+
+```powershell
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.suite --config benchmarks/configs/suite_milestone1b_realistic_ackley_4d_point_external.yaml
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.suite --config benchmarks/configs/suite_milestone1b_realistic_ackley_4d_line_external.yaml
+```
+
 Generate the Milestone 1A synthetic-to-real report after the synthetic and real
 RF point/line suites exist:
 
@@ -263,11 +412,34 @@ suite aggregate directories exist:
 .\.venv\Scripts\python -m benchmarks.zombihop_benchmark.report --config benchmarks/configs/report_milestone1a_with_external_baselines.yaml
 ```
 
+Generate the Step 9 external-baseline report:
+
+```powershell
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.report --config benchmarks/configs/report_milestone1a_external_baselines.yaml
+```
+
+Generate the Step 10 SAASBO mini-suite report:
+
+```powershell
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.report --config benchmarks/configs/report_milestone1a_with_saasbo.yaml
+```
+
+Generate the Step 11 3D-to-4D transfer report after the Step 10 3D realistic
+Ackley SAASBO mini-suites and Step 11 4D mini-suites exist:
+
+```powershell
+.\.venv\Scripts\python -m benchmarks.zombihop_benchmark.report --config benchmarks/configs/report_milestone1b_3d_to_4d.yaml
+```
+
 The report writes a timestamped directory under
 `benchmark_runs/reports/milestone1a_synthetic_real/` with Markdown, CSV tables,
 synthetic-to-real rank deltas, AUC metrics, and plot PNGs. If `matplotlib` is
 not installed in the active environment, CSV/Markdown reporting still runs and
 placeholder plot PNGs are written with a note to install `matplotlib`.
+
+The Step 11 report additionally writes `dimension_rank_delta.csv` and
+`dimension_metric_delta.csv` for 3D-to-4D transfer analysis, plus SAASBO
+fit/acquisition timing diagnostics when those runs are present.
 
 Outputs are written under `benchmark_runs/<experiment_name>/`. Suite aggregate
 files are written under `benchmark_runs/<suite_name>/aggregate/`.
