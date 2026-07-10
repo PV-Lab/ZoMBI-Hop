@@ -45,6 +45,18 @@ Usage:
   python llm/sweep_catastrophic.py            # full 3-group sweep
   python llm/sweep_catastrophic.py --no-llm   # baseline + perturbed only (no LLM)
   python llm/sweep_catastrophic.py --smoke-llm # one real LLM rep, shake-out
+  python llm/sweep_catastrophic.py --resume   # continue newest sweep dir,
+                                              # skipping reps that already have
+                                              # metrics.json (else fresh sweep)
+
+Plain-group reuse (automatic, no flag): the ``baseline`` and ``perturbed`` groups
+are blind to the LLM, so a fresh sweep first copies their reps from the newest
+earlier sweep whose stored signature for that group (landscape + effective
+hyperparameters + budget) matches — no recompute. ``baseline`` matches on the base
+hyperparameters; ``perturbed`` matches only when ``PERTURB`` (hence the perturbed
+hyperparameters) is identical too. Reps are matched by seed and only missing ones
+are filled, so this composes with ``--resume`` and with priors of a different
+N_REPEATS.
 """
 
 from __future__ import annotations
@@ -52,20 +64,89 @@ from __future__ import annotations
 # ═══ HARDCODED CONFIG ════════════════════════════════════════════════════════
 # Path to the MOBO trial.json whose "hparams" block seeds the baseline (and whose
 # dimensionality drives the whole sweep). Relative paths resolve against repo root.
-TRIAL_JSON: str = "optimize/runs/mobo_ensemble_3d_job17402634/trial_3/trial.json"
+TRIAL_JSON: str = "optimize/runs/mobo_ensemble_3d_job17560178/trial_13/trial.json"
 
 # The catastrophic perturbation: {hparam_name: value, ...}. These override the
 # baseline hyperparameters for BOTH the "perturbed" group and the LLM group's
 # starting point. Every name must be a valid ZoMBI-Hop hyperparameter.
+
+# extra exploitative
+# PERTURB: dict = {
+#     "ucb_beta": 0.01,
+#     "max_zooms": 10,
+#     "n_consecutive_converged": 5,
+#     "max_penalty_radius": 0.1
+# }
+
+# extra explorative
 PERTURB: dict = {
-    "max_zooms": 8,
-    "n_consecutive_converged": 5
+    "ucb_beta": 2.986,
+    "max_zooms": 2,
+    "n_consecutive_converged": 1,
+    "max_penalty_radius": 4.556
 }
+
+# Full list of hyperparameters:
+# HPARAM_SPACE: dict[str, tuple] = {
+#     # Acquisition optimisation
+#     "nat_grad_step":               (0.001,  0.5,   "log"),
+#     "nat_grad_max_steps":          (10,     400,   "int"),
+#     "n_restarts":                  (20,     300,   "int"),
+#     "raw":                         (1,    300,  "int"),
+#     # Acquisition function
+#     "ucb_beta":                    (0.001,   3.0,   "linear"),
+#     # Zoom / convergence
+#     "max_zooms":                   (2,      10,    "int"),
+#     "max_iterations":              (2,      30,    "int"),
+#     "top_m_points":                (2,      8,     "int"),
+#     "n_consecutive_converged":     (1,      5,    "int"),
+#     "input_noise_threshold_mult":  (0.5,    6.0,   "linear"),
+#     "output_noise_threshold_mult": (0.01,    2.0,   "linear"),
+#     # Penalisation & needle
+#     "max_penalty_radius":          (0.01,    5.0,   "linear"),
+#     "needle_shrink_factor":        (0.1,   0.99,  "linear"),
+#     "needle_stop_noise_multiplier":(1.0,    8.0,   "linear"),
+#     # Point paring (deduplication)
+#     "paring_spatial_halfnoise":    (0.1,    5.0,   "linear"),
+#     "paring_y_noise_multiplier":   (0.1,    10.0,   "linear"),
+# }
+
+# "optimize/runs/mobo_ensemble_3d_job17402634/trial_3/trial.json"
+# "hparams": {
+#     "nat_grad_step": 0.24614024,
+#     "nat_grad_max_steps": 10,
+#     "n_restarts": 300,
+#     "raw": 1,
+#     "ucb_beta": 2.73573432,
+#     "max_zooms": 10,
+#     "max_iterations": 30,
+#     "top_m_points": 8,
+#     "n_consecutive_converged": 1,
+#     "input_noise_threshold_mult": 2.27923891,
+#     "output_noise_threshold_mult": 1.08670437,
+#     "max_penalty_radius": 0.50107598,
+#     "needle_shrink_factor": 0.99,
+#     "needle_stop_noise_multiplier": 1.0,
+#     "paring_spatial_halfnoise": 0.1,
+#     "paring_y_noise_multiplier": 10.0
+#   },
+
+# Which landscape the sweep runs on:
+#   "ensemble" — the layered synthetic Ensemble oracle (dimension-general), drawn
+#                fresh from ENSEMBLE_SEED below. The original behaviour.
+#   "rf"       — the noise-free RF conditional-mean reconstruction of the Objective
+#                from llm/surrogate.py (exactly the landscape sweep_basic_RF.py
+#                measures). 3D only; ENSEMBLE_SEED / ENSEMBLE_OPTIMA_MARGIN are
+#                ignored, and there are NO ground-truth optima (the needle-distance
+#                metric is NaN and no reference markers are drawn). dim + baseline
+#                hyperparameters are still read from TRIAL_JSON.
+LANDSCAPE: str = "rf"   # "ensemble" | "rf"
 
 # Fixed Ensemble landscape draw. random_ensemble_config(dim, seed=ENSEMBLE_SEED)
 # generates a FRESH landscape (the trial.json's own ensemble_configs are ignored).
 # Bump this until ensemble_landscape.png looks like a landscape you want.
-ENSEMBLE_SEED: int = 0
+# (LANDSCAPE == "ensemble" only.)
+ENSEMBLE_SEED: int = 1
 ENSEMBLE_OPTIMA_MARGIN: float = 0.2   # optima/background gap (run_mobo default)
 
 MAX_ITERS: int = 40          # total ZoMBI-Hop objective iterations per trial
@@ -146,10 +227,42 @@ def load_trial(trial_json: Path) -> Tuple[int, Dict[str, Any]]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Fixed Ensemble landscape + objective
+# Fixed landscape (Ensemble oracle or noise-free RF mean) + objective
 # ═══════════════════════════════════════════════════════════════════════════
 
-def build_landscape(dim: int) -> Tuple[Ensemble, List[np.ndarray]]:
+# A "landscape" here is anything with a ``.predict(X)`` returning the noise-free
+# Objective at composition rows ``X`` (m×dim). ``Ensemble`` satisfies this directly;
+# for the RF option we use sweep_basic_surrogate._ObjMeanPredictor, which wraps the
+# generative surrogate's deterministic RF conditional mean with the same interface.
+
+# Human-readable landscape name for plot titles / colorbar labels.
+LANDSCAPE_LABEL: str = "RF" if LANDSCAPE == "rf" else "Ensemble"
+
+
+def _build_rf_landscape(dim: int) -> Tuple[Any, List[np.ndarray]]:
+    """The noise-free RF conditional-mean landscape (sweep_basic_RF's landscape):
+    load/fit the generative surrogate and wrap its mean-Objective in a predictor.
+    3D only.
+
+    Unlike the Ensemble oracle, the RF reconstruction has NO ground-truth optima, so
+    ``true_optima`` is empty; the needle-distance metric is skipped (NaN) and the
+    plots draw no reference-optima markers for RF runs."""
+    if dim != 3:
+        raise SystemExit(f"LANDSCAPE='rf' is 3D only, but TRIAL_JSON has dim={dim}")
+    # Lazy import: only pull in the surrogate stack (sklearn/pickle) for RF runs.
+    import sweep_basic_surrogate as SBS  # noqa: E402
+    if SBS.SURROGATE_PICKLE and Path(SBS.SURROGATE_PICKLE).exists():
+        print(f"  [landscape] loading surrogate ← {SBS.SURROGATE_PICKLE}")
+        surr = SBS.Surrogate.load(SBS.SURROGATE_PICKLE)
+    else:
+        print("  [landscape] fitting generative surrogate …")
+        surr = SBS.Surrogate.fit(verbose=False)
+    predictor = SBS._ObjMeanPredictor(surr)
+    print("  [landscape] noise-free RF mean (llm/surrogate.py); no ground-truth optima")
+    return predictor, []
+
+
+def _build_ensemble_landscape(dim: int) -> Tuple[Ensemble, List[np.ndarray]]:
     """The single frozen Ensemble landscape used by every trial in the sweep."""
     cfg = random_ensemble_config(dim, index=0, total=1, seed=ENSEMBLE_SEED,
                                  optima_margin=ENSEMBLE_OPTIMA_MARGIN)
@@ -161,13 +274,27 @@ def build_landscape(dim: int) -> Tuple[Ensemble, List[np.ndarray]]:
     return ens, true_optima
 
 
-def make_ensemble_objective(ens: Ensemble):
-    """(fn_callable, feature_log): ``fn(x)`` evaluates the noise-free Ensemble
+def build_landscape(dim: int) -> Tuple[Any, List[np.ndarray]]:
+    """The single frozen landscape used by every trial, dispatched on ``LANDSCAPE``.
+
+    Returns ``(landscape, true_optima)`` where ``landscape`` exposes ``.predict(X)``
+    (Objective at composition rows) — an ``Ensemble`` for ``LANDSCAPE == 'ensemble'``
+    or an RF mean predictor for ``LANDSCAPE == 'rf'``."""
+    if LANDSCAPE == "rf":
+        return _build_rf_landscape(dim)
+    if LANDSCAPE == "ensemble":
+        return _build_ensemble_landscape(dim)
+    raise SystemExit(f"LANDSCAPE must be 'ensemble' or 'rf', got {LANDSCAPE!r}")
+
+
+def make_objective(landscape):
+    """(fn_callable, feature_log): ``fn(x)`` evaluates the noise-free landscape
     Objective at composition ``x`` and logs (composition, Objective) per droplet.
 
-    The physics print-model + output noise are applied downstream by
-    ``run_mobo.make_sim_obj`` exactly as in a real trial; ``feature_log`` records
-    the clean Ensemble value at the measured (physics) composition — the quantity
+    Works on any landscape exposing ``.predict`` (the Ensemble oracle or the RF
+    conditional mean). The physics print-model + output noise are applied downstream
+    by ``run_mobo.make_sim_obj`` exactly as in a real trial; ``feature_log`` records
+    the clean landscape value at the measured (physics) composition — the quantity
     the LLM prompt and the needle plots report."""
     feature_log: List[Dict[str, Any]] = []
 
@@ -175,7 +302,7 @@ def make_ensemble_objective(ens: Ensemble):
         comp = np.asarray(x, float)
         s = comp.sum()
         comp = comp / (s if s != 0 else 1.0)
-        val = float(ens.predict(comp.reshape(1, -1))[0])
+        val = float(landscape.predict(comp.reshape(1, -1))[0])
         feature_log.append({"comp": comp.tolist(), "Objective": val})
         return val
 
@@ -208,7 +335,7 @@ def plot_ensemble_landscape(out_png: Path, ens: Ensemble, true_optima, dim: int)
         fig, ax = plt.subplots(figsize=(6.6, 5.8))
         tcf = ax.tricontourf(xy[:, 0], xy[:, 1], np.asarray(grid_vals, float),
                              levels=24, cmap="viridis")
-        fig.colorbar(tcf, ax=ax, shrink=0.82, label="Ensemble Objective")
+        fig.colorbar(tcf, ax=ax, shrink=0.82, label=f"{LANDSCAPE_LABEL} Objective")
         tri = np.vstack([_TERNARY_VERTS, _TERNARY_VERTS[:1]])
         ax.plot(tri[:, 0], tri[:, 1], "k-", lw=1.4, zorder=3)
         offs = [(-0.06, -0.05), (1.06, -0.05), (0.5, np.sqrt(3.0) / 2.0 + 0.05)]
@@ -222,7 +349,7 @@ def plot_ensemble_landscape(out_png: Path, ens: Ensemble, true_optima, dim: int)
             ax.legend(fontsize=8, loc="upper right", framealpha=0.85)
         ax.set_aspect("equal")
         ax.axis("off")
-        ax.set_title(f"Fixed Ensemble landscape (dim=3, seed={ENSEMBLE_SEED})", fontsize=11)
+        ax.set_title(f"Fixed {LANDSCAPE_LABEL} landscape (dim=3" + (f", seed={ENSEMBLE_SEED}" if LANDSCAPE == "ensemble" else "") + ")", fontsize=11)
     else:
         rng = np.random.default_rng(12345)
         samples = rng.dirichlet(np.ones(dim), size=40000)
@@ -232,9 +359,9 @@ def plot_ensemble_landscape(out_png: Path, ens: Ensemble, true_optima, dim: int)
         for c in true_optima:
             ax.axvline(float(ens.predict(np.asarray(c).reshape(1, -1))[0]),
                        color="red", lw=0.8, alpha=0.6)
-        ax.set_xlabel("Ensemble Objective")
+        ax.set_xlabel(f"{LANDSCAPE_LABEL} Objective")
         ax.set_ylabel("count (Dirichlet samples)")
-        ax.set_title(f"Fixed Ensemble landscape (dim={dim}, seed={ENSEMBLE_SEED}); "
+        ax.set_title(f"Fixed {LANDSCAPE_LABEL} landscape (dim={dim}, seed={ENSEMBLE_SEED}); "
                      f"{len(true_optima)} true optima (red)", fontsize=10)
     fig.tight_layout()
     fig.savefig(out_png, dpi=150, bbox_inches="tight")
@@ -255,7 +382,7 @@ def plot_needles_on_ensemble(out_png: Path, needles: np.ndarray, ens: Ensemble,
     fig, ax = plt.subplots(figsize=(6.4, 5.6))
     tcf = ax.tricontourf(xy[:, 0], xy[:, 1], np.asarray(grid_vals, float),
                          levels=24, cmap="viridis")
-    fig.colorbar(tcf, ax=ax, shrink=0.82, label="Ensemble Objective")
+    fig.colorbar(tcf, ax=ax, shrink=0.82, label=f"{LANDSCAPE_LABEL} Objective")
     tri = np.vstack([_TERNARY_VERTS, _TERNARY_VERTS[:1]])
     ax.plot(tri[:, 0], tri[:, 1], "k-", lw=1.4, zorder=3)
     offs = [(-0.06, -0.05), (1.06, -0.05), (0.5, np.sqrt(3.0) / 2.0 + 0.05)]
@@ -273,7 +400,7 @@ def plot_needles_on_ensemble(out_png: Path, needles: np.ndarray, ens: Ensemble,
                    label=f"final needles (n={needles.shape[0]})")
     ax.set_aspect("equal")
     ax.axis("off")
-    ax.set_title(title or "Final needles on Ensemble Objective landscape", fontsize=11)
+    ax.set_title(title or f"Final needles on {LANDSCAPE_LABEL} Objective landscape", fontsize=11)
     if ax.get_legend_handles_labels()[0]:
         ax.legend(fontsize=8, loc="upper right", framealpha=0.85)
     fig.tight_layout()
@@ -820,7 +947,7 @@ def run_plain_trial(ens, true_optima, hp, dim, seed, trial_dir: Path,
                     source: str) -> Dict[str, Any]:
     """Whole budget in one cold-started run, no LLM (baseline or perturbed group)."""
     E._seed_everything(seed)
-    fn_callable, feature_log = make_ensemble_objective(ens)
+    fn_callable, feature_log = make_objective(ens)
     tmp = Path(tempfile.mkdtemp(prefix="zombi_cat_"))
     payloads: List[dict] = []
     snap_records: List[tuple] = []
@@ -843,7 +970,7 @@ def run_llm_trial(ens, true_optima, start_hp, dim, seed, trial_dir: Path,
     """Cold-start from ``start_hp`` (the perturbed setting), then inject the LLM
     every ``INJECT_INTERVAL`` iterations, resuming ZoMBI-Hop's exact state."""
     E._seed_everything(seed)
-    fn_callable, feature_log = make_ensemble_objective(ens)
+    fn_callable, feature_log = make_objective(ens)
     tmp = Path(tempfile.mkdtemp(prefix="zombi_cat_"))
     inj_dir = trial_dir / "injections"
     payloads: List[dict] = []
@@ -926,14 +1053,113 @@ def run_llm_trial(ens, true_optima, start_hp, dim, seed, trial_dir: Path,
 # Orchestration
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _write_run_config(sweep_dir: Path, dim: int) -> None:
+def _group_signature(dim: int, hp: Dict[str, Any]) -> Dict[str, Any]:
+    """The config fields that FULLY determine a plain (no-LLM) group's output.
+
+    Such a group runs a fixed hyperparameter set ``hp`` on the frozen landscape with
+    the fixed common-random-number seeds, so two sweeps that agree on all of these
+    produce byte-identical trajectories — meaning one can copy the other's reps
+    instead of recomputing them. ``INJECT_INTERVAL``, ``N_REPEATS`` and every LLM
+    knob are intentionally EXCLUDED (a plain group is blind to them; reps are matched
+    individually by seed). For ``baseline`` ``hp`` is ``base_hp``; for ``perturbed``
+    it is ``base_hp`` with ``PERTURB`` applied — so a perturbed group only matches
+    when PERTURB (and the base it modifies) is identical."""
+    return {
+        "landscape": LANDSCAPE,
+        "ensemble_seed": ENSEMBLE_SEED,
+        "ensemble_optima_margin": ENSEMBLE_OPTIMA_MARGIN,
+        "dim": dim,
+        "max_iters": MAX_ITERS,
+        "trial_json": str(_resolve(TRIAL_JSON)),
+        "hp": {k: hp.get(k) for k in R.HPARAM_NAMES},
+    }
+
+
+def _group_sig_match(a: Optional[Dict[str, Any]], b: Dict[str, Any]) -> bool:
+    """True iff a stored signature ``a`` matches the current signature ``b`` on every
+    non-hparam field (exact) and every ZoMBI-Hop hyperparameter (float-tolerant)."""
+    if not isinstance(a, dict):
+        return False
+    for k in b:
+        if k == "hp":
+            continue
+        if a.get(k) != b.get(k):
+            return False
+    return _same_hparams(a.get("hp", {}) or {}, b.get("hp", {}))
+
+
+def _write_run_config(sweep_dir: Path, dim: int, base_hp: Dict[str, Any],
+                      perturbed_hp: Dict[str, Any]) -> None:
     """run_config.json at the sweep root so coverage_plot._find_config (which walks
-    up to the grandparent of a rep dir) can classify the landscape."""
+    up to the grandparent of a rep dir) can classify the landscape.
+
+    Also records a per-group signature (``group_signatures``) so a later fresh sweep
+    can copy this sweep's plain (no-LLM) groups verbatim when their settings match
+    (see ``_reuse_group``)."""
     (sweep_dir / "run_config.json").write_text(json.dumps({
-        "dataset": "ensemble", "dim": dim, "maximize": True,
+        "dataset": LANDSCAPE, "dim": dim, "maximize": True,
         "landscape": "synthetic", "hparam_names": R.HPARAM_NAMES,
         "ensemble_seed": ENSEMBLE_SEED, "trial_json": str(_resolve(TRIAL_JSON)),
+        "group_signatures": {
+            "baseline": _group_signature(dim, base_hp),
+            "perturbed": _group_signature(dim, perturbed_hp),
+        },
     }, indent=2))
+
+
+def _reuse_group(sweep_dir: Path, dim: int, hp: Dict[str, Any], prefix: str,
+                 group: str) -> int:
+    """Copy ``group``'s reps from the newest prior sweep(s) whose stored signature
+    for that group matches ``hp``, so a fresh (non-``--resume``) sweep doesn't
+    recompute a plain group it has already produced. Only ``baseline`` and
+    ``perturbed`` are reusable (the LLM group is stochastic and never reused); a
+    ``perturbed`` group only matches when PERTURB is identical.
+
+    Reps are matched individually by index (== seed) and only missing ones are
+    filled, so this composes with ``--resume`` and with priors that had a different
+    ``N_REPEATS``. Copies the whole rep dir (metrics.json + all artifacts). Returns
+    the number of reps copied."""
+    root = _resolve(RESULTS_ROOT)
+    if not root.is_dir():
+        return 0
+    sig = _group_signature(dim, hp)
+    dest_gdir = sweep_dir / group
+    copied = 0
+    priors = sorted((d for d in root.glob(f"{prefix}_*") if d.is_dir()), reverse=True)
+    for pdir in priors:
+        if pdir.resolve() == sweep_dir.resolve():
+            continue
+        cfg_path = pdir / "run_config.json"
+        if not cfg_path.exists():
+            continue
+        try:
+            pcfg = json.loads(cfg_path.read_text())
+        except Exception:
+            continue
+        stored = (pcfg.get("group_signatures") or {}).get(group)
+        if not _group_sig_match(stored, sig):
+            continue
+        src_gdir = pdir / group
+        if not src_gdir.is_dir():
+            continue
+        for r in range(N_REPEATS):
+            dest_rep = dest_gdir / f"rep{r}"
+            if (dest_rep / "metrics.json").exists():
+                continue  # already present (resume, or an earlier prior)
+            src_rep = src_gdir / f"rep{r}"
+            if not (src_rep / "metrics.json").exists():
+                continue
+            dest_gdir.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src_rep, dest_rep, dirs_exist_ok=True)
+            copied += 1
+            print(f"      [reuse] {group}/rep{r} ← {pdir.name} (no recompute)")
+        if all((dest_gdir / f"rep{r}" / "metrics.json").exists()
+               for r in range(N_REPEATS)):
+            break  # group fully populated; no need to scan older sweeps
+    if copied:
+        print(f"[catastrophic] reused {copied} {group} rep(s) from prior sweep(s) "
+              f"with matching settings")
+    return copied
 
 
 def _agg(samples: List[Dict[str, Any]], key: str) -> Dict[str, float]:
@@ -944,10 +1170,24 @@ def _agg(samples: List[Dict[str, Any]], key: str) -> Dict[str, float]:
             "n": int(fin.size)}
 
 
-def _setup_sweep(prefix: str) -> dict:
+def _find_latest_sweep_dir(prefix: str) -> Optional[Path]:
+    """Newest existing ``<prefix>_<ts>`` dir under RESULTS_ROOT (timestamps sort
+    lexically), or None if there is none to resume."""
+    root = _resolve(RESULTS_ROOT)
+    if not root.is_dir():
+        return None
+    cands = sorted(d for d in root.glob(f"{prefix}_*") if d.is_dir())
+    return cands[-1] if cands else None
+
+
+def _setup_sweep(prefix: str, resume: bool = False) -> dict:
     """Shared setup for main() and the smoke run: validate config, create the
     sweep dir, write run_config.json, build the fixed landscape, and draw the
-    landscape preview. Returns everything the trial loop needs."""
+    landscape preview. Returns everything the trial loop needs.
+
+    ``resume=True`` reuses the newest existing ``<prefix>_<ts>`` dir instead of
+    minting a fresh one (falling back to a new dir if none exists), so the rep
+    loop can skip already-completed reps."""
     trial_json = _resolve(TRIAL_JSON)
     dim, base_hp = load_trial(trial_json)
     bad_keys = [k for k in PERTURB if k not in R.HPARAM_NAMES]
@@ -958,14 +1198,23 @@ def _setup_sweep(prefix: str) -> dict:
     comp_cols = composition_column_names(dim)
 
     print(f"[catastrophic] trial_json={trial_json}")
+    print(f"[catastrophic] landscape={LANDSCAPE}")
     print(f"[catastrophic] dim={dim}  budget={MAX_ITERS}  repeats={N_REPEATS}  "
           f"inject_every={INJECT_INTERVAL}")
     print(f"[catastrophic] PERTURB={PERTURB}")
 
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    sweep_dir = _resolve(RESULTS_ROOT) / f"{prefix}_{ts}"
+    sweep_dir = _find_latest_sweep_dir(prefix) if resume else None
+    if sweep_dir is not None:
+        print(f"[catastrophic] --resume: continuing {sweep_dir} "
+              f"(reps with metrics.json are skipped)")
+    else:
+        if resume:
+            print(f"[catastrophic] --resume: no existing {prefix}_* dir found; "
+                  f"starting a fresh sweep")
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        sweep_dir = _resolve(RESULTS_ROOT) / f"{prefix}_{ts}"
     sweep_dir.mkdir(parents=True, exist_ok=True)
-    _write_run_config(sweep_dir, dim)
+    _write_run_config(sweep_dir, dim, base_hp, perturbed_hp)
 
     ens, true_optima = build_landscape(dim)
     # First artifact: the fixed landscape, for eyeballing the seed.
@@ -994,11 +1243,18 @@ def smoke_llm() -> None:
           f"dist={m['dist_to_true_optima']:.4f}")
 
 
-def main(no_llm: bool = False) -> None:
-    s = _setup_sweep("sweep_catastrophic")
+def main(no_llm: bool = False, resume: bool = False) -> None:
+    s = _setup_sweep("sweep_catastrophic", resume=resume)
     sweep_dir, dim = s["sweep_dir"], s["dim"]
     base_hp, perturbed_hp = s["base_hp"], s["perturbed_hp"]
     comp_cols, ens, true_optima = s["comp_cols"], s["ens"], s["true_optima"]
+
+    # Copy matching plain groups from an earlier sweep (no --resume needed): a plain
+    # group is blind to the LLM, so identical landscape + hyperparameters + budget ⇒
+    # identical trajectories, safe to reuse verbatim. baseline reuses on base_hp;
+    # perturbed reuses only when PERTURB (hence perturbed_hp) is identical too.
+    _reuse_group(sweep_dir, dim, base_hp, "sweep_catastrophic", "baseline")
+    _reuse_group(sweep_dir, dim, perturbed_hp, "sweep_catastrophic", "perturbed")
 
     groups: List[Tuple[str, str]] = [
         ("baseline", "plain"),
@@ -1018,6 +1274,19 @@ def main(no_llm: bool = False) -> None:
         for r in range(N_REPEATS):
             seed = 1000 + r  # common random numbers across groups
             rep_dir = gdir / f"rep{r}"
+            metrics_path = rep_dir / "metrics.json"
+            # Skip any rep that already has metrics.json — from --resume OR from a
+            # baseline copied out of a prior matching sweep by _reuse_baseline.
+            if metrics_path.exists():
+                try:
+                    m = json.loads(metrics_path.read_text())
+                    samples.append(m)
+                    print(f"\n=== {group} / rep{r} (seed={seed}) — SKIP (already "
+                          f"done: best_obj={m.get('best_objective', float('nan')):.4f}) ===")
+                    continue
+                except Exception as e:
+                    print(f"\n=== {group} / rep{r}: existing metrics.json unreadable "
+                          f"({e}); re-running ===")
             print(f"\n=== {group} / rep{r} (seed={seed}) ===")
             try:
                 if kind == "plain":
@@ -1059,4 +1328,4 @@ if __name__ == "__main__":
     if "--smoke-llm" in args:
         smoke_llm()
     else:
-        main(no_llm="--no-llm" in args)
+        main(no_llm="--no-llm" in args, resume="--resume" in args)
