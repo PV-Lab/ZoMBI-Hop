@@ -71,20 +71,20 @@ TRIAL_JSON: str = "optimize/runs/mobo_ensemble_3d_job17560178/trial_13/trial.jso
 # starting point. Every name must be a valid ZoMBI-Hop hyperparameter.
 
 # extra exploitative
-# PERTURB: dict = {
-#     "ucb_beta": 0.01,
-#     "max_zooms": 10,
-#     "n_consecutive_converged": 5,
-#     "max_penalty_radius": 0.1
-# }
+PERTURB: dict = {
+    "ucb_beta": 0.01,
+    "max_zooms": 10,
+    "n_consecutive_converged": 5,
+    "max_penalty_radius": 0.1
+}
 
 # extra explorative
-PERTURB: dict = {
-    "ucb_beta": 2.986,
-    "max_zooms": 2,
-    "n_consecutive_converged": 1,
-    "max_penalty_radius": 4.556
-}
+# PERTURB: dict = {
+#     "ucb_beta": 2.986,
+#     "max_zooms": 2,
+#     "n_consecutive_converged": 1,
+#     "max_penalty_radius": 4.556
+# }
 
 # Full list of hyperparameters:
 # HPARAM_SPACE: dict[str, tuple] = {
@@ -158,7 +158,7 @@ INJECT_INTERVAL: int = 10     # LLM injects every k iterations (group 3 only)
 # in run_mobo.make_sim_obj + _gen_init_data. run_mobo's real-hardware default is
 # 0.045 (~4.5%); crank this up to make the landscape dramatically noisier. Set to
 # None to leave run_mobo.OUTPUT_NOISE_FRAC untouched.
-OUTPUT_NOISE_FRAC: Optional[float] = 0.30
+OUTPUT_NOISE_FRAC: Optional[float] = 0.2
 
 RESULTS_ROOT: str = "llm/results"   # sweep dir created under here (repo-root relative)
 # ═════════════════════════════════════════════════════════════════════════════
