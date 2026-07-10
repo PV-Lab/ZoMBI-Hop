@@ -122,8 +122,20 @@ class ZoMBIHop:
                  bounds_shrink_factor: float = 0.8,
                  min_axis_noise_mult: float = 2.0,
                  jaccard_window: int = 3,
-                 jaccard_threshold: float = 0.9):
-        """Initialize ZoMBIHop optimizer."""
+                 jaccard_threshold: float = 0.9,
+                 min_zoom_for_needle: int = 2,
+                 min_iters_per_zoom: int = 2):
+        """Initialize ZoMBIHop optimizer.
+
+        Search-discipline constraints (hard, not tuned):
+          * ``min_zoom_for_needle`` — a needle may only be declared once the
+            search has zoomed to this 0-indexed level or deeper (default 2 ⇒
+            zoom level 3+). This also forces the optimiser to zoom in at least
+            ``min_zoom_for_needle + 1`` times before it can localise an optimum.
+          * ``min_iters_per_zoom`` — at least this many objective lines must be
+            sampled at the current zoom level before the optimiser may declare a
+            needle or zoom in/out from it (default 2).
+        """
         self.device = torch.device(device)
         self.dtype = dtype
         self.verbose = verbose
@@ -139,6 +151,8 @@ class ZoMBIHop:
         self.zoom_jaccard_threshold = float(zoom_jaccard_threshold)
         self.bounds_shrink_factor = float(bounds_shrink_factor)
         self.min_axis_noise_mult = float(min_axis_noise_mult)
+        self.min_zoom_for_needle = int(min_zoom_for_needle)
+        self.min_iters_per_zoom = int(min_iters_per_zoom)
 
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
@@ -658,6 +672,10 @@ class ZoMBIHop:
 
                 start_iteration = iteration if (activation == start_activation and zoom == start_zoom) else 0
 
+                # Lines sampled at THIS zoom level; gates the min_iters_per_zoom
+                # constraint (needle declaration / zoom-in require ≥ this many).
+                iters_this_zoom = 0
+
                 for iteration in range(start_iteration, dh.max_iterations):
                     self._log(f"\n  · iter {iteration+1}/{dh.max_iterations}")
                     # Time limit check
@@ -706,6 +724,7 @@ class ZoMBIHop:
                         candidate, bounds, self.gp_handler.acq_fn
                     )
                     global_iteration += 1
+                    iters_this_zoom += 1
                     data_added_since_last_failure = True
                     if self.verbose:
                         if unpenalized_Y.numel() > 0:
@@ -760,14 +779,28 @@ class ZoMBIHop:
 
                     # --- Declare needle after N consecutive converged iterations ---
                     if consecutive_converged >= dh.n_consecutive_converged:
-                        needle = self._declare_needle_at_best(
-                            dh, zoom, global_iteration, reason="EI convergence"
-                        )
-                        if needle is not None:
-                            dh.take_snapshot(
-                                f"act{activation}_z{zoom}_i{iteration}_needle", permanent=True
+                        deep_enough = zoom >= self.min_zoom_for_needle
+                        sampled_enough = iters_this_zoom >= self.min_iters_per_zoom
+                        if deep_enough and sampled_enough:
+                            needle = self._declare_needle_at_best(
+                                dh, zoom, global_iteration, reason="EI convergence"
                             )
-                        break
+                            if needle is not None:
+                                dh.take_snapshot(
+                                    f"act{activation}_z{zoom}_i{iteration}_needle", permanent=True
+                                )
+                            break
+                        elif sampled_enough and not deep_enough:
+                            # Converged, but the search is too shallow to declare a
+                            # needle (min_zoom_for_needle). Zoom in further instead.
+                            self._log(
+                                f"  Converged at zoom {zoom+1} < minimum zoom "
+                                f"{self.min_zoom_for_needle+1} for needle — zooming in."
+                            )
+                            consecutive_converged = 0
+                            break
+                        # else: converged but fewer than min_iters_per_zoom lines
+                        # sampled at this zoom — keep sampling until the minimum is met.
 
                     if finished:
                         break
@@ -863,7 +896,7 @@ class ZoMBIHop:
                             if jac > self.zoom_jaccard_threshold:
                                 repeated_jac = jac
                                 break
-                        if repeated_jac > self.zoom_jaccard_threshold:
+                        if repeated_jac > self.zoom_jaccard_threshold and zoom >= self.min_zoom_for_needle:
                             self._log(
                                 f"  → repeated zoom (Jaccard={repeated_jac:.3f}) — forcing needle."
                             )
@@ -879,6 +912,14 @@ class ZoMBIHop:
                                 f"act{activation}_z{zoom}_jaccard_needle", permanent=True
                             )
                             break  # needle found
+                        elif repeated_jac > self.zoom_jaccard_threshold:
+                            # Repeated region but too shallow to declare a needle
+                            # (min_zoom_for_needle) — advance the zoom anyway.
+                            self._log(
+                                f"  → repeated zoom (Jaccard={repeated_jac:.3f}) but zoom "
+                                f"{zoom+1} < minimum zoom {self.min_zoom_for_needle+1} "
+                                f"for needle — advancing zoom."
+                            )
                         zoom_bounds_history.append(new_bounds.clone())
                         if len(zoom_bounds_history) > dh.max_zooms:
                             zoom_bounds_history.pop(0)
