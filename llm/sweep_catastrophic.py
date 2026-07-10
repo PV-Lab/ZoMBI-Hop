@@ -153,6 +153,13 @@ MAX_ITERS: int = 40          # total ZoMBI-Hop objective iterations per trial
 N_REPEATS: int = 5           # repeats per group (variance)
 INJECT_INTERVAL: int = 10     # LLM injects every k iterations (group 3 only)
 
+# Multiplicative output/objective noise seen by the algorithm at EVERY sampled
+# point: each measured y is perturbed by N(0, (OUTPUT_NOISE_FRAC·|y|)^2), applied
+# in run_mobo.make_sim_obj + _gen_init_data. run_mobo's real-hardware default is
+# 0.045 (~4.5%); crank this up to make the landscape dramatically noisier. Set to
+# None to leave run_mobo.OUTPUT_NOISE_FRAC untouched.
+OUTPUT_NOISE_FRAC: Optional[float] = 0.30
+
 RESULTS_ROOT: str = "llm/results"   # sweep dir created under here (repo-root relative)
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -1070,6 +1077,7 @@ def _group_signature(dim: int, hp: Dict[str, Any]) -> Dict[str, Any]:
         "ensemble_optima_margin": ENSEMBLE_OPTIMA_MARGIN,
         "dim": dim,
         "max_iters": MAX_ITERS,
+        "output_noise_frac": OUTPUT_NOISE_FRAC,
         "trial_json": str(_resolve(TRIAL_JSON)),
         "hp": {k: hp.get(k) for k in R.HPARAM_NAMES},
     }
@@ -1203,6 +1211,14 @@ def _setup_sweep(prefix: str, resume: bool = False) -> dict:
           f"inject_every={INJECT_INTERVAL}")
     print(f"[catastrophic] PERTURB={PERTURB}")
 
+    # Override run_mobo's output-noise fraction for the whole sweep. make_sim_obj +
+    # _gen_init_data read this module global at call time, so setting it here makes
+    # every group (perturbed/baseline/llm) see the amplified objective noise.
+    if OUTPUT_NOISE_FRAC is not None:
+        print(f"[catastrophic] output noise: run_mobo.OUTPUT_NOISE_FRAC "
+              f"{R.OUTPUT_NOISE_FRAC} → {OUTPUT_NOISE_FRAC}")
+        R.OUTPUT_NOISE_FRAC = OUTPUT_NOISE_FRAC
+
     sweep_dir = _find_latest_sweep_dir(prefix) if resume else None
     if sweep_dir is not None:
         print(f"[catastrophic] --resume: continuing {sweep_dir} "
@@ -1257,8 +1273,8 @@ def main(no_llm: bool = False, resume: bool = False) -> None:
     _reuse_group(sweep_dir, dim, perturbed_hp, "sweep_catastrophic", "perturbed")
 
     groups: List[Tuple[str, str]] = [
-        ("baseline", "plain"),
         ("perturbed", "plain"),
+        ("baseline", "plain"),
         (f"llm_every_{INJECT_INTERVAL}", "llm"),
     ]
     if no_llm:
