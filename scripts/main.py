@@ -70,7 +70,7 @@ def start_serial(parent_shutdown: "multiprocessing.synchronize.Event"):
     try:
         start_serial_dual_io_shared_port(
             COM="COM5",
-            baud=9600,
+            baud=115200,
             obj_hz=1.0,
             comp_hz=1.0,
             chaos=False,
@@ -93,7 +93,25 @@ def start_zombi(resume_uuid=None, optimizing_dims=None, checkpoint_dir=None,
                        checkpoint_dir=checkpoint_dir, hparams_path=hparams_path,
                        new_run_uuid=new_run_uuid)
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
         print(f"[ZoMBI Process] Error: {e}")
+        # Emit the full stack so the failing file:line reaches the GUI log panel
+        # (Popen pipes stdout->the app). Without this only str(e) was visible.
+        print(tb)
+        # ALSO persist the traceback to the run's run.log directly. start_zombi runs
+        # as a spawned multiprocessing child (main.py) whose stderr is not reliably
+        # captured by the GUI's stdout pipe, so the tee could miss the crash. We own
+        # the run dir path here, so write it where it will always survive.
+        try:
+            _uuid = resume_uuid or new_run_uuid
+            if checkpoint_dir and _uuid:
+                _rp = Path(checkpoint_dir) / f"run_{_uuid}" / "run.log"
+                _rp.parent.mkdir(parents=True, exist_ok=True)
+                with open(_rp, "a", encoding="utf-8") as _f:
+                    _f.write(f"\n[ZoMBI Process] Error: {e}\n{tb}\n")
+        except Exception:
+            pass
         sys.exit(1)
 
 
