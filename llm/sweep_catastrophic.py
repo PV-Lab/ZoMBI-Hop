@@ -64,7 +64,7 @@ from __future__ import annotations
 # ═══ HARDCODED CONFIG ════════════════════════════════════════════════════════
 # Path to the MOBO trial.json whose "hparams" block seeds the baseline (and whose
 # dimensionality drives the whole sweep). Relative paths resolve against repo root.
-TRIAL_JSON: str = "optimize/runs/mobo_ensemble_3d_job17560178/trial_13/trial.json"
+TRIAL_JSON: str = "optimize/runs/archived_runs/mobo_3d_05_06_15_32/trial_112/trial.json"
 
 # The catastrophic perturbation: {hparam_name: value, ...}. These override the
 # baseline hyperparameters for BOTH the "perturbed" group and the LLM group's
