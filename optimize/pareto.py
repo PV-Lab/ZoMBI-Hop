@@ -42,6 +42,8 @@ Usage
 -----
   conda activate zombi-hop
   python optimize/pareto.py                 # crawl optimize/runs, write there
+  python optimize/pareto.py <pareto.json>   # replot a saved pareto.json as-is
+                                            #   (no crawling / recomputation)
   python optimize/pareto.py <runs_dir>      # crawl a specific runs directory
   python optimize/pareto.py <run_dir>       # a single run dir: pools its config-
                                             #   matching siblings (shared history),
@@ -91,6 +93,24 @@ TIME_KEYS = ("avg_time_per_iter_s", "runtime_s")
 # Only runs created after it was added record it, so it is promoted to a real axis
 # only when every collected trial has it (see main); otherwise the front is 3-D.
 NPTS_KEY  = "n_points_penalty"
+
+# Full, human-readable axis titles for --pretty mode (the default plot uses the
+# raw metric keys). Anything not listed falls back to title-cased underscores.
+PRETTY_LABELS: dict[str, str] = {
+    DIST_KEY:               "Distance To Needles",
+    DUP_KEY:                "Duplicate Fraction",
+    "avg_time_per_iter_s":  "Average Time Per Iteration (s)",
+    "runtime_s":            "Runtime (s)",
+    NPTS_KEY:               "Number Of Points Penalty",
+}
+
+
+def _pretty_label(label: str) -> str:
+    """Full-title axis label for --pretty mode (title-cased fallback)."""
+    if label in PRETTY_LABELS:
+        return PRETTY_LABELS[label]
+    return label.replace("_", " ").title()
+
 
 HPARAM_SPACE: dict[str, tuple] = {
     "nat_grad_step":               (0.001,  0.5,   "log"),
@@ -514,13 +534,18 @@ def _user_colors(users: list[str]) -> tuple[dict[str, tuple], list[str]]:
 
 
 def plot_pareto(M: np.ndarray, mask: np.ndarray, obj_labels: list[str],
-                out_path: str, users: list[str] | None = None) -> None:
+                out_path: str, users: list[str] | None = None,
+                pretty: bool = False) -> None:
     """Pairwise objective scatter; Pareto-optimal points starred (static PNG).
 
     When *users* spans more than one collaborator, Pareto stars are coloured by the
     user who produced them (dominated points greyed as context) so a shared-history
     plot shows each person's contributions; a single-user collection keeps the plain
     gold-star / steelblue look.
+
+    *pretty*: prettier single-user styling — full-title axis labels, larger markers,
+    soft-grey transparent dominated dots and opaque bright-red Pareto stars with a
+    thin black outline.
     """
     matplotlib.use("Agg")
     plt.switch_backend("Agg")
@@ -544,13 +569,18 @@ def plot_pareto(M: np.ndarray, mask: np.ndarray, obj_labels: list[str],
                 ax.scatter(M[um, ix], M[um, iy], marker="*", s=220,
                            c=[colors[u]], zorder=5, edgecolors="k", linewidths=0.5,
                            label=f"{u} (Pareto)")
+        elif pretty:
+            ax.scatter(M[~mask, ix], M[~mask, iy], c="#707070", alpha=0.45, s=70,
+                       edgecolors="none", label="dominated")
+            ax.scatter(M[mask, ix], M[mask, iy], marker="*", s=420, c="red",
+                       zorder=5, edgecolors="k", linewidths=0.5, label="Pareto")
         else:
             ax.scatter(M[~mask, ix], M[~mask, iy], c="steelblue", alpha=0.6,
                        edgecolors="k", linewidths=0.3, label="dominated")
             ax.scatter(M[mask, ix], M[mask, iy], marker="*", s=220, c="gold",
                        zorder=5, edgecolors="k", linewidths=0.5, label="Pareto")
-        ax.set_xlabel(xl)
-        ax.set_ylabel(yl)
+        ax.set_xlabel(_pretty_label(xl) if pretty else xl)
+        ax.set_ylabel(_pretty_label(yl) if pretty else yl)
         ax.legend(fontsize=8)
     for ax in axes_flat[len(pairs):]:   # hide any unused grid cells
         ax.set_visible(False)
@@ -638,6 +668,7 @@ def plot_pareto_interactive(
     obj_labels: list[str],
     *,
     show_numberline: bool = False,
+    pretty: bool = False,
 ) -> None:
     """Interactive Pareto plot: hover highlights across all subplots, click opens trial image.
 
@@ -696,6 +727,16 @@ def plot_pareto_interactive(
                     M[um, ix], M[um, iy], marker="*", s=220, c=[colors[u]],
                     zorder=5, edgecolors="k", linewidths=0.5, label=f"{u} (Pareto)",
                 )
+        elif pretty:
+            ax.scatter(
+                M[~mask, ix], M[~mask, iy],
+                c="#707070", alpha=0.45, s=70, edgecolors="none", label="dominated",
+            )
+            ax.scatter(
+                pareto_M[:, ix], pareto_M[:, iy],
+                marker="*", s=420, c="red", zorder=5,
+                edgecolors="k", linewidths=0.5, label="Pareto",
+            )
         else:
             ax.scatter(
                 M[~mask, ix], M[~mask, iy],
@@ -706,8 +747,8 @@ def plot_pareto_interactive(
                 marker="*", s=220, c="gold", zorder=5,
                 edgecolors="k", linewidths=0.5, label="Pareto",
             )
-        ax.set_xlabel(xl)
-        ax.set_ylabel(yl)
+        ax.set_xlabel(_pretty_label(xl) if pretty else xl)
+        ax.set_ylabel(_pretty_label(yl) if pretty else yl)
         ax.legend(fontsize=8)
     for ax in axes_flat[len(pairs):]:   # hide any unused grid cells
         ax.set_visible(False)
@@ -888,13 +929,52 @@ def plot_pareto_interactive(
     plt.show()
 
 
+# ─── Replot from a saved pareto.json ─────────────────────────────────────────────
+
+def _load_pareto_json(path: str) -> tuple[list[dict], np.ndarray, np.ndarray, list[str]]:
+    """Load a previously written ``pareto.json`` for replotting (no recomputation).
+
+    Returns (records, M, mask, obj_labels) reconstructed from the file's stored
+    Pareto set. Because only Pareto-optimal trials are saved, every loaded point is
+    on the front (``mask`` is all-True) and there are no dominated dots to grey out —
+    the plot shows just the saved stars.
+    """
+    with open(path) as f:
+        data = json.load(f)
+    records = data.get("pareto", [])
+    if not records:
+        sys.exit(f"{path} has no 'pareto' records to plot.")
+    obj_labels = list(data.get("objectives", {}).keys())
+    if not obj_labels:
+        # Fall back to the fixed first two objectives plus the trials' time key.
+        time_label = records[0].get("time_key", TIME_KEYS[0])
+        obj_labels = [DIST_KEY, DUP_KEY, time_label]
+
+    def _col_value(r: dict, label: str) -> float:
+        if label == DIST_KEY:
+            return float(r["metrics"][DIST_KEY])
+        if label == DUP_KEY:
+            return float(r["metrics"][DUP_KEY])
+        if label == NPTS_KEY:
+            return float(r["npts_value"])
+        # Anything else is the time axis (avg_time_per_iter_s / runtime_s / MIXED).
+        return float(r["time_value"])
+
+    M = np.array([[_col_value(r, lbl) for lbl in obj_labels] for r in records],
+                 dtype=float)
+    mask = np.ones(len(records), dtype=bool)   # every saved trial is Pareto-optimal
+    return records, M, mask, obj_labels
+
+
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Collect the global Pareto-optimal MOBO trials and write pareto.json.")
     parser.add_argument("runs_dir", nargs="?", default=None,
-                        help="Directory containing runs/mobo_* (default: optimize/runs).")
+                        help="Directory containing runs/mobo_* (default: optimize/runs). "
+                             "Or a path directly to a saved pareto.json, in which case "
+                             "that front is replotted as-is (no recomputation).")
     parser.add_argument("--out", default=None,
                         help="Output directory for pareto.json / pareto_front.png "
                              "(default: the runs directory).")
@@ -911,6 +991,10 @@ def main() -> None:
                         help="Include trials from mobo_old_jackson (excluded by default).")
     parser.add_argument("--show-numberline", action="store_true",
                         help="Show hyperparameter number-line figure in interactive mode.")
+    parser.add_argument("--pretty", action="store_true",
+                        help="Prettier styling: full-title axis labels, larger markers, "
+                             "soft-grey transparent dominated dots and opaque bright-red "
+                             "Pareto stars with a thin black outline.")
     parser.add_argument("--no-shared-history", action="store_true",
                         help="When a single run dir is given, do NOT pool sibling runs "
                              "with a matching run_config; use only that one run's trials.")
@@ -920,6 +1004,38 @@ def main() -> None:
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Replot mode: if the positional argument points directly at a saved pareto.json
+    # (a file, not a runs directory), just load and plot it — skip crawling runs and
+    # recomputing the front. Handy for re-viewing a shared/committed pareto.json.
+    if args.runs_dir and os.path.isfile(args.runs_dir) and args.runs_dir.endswith(".json"):
+        json_in = os.path.abspath(args.runs_dir)
+        out_dir = os.path.abspath(args.out) if args.out else os.path.dirname(json_in)
+        print("=" * 70)
+        print(f"MOBO Pareto replot  |  {json_in}")
+        print("=" * 70)
+        records, M, mask, obj_labels = _load_pareto_json(json_in)
+        users = [r.get("source_user", "unknown") for r in records]
+        # Click-to-open resolves each trial against its own stored source_dir, so a
+        # single fallback runs dir here suffices; use the first record's.
+        plot_runs_dir = records[0].get("source_dir") or out_dir
+        print(f"  Loaded {len(records)} Pareto trial(s) from {os.path.basename(json_in)}.")
+        if args.no_interactive:
+            plot_pareto(M, mask, obj_labels,
+                        os.path.join(out_dir, "pareto_front.png"), users=users,
+                        pretty=args.pretty)
+        elif not _has_display():
+            png_path = os.path.join(script_dir, "pareto_front.png")
+            print("  No display detected (headless); saving static PNG instead of "
+                  "opening an interactive window.")
+            plot_pareto(M, mask, obj_labels, png_path, users=users,
+                        pretty=args.pretty)
+        else:
+            plot_pareto_interactive(M, mask, records, plot_runs_dir, obj_labels,
+                                    show_numberline=args.show_numberline,
+                                    pretty=args.pretty)
+        return
+
     runs_dir = os.path.abspath(args.runs_dir) if args.runs_dir else os.path.join(script_dir, "runs")
     out_dir = os.path.abspath(args.out) if args.out else runs_dir
 
@@ -1039,17 +1155,18 @@ def main() -> None:
 
     if args.no_interactive:
         plot_pareto(M, mask, obj_labels, os.path.join(out_dir, "pareto_front.png"),
-                    users=users)
+                    users=users, pretty=args.pretty)
     elif not _has_display():
         # Headless system (e.g. SSH / batch node): an interactive window can't be
         # shown, so save a static PNG into optimize/ instead of failing.
         png_path = os.path.join(script_dir, "pareto_front.png")
         print("  No display detected (headless); saving static PNG instead of "
               "opening an interactive window.")
-        plot_pareto(M, mask, obj_labels, png_path, users=users)
+        plot_pareto(M, mask, obj_labels, png_path, users=users, pretty=args.pretty)
     else:
         plot_pareto_interactive(M, mask, records, plot_runs_dir, obj_labels,
-                                show_numberline=args.show_numberline)
+                                show_numberline=args.show_numberline,
+                                pretty=args.pretty)
 
     print("\n  Pareto-optimal configurations (best dist first):")
     for r in pareto:

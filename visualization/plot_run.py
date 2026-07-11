@@ -45,8 +45,10 @@ Flags
   --value COL       DB value column to plot as the objective (default: Objective).
   --snapshot NAME   Snapshot to reconstruct up to (default: latest.txt).
   --out PATH        Output PNG path for --export.
-  --grid-n N        Ternary grid resolution for the RF background (default: 120).
+  --grid-n N        Ternary grid resolution for the background (default: 200).
   --n-estimators N  Number of trees in the RF surrogate (default: 500).
+  --background M    Background surrogate: rf, gp, or none (default: rf).
+  --no-points       (export only) Hide the measured sampled points.
   --corner-dims D   Run dims placed at [bottom-left,bottom-right,top]
                     (default: 9,8,0 — dim 9 bottom-left, dim 0 at the top).
   --labels A,B,C    Corner labels for [bottom-left,bottom-right,top]
@@ -63,6 +65,8 @@ from pathlib import Path
 
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
 
 # ── project root on sys.path so `src` imports resolve ──────────────────────────
 _HERE = Path(__file__).resolve().parent
@@ -76,7 +80,7 @@ RUNS_DIR = ROOT / "runs"
 DATA_DIR = ROOT / "data"
 DEFAULT_RUN = "run_7eb9"
 RF_N_ESTIMATORS = 500
-TERNARY_GRID_N = 120
+TERNARY_GRID_N = 200
 _SQRT3_2 = np.sqrt(3) / 2
 
 # Physical identity of each hardware dim, and which ternary corner it occupies.
@@ -338,7 +342,10 @@ def load_db_dataset(
     return X, Y, labels, title
 
 
-# ── RF surrogate ─────────────────────────────────────────────────────────────
+# ── background surrogates ────────────────────────────────────────────────────
+
+BACKGROUND_MODES: tuple[str, ...] = ("rf", "gp", "none")
+
 
 def fit_rf_background(
     X: np.ndarray, Y: np.ndarray, grid_n: int, n_estimators: int
@@ -354,7 +361,70 @@ def fit_rf_background(
     return grid_pts, grid_vals
 
 
+def fit_gp_background(
+    X: np.ndarray, Y: np.ndarray, grid_n: int, length_scale: float = 0.3
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit a Gaussian-Process surrogate on (X, Y) and evaluate over the grid.
+
+    A Matern(nu=2.5) kernel plus a white-noise term gives a smooth interpolation
+    across the simplex. ``length_scale`` is held fixed so it directly controls
+    smoothness (smaller = more local/wiggly, larger = smoother). Y is
+    standardised for numerical stability and mapped back to the original scale.
+
+    Returns ``(grid_pts (M,3), grid_vals (M,))``.
+    """
+    y_mean = float(Y.mean())
+    y_std = float(Y.std()) or 1.0
+    y = (Y - y_mean) / y_std
+
+    kernel = (
+        ConstantKernel(1.0, (1e-3, 1e3))
+        * Matern(length_scale=length_scale, length_scale_bounds="fixed", nu=2.5)
+        + WhiteKernel(noise_level=1e-2, noise_level_bounds=(1e-6, 1e1))
+    )
+    gp = GaussianProcessRegressor(
+        kernel=kernel, normalize_y=False, n_restarts_optimizer=2, random_state=42
+    )
+    gp.fit(X, y)
+    grid_pts = ternary_grid(grid_n)
+    grid_vals = gp.predict(grid_pts) * y_std + y_mean
+    return grid_pts, grid_vals
+
+
+def fit_background(
+    X: np.ndarray, Y: np.ndarray, grid_n: int, n_estimators: int, mode: str,
+    *, length_scale: float = 0.3,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Dispatch to the requested background surrogate.
+
+    ``mode`` is one of ``"rf"``, ``"gp"``, ``"none"``. Returns ``None`` when no
+    background is requested, else ``(grid_pts, grid_vals)``.
+    """
+    if mode == "none":
+        return None
+    if mode == "gp":
+        return fit_gp_background(X, Y, grid_n, length_scale=length_scale)
+    return fit_rf_background(X, Y, grid_n, n_estimators)
+
+
 # ── plotly figure ─────────────────────────────────────────────────────────────
+
+_BG_LABELS: dict[str, str] = {
+    "rf": "RF-interpolated background",
+    "gp": "GP-interpolated background",
+    "none": "no background",
+}
+
+
+def _bg_marker_size(grid_n: int) -> float:
+    """Marker size that keeps the background grid visually gap-free as grid_n grows.
+
+    The grid spacing on the plotted ternary shrinks like 1/grid_n, so the marker
+    size is scaled the same way (clamped). Sized to slightly overlap so there is
+    no white space between neighbouring background points.
+    """
+    return float(np.clip(1100.0 / max(grid_n, 1), 3.0, 16.0))
+
 
 def build_ternary_figure(
     X: np.ndarray,
@@ -365,74 +435,111 @@ def build_ternary_figure(
     n_estimators: int,
     title: str,
     value_name: str = "Objective",
+    background: str = "rf",
+    show_points: bool = True,
+    gp_length_scale: float = 0.3,
 ):
-    """Interactive Plotly ternary: RF background grid + measured points overlay.
+    """Interactive Plotly ternary: optional interpolated background + points overlay.
+
+    ``background`` selects the surrogate heatmap: ``"rf"``, ``"gp"``, or ``"none"``.
+    ``show_points`` toggles the measured-datapoint overlay.
 
     Corner mapping mirrors comp_to_xy / matplotlib:
       col0 → bottom-left (b),  col1 → bottom-right (c),  col2 → top (a).
     """
     import plotly.graph_objects as go
 
-    grid_pts, grid_vals = fit_rf_background(X, Y, grid_n, n_estimators)
+    bg = fit_background(X, Y, grid_n, n_estimators, background, length_scale=gp_length_scale)
 
-    vmin = float(min(grid_vals.min(), Y.min()))
-    vmax = float(max(grid_vals.max(), Y.max()))
+    if bg is not None:
+        grid_pts, grid_vals = bg
+        vmin = float(min(grid_vals.min(), Y.min()))
+        vmax = float(max(grid_vals.max(), Y.max()))
+    else:
+        grid_pts = grid_vals = None
+        vmin, vmax = float(Y.min()), float(Y.max())
     if vmax <= vmin:
         vmax = vmin + 1e-9
 
     fig = go.Figure()
 
-    # Background: RF-interpolated heatmap rendered as a dense marker grid.
-    fig.add_trace(go.Scatterternary(
-        a=grid_pts[:, 2], b=grid_pts[:, 0], c=grid_pts[:, 1],
-        mode="markers",
-        marker=dict(
-            symbol="circle", size=5, color=grid_vals,
-            colorscale="Viridis", cmin=vmin, cmax=vmax,
-            opacity=0.80, line=dict(width=0),
-        ),
-        hoverinfo="skip",
-        name="RF background",
-        showlegend=False,
-    ))
+    # Colorbar rides on whichever trace is present (background if points hidden).
+    # Pulled in toward the plot (x) and enlarged (thicker + taller, bigger fonts).
+    colorbar = dict(
+        title=dict(text=value_name, font=dict(size=18)),
+        thickness=28, len=0.9, x=0.86, xpad=0,
+        tickfont=dict(size=14),
+    )
+
+    # Background: interpolated heatmap rendered as a dense marker grid.
+    if bg is not None:
+        fig.add_trace(go.Scatterternary(
+            a=grid_pts[:, 2], b=grid_pts[:, 0], c=grid_pts[:, 1],
+            mode="markers",
+            marker=dict(
+                symbol="circle", size=_bg_marker_size(grid_n), color=grid_vals,
+                colorscale="Viridis", cmin=vmin, cmax=vmax,
+                opacity=0.80, line=dict(width=0),
+                colorbar=None if show_points else colorbar,
+            ),
+            hoverinfo="skip",
+            name=f"{background.upper()} background",
+            showlegend=False,
+        ))
 
     # Foreground: every measured datapoint, coloured by value with a black edge.
-    customdata = np.column_stack([X[:, 0], X[:, 1], X[:, 2], Y])
-    fig.add_trace(go.Scatterternary(
-        a=X[:, 2], b=X[:, 0], c=X[:, 1],
-        mode="markers",
-        marker=dict(
-            symbol="circle", size=9, color=Y,
-            colorscale="Viridis", cmin=vmin, cmax=vmax,
-            line=dict(width=1.0, color="black"),
-            colorbar=dict(title=value_name, thickness=16, len=0.75),
-        ),
-        customdata=customdata,
-        hovertemplate=(
-            f"{labels[0]}=%{{customdata[0]:.3f}}<br>"
-            f"{labels[1]}=%{{customdata[1]:.3f}}<br>"
-            f"{labels[2]}=%{{customdata[2]:.3f}}<br>"
-            f"{value_name}=%{{customdata[3]:.4f}}<extra></extra>"
-        ),
-        name="measured",
-        showlegend=False,
-    ))
+    if show_points:
+        customdata = np.column_stack([X[:, 0], X[:, 1], X[:, 2], Y])
+        fig.add_trace(go.Scatterternary(
+            a=X[:, 2], b=X[:, 0], c=X[:, 1],
+            mode="markers",
+            marker=dict(
+                symbol="circle", size=9, color=Y,
+                colorscale="Viridis", cmin=vmin, cmax=vmax,
+                line=dict(width=1.0, color="black"),
+                colorbar=colorbar,
+            ),
+            customdata=customdata,
+            hovertemplate=(
+                f"{labels[0]}=%{{customdata[0]:.3f}}<br>"
+                f"{labels[1]}=%{{customdata[1]:.3f}}<br>"
+                f"{labels[2]}=%{{customdata[2]:.3f}}<br>"
+                f"{value_name}=%{{customdata[3]:.4f}}<extra></extra>"
+            ),
+            name="measured",
+            showlegend=False,
+        ))
+
+    caption_bits = []
+    if show_points:
+        caption_bits.append(f"{X.shape[0]} measured points")
+    caption_bits.append(_BG_LABELS.get(background, background))
+
+    # Ternary axes: bigger corner-label + tick fonts, and a visible triangle
+    # outline (linecolor/linewidth) that shows even when there is no background.
+    axis_common = dict(
+        min=0, ticks="outside",
+        title_font=dict(size=20),
+        tickfont=dict(size=14),
+        linecolor="black", linewidth=2, showline=True,
+    )
 
     fig.update_layout(
-        title=dict(text=title, x=0.5, font=dict(size=14)),
+        title=dict(text=title, x=0.5, y=0.98, yanchor="top", font=dict(size=17)),
+        font=dict(size=15),
         ternary=dict(
             sum=1,
-            aaxis=dict(title=labels[2], min=0, ticks="outside"),   # top
-            baxis=dict(title=labels[0], min=0, ticks="outside"),   # bottom-left
-            caxis=dict(title=labels[1], min=0, ticks="outside"),   # bottom-right
+            aaxis=dict(title=labels[2], **axis_common),   # top
+            baxis=dict(title=labels[0], **axis_common),   # bottom-left
+            caxis=dict(title=labels[1], **axis_common),   # bottom-right
             bgcolor="white",
         ),
-        margin=dict(l=60, r=60, t=60, b=40),
+        margin=dict(l=60, r=40, t=90, b=40),
         height=720,
         annotations=[dict(
-            text=f"{X.shape[0]} measured points · RF-interpolated background",
+            text=" · ".join(caption_bits),
             showarrow=False, x=0.5, y=-0.06, xref="paper", yref="paper",
-            font=dict(size=11, color="#555"),
+            font=dict(size=13, color="#555"),
         )],
     )
     return fig
@@ -514,16 +621,41 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
                 dcc.Dropdown(id="db-value-dropdown", clearable=False),
             ]),
 
-            html.Label("RF grid resolution", style=label_style),
+            html.Label("Background", style=label_style),
+            dcc.RadioItems(
+                id="background-mode",
+                options=[
+                    {"label": " Random Forest", "value": "rf"},
+                    {"label": " Gaussian Process", "value": "gp"},
+                    {"label": " None", "value": "none"},
+                ],
+                value="rf",
+                labelStyle={"display": "block"},
+            ),
+
+            dcc.Checklist(
+                id="show-points",
+                options=[{"label": " Show sampled points", "value": "show"}],
+                value=["show"],
+                style={"marginTop": "12px"},
+            ),
+
+            html.Label("Grid resolution", style=label_style),
             dcc.Slider(
-                id="grid-n", min=40, max=200, step=20, value=grid_n,
-                marks={40: "40", 120: "120", 200: "200"},
+                id="grid-n", min=40, max=400, step=20, value=grid_n,
+                marks={40: "40", 120: "120", 240: "240", 400: "400"},
             ),
 
             html.Label("RF trees", style=label_style),
             dcc.Slider(
                 id="n-estimators", min=100, max=800, step=100, value=n_estimators,
                 marks={100: "100", 500: "500", 800: "800"},
+            ),
+
+            html.Label("GP length scale", style=label_style),
+            dcc.Slider(
+                id="gp-length-scale", min=0.05, max=1.0, step=0.05, value=0.3,
+                marks={0.05: "0.05", 0.3: "0.3", 0.6: "0.6", 1.0: "1.0"},
             ),
 
             html.Div(id="status", style={
@@ -571,10 +703,13 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         Input("run-dropdown", "value"),
         Input("db-dropdown", "value"),
         Input("db-value-dropdown", "value"),
+        Input("background-mode", "value"),
+        Input("show-points", "value"),
         Input("grid-n", "value"),
         Input("n-estimators", "value"),
+        Input("gp-length-scale", "value"),
     )
-    def _render(source_type, run_name, db_name, db_value, gn, ntrees):
+    def _render(source_type, run_name, db_name, db_value, background, show_points, gn, ntrees, gp_ls):
         try:
             if source_type == "run":
                 if not run_name:
@@ -590,10 +725,13 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
                 X, Y, labels,
                 grid_n=int(gn), n_estimators=int(ntrees),
                 title=title, value_name=value_name,
+                background=background, show_points=bool(show_points),
+                gp_length_scale=float(gp_ls),
             )
             status = (
                 f"{X.shape[0]} points\n"
                 f"Y range: [{Y.min():.4f}, {Y.max():.4f}]\n"
+                f"background: {background}\n"
                 f"corners (BL, BR, top): {labels}"
             )
             return fig, status
@@ -628,9 +766,15 @@ def export_png(args: argparse.Namespace) -> None:
     print(f"Labels : {labels}")
     print(f"Points : {X.shape[0]}   Y range: [{Y.min():.4f}, {Y.max():.4f}]")
 
-    grid_pts, grid_vals = fit_rf_background(X, Y, args.grid_n, args.n_estimators)
-    vmin = float(min(grid_vals.min(), Y.min()))
-    vmax = float(max(grid_vals.max(), Y.max()))
+    bg = fit_background(X, Y, args.grid_n, args.n_estimators, args.background,
+                        length_scale=args.gp_length_scale)
+    if bg is not None:
+        grid_pts, grid_vals = bg
+        vmin = float(min(grid_vals.min(), Y.min()))
+        vmax = float(max(grid_vals.max(), Y.max()))
+    else:
+        grid_pts = grid_vals = None
+        vmin, vmax = float(Y.min()), float(Y.max())
     if vmax <= vmin:
         vmax = vmin + 1e-9
 
@@ -645,13 +789,22 @@ def export_png(args: argparse.Namespace) -> None:
     ax.text(0.5, _SQRT3_2 + 0.04, labels[2], ha="center", va="bottom", fontsize=9)
     ax.set_title(title, fontsize=11)
 
-    gxy = comp_to_xy(grid_pts)
-    ax.scatter(gxy[:, 0], gxy[:, 1], c=grid_vals, cmap="viridis",
-               vmin=vmin, vmax=vmax, s=8, alpha=0.80, zorder=2, rasterized=True)
-    pxy = comp_to_xy(X)
-    sc = ax.scatter(pxy[:, 0], pxy[:, 1], c=Y, cmap="viridis", vmin=vmin, vmax=vmax,
-                    s=30, alpha=0.95, zorder=4, edgecolors="black", linewidths=0.9)
-    fig.colorbar(sc, ax=ax, label=value_name, fraction=0.046, pad=0.04)
+    # Marker size scales inversely with grid resolution so denser grids stay
+    # gap-free without blotting; mirrors the Plotly background sizing.
+    mappable = None
+    if bg is not None:
+        gxy = comp_to_xy(grid_pts)
+        bg_s = float(np.clip(6000.0 / max(args.grid_n, 1), 2.0, 40.0))
+        mappable = ax.scatter(gxy[:, 0], gxy[:, 1], c=grid_vals, cmap="viridis",
+                              vmin=vmin, vmax=vmax, s=bg_s, alpha=0.80, zorder=2,
+                              rasterized=True)
+    if not args.no_points:
+        pxy = comp_to_xy(X)
+        mappable = ax.scatter(pxy[:, 0], pxy[:, 1], c=Y, cmap="viridis",
+                              vmin=vmin, vmax=vmax, s=30, alpha=0.95, zorder=4,
+                              edgecolors="black", linewidths=0.9)
+    if mappable is not None:
+        fig.colorbar(mappable, ax=ax, label=value_name, fraction=0.046, pad=0.04)
     fig.tight_layout()
 
     out = Path(args.out) if args.out else out_default
@@ -682,9 +835,15 @@ def main() -> None:
                         help="Snapshot to reconstruct up to (default: latest.txt).")
     parser.add_argument("--out", default=None, help="Output PNG path (export).")
     parser.add_argument("--grid-n", type=int, default=TERNARY_GRID_N,
-                        help="Ternary grid resolution for the RF background.")
+                        help="Ternary grid resolution for the interpolated background.")
     parser.add_argument("--n-estimators", type=int, default=RF_N_ESTIMATORS,
                         help="Number of trees in the RF surrogate.")
+    parser.add_argument("--background", choices=BACKGROUND_MODES, default="rf",
+                        help="Background surrogate: rf, gp, or none (default: rf).")
+    parser.add_argument("--gp-length-scale", type=float, default=0.3,
+                        help="Fixed Matern length scale for the GP background (default: 0.3).")
+    parser.add_argument("--no-points", action="store_true",
+                        help="(export only) Hide the measured sampled points.")
     parser.add_argument("--corner-dims", default=None,
                         help="Comma-separated run dims placed at "
                              "[bottom-left,bottom-right,top] (default: 9,8,0).")

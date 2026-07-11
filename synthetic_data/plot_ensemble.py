@@ -22,6 +22,8 @@ Usage:
     python plot_ensemble.py
 """
 
+import argparse
+import os
 import random
 import sys
 from pathlib import Path
@@ -399,7 +401,9 @@ def _ternary_figure(fn, peaks, grid_n, basin_threshold, title):
         name="objective", hoverinfo="skip",
         marker=dict(color=obj[above], colorscale="Viridis", cmin=obj_min, cmax=obj_max,
                     size=TERNARY_MARKER_SIZE, showscale=True,
-                    colorbar=dict(title="Objective", x=1.02)),
+                    colorbar=dict(
+                        title=dict(text="Objective", side="top", font=dict(size=20)),
+                        tickfont=dict(size=18), len=0.8, x=1.12)),
     ))
     if len(peaks):
         traces.append(go.Scatterternary(
@@ -410,11 +414,22 @@ def _ternary_figure(fn, peaks, grid_n, basin_threshold, title):
         ))
 
     fig = go.Figure(data=traces)
+    axis_title_font = dict(size=22)
+    axis_tick_font = dict(size=18)
     fig.update_layout(
         title=title,
-        ternary=dict(sum=1, aaxis=dict(title="x3"), baxis=dict(title="x1"),
-                     caxis=dict(title="x2")),
-        legend=dict(x=1.18, y=1.0), width=FIG_W, height=FIG_H, margin=dict(t=60),
+        ternary=dict(
+            sum=1,
+            # a-axis is the top vertex; b/c are the two bottom vertices, so pad
+            # their titles with a leading line break to clear the tick labels.
+            aaxis=dict(title=dict(text="FAPbI3", font=axis_title_font),
+                       tickfont=axis_tick_font),
+            baxis=dict(title=dict(text="<br>MAPbI3", font=axis_title_font),
+                       tickfont=axis_tick_font),
+            caxis=dict(title=dict(text="<br>MAPbBr3", font=axis_title_font),
+                       tickfont=axis_tick_font),
+        ),
+        legend=dict(x=1.28, y=1.0), width=FIG_W, height=FIG_H, margin=dict(t=60),
     )
     return fig
 
@@ -459,8 +474,14 @@ def _point_cloud_figure(fn, peaks, grid_n, basin_threshold, title):
 
 
 def main() -> None:
-    print("Starting Dash app at http://127.0.0.1:8051")
-    build_app().run(debug=True, port=8051)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", type=int,
+                        default=int(os.environ.get("PLOT_ENSEMBLE_PORT", 8060)),
+                        help="Port to serve the Dash app on (default: 8060, "
+                             "or $PLOT_ENSEMBLE_PORT).")
+    args = parser.parse_args()
+    print(f"Starting Dash app at http://127.0.0.1:{args.port}")
+    build_app().run(debug=True, port=args.port)
 
 
 if __name__ == "__main__":

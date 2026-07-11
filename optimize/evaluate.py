@@ -938,6 +938,22 @@ def save_convergence_metrics_plot(
 
 # ─── Single evaluation run ──────────────────────────────────────────────────────
 
+def _force_zoom_floors() -> tuple[int, int]:
+    """Minimum ``(max_zooms, max_iterations)`` that let a run declare a needle.
+
+    Mirrors the HPARAM_SPACE lower bounds run_mobo enforces during hparam search,
+    but derived from ZoMBIHop's actual search-discipline defaults so the two can't
+    drift: a needle can only be declared once the search has zoomed to level
+    ``min_zoom_for_needle + 1`` (so ``max_zooms`` must be able to reach it) and only
+    after at least ``min_iters_per_zoom`` lines have been sampled at that zoom.
+    """
+    import inspect
+    params = inspect.signature(rm.ZoMBIHop.__init__).parameters
+    min_zoom = int(params["min_zoom_for_needle"].default)
+    min_iters = int(params["min_iters_per_zoom"].default)
+    return min_zoom + 1, min_iters
+
+
 def run_single_eval(
     hparams: dict,
     ds: dict,
@@ -1014,6 +1030,16 @@ def run_single_eval(
     hp = dict(hparams)
     if dim > 3 and (hp.get("top_m_points") is None or hp.get("top_m_points", 0) < dim + 1):
         hp["top_m_points"] = max(dim + 1, 4)
+
+    # Force-zooming discipline: MOBO clamps these via HPARAM_SPACE, but a fixed
+    # re-evaluation reads hparams straight from JSON, so enforce the same floors
+    # here or a low-max_zooms config could never zoom deep enough to declare a needle.
+    _zoom_floor, _iter_floor = _force_zoom_floors()
+    for _key, _floor in (("max_zooms", _zoom_floor), ("max_iterations", _iter_floor)):
+        if hp.get(_key) is not None and hp[_key] < _floor:
+            print(f"      [run] raising {_key} {hp[_key]} -> {_floor} to satisfy "
+                  f"force-zooming constraints.")
+            hp[_key] = _floor
 
     zombi_fixed = dict(rm.ZOMBI_FIXED)
     for k in _ZOMBI_OVERRIDE_KEYS:
