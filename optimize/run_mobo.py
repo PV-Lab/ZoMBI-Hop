@@ -382,7 +382,11 @@ HPARAM_SPACE: dict[str, tuple] = {
     # Acquisition function
     "ucb_beta":                    (0.001,   3.0,   "linear"),
     # Zoom / convergence
-    "max_zooms":                   (2,      10,    "int"),
+    # Lower bound is 3: a needle can only be declared at zoom level 3+
+    # (ZoMBIHop.min_zoom_for_needle), so max_zooms must allow reaching it.
+    "max_zooms":                   (3,      10,    "int"),
+    # Lower bound is 2 so at least min_iters_per_zoom (=2) lines can be sampled
+    # per zoom level before the optimiser may advance or declare a needle.
     "max_iterations":              (2,      30,    "int"),
     "top_m_points":                (2,      8,     "int"),
     "n_consecutive_converged":     (1,      5,    "int"),
@@ -1481,7 +1485,12 @@ def load_seed_hparams(trial_paths: list[str]) -> list[torch.Tensor]:
     for p in trial_paths:
         json_path = p if p.lower().endswith(".json") else os.path.join(p, "trial.json")
         if not os.path.exists(json_path):
-            sys.exit(f"--start-from-best: no trial.json found at {json_path}")
+            # A seed dir may be absent (e.g. a collaborator's run archived away, or a
+            # path that never existed on this account). Skip it rather than aborting:
+            # the full Sobol init still runs, so a missing seed just means one fewer
+            # re-evaluated known-good point, not a dead run/requeue chain.
+            print(f"  [seed] WARNING: no trial.json found at {json_path} — skipping.")
+            continue
         try:
             with open(json_path) as f:
                 data = json.load(f)
