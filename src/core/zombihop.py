@@ -241,6 +241,25 @@ class ZoMBIHop:
         # self.bounds is a convenience alias; always kept in sync with data_handler.bounds
         self.bounds = self.data_handler.bounds
 
+        # Resuming a checkpoint that has no saved bounds (e.g. the run crashed before
+        # writing its first snapshot, so load_state restored only the iteration
+        # counter) leaves data_handler.bounds / current_zoom_bounds — and this alias —
+        # as None. run() then dereferences None at the activation-entry
+        # `bounds = self.bounds.clone()` (and the never_terminate bounds clones).
+        # A snapshotless resume has no zoom region to preserve, so fall back to the
+        # full [0,1]^d simplex — identical to the bounds0 a fresh run builds in
+        # save_init above.
+        if self.bounds is None:
+            full_bounds = torch.zeros(2, d, device=self.device, dtype=self.dtype)
+            full_bounds[1] = 1.0
+            self.bounds = full_bounds
+            self.data_handler.bounds = full_bounds.clone()
+            if self.verbose:
+                print("[ZoMBIHop] Resumed checkpoint had no saved bounds; "
+                      "initialized to the full [0,1]^d simplex.")
+        if self.data_handler.current_zoom_bounds is None:
+            self.data_handler.current_zoom_bounds = self.bounds.clone()
+
         # GP handler
         self.gp_handler = GPSimplex(
             data_handler=self.data_handler,

@@ -1117,6 +1117,50 @@ class DistancePlotFrame(PlotFrame):
         self.draw()
 
 
+# ── composition-column labels ─────────────────────────────────────────────────
+
+def _read_run_hw_dims(rd: "RunData") -> Optional[list]:
+    """Read a run's hardware optimizing-dim indices (e.g. ``[0, 2, 8, 9]``).
+
+    Looks for a ``dims`` field like ``"0,2,8,9"`` in ``hw_config.json`` then
+    ``config.json`` in the run dir. Returns the parsed integer list, or None if
+    unavailable/malformed. These are the actual column indices in the database,
+    which need not be contiguous (the optimizer only sees a dense 0…d-1 slice).
+    """
+    if rd is None:
+        return None
+    for fname in ("hw_config.json", "config.json"):
+        p = rd.run_dir / fname
+        if not p.exists():
+            continue
+        try:
+            data     = json.loads(p.read_text())
+            dims_raw = data.get("dims", "")
+            if not dims_raw:
+                continue
+            parsed = [int(x.strip()) for x in str(dims_raw).split(",")
+                      if x.strip().lstrip("-").isdigit()]
+            if parsed:
+                return parsed
+        except Exception:
+            pass
+    return None
+
+
+def _run_comp_labels(rd: "RunData") -> list[str]:
+    """Composition-component column headers for a run.
+
+    Uses the real hardware dim indices when known (e.g.
+    ``["x[0]","x[2]","x[8]","x[9]"]``) so columns map back to the database,
+    falling back to a dense ``["x[0]"…"x[d-1]"]`` otherwise.
+    """
+    d = rd.d if rd is not None else 0
+    dims = _read_run_hw_dims(rd)
+    if dims is not None and len(dims) == d:
+        return [f"x[{k}]" for k in dims]
+    return [f"x[{i}]" for i in range(d)]
+
+
 # ── points table ──────────────────────────────────────────────────────────────
 
 class PointsTableFrame(ttk.Frame):
@@ -1133,7 +1177,7 @@ class PointsTableFrame(ttk.Frame):
             return
 
         d    = rd.d
-        cols = ["#"] + [f"x[{i}]" for i in range(d)] + ["Y", "valid"]
+        cols = ["#"] + _run_comp_labels(rd) + ["Y", "valid"]
         tree = ttk.Treeview(self._inner, columns=cols, show="headings", height=22)
         for c in cols:
             tree.heading(c, text=c)
@@ -1193,21 +1237,37 @@ class NeedlesFrame(ttk.Frame):
             return
 
         d    = rd.d
-        ccols = [f"x[{i}]" for i in range(d)]
+        ccols = _run_comp_labels(rd)
         cols  = ["#"] + ccols + ["value", "med_val", "zoom", "iter"]
+        # Friendly display headings + widths (column ids stay short/stable).
+        # "radial median objective" = median objective over all raw measurements
+        # within the needle's paring radius — a noise-robust height estimate.
+        headings = {"value": "objective value",
+                    "med_val": "radial median objective"}
+        widths   = {"value": 115, "med_val": 175}
         self._tree["columns"] = cols
         for c in cols:
-            self._tree.heading(c, text=c)
-            w = 35 if c == "#" else (60 if c.startswith("x[") else 75)
+            self._tree.heading(c, text=headings.get(c, c))
+            w = 35 if c == "#" else (60 if c.startswith("x[") else widths.get(c, 75))
             self._tree.column(c, width=w, anchor="e", minwidth=w)
 
-        for i, n in enumerate(self._data):
+        # Display highest-value needles first. Keep each needle's original index
+        # (in needles.json order) as its "#"/iid so the detail lookup below and
+        # the discovery order both stay intact.
+        def _val_key(item):
+            v = item[1].get("value")
+            if isinstance(v, (int, float)) and not (isinstance(v, float) and math.isnan(v)):
+                return v
+            return float("-inf")
+        order = sorted(enumerate(self._data), key=_val_key, reverse=True)
+
+        for orig_i, n in order:
             pt   = n.get("point", [])
             comp = [f"{v:.4f}" for v in pt]
             val  = f"{n['value']:.5f}"   if n.get("value")        is not None else ""
             mv   = f"{n['median_value']:.5f}" if n.get("median_value") is not None else ""
-            self._tree.insert("", "end", iid=str(i),
-                              values=[str(i)] + comp + [val, mv,
+            self._tree.insert("", "end", iid=str(orig_i),
+                              values=[str(orig_i)] + comp + [val, mv,
                                       n.get("zoom", ""),
                                       n.get("iteration", "")])
 
@@ -1236,6 +1296,7 @@ class GPQueryFrame(ttk.Frame):
         self._gp_rid  = ""
         self._entries: list[tk.StringVar] = []
         self._d_built = 0
+        self._labels_built: list[str] = []
 
         top = ttk.Frame(self)
         top.pack(fill="x", padx=8, pady=6)
@@ -1271,15 +1332,17 @@ class GPQueryFrame(ttk.Frame):
         self._sum_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self._sum_var, foreground="gray").pack(anchor="w", padx=8)
 
-    def _rebuild_entries(self, d: int):
+    def _rebuild_entries(self, d: int, labels: Optional[list[str]] = None):
         for w in self._ef.winfo_children():
             w.destroy()
         self._entries = []
         self._d_built = d
+        self._labels_built = list(labels) if labels is not None else [f"x[{i}]" for i in range(d)]
         n_cols = 4
         for i in range(d):
             r, c = divmod(i, n_cols)
-            ttk.Label(self._ef, text=f"x[{i}]:", width=6).grid(
+            lbl = self._labels_built[i] if i < len(self._labels_built) else f"x[{i}]"
+            ttk.Label(self._ef, text=f"{lbl}:", width=7).grid(
                 row=r, column=2*c, sticky="e", padx=2, pady=1)
             v = tk.StringVar(value=f"{1.0/d:.6f}")
             ttk.Entry(self._ef, textvariable=v, width=10).grid(
@@ -1319,8 +1382,9 @@ class GPQueryFrame(ttk.Frame):
             self._sum_var.set(f"sum = {v.sum():.6f}")
 
     def update_for_run(self, rd: RunData):
-        if rd.d != self._d_built:
-            self._rebuild_entries(max(rd.d, 1))
+        labels = _run_comp_labels(rd)
+        if rd.d != self._d_built or labels != self._labels_built:
+            self._rebuild_entries(max(rd.d, 1), labels)
         if rd.run_id != self._gp_rid:
             with self._gp_lock:
                 self._gp = None
@@ -1732,22 +1796,7 @@ class TernaryPlotFrame(ttk.Frame):
 
     def _read_hw_dims(self, rd: "RunData") -> Optional[list]:
         """Try to read hardware optimizing dims from config files in the run dir."""
-        for fname in ("hw_config.json", "config.json"):
-            p = rd.run_dir / fname
-            if not p.exists():
-                continue
-            try:
-                data     = json.loads(p.read_text())
-                dims_raw = data.get("dims", "")
-                if not dims_raw:
-                    continue
-                parsed = [int(x.strip()) for x in str(dims_raw).split(",")
-                          if x.strip().lstrip("-").isdigit()]
-                if parsed:
-                    return parsed
-            except Exception:
-                pass
-        return None
+        return _read_run_hw_dims(rd)
 
     def _sync_combos(self, labels: list[str], n_cols: int, rd: "RunData"):
         """Rebuild combobox choices and restore any saved selection for this run."""
@@ -2440,7 +2489,7 @@ class ManualControlFrame(ttk.Frame):
         self._com_var = tk.StringVar(value="COM5")
         ttk.Entry(r1, textvariable=self._com_var, width=9).pack(side="left", padx=(4, 18))
         ttk.Label(r1, text="Baud:").pack(side="left")
-        self._baud_var = tk.IntVar(value=9600)
+        self._baud_var = tk.IntVar(value=115200)
         ttk.Entry(r1, textvariable=self._baud_var, width=8).pack(side="left", padx=4)
 
         r2 = ttk.Frame(fr); r2.pack(fill="x", padx=4, pady=2)
@@ -3804,9 +3853,23 @@ class ZoMBIApp(tk.Tk):
         proc_ref: list[subprocess.Popen | None] = [None]
 
         def _pump():
+            log_fh = None            # persistent <run_dir>/run.log for post-mortem review
             try:
                 import os as _os
+                import time as _time
                 _env = {**_os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+                # Tee the child's stdout/stderr to <run_dir>/run.log so crashes and
+                # tracebacks survive after the (in-memory) GUI log panel is gone.
+                if hw_run_id:
+                    try:
+                        _log_dir = Path(ckpt_dir) / hw_run_id
+                        _log_dir.mkdir(parents=True, exist_ok=True)
+                        log_fh = open(_log_dir / "run.log", "a", encoding="utf-8", errors="replace")
+                        log_fh.write(f"\n===== hardware run launched "
+                                     f"{_time.strftime('%Y-%m-%d %H:%M:%S')} =====\n$ {' '.join(cmd)}\n")
+                        log_fh.flush()
+                    except Exception:
+                        log_fh = None
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -3827,6 +3890,12 @@ class ZoMBIApp(tk.Tk):
                         continue
                     rid = hw_run_id
                     app.log_to_main(stripped, run_id=rid)
+                    if log_fh is not None:
+                        try:
+                            log_fh.write(stripped + "\n")
+                            log_fh.flush()   # per-line flush: a hard crash still leaves the log
+                        except Exception:
+                            pass
                     if not uuid:          # only parse UUID for new runs
                         m = _RE_UUID.search(stripped)
                         if m:
@@ -3838,15 +3907,34 @@ class ZoMBIApp(tk.Tk):
                     f"Hardware process exited (rc={rc})",
                     tag="done" if rc == 0 else "error",
                     run_id=hw_run_id)
+                if log_fh is not None:
+                    try:
+                        log_fh.write(f"===== process exited (rc={rc}) "
+                                     f"{_time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+                        log_fh.flush()
+                    except Exception:
+                        pass
                 app.after(0, app.run_browser.refresh)
                 app.after(0, lambda: app.run_browser.set_hw_uuid(None))
                 if hw_run_id:
                     app.after(0, lambda r=hw_run_id: app._unregister_active_run(r))
             except Exception as exc:
                 app.log_to_main(f"ERROR launching hardware: {exc}", tag="error")
+                if log_fh is not None:
+                    try:
+                        log_fh.write(f"ERROR launching hardware: {exc}\n")
+                        log_fh.flush()
+                    except Exception:
+                        pass
                 app.after(0, lambda: app.run_browser.set_hw_uuid(None))
                 if hw_run_id:
                     app.after(0, lambda r=hw_run_id: app._unregister_active_run(r))
+            finally:
+                if log_fh is not None:
+                    try:
+                        log_fh.close()
+                    except Exception:
+                        pass
 
         threading.Thread(target=_pump, daemon=True).start()
 

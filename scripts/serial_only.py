@@ -25,7 +25,7 @@ def main():
     p = argparse.ArgumentParser(description="Serial-only IO process")
     p.add_argument("--com",      default="COM5",
                    help="Serial port name (e.g. COM5 or /dev/ttyUSB0)")
-    p.add_argument("--baud",     type=int, default=9600, help="Baud rate")
+    p.add_argument("--baud",     type=int, default=115200, help="Baud rate")
     p.add_argument("--comp-db",  default="./sql/compositions.db",
                    help="Path to compositions.db")
     p.add_argument("--obj-db",   default="./sql/objective.db",
