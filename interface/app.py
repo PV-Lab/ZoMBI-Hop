@@ -1945,6 +1945,36 @@ class TernaryPlotFrame(ttk.Frame):
                 [self._accum_penalized, np.asarray(new_p, bool)])
         return self._accum_pts, self._accum_y, self._accum_penalized
 
+    def _accumulate_full_history(self, n_cols: int):
+        """
+        Seed the accumulator with the snapshot's *full* evaluated history
+        (``rd.X_all``) so the ternary/tetra shows every point, not just the ones
+        the current live source happens to report.
+
+        This matters on **resume**: a resumed run's ``live_plot_state.json`` is
+        rebuilt from the new points collected since the restart, so a fresh app
+        session reading it would otherwise plot only those. The reconstructed
+        snapshot, however, always carries the complete history. De-duplication by
+        composition means this safely unions with the live batch; declared points
+        are never dropped, so the whole run persists.
+
+        Only merged when the snapshot's column count matches ``n_cols`` so the
+        dim ordering lines up — true for compositional runs (d == n_cols), where
+        this bug bites. Subset-dim hardware runs (d > n_cols) are left untouched.
+        """
+        rd = self._last_rd
+        if rd is None or rd.X_all is None:
+            return
+        Xh = np.asarray(rd.X_all, dtype=float)
+        if Xh.ndim != 2 or Xh.shape[0] == 0 or Xh.shape[1] != n_cols:
+            return
+        Yh = (np.asarray(rd.Y_all, dtype=float).ravel()
+              if rd.Y_all is not None and len(rd.Y_all) == Xh.shape[0] else None)
+        penh = (~np.asarray(rd.penalty_mask, dtype=bool)
+                if rd.penalty_mask is not None
+                and len(rd.penalty_mask) == Xh.shape[0] else None)
+        self._accumulate_points(Xh, n_cols, Yh, penh)
+
     def _accumulate_needles(self, needles_data: list) -> list:
         """
         Merge the current needle batch into the per-run needle accumulator and
@@ -2004,7 +2034,10 @@ class TernaryPlotFrame(ttk.Frame):
 
         # ── sampled points (no ground-truth background cloud) ─────────────
         # Accumulate every point seen for this run so the cloud persists for the
-        # whole lifetime of the run (see _accumulate_points).
+        # whole lifetime of the run (see _accumulate_points). Seed from the
+        # snapshot's full history first so resumed runs show all points, not just
+        # the ones collected since the restart.
+        self._accumulate_full_history(4)
         acc_pts, acc_y, _ = self._accumulate_points(X, 4, self._resolve_batch_Y(X))
         if acc_pts.shape[0] > 0 and acc_pts.shape[1] >= 4:
             P = acc_pts[:, :4] @ V
@@ -2205,7 +2238,9 @@ class TernaryPlotFrame(ttk.Frame):
         # ── scatter points ────────────────────────────────────────────────
         # Accumulate every point seen for this run so the scatter persists for
         # the whole lifetime of the run, regardless of what the current source
-        # momentarily reports.
+        # momentarily reports. Seed from the snapshot's full history first so
+        # resumed runs show all points, not just those collected since restart.
+        self._accumulate_full_history(n_cols)
         acc_pts, acc_y, acc_pen = self._accumulate_points(
             X, n_cols, self._resolve_batch_Y(X), self._resolve_batch_penalized(X))
         if self._show_points.get() and acc_pts.shape[0] > 0 and acc_pts.shape[1] > max_col:
