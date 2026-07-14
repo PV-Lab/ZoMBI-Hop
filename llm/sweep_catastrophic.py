@@ -64,7 +64,8 @@ from __future__ import annotations
 # ═══ HARDCODED CONFIG ════════════════════════════════════════════════════════
 # Path to the MOBO trial.json whose "hparams" block seeds the baseline (and whose
 # dimensionality drives the whole sweep). Relative paths resolve against repo root.
-TRIAL_JSON: str = "optimize/runs/archived_runs/mobo_3d_05_06_15_32/trial_112/trial.json"
+# TRIAL_JSON: str = "optimize/runs/archived_runs/mobo_3d_05_06_15_32/trial_112/trial.json"
+TRIAL_JSON: str = "optimize/runs/mobo_ensemble_4d_job17147232/trial_10/trial.json" # 4d
 
 # The catastrophic perturbation: {hparam_name: value, ...}. These override the
 # baseline hyperparameters for BOTH the "perturbed" group and the LLM group's
@@ -140,7 +141,21 @@ PERTURB: dict = {
 #                ignored, and there are NO ground-truth optima (the needle-distance
 #                metric is NaN and no reference markers are drawn). dim + baseline
 #                hyperparameters are still read from TRIAL_JSON.
-LANDSCAPE: str = "rf"   # "ensemble" | "rf"
+#   "run_gp"   — a Gaussian-Process interpolation of a REAL ZoMBI-Hop run's measured
+#                (X, Y) dataset (``RUN_GP_DIR`` below), fitted with a fixed Matern
+#                length scale (``GP_LENGTH_SCALE``) exactly as
+#                visualization/plot_run.fit_gp_background. Dimension-general (the run
+#                dim must match TRIAL_JSON's dim); ENSEMBLE_SEED / ENSEMBLE_OPTIMA_MARGIN
+#                are ignored and there are NO ground-truth optima (needle-distance is
+#                NaN, no reference markers drawn). Used here for the 4D run_9dfe.
+LANDSCAPE: str = "run_gp"   # "ensemble" | "rf" | "run_gp"
+
+# LANDSCAPE == "run_gp": the real run directory whose measured (X, Y) is GP-interpolated
+# into the landscape, and the fixed Matern(2.5) length scale of that interpolation
+# (matches visualization/plot_run.py's GP background). Relative paths resolve against
+# repo root. run_9dfe is a 4D run (optimizing dims 0,2,8,9).
+RUN_GP_DIR: str = "runs/run_9dfe"
+GP_LENGTH_SCALE: float = 0.05
 
 # Fixed Ensemble landscape draw. random_ensemble_config(dim, seed=ENSEMBLE_SEED)
 # generates a FRESH landscape (the trial.json's own ensemble_configs are ignored).
@@ -192,6 +207,7 @@ from eval_metrics import (  # noqa: E402
 )
 from mobo_landscapes import composition_column_names  # noqa: E402
 from src.core.zombihop import ZoMBIHop  # noqa: E402
+from src.utils.datahandler import reconstruct_snapshot_tensors  # noqa: E402
 
 from synthetic_data.ensemble import Ensemble, random_ensemble_config  # noqa: E402
 
@@ -243,7 +259,82 @@ def load_trial(trial_json: Path) -> Tuple[int, Dict[str, Any]]:
 # generative surrogate's deterministic RF conditional mean with the same interface.
 
 # Human-readable landscape name for plot titles / colorbar labels.
-LANDSCAPE_LABEL: str = "RF" if LANDSCAPE == "rf" else "Ensemble"
+LANDSCAPE_LABEL: str = {"rf": "RF", "run_gp": "Run-GP"}.get(LANDSCAPE, "Ensemble")
+
+
+class _GPLandscape:
+    """Gaussian-Process interpolation of a real run's (X, Y), exposing ``.predict(X)``.
+
+    A Matern(nu=2.5) kernel with a FIXED length scale (``GP_LENGTH_SCALE``) plus a
+    small white-noise term gives a smooth interpolation across the simplex, exactly
+    as ``visualization/plot_run.fit_gp_background``. Y is standardised for numerical
+    stability and mapped back to the original scale on ``predict``. Like the RF
+    landscape, this reconstruction has NO ground-truth optima."""
+
+    def __init__(self, X: np.ndarray, Y: np.ndarray, length_scale: float):
+        from sklearn.gaussian_process import GaussianProcessRegressor
+        from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
+
+        X = np.atleast_2d(np.asarray(X, float))
+        Y = np.asarray(Y, float).ravel()
+        self._y_mean = float(Y.mean())
+        self._y_std = float(Y.std()) or 1.0
+        y = (Y - self._y_mean) / self._y_std
+        kernel = (
+            ConstantKernel(1.0, (1e-3, 1e3))
+            * Matern(length_scale=length_scale, length_scale_bounds="fixed", nu=2.5)
+            + WhiteKernel(noise_level=1e-2, noise_level_bounds=(1e-6, 1e1))
+        )
+        self._gp = GaussianProcessRegressor(
+            kernel=kernel, normalize_y=False, n_restarts_optimizer=2, random_state=42
+        )
+        self._gp.fit(X, y)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        X = np.atleast_2d(np.asarray(X, float))
+        return self._gp.predict(X) * self._y_std + self._y_mean
+
+
+def _default_snapshot(run_dir: Path) -> str:
+    """The snapshot named in latest.txt, else the last snapshot directory."""
+    latest = run_dir / "latest.txt"
+    if latest.exists():
+        name = latest.read_text().strip()
+        if name:
+            return name
+    snaps = sorted(s.name for s in (run_dir / "snapshots").iterdir() if s.is_dir())
+    if not snaps:
+        raise SystemExit(f"No snapshots found under {run_dir}")
+    return snaps[-1]
+
+
+def _build_run_gp_landscape(dim: int) -> Tuple[Any, List[np.ndarray]]:
+    """The GP-interpolation landscape: reconstruct ``RUN_GP_DIR``'s measured (X, Y)
+    from its snapshots and fit a fixed-length-scale Matern GP over it.
+
+    Dimension-general — the run's optimizing-dim composition width must match ``dim``
+    (from TRIAL_JSON). Like the RF landscape it has NO ground-truth optima, so
+    ``true_optima`` is empty (needle-distance metric NaN, no reference markers)."""
+    run_dir = _resolve(RUN_GP_DIR)
+    snapshot = _default_snapshot(run_dir)
+    tensors = reconstruct_snapshot_tensors(run_dir, snapshot, device="cpu")
+    X_t, Y_t = tensors.get("X_all_actual"), tensors.get("Y_all")
+    if X_t is None or Y_t is None or X_t.shape[0] == 0:
+        raise SystemExit(f"No datapoints reconstructed from {run_dir}/{snapshot}")
+    X = X_t.detach().cpu().numpy().astype(float)
+    Y = Y_t.detach().cpu().numpy().astype(float).ravel()
+    if X.shape[1] != dim:
+        raise SystemExit(
+            f"LANDSCAPE='run_gp': run {run_dir.name} has d={X.shape[1]} but "
+            f"TRIAL_JSON has dim={dim}; they must match.")
+    # Normalise rows to sum 1 (guards against tiny numerical drift).
+    s = X.sum(axis=1, keepdims=True)
+    X = X / np.where(s == 0, 1.0, s)
+    landscape = _GPLandscape(X, Y, GP_LENGTH_SCALE)
+    print(f"  [landscape] GP interpolation of {run_dir.name} ({snapshot}): "
+          f"{X.shape[0]} points, Matern(2.5) length_scale={GP_LENGTH_SCALE}; "
+          f"no ground-truth optima")
+    return landscape, []
 
 
 def _build_rf_landscape(dim: int) -> Tuple[Any, List[np.ndarray]]:
@@ -285,13 +376,16 @@ def build_landscape(dim: int) -> Tuple[Any, List[np.ndarray]]:
     """The single frozen landscape used by every trial, dispatched on ``LANDSCAPE``.
 
     Returns ``(landscape, true_optima)`` where ``landscape`` exposes ``.predict(X)``
-    (Objective at composition rows) — an ``Ensemble`` for ``LANDSCAPE == 'ensemble'``
-    or an RF mean predictor for ``LANDSCAPE == 'rf'``."""
+    (Objective at composition rows) — an ``Ensemble`` for ``LANDSCAPE == 'ensemble'``,
+    an RF mean predictor for ``LANDSCAPE == 'rf'``, or a GP interpolation of a real
+    run for ``LANDSCAPE == 'run_gp'``."""
     if LANDSCAPE == "rf":
         return _build_rf_landscape(dim)
+    if LANDSCAPE == "run_gp":
+        return _build_run_gp_landscape(dim)
     if LANDSCAPE == "ensemble":
         return _build_ensemble_landscape(dim)
-    raise SystemExit(f"LANDSCAPE must be 'ensemble' or 'rf', got {LANDSCAPE!r}")
+    raise SystemExit(f"LANDSCAPE must be 'ensemble', 'rf', or 'run_gp', got {LANDSCAPE!r}")
 
 
 def make_objective(landscape):
@@ -328,11 +422,70 @@ def _bary_to_cart(pts) -> np.ndarray:
     return np.atleast_2d(np.asarray(pts, float)) @ _TERNARY_VERTS
 
 
-def plot_ensemble_landscape(out_png: Path, ens: Ensemble, true_optima, dim: int) -> Path:
-    """First artifact: draw the fixed Ensemble landscape so the seed can be judged.
+def _plot_pointcloud_4d(out_html: Path, landscape, true_optima, *,
+                        needles=None, title: str) -> Path:
+    """4D analogue of the ternary landscape plot: an interactive (rotatable)
+    4-simplex tetrahedron point cloud, exactly as ``run_mobo._render_4d_point_cloud``.
+
+    The landscape Objective is sampled on a dense 4-simplex lattice and drawn as a
+    Viridis point cloud on the tetrahedron (``synthetic_data/plot_ackley``); any
+    ``true_optima`` are red diamonds and any ``needles`` red ``x`` markers. Written
+    as a self-contained HTML file (Plotly Scatter3d; only interactivity is rotation)."""
+    import plotly.graph_objects as go
+    import synthetic_data.plot_ackley as pc4
+
+    comp = pc4.build_simplex_lattice(pc4.GRID_N)
+    obj = np.asarray(landscape.predict(comp), float)
+    xyz = pc4.to_3d(comp)
+    obj_min, obj_max = float(obj.min()), float(obj.max())
+
+    hover = [f"x=[{a:.2f}, {b:.2f}, {c:.2f}, {d:.2f}]<br>obj={v:.3f}"
+             for (a, b, c, d), v in zip(comp, obj)]
+    cloud = go.Scatter3d(
+        x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2], mode="markers", name="objective",
+        text=hover, hoverinfo="text",
+        marker=dict(color=obj, colorscale="Viridis", cmin=obj_min, cmax=obj_max,
+                    size=pc4.MARKER_SIZE, opacity=pc4.MARKER_OPACITY,
+                    showscale=True,
+                    colorbar=dict(title=f"{LANDSCAPE_LABEL} Objective")),
+    )
+    data = [cloud, pc4.tetra_edges_trace(), pc4.vertex_labels_trace()]
+    if true_optima is not None and len(true_optima):
+        pk = pc4.to_3d(np.asarray(true_optima, float))
+        data.append(go.Scatter3d(
+            x=pk[:, 0], y=pk[:, 1], z=pk[:, 2], mode="markers", name="true optima",
+            marker=dict(symbol="diamond", color="red", size=6,
+                        line=dict(color="white", width=1)),
+            hoverinfo="name",
+        ))
+    needles = (np.atleast_2d(np.asarray(needles, float))
+               if needles is not None and np.asarray(needles).size else None)
+    if needles is not None and needles.shape[0]:
+        data.append(pc4.needle_marker_trace(needles, name="final needles"))
+
+    fig = go.Figure(data=data)
+    fig.update_layout(
+        title=title,
+        scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False),
+                   zaxis=dict(visible=False), aspectmode="data"),
+        legend=dict(x=0.0, y=1.0), width=pc4.FIG_W, height=pc4.FIG_H,
+    )
+    fig.write_html(str(out_html), include_plotlyjs="cdn", auto_open=False)
+    print(f"  wrote {out_html}")
+    return out_html
+
+
+def plot_ensemble_landscape(out_png: Path, ens, true_optima, dim: int) -> Path:
+    """First artifact: draw the fixed landscape so the draw can be judged.
 
     dim == 3 → filled ternary contour of the Objective with true optima marked.
+    dim == 4 → interactive 4-simplex tetrahedron point cloud (HTML), like run_mobo.
     Other dims → distribution of Objective over Dirichlet samples (no ternary)."""
+    if dim == 4:
+        return _plot_pointcloud_4d(
+            Path(out_png).with_suffix(".html"), ens, true_optima,
+            title=f"Fixed {LANDSCAPE_LABEL} landscape (4-simplex point cloud)")
+
     import matplotlib.pyplot as plt  # Agg already selected via evaluate_llm
 
     if dim == 3:
@@ -377,10 +530,20 @@ def plot_ensemble_landscape(out_png: Path, ens: Ensemble, true_optima, dim: int)
     return out_png
 
 
-def plot_needles_on_ensemble(out_png: Path, needles: np.ndarray, ens: Ensemble,
-                             true_optima, title: Optional[str] = None) -> Optional[Path]:
-    """3D only: Ensemble Objective as a filled ternary contour with the run's final
-    declared needles overlaid as red stars (true optima as hollow white rings)."""
+def plot_needles_on_ensemble(out_png: Path, needles: np.ndarray, ens,
+                             true_optima, dim: int = 3,
+                             title: Optional[str] = None) -> Optional[Path]:
+    """Landscape Objective with the run's final declared needles overlaid.
+
+    dim == 3 → filled ternary contour, needles as red stars (true optima as hollow
+    white rings). dim == 4 → interactive 4-simplex tetrahedron point cloud (HTML),
+    needles as red ``x`` markers, like run_mobo's final point cloud."""
+    if dim == 4:
+        return _plot_pointcloud_4d(
+            Path(out_png).with_suffix(".html"), ens, true_optima, needles=needles,
+            title=title or f"Final needles on {LANDSCAPE_LABEL} landscape "
+                           f"(4-simplex point cloud)")
+
     import matplotlib.pyplot as plt
 
     grid_pts = R.ternary_grid(R.TERNARY_GRID_N)
@@ -474,6 +637,116 @@ def plot_convergence_segments(out_png: Path, dh, snap_records: List[tuple],
     fig.tight_layout()
     fig.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
+    return out_png
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Group-comparison convergence plot (mean ± 95% CI per group, no points)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# One colour per group. The LLM group's name carries INJECT_INTERVAL, so it is
+# matched by prefix rather than an exact key.
+_GROUP_COLORS: Dict[str, str] = {"baseline": "steelblue", "perturbed": "firebrick"}
+_LLM_COLOR = "darkorange"
+
+
+def _group_color(group: str) -> str:
+    return _LLM_COLOR if group.startswith("llm") else _GROUP_COLORS.get(group, "gray")
+
+
+def _group_label(group: str) -> str:
+    """Human-readable legend label for a group directory name."""
+    if group.startswith("llm_every_"):
+        return f"LLM (inject every {group.rsplit('_', 1)[-1]} iters)"
+    return group.capitalize()
+
+
+def _group_order(group: str) -> int:
+    """Stable plot order: baseline, perturbed, then the LLM group(s)."""
+    return {"baseline": 0, "perturbed": 1}.get(group, 2)
+
+
+def _ci95(stack: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Mean and 95% CI (mean ± 1.96·SEM) down axis 0 (reps)."""
+    mean = stack.mean(axis=0)
+    n = stack.shape[0]
+    sem = stack.std(axis=0, ddof=1) / np.sqrt(n) if n > 1 else np.zeros_like(mean)
+    half = 1.96 * sem
+    return mean, mean - half, mean + half
+
+
+def _load_group_running_best(gdir: Path) -> List[np.ndarray]:
+    """The per-rep ``Y_all_running_best`` curves stored in ``gdir/rep*/metrics.json``."""
+    curves: List[np.ndarray] = []
+    for rep in sorted(gdir.glob("rep*")):
+        mp = rep / "metrics.json"
+        if not mp.exists():
+            continue
+        try:
+            rb = json.loads(mp.read_text()).get("Y_all_running_best") or []
+        except Exception:
+            continue
+        if rb:
+            curves.append(np.asarray(rb, dtype=float))
+    return curves
+
+
+def plot_group_convergence(sweep_dir: Path,
+                           out_png: Optional[Path] = None) -> Optional[Path]:
+    """Compare the baseline / perturbed / LLM groups on ONE convergence figure.
+
+    For each group we stack its reps' running-best curves (``Y_all_running_best``
+    from each rep's metrics.json), truncate them to their common length, and draw
+    the mean with a shaded 95% CI band (mean ± 1.96·SEM). No individual points or
+    per-rep lines are drawn — à la ``optimize/compare_arb_tuned.plot_summary`` — so
+    the three groups read cleanly against each other. Groups are discovered from the
+    sweep directory, so this works both at the end of a sweep and as a standalone
+    regeneration (see ``--replot``)."""
+    import matplotlib.pyplot as plt
+
+    sweep_dir = Path(sweep_dir)
+    out_png = Path(out_png) if out_png is not None else sweep_dir / "convergence_comparison.png"
+
+    groups = sorted(
+        (d.name for d in sweep_dir.iterdir()
+         if d.is_dir() and any((d / f"rep{r}" / "metrics.json").exists()
+                               for r in range(N_REPEATS))),
+        key=lambda g: (_group_order(g), g))
+    if not groups:
+        print(f"      [group-convergence] no groups with metrics.json under {sweep_dir}")
+        return None
+
+    fig, ax = plt.subplots(figsize=(8.5, 4.8))
+    plotted = 0
+    for group in groups:
+        curves = _load_group_running_best(sweep_dir / group)
+        if not curves:
+            continue
+        L = min(c.size for c in curves)
+        stack = np.vstack([c[:L] for c in curves])  # (n_reps, L)
+        mean, lo, hi = _ci95(stack)
+        idx = np.arange(L)
+        color = _group_color(group)
+        ax.fill_between(idx, lo, hi, color=color, alpha=0.2, lw=0, zorder=2)
+        ax.plot(idx, mean, color=color, lw=2.0, zorder=4,
+                label=f"{_group_label(group)} (mean ± 95% CI, n={stack.shape[0]})")
+        plotted += 1
+
+    if not plotted:
+        plt.close(fig)
+        print(f"      [group-convergence] no usable running-best curves under {sweep_dir}")
+        return None
+
+    ax.set_xlabel("Objective evaluations (sample index)")
+    ax.set_ylabel("Best objective Y found")
+    ax.set_title(f"Convergence by group on the fixed {LANDSCAPE_LABEL} landscape "
+                 f"(mean ± 95% CI over {N_REPEATS} repeats)", fontsize=10)
+    ax.legend(fontsize=8, loc="lower right")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out_png}")
     return out_png
 
 
@@ -640,9 +913,17 @@ def finalize_trial(dh, true_optima, payloads, snap_records, trial_dir: Path,
             print(f"      [finalize] coverage plot failed: {e}")
         try:
             plot_needles_on_ensemble(trial_dir / "needles_on_ensemble.png",
-                                     discovered, ens, true_optima)
+                                     discovered, ens, true_optima, dim=dim)
         except Exception as e:
             print(f"      [finalize] needles-on-ensemble plot failed: {e}")
+    elif dim == 4:
+        # 4D landscape view: the interactive 4-simplex point cloud with the run's
+        # final needles overlaid (run_mobo's per-trial 4D artifact). No coverage plot.
+        try:
+            plot_needles_on_ensemble(trial_dir / "needles_on_ensemble.png",
+                                     discovered, ens, true_optima, dim=dim)
+        except Exception as e:
+            print(f"      [finalize] needles-on-ensemble point cloud failed: {e}")
 
     return {
         "n_iters": len(payloads),
@@ -1075,6 +1356,11 @@ def _group_signature(dim: int, hp: Dict[str, Any]) -> Dict[str, Any]:
         "landscape": LANDSCAPE,
         "ensemble_seed": ENSEMBLE_SEED,
         "ensemble_optima_margin": ENSEMBLE_OPTIMA_MARGIN,
+        # run_gp landscape identity: the source run + fixed GP length scale. Only
+        # meaningful when LANDSCAPE == "run_gp" (ignored otherwise), but always
+        # recorded so a run_gp group is never reused across a different GP config.
+        "run_gp_dir": RUN_GP_DIR,
+        "gp_length_scale": GP_LENGTH_SCALE,
         "dim": dim,
         "max_iters": MAX_ITERS,
         "output_noise_frac": OUTPUT_NOISE_FRAC,
@@ -1329,6 +1615,13 @@ def main(no_llm: bool = False, resume: bool = False) -> None:
         }
 
     (sweep_dir / "sweep_summary.json").write_text(json.dumps(summary, indent=2))
+
+    # Headline cross-group comparison: mean ± 95% CI convergence per group (no points).
+    try:
+        plot_group_convergence(sweep_dir)
+    except Exception as e:
+        print(f"[catastrophic] group-convergence plot failed: {e}")
+
     print(f"\n[catastrophic] done → {sweep_dir}")
     for group, _ in groups:
         s = summary.get(group, {})
@@ -1341,7 +1634,17 @@ def main(no_llm: bool = False, resume: bool = False) -> None:
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if "--smoke-llm" in args:
+    if "--replot" in args:
+        # Regenerate only the group-comparison convergence plot for an existing
+        # sweep dir (the argument after --replot; else the newest sweep dir).
+        i = args.index("--replot")
+        arg = args[i + 1] if i + 1 < len(args) and not args[i + 1].startswith("-") else None
+        target = _resolve(arg) if arg else _find_latest_sweep_dir("sweep_catastrophic")
+        if target is None or not Path(target).is_dir():
+            raise SystemExit(f"--replot: no sweep dir to plot (got {target!r})")
+        print(f"[catastrophic] --replot: regenerating group convergence for {target}")
+        plot_group_convergence(Path(target))
+    elif "--smoke-llm" in args:
         smoke_llm()
     else:
         main(no_llm="--no-llm" in args, resume="--resume" in args)

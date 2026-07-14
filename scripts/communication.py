@@ -46,6 +46,11 @@ def _register_signal_handlers_in_serial_process_only() -> None:
     try:
         signal.signal(signal.SIGINT, _serial_process_signal_handler)
         signal.signal(signal.SIGTERM, _serial_process_signal_handler)
+        # Windows Ctrl+Break (how the GUI asks a hardware run to stop). Handling it
+        # here lets the serial child close the COM port cleanly instead of being
+        # killed by the default action with the port still open.
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, _serial_process_signal_handler)
     except (OSError, ValueError):
         pass
 

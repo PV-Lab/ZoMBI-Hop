@@ -19,6 +19,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -3579,6 +3580,111 @@ class HardwareResumeDialog(tk.Toplevel):
 
 # ── main application window ───────────────────────────────────────────────────
 
+class _WinJobObject:
+    """Windows Job Object with KILL_ON_JOB_CLOSE, used to own a hardware run's
+    whole process tree.
+
+    Assigning ``main.py`` to the job makes the OS treat it and all its (future)
+    descendants — including the serial child that holds COM — as one unit:
+    ``terminate()`` kills them all atomically, and if this handle ever closes
+    (notably if the GUI process itself dies) the OS kills them too. That is what
+    guarantees the serial child is never left orphaned holding the COM port,
+    which would otherwise require physically unplugging it.
+
+    Every method is a best-effort no-op on failure; on non-Windows nothing is
+    created and callers fall back to signal/taskkill handling.
+    """
+
+    def __init__(self):
+        self._h = None
+        self._k32 = None
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes as wt
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateJobObjectW.restype = wt.HANDLE
+            k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            k32.SetInformationJobObject.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD]
+            k32.SetInformationJobObject.restype = wt.BOOL
+            k32.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
+            k32.AssignProcessToJobObject.restype = wt.BOOL
+            k32.TerminateJobObject.argtypes = [wt.HANDLE, wt.UINT]
+            k32.TerminateJobObject.restype = wt.BOOL
+            k32.CloseHandle.argtypes = [wt.HANDLE]
+
+            class _BASIC(ctypes.Structure):
+                _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                            ("PerJobUserTimeLimit", ctypes.c_int64),
+                            ("LimitFlags", wt.DWORD),
+                            ("MinimumWorkingSetSize", ctypes.c_size_t),
+                            ("MaximumWorkingSetSize", ctypes.c_size_t),
+                            ("ActiveProcessLimit", wt.DWORD),
+                            ("Affinity", ctypes.c_size_t),
+                            ("PriorityClass", wt.DWORD),
+                            ("SchedulingClass", wt.DWORD)]
+
+            class _IOC(ctypes.Structure):
+                _fields_ = [(f"c{i}", ctypes.c_uint64) for i in range(6)]
+
+            class _EXT(ctypes.Structure):
+                _fields_ = [("BasicLimitInformation", _BASIC),
+                            ("IoInfo", _IOC),
+                            ("ProcessMemoryLimit", ctypes.c_size_t),
+                            ("JobMemoryLimit", ctypes.c_size_t),
+                            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                            ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+            h = k32.CreateJobObjectW(None, None)
+            if not h:
+                return
+            info = _EXT()
+            info.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+            # 9 == JobObjectExtendedLimitInformation
+            if not k32.SetInformationJobObject(h, 9, ctypes.byref(info), ctypes.sizeof(info)):
+                k32.CloseHandle(h)
+                return
+            self._k32 = k32
+            self._h = h
+        except Exception:
+            self._h = None
+
+    @property
+    def ok(self) -> bool:
+        return self._h is not None
+
+    def assign(self, proc) -> bool:
+        """Put ``proc`` (a subprocess.Popen) into the job. Its future children join too."""
+        if self._h is None or proc is None:
+            return False
+        try:
+            handle = getattr(proc, "_handle", None)
+            if handle is None:
+                return False
+            return bool(self._k32.AssignProcessToJobObject(self._h, int(handle)))
+        except Exception:
+            return False
+
+    def terminate(self, exit_code: int = 1) -> None:
+        if self._h is None:
+            return
+        try:
+            self._k32.TerminateJobObject(self._h, exit_code)
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        if self._h is None:
+            return
+        try:
+            self._k32.CloseHandle(self._h)
+        except Exception:
+            pass
+        self._h = None
+
+
 class ZoMBIApp(tk.Tk):
     def __init__(self, ckpt_dir: str = DEFAULT_CKPT_DIR):
         super().__init__()
@@ -3593,7 +3699,15 @@ class ZoMBIApp(tk.Tk):
         self._active_runs: dict[str, dict] = {}
         # Which run's log is currently shown in the log panel
         self._viewed_run_id: Optional[str] = None
+        # Every hardware-run subprocess (scripts/main.py) we launch. Tracked so we
+        # can kill the whole process tree — including the serial child holding
+        # COM — on stop, before a new launch, and on app close, so the port is
+        # never left orphaned (which would otherwise require unplugging it).
+        self._hw_procs: list[subprocess.Popen] = []
         self._build_ui()
+        # Kill any live hardware process trees before the window closes so COM
+        # is released instead of being held by an orphaned serial child.
+        self.protocol("WM_DELETE_WINDOW", self._on_app_close)
         self._start_poll()
 
     def _build_ui(self):
@@ -3727,6 +3841,111 @@ class ZoMBIApp(tk.Tk):
             label = "▶ Resume" if not ev.is_set() else "⏸ Pause"
             self._pause_btn.config(state="normal", text=label)
 
+    def _terminate_hw_proc_tree(self, proc: "subprocess.Popen | None",
+                                run_id: str | None = None,
+                                graceful: bool = True,
+                                graceful_timeout: float = 20.0):
+        """Terminate a hardware run's whole process *tree* so COM5 is released.
+
+        scripts/main.py spawns a serial child that owns the COM port. On Windows
+        a plain terminate() kills only main.py and orphans that child, which then
+        holds the port until it is physically unplugged. To avoid that:
+
+          • graceful=True → send CTRL_BREAK to main.py's process group so it can
+            shut the serial child down cleanly (closing the port); if it does not
+            exit within graceful_timeout, force-kill the whole tree.
+          • graceful=False → force-kill the tree immediately (used before a new
+            launch and on app close, where we just need the port free now).
+
+        The force path terminates the run's kill-on-close Job Object, which takes
+        down main.py and every descendant atomically — even an already-orphaned
+        serial child (`taskkill /T` can't reach an orphan of a dead parent, so it
+        is only a fallback when no job was established). A dead process's port
+        handle is released by the OS. Safe to call on an already-exited process.
+        """
+        if proc is None:
+            return
+        job = getattr(proc, "_zombi_job", None)
+
+        def _log(msg, tag="info"):
+            try:
+                self.log_to_main(msg, tag=tag, run_id=run_id)
+            except Exception:
+                pass
+
+        def _release_job():
+            if job is not None:
+                job.close()  # drop the handle; tree is already gone by here
+
+        try:
+            if proc.poll() is not None:
+                _release_job()
+                return  # already exited
+            if os.name == "nt":
+                if graceful:
+                    try:
+                        proc.send_signal(signal.CTRL_BREAK_EVENT)
+                        _log("Sent stop signal to hardware run; waiting for COM release…")
+                        proc.wait(timeout=graceful_timeout)
+                        _log("Hardware run stopped cleanly; COM released.", tag="done")
+                        _release_job()
+                        return
+                    except subprocess.TimeoutExpired:
+                        _log("Hardware run did not stop in time — force-killing process tree…",
+                             tag="error")
+                    except Exception as e:
+                        _log(f"Could not signal hardware run ({e}); force-killing…", tag="error")
+                # Force-kill main.py AND its serial/zombi children so COM frees.
+                # The job kills the whole tree atomically even if main.py already
+                # died (taskkill /T can't reach an orphan of a dead parent); fall
+                # back to taskkill only when no job was established.
+                if job is not None and job.ok:
+                    job.terminate()
+                else:
+                    try:
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                       capture_output=True)
+                    except Exception as e:
+                        _log(f"taskkill failed: {e}", tag="error")
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                _release_job()
+            else:
+                # POSIX: terminate (catchable) then hard-kill.
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=graceful_timeout if graceful else 3.0)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        except Exception as e:
+            _log(f"Error stopping hardware run: {e}", tag="error")
+            _release_job()
+
+    def _reap_hw_procs(self, graceful: bool = False):
+        """Force any still-alive hardware process trees to exit, then forget the
+        dead ones. Used before a new launch and on app close so a lingering
+        serial child never keeps COM5 open."""
+        for proc in list(self._hw_procs):
+            try:
+                if proc.poll() is None:
+                    self._terminate_hw_proc_tree(proc, graceful=graceful)
+            except Exception:
+                pass
+        self._hw_procs = [p for p in self._hw_procs if p.poll() is None]
+
+    def _on_app_close(self):
+        """Window-close handler: release COM by killing hardware trees first."""
+        try:
+            self._reap_hw_procs(graceful=False)
+        except Exception:
+            pass
+        self.destroy()
+
     def _register_active_run(self, pause_event: threading.Event, run_id: str,
                              stop_event: threading.Event | None = None,
                              proc: subprocess.Popen | None = None):
@@ -3753,12 +3972,16 @@ class ZoMBIApp(tk.Tk):
         info = self._active_runs.get(run_id)
         if info is None:
             return
-        # Hardware run: terminate the subprocess
+        # Hardware run: stop the whole process tree so the serial child releases
+        # COM (a plain terminate() would orphan it). Runs on a background thread
+        # because the graceful path waits up to ~15s for a clean port close.
         proc = info.get("proc")
         if proc is not None and proc.poll() is None:
-            self.log_to_main(f"Terminating hardware process for {run_id} …",
+            self.log_to_main(f"Stopping hardware process for {run_id} …",
                              tag="info", run_id=run_id)
-            proc.terminate()
+            threading.Thread(
+                target=self._terminate_hw_proc_tree, args=(proc, run_id),
+                kwargs={"graceful": True}, daemon=True).start()
             return
         # Synthetic run: signal the stop event
         stop_ev = info.get("stop_event")
@@ -3870,6 +4093,19 @@ class ZoMBIApp(tk.Tk):
                         log_fh.flush()
                     except Exception:
                         log_fh = None
+                # Make sure no serial child from a previous run is still holding
+                # COM before we start a new one (belt-and-suspenders alongside the
+                # stop/close handlers).
+                app._reap_hw_procs(graceful=False)
+                # Launch main.py in its own process group so we can send it a
+                # CTRL_BREAK for a clean shutdown, and so force-killing its tree
+                # never touches the GUI.
+                _popen_kwargs = {}
+                if os.name == "nt":
+                    _popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                # Kill-on-close job: owns the whole run tree so the serial child
+                # can never orphan COM (also auto-killed by the OS if the GUI dies).
+                _job = _WinJobObject()
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -3879,8 +4115,14 @@ class ZoMBIApp(tk.Tk):
                     bufsize=1,
                     cwd=proj_root,
                     env=_env,
+                    **_popen_kwargs,
                 )
+                # Assign now, before main.py has imported/spawned its serial child,
+                # so that child is captured by the job too.
+                _job.assign(proc)
+                proc._zombi_job = _job
                 proc_ref[0] = proc
+                app._hw_procs.append(proc)
                 if hw_run_id:
                     app.after(0, lambda: app._register_active_run(
                         threading.Event(), hw_run_id, proc=proc))

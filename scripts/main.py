@@ -165,6 +165,27 @@ def main():
     else:
         print("[Main] Skipping database reset (resuming trial)")
 
+    # needles.db is reset on EVERY hardware run (new or resume). When resuming,
+    # preload the already-discovered needles so the DB reflects the run's state
+    # before the serial (DiSCO) link is established. Sorted best-first inside.
+    try:
+        from src.utils.needles_db import (
+            reset_needles_db, write_needles, load_checkpoint_needles, read_run_dims,
+        )
+        reset_needles_db()
+        if resume_uuid is not None:
+            _ckpt = checkpoint_dir or str(Path("actual_runs") / "checkpoints")
+            preload = load_checkpoint_needles(_ckpt, resume_uuid)
+            if preload:
+                dims_for_db = (optimizing_dims
+                               or read_run_dims(_ckpt, resume_uuid)
+                               or [0, 8, 9])
+                n = write_needles(preload, dims_for_db)
+                print(f"[Main] needles.db preloaded with {n} discovered needle(s).")
+        print("[Main] needles.db reset complete.")
+    except Exception as e:
+        print(f"[Main] Warning: needles.db init failed: {e}")
+
     shutdown = multiprocessing.Event()
     p_serial: multiprocessing.Process | None = None
     p_zombi: multiprocessing.Process | None = None
