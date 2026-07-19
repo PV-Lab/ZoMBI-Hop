@@ -178,6 +178,7 @@ import os
 import random
 import shlex
 import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -2457,6 +2458,41 @@ def reseed_ensemble(landscape: LandscapeSpec, config: dict):
     return fn, true_optima, grid_vals
 
 
+def _render_conet_artifacts(trial_dir: str, *, timeout_s: int = 1800) -> None:
+    """Render ``conet.png`` (the run's own samples + discovered needles) and
+    ``conet_uniform.png`` (a uniform-sampling baseline of the same landscape with
+    its true optima starred) for a completed ensemble repeat.
+
+    Each render runs as an isolated subprocess: the CoNet builder fits UMAP on a
+    full N×N distance matrix (>10 GB for ~19k samples), so keeping it out of this
+    process means an OOM, timeout, or crash there is logged and skipped rather than
+    taking the MOBO run down before its metrics.json lands.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    viz = os.path.join(repo_root, "visualization")
+    env = dict(os.environ, MPLBACKEND="Agg")
+    jobs = [
+        ("conet.png", [sys.executable, os.path.join(viz, "plot_10d.py"),
+                       "--run", trial_dir, "--needles",
+                       "--save", os.path.join(trial_dir, "conet.png")]),
+        ("conet_uniform.png", [sys.executable, os.path.join(viz, "uniform_baseline_conet.py"),
+                               "--run", trial_dir,
+                               "--save", os.path.join(trial_dir, "conet_uniform.png")]),
+    ]
+    for name, cmd in jobs:
+        t0 = time.time()
+        try:
+            r = subprocess.run(cmd, env=env, cwd=repo_root, timeout=timeout_s,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if r.returncode == 0:
+                print(f"    [trial] {name} rendered ({time.time() - t0:.0f}s)", flush=True)
+            else:
+                tail = "\n      ".join((r.stdout or "").splitlines()[-3:])
+                print(f"    [trial] {name} render failed rc={r.returncode}:\n      {tail}", flush=True)
+        except Exception as exc:
+            print(f"    [trial] {name} render error: {exc}", flush=True)
+
+
 # ─── Single trial: run ZoMBI on the objective + write all artifacts ────────────
 
 def run_single_trial(
@@ -2698,6 +2734,11 @@ def run_single_trial(
         plot_convergence(os.path.join(trial_dir, "convergence.png"), dh, maximize)
     except Exception as exc:
         print(f"    [trial] static plot failed: {exc}")
+
+    # CoNet artifacts (ensemble runs only: the uniform baseline reconstructs the
+    # landscape from ensemble_config.json). Best-effort, isolated subprocesses.
+    if ensemble_config is not None:
+        _render_conet_artifacts(trial_dir)
 
     if landscape.render_ternary and grid_pts is not None and grid_vals is not None and payloads:
         plots_dir = os.path.join(trial_dir, "plots")
