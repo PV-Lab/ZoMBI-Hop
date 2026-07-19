@@ -43,11 +43,63 @@ viewer, and main) lives at the very bottom.
 from __future__ import annotations
 
 import argparse
+import itertools
 import re  # noqa: F401  (used by the copied build_formula chemistry helpers)
 import sys
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
+
+
+class _Progress:
+    """Tiny threaded spinner so a long, blocking stage (S-matrix build, UMAP fit,
+    dominance fields) shows it is *thinking*, not *stuck*. Prints a rotating glyph +
+    label + elapsed seconds to stderr, updating ~5x/sec, and clears the line on exit.
+    No-ops (stays silent) when stderr is not a TTY, so piped/redirected output and the
+    headless PNG path stay clean. Use as a context manager:
+
+        with _Progress("building UMAP embedding"):
+            ...heavy work...
+    """
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, label, stream=sys.stderr):
+        self.label = label
+        self.stream = stream
+        self.enabled = bool(getattr(stream, "isatty", lambda: False)())
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _run(self):
+        t0 = time.monotonic()
+        for frame in itertools.cycle(self.FRAMES):
+            if self._stop.is_set():
+                break
+            self.stream.write(f"\r  {frame} {self.label} … {time.monotonic() - t0:5.1f}s")
+            self.stream.flush()
+            self._stop.wait(0.2)
+
+    def __enter__(self):
+        if self.enabled:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        else:
+            # non-TTY: still leave a one-line breadcrumb so logs show the stage started
+            self.stream.write(f"  … {self.label}\n"); self.stream.flush()
+        self._t0 = time.monotonic()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join()
+            dt = time.monotonic() - self._t0
+            mark = "✗" if exc_type else "✓"
+            self.stream.write(f"\r  {mark} {self.label} … {dt:5.1f}s\n")
+            self.stream.flush()
+        return False
 
 # project root on sys.path so `src` imports resolve
 _HERE = Path(__file__).resolve().parent
@@ -199,8 +251,15 @@ CN_PRETTY = {"MAPbI3": r"MAPbI$_3$", "MAPbBr3": r"MAPbBr$_3$", "FAPbI3": r"FAPbI
 def _apply_mpl_theme():
     """Point matplotlib at the dark UI theme (idempotent; called before any figure)."""
     import matplotlib as mpl
+    from matplotlib import font_manager
+    # Only keep the primary UI font if it's actually installed. On headless HPC
+    # nodes Segoe UI (a Windows font) is absent, and matplotlib otherwise emits a
+    # "findfont: Font family 'Segoe UI' not found." warning for every text
+    # element, flooding stderr. Drop it there and fall straight to DejaVu Sans.
+    installed = {f.name for f in font_manager.fontManager.ttflist}
+    font_family = ([UI_FONT] if UI_FONT in installed else []) + ["DejaVu Sans"]
     mpl.rcParams.update({
-        "font.family": [UI_FONT, "DejaVu Sans"],
+        "font.family": font_family,
         "text.color": UI_TEXT,
         "axes.edgecolor": UI_FAINT,
         "axes.labelcolor": UI_TEXT,
@@ -555,11 +614,15 @@ def build_conet_structure(comp, comp_names, resp, iters, resp_names,
     dom = comp.argmax(1)
 
     active = comp > CN_FLOOR
-    S = np.zeros((N, N))
-    for c in range(comp.shape[1]):
-        S += np.where(np.outer(active[:, c], active[:, c]),
-                      np.minimum.outer(comp[:, c], comp[:, c]), 0.0)
-    np.fill_diagonal(S, 0.0)
+    with _Progress(f"co-occurrence matrix ({N}×{N})"):
+        # Zero out inactive fractions up front: min(mc_i, mc_j) is then already 0 whenever either
+        # sample is inactive in component c, so the explicit active-outer + where() masking (which
+        # allocated two extra N×N temporaries per component) is redundant. Bit-identical result.
+        mc = np.where(active, comp, 0.0)
+        S = np.zeros((N, N))
+        for c in range(comp.shape[1]):
+            S += np.minimum.outer(mc[:, c], mc[:, c])
+        np.fill_diagonal(S, 0.0)
 
     A = (S / (S.max() + 1e-12)) ** CN_BETA
     Dmat = 1.0 - A; np.fill_diagonal(Dmat, 0.0)
@@ -570,8 +633,9 @@ def build_conet_structure(comp, comp_names, resp, iters, resp_names,
         # purpose (inverse_transform is never used), and n_jobs=1 matches what seeding forces anyway.
         warnings.filterwarnings("ignore", message="using precomputed metric.*")
         warnings.filterwarnings("ignore", message="n_jobs value.*overridden to 1")
-        E = umap.UMAP(n_neighbors=nn, min_dist=min_dist, spread=CN_UMAP_SPREAD,
-                      random_state=CN_SEED, metric="precomputed", n_jobs=1).fit_transform(Dmat)
+        with _Progress(f"UMAP embedding ({N} nodes)"):
+            E = umap.UMAP(n_neighbors=nn, min_dist=min_dist, spread=CN_UMAP_SPREAD,
+                          random_state=CN_SEED, metric="precomputed", n_jobs=1).fit_transform(Dmat)
     # Cache the RAW embedding + the gap-squashed/PCA-oriented layout so the PURITY knob can re-warp the
     # map without a UMAP re-fit; then apply the purity warp for the current threshold.
     E_raw = E - E.mean(0)
@@ -581,12 +645,18 @@ def build_conet_structure(comp, comp_names, resp, iters, resp_names,
     ccolor = _assign_colors_by_space(list(comp_names), E, dom)
 
     edges = {}
-    for i in range(N):
-        for j in np.argsort(-S[i])[:CN_KNN]:
-            if S[i, j] <= 0:
-                continue
-            a, b = (i, j) if i < j else (j, i)
-            edges[(a, b)] = S[i, j]
+    with _Progress(f"k-NN graph edges ({N} nodes)"):
+        k = min(CN_KNN, N - 1)
+        for i in range(N):
+            row = S[i]
+            # argpartition finds the top-k neighbours in O(N) without fully sorting the row; the
+            # edges dict is keyed by pair with weight S[i,j], so the order within the top-k is
+            # irrelevant and the resulting graph is identical to the argsort version.
+            for j in np.argpartition(-row, k)[:k]:
+                if row[j] <= 0:
+                    continue
+                a, b = (i, j) if i < j else (j, i)
+                edges[(a, b)] = row[j]
     if edges:
         ei = np.array([k[0] for k in edges]); ej = np.array([k[1] for k in edges])
         ew = np.array(list(edges.values()))
@@ -1468,7 +1538,8 @@ def build_conet(comp, names, resp, iters, umap_md=CN_UMAP_MD, gap_reach=CN_GAP_R
     M["iters"] = np.asarray(iters, float)
     M["needles"] = _needle_rows(M["comp"], needles_comp)
     M["show_needles"] = bool(show_needles)
-    F = conet_dominance_fields(M)
+    with _Progress("dominance fields"):
+        F = conet_dominance_fields(M)
     return M, F
 
 
@@ -1706,6 +1777,24 @@ def save_png(M, F, bounds, title, out_path, target_eg=TARGET_EG_DEFAULT, dpi=130
     fig.text(0.5, 0.985, title, ha="center", va="top", color=UI_TEXT, fontsize=12.5)
     fig.savefig(out_path, dpi=dpi, facecolor=UI_BG)
     return out_path
+
+
+def render_run_conet(run_dir, save_path=None, *, snapshot=None, show_needles=True,
+                     umap_md=CN_UMAP_MD, gap_reach=CN_GAP_REACH, purity_thr=CN_PURITY_THR):
+    """Render a run's CoNet PNG headlessly (the same view ``main --save`` produces).
+
+    Loads the run's own samples + discovered needles, builds the CoNet and writes
+    the PNG to ``save_path`` (default: ``<run_dir>/conet.png``). Returns
+    ``(png_path, n_stars_drawn)``.
+    """
+    run_dir = Path(run_dir)
+    save_path = Path(save_path) if save_path else run_dir / "conet.png"
+    comp, names, resp, iters, title, needles_comp = load_run_conet_data(run_dir, snapshot)
+    M, F = build_conet(comp, names, resp, iters, umap_md=umap_md, gap_reach=gap_reach,
+                       purity_thr=purity_thr, needles_comp=needles_comp, show_needles=show_needles)
+    bounds = conet_bounds(resp)
+    out = save_png(M, F, bounds, title, str(save_path))
+    return out, len(M["needles"])
 
 
 # ---------------------------------------------------------------------------
