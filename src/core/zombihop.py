@@ -19,6 +19,10 @@ from ..utils.simplex import (
 )
 from ..utils.datahandler import DataHandler
 from ..utils.gp_simplex import GPSimplex
+from .hparam_live import (
+    apply_pending as apply_pending_hparams,
+    write_effective as write_effective_hparams,
+)
 
 
 # --- CUDA optimization settings (when CUDA is available) ---
@@ -715,6 +719,12 @@ class ZoMBIHop:
 
         start_time = time.time() if time_limit_hours is not None else None
 
+        # Publish the in-force hyperparameters (and clear any stale override left
+        # by a previous run of this UUID) so a live retune starts from truth.
+        write_effective_hparams(self)
+        for _chg in apply_pending_hparams(self, log=self._log):
+            self._log(f"  [hparams] {_chg}")
+
         finished = False
         activation, zoom, iteration, _ = dh.get_iteration_state()
         start_activation = activation
@@ -799,8 +809,20 @@ class ZoMBIHop:
                 # constraint (needle declaration / zoom-in require ≥ this many).
                 iters_this_zoom = 0
 
-                for iteration in range(start_iteration, dh.max_iterations):
+                # Mirrors `for iteration in range(start_iteration, dh.max_iterations)`
+                # exactly (`iteration` holds the last-executed index on exit), but
+                # re-reads dh.max_iterations every pass so a manual change to it
+                # takes effect within this zoom rather than at the next one.
+                _next_iteration = start_iteration
+                while _next_iteration < dh.max_iterations:
+                    iteration = _next_iteration
+                    _next_iteration += 1
                     self._log(f"\n  · iter {iteration+1}/{dh.max_iterations}")
+
+                    # Operator hyperparameter changes, applied between measured lines.
+                    for _chg in apply_pending_hparams(zombi=self, log=self._log):
+                        self._log(f"  [hparams] {_chg}")
+
                     # Time limit check
                     if time_limit_hours is not None:
                         elapsed_hours = (time.time() - start_time) / 3600.0

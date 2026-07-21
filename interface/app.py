@@ -60,6 +60,13 @@ except ImportError:
     _BOTORCH_OK = False
 
 from src import ZoMBIHop, LineBO
+from src.core.hparam_live import (
+    LIVE_EDITABLE_NAMES,
+    OVERRIDE_FILENAME as OVERRIDE_HPARAMS_FILENAME,
+    coerce as coerce_hparam,
+    read_effective as read_effective_hparams,
+    write_override as write_override_hparams,
+)
 from src.core.linebo import line_simplex_segment, zero_sum_dirs
 from src.utils.simplex import add_composition_noise, proj_simplex, get_tangent_basis
 from src.utils.datahandler import reconstruct_snapshot_tensors
@@ -824,6 +831,7 @@ class RunBrowserPanel(ttk.Frame):
         ttk.Button(bf, text="Refresh",  width=_bw, command=self.refresh).pack(side="left", padx=2)
         ttk.Button(bf, text="Load",     width=_bw, command=self._load_selected).pack(side="left", padx=2)
         ttk.Button(bf, text="New Run",  width=_bw, command=app.open_new_run_dialog).pack(side="left", padx=2)
+        ttk.Button(bf, text="Adjust",   width=_bw, command=self._adjust_selected).pack(side="left", padx=2)
         ttk.Button(bf, text="Stop Run", width=_bw, command=self._stop_selected,
                    style="Danger.TButton").pack(side="left", padx=2)
         ttk.Button(bf, text="Delete",   width=_bw, command=self._delete_selected,
@@ -897,6 +905,21 @@ class RunBrowserPanel(ttk.Frame):
             messagebox.showinfo("Select", "Click a run first.")
             return
         HardwareResumeDialog(self, self._app, self._runs[sel[0]])
+
+    def _adjust_selected(self):
+        sel = self._lb.curselection()
+        if not sel:
+            messagebox.showinfo("Select", "Click a running run first.")
+            return
+        run_info = self._runs[sel[0]]
+        run_id   = run_info["run_id"]
+        if run_id not in self._app._active_runs:
+            messagebox.showinfo(
+                "Not running",
+                f"{run_id} is not currently running.\n\nHyperparameters can only be "
+                "adjusted on a run that is in flight — start or resume it first.")
+            return
+        LiveHparamsDialog(self, self._app, run_id, run_info["run_dir"])
 
     def _delete_selected(self):
         sel = self._lb.curselection()
@@ -3085,6 +3108,245 @@ class LiveLogPanel(ttk.LabelFrame):
             "status_tag": "",
         })
         self._status_var.set("A:—  Z:—  I:—")
+
+
+class _Tooltip:
+    """Minimal hover tooltip for a Tk widget (no external deps)."""
+
+    def __init__(self, widget, text: str, wraplength: int = 380):
+        self._widget = widget
+        self._text = text
+        self._wrap = wraplength
+        self._tip: Optional[tk.Toplevel] = None
+        self._job: Optional[str] = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _e=None):
+        self._cancel()
+        self._job = self._widget.after(450, self._show)
+
+    def _cancel(self):
+        if self._job:
+            try:
+                self._widget.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+    def _show(self):
+        if self._tip is not None or not self._text:
+            return
+        x = self._widget.winfo_rootx() + 20
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        self._tip = tk.Toplevel(self._widget)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self._tip, text=self._text, justify="left",
+                 background="#ffffe0", relief="solid", borderwidth=1,
+                 font=("Segoe UI", 8), wraplength=self._wrap).pack(ipadx=3, ipady=2)
+
+    def _hide(self, _e=None):
+        self._cancel()
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+
+class LiveHparamsDialog(tk.Toplevel):
+    """
+    Manually change ZoMBI-Hop hyperparameters on a run that is already in flight.
+
+    Values are written to ``<run_dir>/hparams_override.json``; the optimiser
+    consumes them at the top of its next iteration — i.e. between measured lines
+    — and republishes what is actually in force. This dialog watches for that
+    handoff so "Apply" reports *applied*, not merely *requested*. Identical for
+    synthetic (in-process thread) and hardware (subprocess) runs, since the file
+    lives in the shared run directory.
+    """
+
+    _POLL_MS = 700
+
+    def __init__(self, parent, app: "ZoMBIApp", run_id: str, run_dir):
+        super().__init__(parent)
+        self.title(f"Adjust Hyperparameters — {run_id}")
+        self.geometry("560x560")
+        self._app     = app
+        self._run_id  = run_id
+        self._run_dir = Path(run_dir)
+        self._vars: dict[str, tk.StringVar] = {}
+        self._widgets: dict[str, tk.Widget] = {}
+        self._specs: dict[str, tuple] = {}
+        # Exact text last written into each field. A field counts as edited only
+        # if its text differs from this, so untouched fields are never sent (and
+        # float round-tripping, e.g. "0.02" vs 0.02, can't fake a change).
+        self._baseline: dict[str, str] = {}
+        self._effective: dict = {}
+        self._poll_job: Optional[str] = None
+        self._build()
+        self._reload(announce=False)
+        self._poll()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.transient(parent)
+
+    # ── construction ─────────────────────────────────────────────────────
+    def _build(self):
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(top, text="Edit a value and click Apply. Changes take effect on "
+                            "the run's next iteration (between printed lines); "
+                            "in-flight lines are never interrupted.",
+                  foreground="gray", wraplength=520, justify="left").pack(anchor="w")
+
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        for cat, params in HPARAM_CATEGORIES.items():
+            live = [p for p in params if p[0] in LIVE_EDITABLE_NAMES]
+            if not live:
+                continue
+            tab = ttk.Frame(nb)
+            nb.add(tab, text=cat)
+            for row, (name, typ, default, label, desc) in enumerate(live):
+                self._specs[name] = (typ, default, label, desc)
+                lbl = ttk.Label(tab, text=f"{label}:", anchor="w")
+                lbl.grid(row=row, column=0, sticky="w", padx=8, pady=3)
+                var = tk.StringVar(value=str(default))
+                self._vars[name] = var
+                if name == "acquisition_type":
+                    w = ttk.OptionMenu(tab, var, str(default), "ucb", "ei")
+                else:
+                    w = ttk.Entry(tab, textvariable=var, width=16)
+                w.grid(row=row, column=1, sticky="w", padx=4, pady=3)
+                self._widgets[name] = w
+                hint = ttk.Label(tab, text=name, foreground="#999999",
+                                 font=("Consolas", 8))
+                hint.grid(row=row, column=2, sticky="w", padx=6)
+                for target in (lbl, w, hint):
+                    _Tooltip(target, desc)
+            tab.columnconfigure(2, weight=1)
+
+        self._status_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self._status_var, wraplength=520,
+                  justify="left", font=("Segoe UI", 8)).pack(
+            anchor="w", padx=8, pady=(0, 4))
+
+        bf = ttk.Frame(self)
+        bf.pack(fill="x", padx=8, pady=(0, 8))
+        self._apply_btn = ttk.Button(bf, text="Apply", command=self._apply)
+        self._apply_btn.pack(side="left")
+        ttk.Button(bf, text="Revert to in-force",
+                   command=lambda: self._reload(announce=True)).pack(side="left", padx=6)
+        ttk.Button(bf, text="Close", command=self._close).pack(side="right")
+
+    # ── in-force values ──────────────────────────────────────────────────
+    def _read_in_force(self) -> dict:
+        """In-force values: what the optimiser published, else the run's
+        config.json, else the shipped defaults."""
+        eff = read_effective_hparams(self._run_dir)
+        if eff:
+            return eff
+        merged = dict(DEFAULT_HPARAMS)
+        cfg = self._run_dir / "config.json"
+        if cfg.exists():
+            try:
+                data = json.loads(cfg.read_text())
+                merged.update({k: v for k, v in data.items()
+                               if k in LIVE_EDITABLE_NAMES})
+            except Exception:
+                pass
+        return {k: v for k, v in merged.items() if k in LIVE_EDITABLE_NAMES}
+
+    def _set_field(self, name: str, value) -> None:
+        """Write a field and re-baseline it, so it reads as unedited."""
+        txt = str(value)
+        self._vars[name].set(txt)
+        self._baseline[name] = txt
+
+    def _reload(self, announce: bool):
+        self._effective = self._read_in_force()
+        for name in self._vars:
+            if name in self._effective:
+                self._set_field(name, self._effective[name])
+            else:
+                # Nothing in force for this one (partial effective file) — keep
+                # the displayed default and baseline it, so it is only ever sent
+                # if the user actually types something different.
+                self._baseline[name] = self._vars[name].get()
+        if announce:
+            self._status_var.set("Reverted to the values currently in force.")
+
+    def _edited(self) -> dict:
+        """Fields the user actually changed, coerced/validated."""
+        out = {}
+        for name, var in self._vars.items():
+            txt = var.get().strip()
+            if not txt or txt == self._baseline.get(name):
+                continue
+            out[name] = coerce_hparam(name, txt)  # raises ValueError on bad input
+        return out
+
+    # ── apply / confirm ──────────────────────────────────────────────────
+    def _apply(self):
+        if self._run_id not in self._app._active_runs:
+            messagebox.showwarning(
+                "Run not active",
+                f"{self._run_id} is not currently running, so there is nothing to "
+                "change. Start or resume the run first.")
+            return
+        try:
+            hp = self._edited()
+        except (ValueError, TypeError) as exc:
+            messagebox.showerror("Invalid value", str(exc))
+            return
+        if not hp:
+            self._status_var.set("No changes to apply.")
+            return
+        try:
+            write_override_hparams(self._run_dir, hp)
+        except Exception as exc:
+            messagebox.showerror("Could not write override", str(exc))
+            return
+        summary = ", ".join(f"{k}={v}" for k, v in hp.items())
+        self._status_var.set(f"Requested: {summary}\nWaiting for the run to pick "
+                             f"it up at its next iteration…")
+        self._app.log_to_main(f"[hparams] manual change requested for "
+                              f"{self._run_id}: {summary}",
+                              tag="info", run_id=self._run_id)
+
+    def _poll(self):
+        """Watch for the optimiser consuming the override, then show what
+        actually took effect."""
+        pending = (self._run_dir / OVERRIDE_HPARAMS_FILENAME).exists()
+        if not pending:
+            new_eff = self._read_in_force()
+            if new_eff and new_eff != self._effective:
+                changed = {k: v for k, v in new_eff.items()
+                           if self._effective.get(k) != v}
+                self._effective = new_eff
+                try:
+                    focused = self.focus_get()
+                except Exception:
+                    focused = None
+                for name in self._vars:
+                    # Don't yank the field out from under someone mid-edit.
+                    if name in new_eff and self._widgets.get(name) is not focused:
+                        self._set_field(name, new_eff[name])
+                if changed:
+                    self._status_var.set(
+                        "Applied by the run: "
+                        + ", ".join(f"{k}={v}" for k, v in changed.items()))
+        self._poll_job = self.after(self._POLL_MS, self._poll)
+
+    def _close(self):
+        if self._poll_job:
+            try:
+                self.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
+        self.destroy()
 
 
 class NewRunDialog(tk.Toplevel):
