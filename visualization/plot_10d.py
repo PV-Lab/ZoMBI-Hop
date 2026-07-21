@@ -186,7 +186,7 @@ CN_FILL_TAPER = 0.10       # soft outer fade of the fill
 CN_FILL_BLUR = 5.0         # extra Gaussian blur (grid cells) on the fill alpha
 CN_MIN_CELLS, CN_MIN_NODES = 30, 4
 CN_PCT = (10.0, 90.0)      # CoNet colour bounds: 10th-90th percentile of the response
-CN_STAR = "#ffcf33"        # incumbent (best Objective) marker
+CN_STAR = "#ff2d2d"        # discovered-needle / incumbent (best Objective) marker (red)
 # ---- two LIVE, user-tunable layout knobs (persist across new samples / timeline; see the UI) --------
 # CLUSTER DIST (self.gap_reach): when the campaign repeatedly samples one composition (e.g. near-pure
 # CsPbI3), that clique's UMAP neighbourhoods become self-contained and repulsion exiles it many main-mass
@@ -768,9 +768,9 @@ def _cn_place_labels(ax, cands, names, F, iy, ix, border_mask):
     Cy, Cx = float(np.median(iy)), float(np.median(ix))
     # ---- per-label geometry (precomputed so a label can be RE-placed during the repulsion pass) ----
     for r in cands:
-        fs = 9.0
-        w_pt = max(len(str(names[c])) for c in r["comps"]) * 0.60 * fs + 16   # text + brackets
-        h_pt = len(r["comps"]) * fs * 1.5 + 6
+        fs = 27.0                                         # match _draw_blend_label: 3x-scaled labels
+        w_pt = max(len(str(names[c])) for c in r["comps"]) * 0.60 * fs + 40   # text + brackets
+        h_pt = len(r["comps"]) * fs * 1.5 + 12
         r["hw"], r["hh"] = 0.5 * w_pt * ppx, 0.5 * h_pt * ppy
         # test a PADDED box (+2 cells) so labels keep a margin from points/borders/each other
         r["_cw"] = max(int(np.ceil(r["hw"] / cellw)), 1) + 2
@@ -948,24 +948,26 @@ def _draw_blend_label(ax, x, y, pretty_names, color, alpha=1.0, stroke_col=None)
     import matplotlib.patheffects as pe
     from matplotlib.offsetbox import TextArea, VPacker, HPacker, DrawingArea, AnnotationBbox
     from matplotlib.lines import Line2D
-    rgba = mpl.colors.to_rgba(color, alpha)
-    stroke = [pe.withStroke(linewidth=2.4,
-                            foreground=mpl.colors.to_rgba(stroke_col or UI_BG, 0.5 * alpha))]
-    fs = 9.0
+    # WHITE text + brackets with a BLACK outline for maximum readability over the coloured map. The
+    # region `color`/`stroke_col` args are kept in the signature (callers still pass them) but the label
+    # itself no longer tints with the region hue -- only the leader line does.
+    rgba = mpl.colors.to_rgba("white", alpha)
+    stroke = [pe.withStroke(linewidth=4.0, foreground=mpl.colors.to_rgba("black", alpha))]
+    fs = 27.0                                              # ~3x the old 9.0 pt: big, bold region labels
     segs = [TextArea(nm, textprops=dict(color=rgba, fontsize=fs, fontweight="bold", path_effects=stroke))
             for nm in pretty_names]
-    col = VPacker(children=segs, align="center", pad=0, sep=1)
-    h = len(pretty_names) * (fs * 1.42) + 2                 # approx stack height (points)
-    bw, serif = 3.2, 3.0                                    # bracket stem-to-serif width / serif length
+    col = VPacker(children=segs, align="center", pad=0, sep=3)
+    h = len(pretty_names) * (fs * 1.42) + 6                 # approx stack height (points)
+    bw, serif = 9.6, 9.0                                   # bracket stem-to-serif width / serif length (3x)
 
     def bracket(left):
         da = DrawingArea(bw, h, 0, 0)
         xs = ([serif, 0, 0, serif] if left else [0, serif, serif, 0])
-        da.add_artist(Line2D(xs, [0, 0, h, h], color=rgba, lw=1.6, solid_capstyle="round",
+        da.add_artist(Line2D(xs, [0, 0, h, h], color=rgba, lw=3.2, solid_capstyle="round",
                              solid_joinstyle="miter", path_effects=stroke))
         return da
 
-    box = HPacker(children=[bracket(True), col, bracket(False)], align="center", pad=0, sep=2)
+    box = HPacker(children=[bracket(True), col, bracket(False)], align="center", pad=0, sep=5)
     ax.figure.add_artist(AnnotationBbox(box, (x, y), xycoords=ax.transData, frameon=False, pad=0,
                                         box_alignment=(0.5, 0.5), annotation_clip=False, zorder=30))
 
@@ -1066,14 +1068,27 @@ def _conet_underlay(ax, M, F, pal=None, labels=True):
         r["alpha"] = ((pal["a_pure"] or CN_PURE_ALPHA) if r["kind"] == "pure"
                       else (pal["a_blend"] or CN_BLEND_ALPHA))   # exports use stronger alphas on white
         ind = gaussian_filter(cells.astype(float), sigma=2.0)
+
+        def _outline(cs, black_lw):
+            """WHITE region border with a BLACK outline (readability over the coloured map)."""
+            eff = [pe.withStroke(linewidth=black_lw, foreground="black")]
+            try:
+                cs.set_path_effects(eff)                  # mpl>=3.8: ContourSet is a Collection
+            except AttributeError:                        # older mpl: per-LineCollection
+                for c in cs.collections:
+                    c.set_path_effects(eff)
+
         if r["kind"] == "pure":
-            ax.contour(gx, gy, ind, [0.5], colors=[r["color"]],
-                       linewidths=1.8 if r["dashed"] else 2.2, alpha=r["alpha"],
-                       linestyles="dashed" if r["dashed"] else "solid", zorder=6)
+            lw = 1.8 if r["dashed"] else 2.2
+            cs = ax.contour(gx, gy, ind, [0.5], colors="white",
+                            linewidths=lw, alpha=r["alpha"],
+                            linestyles="dashed" if r["dashed"] else "solid", zorder=6)
+            _outline(cs, lw + 2.2)
         else:
             for comp, lev in zip(r["comps"], np.linspace(0.5, 0.85, len(r["comps"]))):
-                ax.contour(gx, gy, ind, [lev], colors=[bcol[names[comp]]], linewidths=1.6,
-                           alpha=r["alpha"], linestyles="dashed", zorder=6)
+                cs = ax.contour(gx, gy, ind, [lev], colors="white", linewidths=1.6,
+                                alpha=r["alpha"], linestyles="dashed", zorder=6)
+                _outline(cs, 3.8)
         r["border"] = cells ^ binary_erosion(cells)
         border_all |= r["border"]
         # leader ANCHOR = the CENTROID of the region's cells, verified to lie INSIDE the boundary: for a
@@ -1115,8 +1130,9 @@ def _conet_underlay(ax, M, F, pal=None, labels=True):
                   r["hh"] / abs(ddy) if abs(ddy) > 1e-12 else np.inf]
             t0 = min(min(tt), 1.0)
             ax.plot([r["lx"] + ddx * t0, r["lx"] + ddx * 0.92], [r["ly"] + ddy * t0, r["ly"] + ddy * 0.92],
-                    color=r["color"], lw=1.3, alpha=0.75, zorder=5.5,   # leader: thicker, fixed 75%
-                    clip_on=False)                                      # labels may sit outside the panel
+                    color="white", lw=3.0, alpha=0.9, zorder=5.5,       # leader: white, thick
+                    clip_on=False,                                      # labels may sit outside the panel
+                    path_effects=[pe.withStroke(linewidth=5.4, foreground="black")])  # black outline
         _draw_blend_label(ax, r["lx"], r["ly"],
                           [CN_PRETTY.get(names[c], names[c]) for c in r["comps"]],
                           r["color"], alpha=r["alpha"], stroke_col=pal["stroke"])
@@ -1559,7 +1575,7 @@ def conet_bounds(resp, pct=CN_PCT):
 # single-panel CoNet layout (the live viewer's draw_conet is a 2x2 grid; a run
 # has a single Objective response, so we draw one large panel + legend/tooltip)
 # ---------------------------------------------------------------------------
-def _single_rects(fig, data_aspect=CONET_FRAME_ASPECT, x_lo=0.055, x_hi=CONET_LEGEND_X,
+def _single_rects(fig, data_aspect=CONET_FRAME_ASPECT, x_lo=0.045, x_hi=0.99,
                   y0=0.075, y1=0.94, cb_w=0.014, cb_pad=0.006):
     """One CoNet panel + right colourbar, sized to data_aspect within [x_lo,x_hi] x [y0,y1]."""
     fw, fh = fig.get_size_inches()
@@ -1582,10 +1598,11 @@ def draw_conet_single(fig, M, F, bounds, view=None, target_eg=TARGET_EG_DEFAULT,
     panel, cb = _single_rects(fig)
     _conet_panel(fig, panel, cb, M, F, "Objective", bounds, view, target_eg)
     _draw_umap_axes(fig, panel)                  # orientation L off the panel's bottom-left corner
-    strip = [0.875, 0.095, 0.115, 0.84]          # right strip: legend, or the tooltip while selected
+    # The Compositions / Node-Size legend has been removed so the CoNet panel can occupy the full width.
+    # The selected-sample tooltip (interactive click-to-inspect) still overlays a right strip when active.
     if tooltip is not None:
+        strip = [0.875, 0.095, 0.115, 0.84]
         return draw_tooltip(fig, strip, tooltip)
-    draw_conet_legend(fig, strip, ccolor=M.get("ccolor"))
     return None
 
 
