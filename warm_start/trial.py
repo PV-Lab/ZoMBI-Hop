@@ -364,9 +364,16 @@ def _write_artifacts(trial_dir, dh, snap_records, payloads, X_all_np, true_optim
     the trial's data, which is expensive to regenerate.
     """
     def _try(label, fn, *a, **k):
+        # SystemExit is caught alongside Exception because some best-effort plot
+        # helpers (e.g. optimize/coverage_plot._find_config) call sys.exit() on a
+        # missing input rather than raising. sys.exit raises SystemExit, which is a
+        # BaseException, so a plain ``except Exception`` would let it abort the whole
+        # trial — defeating this guard's purpose of isolating per-artifact failures.
+        # The Ensemble-landscape coverage plot has no run_config.json and is not
+        # applicable here, so its exit must degrade to a skipped artifact.
         try:
             fn(*a, **k)
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             print(f"    [artifact] {label} failed: {exc}")
 
     _try("points.csv", rm.write_points_csv,

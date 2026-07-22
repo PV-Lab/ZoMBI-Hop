@@ -160,7 +160,10 @@ def main() -> None:
     report = build_report(rows)
     print(report)
 
-    with open(os.path.join(run_dir, "comparison.md"), "w") as f:
+    # encoding pinned: the report uses non-ASCII glyphs (the U+2212 minus in the
+    # "warm − cold" headers), and open()'s default is the locale codec — cp1252 on
+    # Windows, which cannot encode them and would abort the write.
+    with open(os.path.join(run_dir, "comparison.md"), "w", encoding="utf-8") as f:
         f.write(report + "\n")
     try:
         plot(rows, os.path.join(run_dir, "comparison.png"))

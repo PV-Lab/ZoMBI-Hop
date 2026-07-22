@@ -521,6 +521,7 @@ def build_ternary_figure(
     show_points: bool = True,
     gp_length_scale: float = 0.3,
     scale: float = 1.0,
+    color_limits: tuple[float, float] | None = None,
 ):
     """Interactive Plotly ternary: optional interpolated background + points overlay.
 
@@ -529,6 +530,9 @@ def build_ternary_figure(
 
     ``scale`` multiplies the measured-point marker size, corner-label fonts and
     the objective colorbar fonts (the triangle geometry itself is unchanged).
+
+    ``color_limits`` forces the viridis (vmin, vmax); pass it when two figures
+    must share one colour scale, else it is derived from this figure's data.
 
     Corner mapping mirrors comp_to_xy / matplotlib:
       col0 → bottom-left (b),  col1 → bottom-right (c),  col2 → top (a).
@@ -541,7 +545,7 @@ def build_ternary_figure(
         grid_pts, grid_vals = bg
     else:
         grid_pts = grid_vals = None
-    vmin, vmax = _color_limits(grid_vals, Y)
+    vmin, vmax = color_limits if color_limits is not None else _color_limits(grid_vals, Y)
 
     fig = go.Figure()
 
@@ -635,6 +639,7 @@ def build_quaternary_figure(
     show_points: bool = True,
     gp_length_scale: float = 0.3,
     scale: float = 1.0,
+    color_limits: tuple[float, float] | None = None,
 ):
     """Interactive Plotly 3D tetrahedron for d=4 compositions.
 
@@ -655,7 +660,7 @@ def build_quaternary_figure(
         grid_pts, grid_vals = bg
     else:
         grid_pts = grid_vals = None
-    vmin, vmax = _color_limits(grid_vals, Y)
+    vmin, vmax = color_limits if color_limits is not None else _color_limits(grid_vals, Y)
 
     colorbar = dict(
         title=dict(text=value_name, font=dict(size=14 * scale)),
