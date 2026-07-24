@@ -32,7 +32,10 @@ from ela.gp_tree import (
     tree_size,
     tree_to_string,
 )
-from ela.tier1 import TIER1_NAMES, compute_tier1, weighted_feature_loss
+from sklearn.metrics import r2_score
+
+from ela.features import rf_transform_predict
+from ela.tier1 import ALLOWED_FITNESS_NAMES, TIER1_NAMES, compute_tier1, weighted_feature_loss
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,12 @@ class EvolutionConfig:
     require_subspace_rmse: bool = True
     paper_ga: bool = True  # Muñoz GP operators + 60/30/10 offspring
     paper_mode: bool = True  # legacy alias for paper_ga (gp_tree / viz)
+    allow_rbf: bool = False  # localized ILR Gaussian bump primitive
+    oscillatory_bias: bool = False  # upweight sin/cos + additive stacking
+    rbf_upweight: bool = True  # high vs mild RBF sampling rates when allow_rbf
+    rbf_additive_only: bool = False  # trees are only sums of RBF bumps (+ optional const)
+    rbf_min_bumps: int = 1  # additive-only: floor on number of RBF leaves
+    rbf_max_bumps: int | None = None  # additive-only: ceiling (defaults to max_tree_depth)
     alpha_subspace: float = 3.0
     beta_complexity: float = 0.001
     tier1_gamma: float = 1.0
@@ -79,6 +88,10 @@ class EvolutionConfig:
     landscape_viz_every: int = 1
     landscape_grid_n: int = 100
     eval_workers: int = 1
+    # ELA(RF_g): features from RF fit on fixed samples of g, not raw g(z).
+    rf_transform_features: bool = False
+    rf_transform_n_estimators: int = 500
+    rf_transform_seed: int = 42
 
 
 def _elitism_count(cfg: EvolutionConfig) -> int:
@@ -95,24 +108,40 @@ def _spawn_offspring_trees(
     n_vars: int,
 ) -> list[Node]:
     """Create 1–2 child trees. Paper: 60% crossover, 30% mutation, 10% direct transfer."""
+    allow_rbf = bool(cfg.allow_rbf) or bool(cfg.rbf_additive_only)
+    oscillatory = bool(cfg.oscillatory_bias) and not cfg.paper_ga and not cfg.rbf_additive_only
+    rbf_up = bool(cfg.rbf_upweight) and allow_rbf
+    rbf_add = bool(cfg.rbf_additive_only)
+    mut_kw = dict(
+        n_vars=n_vars,
+        max_depth=cfg.max_tree_depth,
+        paper_mode=cfg.paper_ga and not rbf_add,
+        allow_rbf=allow_rbf,
+        oscillatory_bias=oscillatory,
+        rbf_upweight=rbf_up,
+        rbf_additive_only=rbf_add,
+        rbf_min_bumps=int(cfg.rbf_min_bumps),
+        rbf_max_bumps=cfg.rbf_max_bumps,
+    )
     if cfg.paper_ga:
         r = rng.random()
         if r < cfg.crossover_prob:
             p1 = _tournament_select(rng, pop, cfg.tournament_k)
             p2 = _tournament_select(rng, pop, cfg.tournament_k)
             return list(
-                crossover(rng, p1.tree, p2.tree, max_depth=cfg.max_tree_depth)
+                crossover(
+                    rng,
+                    p1.tree,
+                    p2.tree,
+                    max_depth=cfg.max_tree_depth,
+                    rbf_additive_only=rbf_add,
+                    rbf_min_bumps=int(cfg.rbf_min_bumps),
+                    rbf_max_bumps=cfg.rbf_max_bumps,
+                )
             )
         if r < cfg.crossover_prob + cfg.mutation_prob:
             parent = _tournament_select(rng, pop, cfg.tournament_k)
-            return [
-                mutate(
-                    rng,
-                    parent.tree,
-                    n_vars=n_vars,
-                    max_depth=cfg.max_tree_depth,
-                )
-            ]
+            return [mutate(rng, parent.tree, **mut_kw)]
         parent = _tournament_select(rng, pop, cfg.tournament_k)
         return [copy.deepcopy(parent.tree)]
 
@@ -120,7 +149,15 @@ def _spawn_offspring_trees(
         p1 = _tournament_select(rng, pop, cfg.tournament_k)
         p2 = _tournament_select(rng, pop, cfg.tournament_k)
         child_trees = list(
-            crossover(rng, p1.tree, p2.tree, max_depth=cfg.max_tree_depth)
+            crossover(
+                rng,
+                p1.tree,
+                p2.tree,
+                max_depth=cfg.max_tree_depth,
+                rbf_additive_only=rbf_add,
+                rbf_min_bumps=int(cfg.rbf_min_bumps),
+                rbf_max_bumps=cfg.rbf_max_bumps,
+            )
         )
     else:
         parent = _tournament_select(rng, pop, cfg.tournament_k)
@@ -129,7 +166,7 @@ def _spawn_offspring_trees(
     out: list[Node] = []
     for tree in child_trees:
         if rng.random() < cfg.mutation_prob:
-            tree = mutate(rng, tree, n_vars=n_vars, max_depth=cfg.max_tree_depth)
+            tree = mutate(rng, tree, **mut_kw)
         out.append(tree)
     return out
 
@@ -158,6 +195,38 @@ def _eval_objective(
         y, coeffs = predict_calibrated(tree, z, calib=calib)
         return y, coeffs
     return predict_calibrated(tree, z, y_ref=ctx.y_target)
+
+
+def _feature_y_dense(
+    tree: Node,
+    y_dense: np.ndarray,
+    ctx: EvolutionContext,
+    cfg: EvolutionConfig,
+    *,
+    calib: tuple[float, float],
+) -> tuple[np.ndarray, float | None, float | None]:
+    """Dense y for ELA features — optionally via RF(g).
+
+    Returns ``(y_features, rf_oob_r2, rf_vs_campaign_r2)``. OOB / vs-campaign
+    R² are set only when ``rf_transform_features`` is enabled.
+    """
+    if not cfg.rf_transform_features:
+        return y_dense, None, None
+    if ctx.x_rf_train is None or ctx.z_rf_train is None:
+        raise RuntimeError(
+            "rf_transform_features enabled but x_rf_train/z_rf_train missing on context"
+        )
+    y_train, _ = _eval_objective(tree, ctx.z_rf_train, ctx, cfg, calib=calib)
+    y_features, oob = rf_transform_predict(
+        ctx.x_rf_train,
+        y_train,
+        ctx.x_dense,
+        n_estimators=cfg.rf_transform_n_estimators,
+        random_state=cfg.rf_transform_seed,
+        return_oob=True,
+    )
+    vs_campaign = float(r2_score(ctx.y_target, y_features))
+    return y_features, float(oob), vs_campaign
 
 
 def evaluate_individual(
@@ -195,10 +264,21 @@ def evaluate_individual(
         ind.accepted = False
         return ind
 
+    y_features, rf_oob, rf_vs_campaign = _feature_y_dense(
+        ind.tree, y_dense, ctx, cfg, calib=(a, b),
+    )
+    if float(np.std(y_features)) < 1e-5:
+        ind.tier1_loss = 2.0
+        ind.tier1 = {}
+        ind.tier1_rel_err = {n: 1.0 for n in TIER1_NAMES}
+        ind.fitness = cfg.tier1_gamma * 2.0 + cfg.beta_complexity * ind.complexity
+        ind.accepted = False
+        return ind
+
     y_campaign, _ = _eval_objective(ind.tree, ctx.z_campaign, ctx, cfg, calib=(a, b))
     tier1 = compute_tier1(
         ctx.z_dense,
-        y_dense,
+        y_features,
         ctx.x_dense,
         x_campaign=ctx.x_campaign,
         y_campaign=ctx.y_campaign,
@@ -206,6 +286,10 @@ def evaluate_individual(
         maximize=ctx.maximize,
         seed=ctx.sample_seed,
     )
+    if rf_oob is not None:
+        tier1["oob_r2"] = float(rf_oob)
+    if rf_vs_campaign is not None:
+        tier1["rf_vs_campaign_r2"] = float(rf_vs_campaign)
     loss, rel = weighted_feature_loss(
         tier1,
         ctx.tier1_target,
@@ -324,12 +408,22 @@ def _tournament_select(rng: random.Random, pop: list[Individual], k: int) -> Ind
 def _init_population(rng: random.Random, ctx: EvolutionContext, cfg: EvolutionConfig) -> list[Individual]:
     pop: list[Individual] = []
     init_depth = cfg.max_tree_depth if cfg.paper_ga else cfg.max_tree_depth - 1
+    allow_rbf = bool(cfg.allow_rbf) or bool(cfg.rbf_additive_only)
+    oscillatory = bool(cfg.oscillatory_bias) and not cfg.paper_ga and not cfg.rbf_additive_only
+    rbf_up = bool(cfg.rbf_upweight) and allow_rbf
+    rbf_add = bool(cfg.rbf_additive_only)
     for _ in range(cfg.population):
         tree = random_tree(
             rng,
             n_vars=ctx.n_vars,
             max_depth=init_depth,
-            paper_mode=cfg.paper_ga,
+            paper_mode=cfg.paper_ga and not rbf_add,
+            allow_rbf=allow_rbf,
+            oscillatory_bias=oscillatory,
+            rbf_upweight=rbf_up,
+            rbf_additive_only=rbf_add,
+            rbf_min_bumps=int(cfg.rbf_min_bumps),
+            rbf_max_bumps=cfg.rbf_max_bumps,
         )
         pop.append(Individual(tree=tree))
     return pop
@@ -389,6 +483,7 @@ def _plot_generation_landscape(
         accepted=best.accepted,
         paper_mode=not cfg.linear_calibration,
         calib=None if not cfg.linear_calibration else (best.calib_a, best.calib_b),
+        rf_transform=cfg.rf_transform_features,
     )
     latest = land_dir / "latest.png"
     try:
@@ -475,6 +570,17 @@ def run_evolution(
     )
     cfg.paper_ga = bool(ctx.metadata.get("paper_ga", cfg.paper_ga))
     cfg.paper_mode = cfg.paper_ga
+    cfg.allow_rbf = bool(ctx.metadata.get("allow_rbf", cfg.allow_rbf))
+    cfg.oscillatory_bias = bool(ctx.metadata.get("oscillatory_bias", cfg.oscillatory_bias))
+    cfg.rbf_upweight = bool(ctx.metadata.get("rbf_upweight", cfg.rbf_upweight))
+    cfg.rbf_additive_only = bool(
+        ctx.metadata.get("rbf_additive_only", cfg.rbf_additive_only)
+    )
+    cfg.rbf_min_bumps = int(ctx.metadata.get("rbf_min_bumps", cfg.rbf_min_bumps))
+    raw_max_b = ctx.metadata.get("rbf_max_bumps", cfg.rbf_max_bumps)
+    cfg.rbf_max_bumps = int(raw_max_b) if raw_max_b is not None else None
+    if cfg.rbf_additive_only:
+        cfg.allow_rbf = True
     cfg.linearity_penalty_gamma = float(
         ctx.metadata.get("linearity_penalty_gamma", cfg.linearity_penalty_gamma)
     )
@@ -488,6 +594,12 @@ def run_evolution(
             "linear_calibration": cfg.linear_calibration,
             "require_subspace_rmse": cfg.require_subspace_rmse,
             "paper_ga": cfg.paper_ga,
+            "allow_rbf": bool(cfg.allow_rbf),
+            "oscillatory_bias": bool(cfg.oscillatory_bias) and not cfg.paper_ga,
+            "rbf_upweight": bool(cfg.rbf_upweight) and bool(cfg.allow_rbf),
+            "rbf_additive_only": bool(cfg.rbf_additive_only),
+            "rbf_min_bumps": int(cfg.rbf_min_bumps),
+            "rbf_max_bumps": cfg.rbf_max_bumps,
             "gp_seed": cfg.seed,
             "gp_seed_source": ctx.metadata.get("gp_seed_source"),
             "sample_seed": ctx.sample_seed,
@@ -514,7 +626,13 @@ def run_evolution(
         from ela.visualize_pilot_3d import LandscapePlotCache
 
         logger.info("Building landscape plot cache (grid_n=%d)", cfg.landscape_grid_n)
-        landscape_cache = LandscapePlotCache.build(ctx, grid_n=cfg.landscape_grid_n)
+        landscape_cache = LandscapePlotCache.build(
+            ctx,
+            grid_n=cfg.landscape_grid_n,
+            rf_transform=cfg.rf_transform_features,
+            rf_n_estimators=cfg.rf_transform_n_estimators,
+            rf_seed=cfg.rf_transform_seed,
+        )
 
     logger.info("Evaluating initial population (%d)", len(pop))
     _evaluate_population(pop, ctx, cfg, progress_label="init eval")
@@ -627,10 +745,13 @@ def _finalize_best(
     best_dir.mkdir(parents=True, exist_ok=True)
 
     y_dense, (a, b) = _eval_objective(best.tree, ctx.z_dense, ctx, cfg)
+    y_features, rf_oob, rf_vs_campaign = _feature_y_dense(
+        best.tree, y_dense, ctx, cfg, calib=(a, b),
+    )
     y_campaign, _ = _eval_objective(best.tree, ctx.z_campaign, ctx, cfg, calib=(a, b))
     tier1 = compute_tier1(
         ctx.z_dense,
-        y_dense,
+        y_features,
         ctx.x_dense,
         x_campaign=ctx.x_campaign,
         y_campaign=ctx.y_campaign,
@@ -638,6 +759,10 @@ def _finalize_best(
         maximize=ctx.maximize,
         seed=ctx.sample_seed,
     )
+    if rf_oob is not None:
+        tier1["oob_r2"] = float(rf_oob)
+    if rf_vs_campaign is not None:
+        tier1["rf_vs_campaign_r2"] = float(rf_vs_campaign)
     loss, rel = weighted_feature_loss(
         tier1,
         ctx.tier1_target,
@@ -653,6 +778,8 @@ def _finalize_best(
         "linear_calibration": cfg.linear_calibration,
         "require_subspace_rmse": cfg.require_subspace_rmse,
         "paper_ga": cfg.paper_ga,
+        "rf_transform_features": cfg.rf_transform_features,
+        "rf_transform_n_estimators": cfg.rf_transform_n_estimators,
         "fitness_feature_names": list(ctx.fitness_feature_names),
         "tier1_loss": loss,
         "subspace_rmse": rmse,
@@ -674,7 +801,10 @@ def _finalize_best(
             else median_rel < 0.10
         ),
         "y_dense_range_achieved": [float(y_dense.min()), float(y_dense.max())],
+        "y_features_range": [float(y_features.min()), float(y_features.max())],
         "campaign_r2": tier1["oob_r2"],
+        "rf_oob_r2": None if rf_oob is None else float(rf_oob),
+        "rf_vs_campaign_r2": None if rf_vs_campaign is None else float(rf_vs_campaign),
     }
     if cfg.linear_calibration:
         metrics["calibration"] = {"a": a, "b": b}
@@ -689,11 +819,15 @@ def _finalize_best(
         json.dump(metrics, f, indent=2)
         f.write("\n")
 
+    recovery_names = tuple(
+        name for name in ALLOWED_FITNESS_NAMES
+        if name in tier1 and name in ctx.tier1_target
+    )
     _, rel_all = weighted_feature_loss(
         tier1,
         ctx.tier1_target,
-        {name: 1.0 for name in TIER1_NAMES},
-        feature_names=TIER1_NAMES,
+        {name: 1.0 for name in recovery_names},
+        feature_names=recovery_names,
     )
     recovery = {
         name: {
@@ -702,7 +836,7 @@ def _finalize_best(
             "rel_err": rel_all[name],
             "in_fitness": name in ctx.fitness_feature_names,
         }
-        for name in TIER1_NAMES
+        for name in recovery_names
     }
     with open(best_dir / "recovery.json", "w", encoding="utf-8") as f:
         json.dump(recovery, f, indent=2)
@@ -710,11 +844,11 @@ def _finalize_best(
 
     expr_meta: dict[str, Any] = {
         "string": tree_to_string(best.tree),
-        "linear_calibration": cfg.linear_calibration,
+        "linear_calibration_enabled": cfg.linear_calibration,
         "paper_ga": cfg.paper_ga,
     }
     if cfg.linear_calibration:
-        expr_meta["linear_calibration"] = {"a": a, "b": b}
+        expr_meta["calibration"] = {"a": a, "b": b}
     if cfg.linearity_penalty_gamma > 0:
         expr_meta["raw_linearity_r2"] = raw_linearity_r2(
             ctx.z_dense, evaluate_raw(best.tree, ctx.z_dense)
@@ -777,7 +911,10 @@ _EXPR_PATH = Path(__file__).with_name("expression.json")
 with _EXPR_PATH.open(encoding="utf-8") as _f:
     _META = json.load(_f)
 _EXPRESSION = tree_from_jsonable(_META["expression"])
-_cal = _META.get("linear_calibration", {})
+_cal = _META.get("calibration")
+if not isinstance(_cal, dict):
+    _legacy = _META.get("linear_calibration", {})
+    _cal = _legacy if isinstance(_legacy, dict) else {}
 _CALIB_A = float(_cal.get("a", 1.0))
 _CALIB_B = float(_cal.get("b", 0.0))
 

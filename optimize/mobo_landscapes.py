@@ -5,14 +5,17 @@ Supports:
   • ``rf``        — Random-Forest surrogate (campaign1a or optional RF-on-CSV comparison)
   • ``synthetic`` — Direct analytic oracle from synthetic_data/oracles.py (MOBO default)
                     or ``synthetic_data.ackley.Ackley`` (realistic variant)
+  • ``ela``       — Fixed evolved ELA twin from ``ela/runs/ela_3d_<jobid>/best/oracle.py``
 """
 
 from __future__ import annotations
 
 import glob
+import importlib.util
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -125,11 +128,12 @@ class LandscapeSpec:
     composition_columns: list[str] | None = None
     oracle: str | None = None
     metadata_path: str | None = None
+    ela_run: str | None = None
 
     @property
     def render_ternary(self) -> bool:
         return (
-            self.landscape in ("rf", "synthetic")
+            self.landscape in ("rf", "synthetic", "ela")
             and self.dim == 3
             and self.grid_pts is not None
             and self.grid_vals is not None
@@ -145,6 +149,9 @@ class LandscapeSpec:
             return f"RF surrogate ({self.oracle}, {self.dim}D)"
         if self.landscape == "rf":
             return f"RF surrogate ({self.dim}D)"
+        if self.landscape == "ela":
+            tag = self.oracle or (Path(self.ela_run).name if self.ela_run else "twin")
+            return f"ELA twin ({tag}, {self.dim}D)"
         return self.landscape
 
 
@@ -260,6 +267,193 @@ def build_ackley_oracle_landscape(
     )
 
 
+def resolve_ela_run_dir(
+    *,
+    ela_run: str | None = None,
+    job_id: int | str | None = None,
+    oracle_path: str | None = None,
+    repo_root: str | None = None,
+) -> Path:
+    """Resolve an ELA pilot run directory containing ``best/oracle.py``."""
+    root = Path(repo_root or _REPO).resolve()
+    if ela_run:
+        p = Path(ela_run)
+        if not p.is_absolute():
+            p = root / p
+        return p.resolve()
+    if oracle_path:
+        p = Path(oracle_path)
+        if not p.is_absolute():
+            p = root / p
+        p = p.resolve()
+        # Accept .../best/oracle.py or .../oracle.py
+        if p.name == "oracle.py":
+            return p.parent.parent if p.parent.name == "best" else p.parent
+        return p
+    if job_id is not None:
+        return (root / "ela" / "runs" / f"ela_3d_{job_id}").resolve()
+    raise ValueError(
+        "ELA landscape requires 'ela_run', 'job_id', or 'oracle_path' in the batch JSON."
+    )
+
+
+def load_ela_oracle_module(run_dir: Path):
+    """Import ``best/oracle.py`` from an ELA run (adds repo root for ``ela.*`` imports)."""
+    oracle_py = run_dir / "best" / "oracle.py"
+    if not oracle_py.is_file():
+        raise FileNotFoundError(f"ELA oracle not found: {oracle_py}")
+    if _REPO not in sys.path:
+        sys.path.insert(0, _REPO)
+    mod_name = f"_ela_oracle_{run_dir.name}"
+    spec = importlib.util.spec_from_file_location(mod_name, oracle_py)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load ELA oracle from {oracle_py}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)
+    if not hasattr(mod, "predict_composition"):
+        raise AttributeError(f"{oracle_py} has no predict_composition()")
+    return mod
+
+
+def _ela_scalar_fn(predict_composition) -> ObjectiveFn:
+    def fn(x: np.ndarray) -> float:
+        x = np.asarray(x, dtype=float).ravel()
+        y = predict_composition(x.reshape(1, -1))
+        return float(np.asarray(y, dtype=float).ravel()[0])
+
+    return fn
+
+
+def _log_softmax(log_x: np.ndarray) -> np.ndarray:
+    z = log_x - np.max(log_x)
+    x = np.exp(z)
+    s = float(x.sum())
+    return x / (s if s > 0 else 1.0)
+
+
+def _refine_callable_extremum(
+    fn: ObjectiveFn,
+    x0: np.ndarray,
+    *,
+    maximize: bool,
+    max_l1: float = 0.10,
+) -> tuple[np.ndarray, float]:
+    """L-BFGS-B refinement of a scalar objective on the simplex (log-softmax coords)."""
+    from scipy.optimize import minimize as sp_minimize
+
+    x0 = np.clip(np.asarray(x0, dtype=float).ravel(), 1e-12, None)
+    x0 = x0 / x0.sum()
+    log_x0 = np.log(np.maximum(x0, 1e-300))
+
+    def obj(log_x: np.ndarray) -> float:
+        val = float(fn(_log_softmax(log_x)))
+        return -val if maximize else val
+
+    res = sp_minimize(obj, log_x0, method="L-BFGS-B", options={"maxiter": 400, "ftol": 1e-9})
+    x_opt = _log_softmax(res.x)
+    if float(np.abs(x_opt - x0).sum()) > max_l1:
+        return x0, float(fn(x0))
+    return x_opt, float(fn(x_opt))
+
+
+def auto_detect_callable_optima(
+    fn: ObjectiveFn,
+    grid_pts: np.ndarray,
+    grid_vals: np.ndarray,
+    *,
+    maximize: bool,
+    n_peaks: int = 3,
+    min_sep: float = 0.15,
+) -> list[np.ndarray]:
+    """Greedy top-grid peak picking + L-BFGS-B refinement for any scalar callable."""
+    order = np.argsort(grid_vals)
+    if maximize:
+        order = order[::-1]
+    chosen: list[np.ndarray] = []
+    for idx in order:
+        if len(chosen) >= n_peaks:
+            break
+        pt = np.asarray(grid_pts[idx], dtype=float)
+        if any(float(np.linalg.norm(pt - c)) < min_sep for c in chosen):
+            continue
+        x_ref, _ = _refine_callable_extremum(fn, pt, maximize=maximize)
+        if any(float(np.linalg.norm(x_ref - c)) < min_sep for c in chosen):
+            continue
+        chosen.append(x_ref)
+    if not chosen:
+        dim = int(np.asarray(grid_pts[0]).size)
+        chosen = [np.full(dim, 1.0 / dim, dtype=float)]
+    return chosen
+
+
+def build_ela_landscape(
+    ela_run: str | Path,
+    *,
+    maximize: bool = True,
+    true_optima: list[np.ndarray] | None = None,
+    n_peaks: int = 3,
+    min_sep: float = 0.15,
+    grid_n: int = 80,
+    time_limit_hours: float | None = 0.4,
+    repo_root: str | None = None,
+) -> LandscapeSpec:
+    """Load a fixed ELA twin oracle and build a MOBO ``LandscapeSpec``.
+
+    Peaks are taken from ``true_optima`` when provided; otherwise greedily
+    detected on the run's dense Sobol sample (``X_dense.npy``) or a ternary grid.
+    """
+    run_dir = resolve_ela_run_dir(ela_run=str(ela_run), repo_root=repo_root)
+    mod = load_ela_oracle_module(run_dir)
+    fn = _ela_scalar_fn(mod.predict_composition)
+
+    dense_x = run_dir / "X_dense.npy"
+    if dense_x.is_file():
+        sample_pts = np.load(dense_x)
+        sample_vals = np.asarray(mod.predict_composition(sample_pts), dtype=float).ravel()
+        dim = int(sample_pts.shape[1])
+    else:
+        dim = 3
+        sample_pts = ternary_grid(grid_n) if dim == 3 else None
+        sample_vals = None
+        if sample_pts is not None:
+            sample_vals = np.array([fn(x) for x in sample_pts], dtype=float)
+
+    if true_optima:
+        optima = [np.asarray(t, dtype=float).ravel() for t in true_optima]
+        dim = int(optima[0].size)
+    else:
+        if sample_pts is None or sample_vals is None:
+            raise ValueError(
+                f"ELA run {run_dir} has no X_dense.npy and no true_optima; "
+                "cannot auto-detect peaks."
+            )
+        optima = auto_detect_callable_optima(
+            fn, sample_pts, sample_vals,
+            maximize=maximize, n_peaks=n_peaks, min_sep=min_sep,
+        )
+        dim = int(optima[0].size)
+
+    grid_pts = grid_vals = None
+    if dim == 3:
+        grid_pts = ternary_grid(grid_n)
+        grid_vals = np.array([fn(x) for x in grid_pts], dtype=float)
+
+    return LandscapeSpec(
+        landscape="ela",
+        dim=dim,
+        maximize=maximize,
+        true_optima=optima,
+        fn_callable=fn,
+        grid_pts=grid_pts,
+        grid_vals=grid_vals,
+        time_limit_hours=0.4 if time_limit_hours is None else time_limit_hours,
+        max_activations=float("inf"),
+        oracle=run_dir.name,
+        ela_run=str(run_dir),
+    )
+
+
 def build_rf_landscape(
     rf_fn: ObjectiveFn,
     true_optima: list[np.ndarray],
@@ -323,6 +517,20 @@ def landscape_from_run_config(cfg: dict, *, build_rf_and_grid) -> LandscapeSpec:
         return build_synthetic_landscape(
             syn["oracle"], syn["dim"], syn["layout"],
             seed=syn["seed"],
+            time_limit_hours=time_limit,
+        )
+
+    if landscape == "ela":
+        true_optima = None
+        if cfg.get("true_optima"):
+            true_optima = [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
+        return build_ela_landscape(
+            cfg.get("ela_run") or resolve_ela_run_dir(
+                job_id=cfg.get("job_id"),
+                oracle_path=cfg.get("oracle_path"),
+            ),
+            maximize=bool(cfg.get("maximize", True)),
+            true_optima=true_optima,
             time_limit_hours=time_limit,
         )
 

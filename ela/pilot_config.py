@@ -81,6 +81,13 @@ class ResolvedPilotConfig:
     require_subspace_rmse: bool
     paper_ga: bool
 
+    allow_rbf: bool
+    oscillatory_bias: bool
+    rbf_upweight: bool
+    rbf_additive_only: bool
+    rbf_min_bumps: int
+    rbf_max_bumps: int | None
+
     alpha_subspace: float
     beta_complexity: float
     tier1_gamma: float
@@ -89,6 +96,12 @@ class ResolvedPilotConfig:
     tier1_acceptance_median_rel: float
     fitness_feature_names: tuple[str, ...]
     tier1_weights: dict[str, float]
+
+    # ELA(RF_g): match features of RF(samples of g) to λ_T.
+    rf_transform_features: bool
+    rf_transform_n_samples: int
+    rf_transform_n_estimators: int
+    rf_transform_seed: int
 
     population: int
     generations: int
@@ -137,9 +150,19 @@ class ResolvedPilotConfig:
                 "require_subspace_rmse": self.require_subspace_rmse,
                 "munoz_8_fitness": self.munoz_8_fitness,
                 "tier1_weights": self.tier1_weights,
+                "rf_transform_features": self.rf_transform_features,
+                "rf_transform_n_samples": self.rf_transform_n_samples,
+                "rf_transform_n_estimators": self.rf_transform_n_estimators,
+                "rf_transform_seed": self.rf_transform_seed,
             },
             "ga": {
                 "paper_ga": self.paper_ga,
+                "allow_rbf": self.allow_rbf,
+                "oscillatory_bias": self.oscillatory_bias,
+                "rbf_upweight": self.rbf_upweight,
+                "rbf_additive_only": self.rbf_additive_only,
+                "rbf_min_bumps": self.rbf_min_bumps,
+                "rbf_max_bumps": self.rbf_max_bumps,
                 "population": self.population,
                 "generations": self.generations,
                 "tournament_k": self.tournament_k,
@@ -249,6 +272,13 @@ def resolve_pilot_config(
     linear_cal = bool(_coalesce(preset, fitness, "linear_calibration", True))
     require_rmse = bool(_coalesce(preset, fitness, "require_subspace_rmse", True))
     paper_ga = bool(_coalesce(preset, ga, "paper_ga", preset.get("paper_ga", True)))
+    allow_rbf = bool(ga.get("allow_rbf", ga.get("gp_allow_rbf", False)))
+    oscillatory_bias = bool(ga.get("oscillatory_bias", False))
+    rbf_upweight = bool(ga.get("rbf_upweight", True))
+    rbf_additive_only = bool(ga.get("rbf_additive_only", False))
+    rbf_min_bumps = int(ga.get("rbf_min_bumps", 1))
+    raw_max_b = ga.get("rbf_max_bumps", None)
+    rbf_max_bumps = int(raw_max_b) if raw_max_b is not None else None
 
     if cli.get("no_calibrate"):
         linear_cal = False
@@ -269,6 +299,20 @@ def resolve_pilot_config(
         require_rmse = False
         paper_ga = True
 
+    if rbf_additive_only:
+        # Pure bump forests: force RBF on; no oscillatory mix.
+        allow_rbf = True
+        oscillatory_bias = False
+        if rbf_min_bumps < 1:
+            rbf_min_bumps = 1
+
+    if paper_ga:
+        # Paper GA: Muñoz ops + 60/30/10 schedule. Oscillatory mix stays off.
+        # Explicit allow_rbf=true is kept (paper ops + localized bumps).
+        oscillatory_bias = False
+        if not allow_rbf:
+            rbf_upweight = False
+
     alpha = float(cli.get("alpha") if cli.get("alpha") is not None else _coalesce(preset, fitness, "alpha_subspace", 3.0))
     if not require_rmse and cli.get("alpha") is None and fitness.get("alpha_subspace") is None:
         alpha = 0.0
@@ -286,6 +330,11 @@ def resolve_pilot_config(
     )
     subspace_frac = float(fitness.get("subspace_rmse_frac", 0.02))
     tier1_accept = float(fitness.get("tier1_acceptance_median_rel", 0.10))
+
+    rf_transform_features = bool(fitness.get("rf_transform_features", False))
+    rf_transform_n_samples = int(fitness.get("rf_transform_n_samples", 650))
+    rf_transform_n_estimators = int(fitness.get("rf_transform_n_estimators", 500))
+    rf_transform_seed = int(fitness.get("rf_transform_seed", 42))
 
     fitness_features_raw = fitness.get("fitness_features")
     if fitness_features_raw is not None:
@@ -342,13 +391,34 @@ def resolve_pilot_config(
     direct_transfer = float(ga.get("direct_transfer_prob", ga_defaults["direct_transfer_prob"]))
     elitism = int(ga.get("elitism", ga_defaults["elitism"]))
     elitism_frac = float(ga.get("elitism_frac", ga_defaults["elitism_frac"]))
-    max_tree_depth = int(ga.get("max_tree_depth", ga_defaults["max_tree_depth"]))
+    raw_depth = ga.get("max_tree_depth", ga_defaults["max_tree_depth"])
+    if raw_depth is None or raw_depth == 0:
+        # null/0 → no depth cap (practical sentinel for GP checks).
+        from ela.gp_tree import UNLIMITED_TREE_DEPTH
+
+        max_tree_depth = int(UNLIMITED_TREE_DEPTH)
+    else:
+        max_tree_depth = int(raw_depth)
     fitness_stop = float(ga.get("fitness_stop_threshold", ga_defaults["fitness_stop_threshold"]))
     early_reject = float(
         cli.get("early_reject_mult")
         if cli.get("early_reject_mult") is not None
         else ga.get("early_reject_subspace_mult", ga_defaults["early_reject_subspace_mult"])
     )
+
+    if rbf_additive_only:
+        from ela.gp_tree import UNLIMITED_TREE_DEPTH
+
+        if rbf_max_bumps is not None:
+            rbf_max_bumps = max(1, int(rbf_max_bumps))
+            if max_tree_depth < UNLIMITED_TREE_DEPTH:
+                rbf_max_bumps = min(rbf_max_bumps, max_tree_depth)
+            rbf_min_bumps = max(1, min(int(rbf_min_bumps), rbf_max_bumps))
+        else:
+            # No bump ceiling; still require a floor.
+            rbf_min_bumps = max(1, int(rbf_min_bumps))
+            if max_tree_depth < UNLIMITED_TREE_DEPTH and rbf_min_bumps > max_tree_depth:
+                rbf_min_bumps = max_tree_depth
 
     n_dense = cli.get("n_dense") if cli.get("n_dense") is not None else sampling.get("n_dense")
     n_dense = int(n_dense) if n_dense is not None else None
@@ -382,6 +452,12 @@ def resolve_pilot_config(
         linear_calibration=linear_cal,
         require_subspace_rmse=require_rmse,
         paper_ga=paper_ga,
+        allow_rbf=allow_rbf,
+        oscillatory_bias=oscillatory_bias,
+        rbf_upweight=rbf_upweight,
+        rbf_additive_only=rbf_additive_only,
+        rbf_min_bumps=rbf_min_bumps,
+        rbf_max_bumps=rbf_max_bumps,
         alpha_subspace=alpha,
         beta_complexity=beta,
         tier1_gamma=tier1_gamma,
@@ -390,6 +466,10 @@ def resolve_pilot_config(
         tier1_acceptance_median_rel=tier1_accept,
         fitness_feature_names=fitness_names,
         tier1_weights=tier1_weights,
+        rf_transform_features=rf_transform_features,
+        rf_transform_n_samples=rf_transform_n_samples,
+        rf_transform_n_estimators=rf_transform_n_estimators,
+        rf_transform_seed=rf_transform_seed,
         population=population,
         generations=generations,
         tournament_k=tournament_k,

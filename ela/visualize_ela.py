@@ -23,7 +23,14 @@ if str(ROOT) not in sys.path:
 
 from ela.evolve_context import EvolutionContext, load_context_from_run
 from ela.features import composition_to_ilr, train_rf_surrogate
-from ela.gp_tree import Node, predict_calibrated, predict_tree, tree_from_jsonable
+from ela.gp_tree import (
+    Node,
+    parse_expression_calibration,
+    predict_calibrated,
+    predict_raw_clipped,
+    predict_tree,
+    tree_from_jsonable,
+)
 from ela.tier1 import TIER1_NAMES
 from visualization.needle_overlay import comp_to_xy, ternary_grid
 
@@ -86,22 +93,25 @@ class LandscapePlotCache:
         else:
             y_evolved = predict_tree(tree, self.z_grid, y_min=self.y_min, y_max=self.y_max)
         residual = np.abs(y_evolved - self.y_target_grid)
+        gp_lo, gp_hi = _panel_limits(y_evolved, robust=True)
         rmax = float(np.percentile(residual, 99))
+        if not np.isfinite(rmax) or rmax <= 0.0:
+            rmax = 1e-6
 
-        fig, axes = plt.subplots(1, 3, figsize=(12.0, 4.2))
+        fig, axes = plt.subplots(1, 3, figsize=(13.2, 4.6))
         panels = [
-            (self.y_target_grid, "RF target", "viridis", self.vmin, self.vmax),
-            (y_evolved, "Best GP", "viridis", self.vmin, self.vmax),
-            (residual, "|GP − RF|", "magma", 0.0, rmax),
+            (self.y_target_grid, "RF target", "viridis", self.vmin, self.vmax, "neither"),
+            (y_evolved, "Best GP", "viridis", gp_lo, gp_hi, "both"),
+            (residual, "|GP − RF|", "magma", 0.0, rmax, "max"),
         ]
-        for ax, (vals, subtitle, cmap, lo, hi) in zip(axes, panels):
-            _draw_ternary_frame(ax, pad=0.03)
+        for ax, (vals, subtitle, cmap, lo, hi, extend) in zip(axes, panels):
+            _draw_ternary_frame(ax)
             pc = ax.tripcolor(
                 self.tri, vals, cmap=cmap, vmin=lo, vmax=hi,
                 shading="gouraud", rasterized=True,
             )
             ax.set_title(subtitle, fontsize=9)
-            fig.colorbar(pc, ax=ax, fraction=0.05, pad=0.02)
+            fig.colorbar(pc, ax=ax, fraction=0.046, pad=0.04, extend=extend)
 
         status = "accepted" if accepted else "in progress"
         fig.suptitle(
@@ -109,21 +119,36 @@ class LandscapePlotCache:
             f"rmse={subspace_rmse:.4f} | {status}",
             fontsize=10,
         )
-        fig.tight_layout(rect=(0, 0, 1, 0.92))
+        fig.tight_layout(rect=(0, 0.02, 1, 0.90))
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, dpi=110, bbox_inches="tight")
+        fig.savefig(out_path, dpi=110, bbox_inches="tight", pad_inches=0.15)
         plt.close(fig)
+
+
+def _panel_limits(vals: np.ndarray, *, robust: bool = False) -> tuple[float, float]:
+    arr = np.asarray(vals, dtype=float).ravel()
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return 0.0, 1.0
+    if robust and arr.size >= 8:
+        lo, hi = float(np.percentile(arr, 1)), float(np.percentile(arr, 99))
+    else:
+        lo, hi = float(arr.min()), float(arr.max())
+    if hi <= lo:
+        eps = max(abs(lo) * 1e-3, 1e-6)
+        return lo - eps, hi + eps
+    return lo, hi
 
 
 def _draw_ternary_frame(ax: plt.Axes, *, pad: float = 0.04) -> None:
     ax.plot([0, 1, 0.5, 0], [0, 0, _SQRT3_2, 0], "k-", lw=1.2)
     ax.set_aspect("equal")
-    ax.set_xlim(-0.12, 1.12)
-    ax.set_ylim(-0.12, _SQRT3_2 + 0.16)
+    ax.set_xlim(-0.22, 1.22)
+    ax.set_ylim(-0.24, _SQRT3_2 + 0.20)
     ax.axis("off")
-    ax.text(-pad, -pad, CORNER_LABELS[0], ha="right", va="top", fontsize=9)
-    ax.text(1 + pad, -pad, CORNER_LABELS[1], ha="left", va="top", fontsize=9)
-    ax.text(0.5, _SQRT3_2 + pad, CORNER_LABELS[2], ha="center", va="bottom", fontsize=9)
+    ax.text(0.0, -0.10, CORNER_LABELS[0], ha="center", va="top", fontsize=8)
+    ax.text(1.0, -0.10, CORNER_LABELS[1], ha="center", va="top", fontsize=8)
+    ax.text(0.5, _SQRT3_2 + pad, CORNER_LABELS[2], ha="center", va="bottom", fontsize=8)
 
 
 def _load_expression(run_dir: Path):
@@ -158,27 +183,30 @@ def plot_ternary_triptych(
 ) -> None:
     """RF target | evolved GP | absolute residual on a ternary grid."""
     residual = np.abs(y_evolved - y_target)
-    vmin, vmax = _shared_vmin_vmax(y_target, y_evolved)
+    rf_lo, rf_hi = _panel_limits(y_target)
+    gp_lo, gp_hi = _panel_limits(y_evolved, robust=True)
     rmax = float(np.percentile(residual, 99))
+    if not np.isfinite(rmax) or rmax <= 0.0:
+        rmax = 1e-6
 
     xy = comp_to_xy(grid_pts)
     tri = mtri.Triangulation(xy[:, 0], xy[:, 1])
 
-    fig, axes = plt.subplots(1, 3, figsize=(15.5, 5.4))
+    fig, axes = plt.subplots(1, 3, figsize=(15.5, 5.6))
     panels = [
-        (y_target, "RF surrogate (target)", "viridis", vmin, vmax),
-        (y_evolved, "Evolved GP landscape", "viridis", vmin, vmax),
-        (residual, "|evolved − RF|", "magma", 0.0, rmax),
+        (y_target, "RF surrogate (target)", "viridis", rf_lo, rf_hi, "neither"),
+        (y_evolved, "Evolved GP landscape", "viridis", gp_lo, gp_hi, "both"),
+        (residual, "|evolved − RF|", "magma", 0.0, rmax, "max"),
     ]
-    for ax, (vals, subtitle, cmap, lo, hi) in zip(axes, panels):
+    for ax, (vals, subtitle, cmap, lo, hi, extend) in zip(axes, panels):
         _draw_ternary_frame(ax)
         pc = ax.tripcolor(tri, vals, cmap=cmap, vmin=lo, vmax=hi, shading="gouraud", rasterized=True)
         ax.set_title(subtitle, fontsize=10)
-        fig.colorbar(pc, ax=ax, fraction=0.046, pad=0.03)
+        fig.colorbar(pc, ax=ax, fraction=0.046, pad=0.04, extend=extend)
 
     fig.suptitle(title, fontsize=11)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
-    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    fig.tight_layout(rect=(0, 0.02, 1, 0.94))
+    fig.savefig(out_path, dpi=160, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
 
 
@@ -326,20 +354,28 @@ def visualize_run(
     viz_dir.mkdir(parents=True, exist_ok=True)
 
     ctx = load_context_from_run(run_dir)
+    linear_calibration = bool(ctx.linear_calibration)
     expr_path = run_dir / "best" / "expression.json"
     with expr_path.open(encoding="utf-8") as f:
         expr_meta = json.load(f)
     tree = tree_from_jsonable(expr_meta["expression"])
-    cal = expr_meta.get("linear_calibration", {})
-    calib = (float(cal.get("a", 1.0)), float(cal.get("b", 0.0)))
+    calib = parse_expression_calibration(
+        expr_meta, linear_calibration=linear_calibration,
+    )
 
-    y_evolved_dense, _ = predict_calibrated(tree, ctx.z_dense, calib=calib)
+    if linear_calibration:
+        y_evolved_dense, _ = predict_calibrated(tree, ctx.z_dense, calib=calib)
+    else:
+        y_evolved_dense = predict_raw_clipped(tree, ctx.z_dense)
 
     grid_pts = ternary_grid(grid_n)
     z_grid = composition_to_ilr(grid_pts)
     rf = train_rf_surrogate(ctx.x_campaign, ctx.y_campaign)
     y_target_grid = rf.predict(grid_pts)
-    y_evolved_grid, _ = predict_calibrated(tree, z_grid, calib=calib)
+    if linear_calibration:
+        y_evolved_grid, _ = predict_calibrated(tree, z_grid, calib=calib)
+    else:
+        y_evolved_grid = predict_raw_clipped(tree, z_grid)
 
     run_name = run_dir.name
     plot_ternary_triptych(

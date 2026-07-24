@@ -14,6 +14,9 @@ from ela.features import (
     sample_simplex_sobol,
     train_rf_surrogate,
 )
+
+# RF-train sample seed offset (distinct from dense ELA sample_seed).
+RF_TRANSFORM_SAMPLE_SEED_OFFSET = 17
 from ela.tier1 import (
     CAMPAIGN_WEIGHTS,
     MUNOZ_8_NAMES,
@@ -51,6 +54,9 @@ class EvolutionContext:
     z_campaign: np.ndarray
     n_vars: int
     metadata: dict[str, Any]
+    # Fixed Sobol locations for ELA(RF_g) fitness (None when disabled).
+    x_rf_train: np.ndarray | None = None
+    z_rf_train: np.ndarray | None = None
 
     @property
     def ilr_dim(self) -> int:
@@ -122,6 +128,20 @@ def build_context(
             maximize=maximize,
             seed=sample_seed,
         )
+    else:
+        # Enrich JSON targets with live-computed extras (spatial lipschitz, etc.).
+        live = compute_tier1(
+            z_dense,
+            y_target,
+            x_dense,
+            x_campaign=x_campaign,
+            y_campaign=y_campaign,
+            maximize=maximize,
+            seed=sample_seed,
+        )
+        for key, val in live.items():
+            if key not in tier1_target:
+                tier1_target[key] = val
 
     subspace_rmse_threshold = subspace_rmse_frac * max(y_range, 1e-9)
 
@@ -191,15 +211,18 @@ def export_run_artifacts(
     np.save(run_dir / "X_dense.npy", ctx.x_dense)
     np.save(run_dir / "Z_dense.npy", ctx.z_dense)
     samples_path = run_dir / "samples.npz"
-    np.savez_compressed(
-        samples_path,
-        x_dense=ctx.x_dense,
-        z_dense=ctx.z_dense,
-        y_target=ctx.y_target,
-        x_campaign=ctx.x_campaign,
-        y_campaign=ctx.y_campaign,
-        z_campaign=ctx.z_campaign,
-    )
+    payload: dict[str, Any] = {
+        "x_dense": ctx.x_dense,
+        "z_dense": ctx.z_dense,
+        "y_target": ctx.y_target,
+        "x_campaign": ctx.x_campaign,
+        "y_campaign": ctx.y_campaign,
+        "z_campaign": ctx.z_campaign,
+    }
+    if ctx.x_rf_train is not None and ctx.z_rf_train is not None:
+        payload["x_rf_train"] = ctx.x_rf_train
+        payload["z_rf_train"] = ctx.z_rf_train
+    np.savez_compressed(samples_path, **payload)
 
     target_payload = {
         "source_path": str(Path(target_source).resolve()) if target_source else None,
@@ -248,6 +271,8 @@ def load_context_from_run(run_dir: str | Path) -> EvolutionContext:
     data = np.load(run_dir / "samples.npz")
     y_min, y_max = target["y_dense_range"]
     y_range = y_max - y_min
+    x_rf = data["x_rf_train"] if "x_rf_train" in data.files else None
+    z_rf = data["z_rf_train"] if "z_rf_train" in data.files else None
     return EvolutionContext(
         dim=int(config["dim"]),
         maximize=bool(config.get("maximize", True)),
@@ -257,8 +282,8 @@ def load_context_from_run(run_dir: str | Path) -> EvolutionContext:
         y_max=float(y_max),
         y_range=float(y_range),
         subspace_rmse_threshold=float(target["subspace_rmse_threshold"]),
-        tier1_target={k: float(target["tier1"][k]) for k in TIER1_NAMES},
-        tier1_weights={k: float(target["weights"].get(k, 1.0)) for k in TIER1_NAMES},
+        tier1_target={k: float(v) for k, v in target["tier1"].items()},
+        tier1_weights={k: float(v) for k, v in target["weights"].items()},
         fitness_feature_names=tuple(
             target.get("fitness_feature_names", list(MUNOZ_8_NAMES))
         ),
@@ -274,7 +299,29 @@ def load_context_from_run(run_dir: str | Path) -> EvolutionContext:
         z_campaign=data["z_campaign"],
         n_vars=int(data["z_dense"].shape[1]),
         metadata=config,
+        x_rf_train=x_rf,
+        z_rf_train=z_rf,
     )
+
+
+def attach_rf_transform_samples(
+    ctx: EvolutionContext,
+    *,
+    n_samples: int = 650,
+    sample_seed: int | None = None,
+) -> EvolutionContext:
+    """Fix Sobol train locations for ELA(RF_g) across all individuals."""
+    seed = (
+        int(sample_seed)
+        if sample_seed is not None
+        else int(ctx.sample_seed) + RF_TRANSFORM_SAMPLE_SEED_OFFSET
+    )
+    x_rf = sample_simplex_sobol(ctx.dim, int(n_samples), seed=seed)
+    ctx.x_rf_train = x_rf
+    ctx.z_rf_train = composition_to_ilr(x_rf)
+    ctx.metadata["rf_transform_n_samples"] = int(n_samples)
+    ctx.metadata["rf_transform_sample_seed"] = seed
+    return ctx
 
 
 def tier1_from_ela_full_json(path: str | Path) -> dict[str, float]:

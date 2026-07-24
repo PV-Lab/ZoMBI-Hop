@@ -9,13 +9,10 @@ import numpy as np
 
 from sklearn.metrics import r2_score
 
-from ela.features import feature_median_lipschitz, feature_oob_r2
+from ela.features import compute_spatial_lipschitz_features, feature_oob_r2
 from ela.pflacco_port import (
-    calculate_ela_distribution,
-    calculate_ela_level,
-    calculate_ela_meta,
-    calculate_entropy_y,
-    entropic_significance,
+    calculate_nbc,
+    munoz_table1_features,
 )
 
 TIER1_NAMES: tuple[str, ...] = (
@@ -36,6 +33,43 @@ MUNOZ_8_NAMES: tuple[str, ...] = TIER1_NAMES[:8]
 
 PAPER_WEIGHTS: dict[str, float] = {name: 1.0 for name in MUNOZ_8_NAMES}
 
+# Muñoz et al. (2019) Table 1 — all 33 named features (order matches munoz_table1_features).
+MUNOZ_33_NAMES: tuple[str, ...] = (
+    "FDC",
+    "DISP1pct",
+    "R2_L",
+    "R2_LI",
+    "R2_Q",
+    "R2_QI",
+    "beta_min",
+    "beta_max",
+    "CN",
+    "EL10",
+    "EQ10",
+    "LQ10",
+    "ET10",
+    "EL25",
+    "EQ25",
+    "LQ25",
+    "ET25",
+    "EL50",
+    "EQ50",
+    "LQ50",
+    "ET50",
+    "gamma_Y",
+    "H_Y",
+    "kappa_Y",
+    "PKS",
+    "Hmax",
+    "eps_S",
+    "M0",
+    "xi_D",
+    "xi_1",
+    "xi_2",
+    "sigma_1",
+    "sigma_2",
+)
+
 # ZoMBI campaign-twin extensions (--campaign-mode).
 CAMPAIGN_WEIGHTS: dict[str, float] = {
     "R2_Q": 1.0,
@@ -53,17 +87,104 @@ CAMPAIGN_WEIGHTS: dict[str, float] = {
 # Backward-compatible alias.
 DEFAULT_WEIGHTS = CAMPAIGN_WEIGHTS
 
+# Mersmann / Jones literature extras (Muñoz-33; optional fitness extensions).
+LITERATURE_EXTRA_NAMES: tuple[str, ...] = ("R2_QI", "FDC")
+
+# Spatial roughness extras — kill edge-localized / heavy-tailed Lipschitz cheats.
+SPATIAL_ROUGHNESS_NAMES: tuple[str, ...] = (
+    "interior_median_lipschitz",
+    "lipschitz_p20",
+    "lipschitz_p80",
+    "edge_interior_lip_ratio",
+    "ma_region_median_lipschitz",
+    "fa_region_median_lipschitz",
+    "br_region_median_lipschitz",
+    "local_lipschitz_cv",
+    "tile_min_median_lipschitz",
+)
+
+# Nearest-Better Clustering (composition-L2); short names ↔ flacco keys.
+NBC_FLACCO_KEYS: dict[str, str] = {
+    "NBC_mean_ratio": "nbc.nn_nb.mean_ratio",
+    "NBC_sd_ratio": "nbc.nn_nb.sd_ratio",
+    "NBC_cor": "nbc.nn_nb.cor",
+    "NBC_dist_cv": "nbc.dist_ratio.coeff_var",
+    "NBC_fitness_cor": "nbc.nb_fitness.cor",
+}
+NBC_NAMES: tuple[str, ...] = tuple(NBC_FLACCO_KEYS.keys())
+
+# Dense-sample R² between RF(g) (or g) and the campaign RF target surface.
+RF_SURFACE_R2_NAMES: tuple[str, ...] = ("rf_vs_campaign_r2",)
+
+# Deduped: TIER1 / literature extras overlap Muñoz-33; keep Muñoz-33 first.
+ALLOWED_FITNESS_NAMES: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        MUNOZ_33_NAMES
+        + TIER1_NAMES
+        + LITERATURE_EXTRA_NAMES
+        + SPATIAL_ROUGHNESS_NAMES
+        + NBC_NAMES
+        + RF_SURFACE_R2_NAMES
+    )
+)
+
+# Set B — campaign twin fingerprint (Muñoz 8 + FDC + R²_QI + lipschitz; no ξ₁).
+SET_B_NAMES: tuple[str, ...] = (
+    "R2_Q",
+    "R2_QI",
+    "CN",
+    "H_Y",
+    "gamma_Y",
+    "EL25",
+    "LQ25",
+    "PKS",
+    "FDC",
+    "median_lipschitz",
+)
+
+SET_B_WEIGHTS: dict[str, float] = {
+    "R2_Q": 1.0,
+    "R2_QI": 0.75,
+    "CN": 0.5,
+    "H_Y": 1.0,
+    "gamma_Y": 1.0,
+    "EL25": 1.0,
+    "LQ25": 1.0,
+    "PKS": 1.0,
+    "FDC": 1.0,
+    "median_lipschitz": 1.0,
+}
+
+# Set C — ~12 features: structure + composition FDC + Lipschitz + NBC (spatial multimodal).
+# Drops ξ₁ / CN / R²_QI / oob; de-emphasizes PKS (Y-histogram ≠ spatial peaks).
+SET_C_NAMES: tuple[str, ...] = (
+    "R2_Q",
+    "H_Y",
+    "gamma_Y",
+    "EL25",
+    "LQ25",
+    "FDC",
+    "PKS",
+    "median_lipschitz",
+    "tile_min_median_lipschitz",
+    "NBC_mean_ratio",
+    "NBC_sd_ratio",
+    "NBC_dist_cv",
+)
+
+SET_C_WEIGHTS: dict[str, float] = {name: 1.0 for name in SET_C_NAMES}
+
 
 def validate_fitness_features(names: list[str] | tuple[str, ...]) -> tuple[str, ...]:
     """Validate and dedupe fitness feature names (order preserved)."""
     if not names:
         raise ValueError(
-            f"fitness_features must not be empty; choose from {list(TIER1_NAMES)}"
+            f"fitness_features must not be empty; choose from {list(ALLOWED_FITNESS_NAMES)}"
         )
-    unknown = [n for n in names if n not in TIER1_NAMES]
+    unknown = [n for n in names if n not in ALLOWED_FITNESS_NAMES]
     if unknown:
         raise ValueError(
-            f"unknown fitness features {unknown}; allowed: {list(TIER1_NAMES)}"
+            f"unknown fitness features {unknown}; allowed: {list(ALLOWED_FITNESS_NAMES)}"
         )
     seen: set[str] = set()
     out: list[str] = []
@@ -111,32 +232,37 @@ def compute_tier1(
     x_campaign: np.ndarray,
     y_campaign: np.ndarray,
     y_campaign_pred: np.ndarray | None = None,
+    oob_r2: float | None = None,
     maximize: bool = True,
     seed: int = 42,
 ) -> dict[str, float]:
-    """Compute Tier-1 features using the same definitions as ``ela_full`` output."""
-    meta = calculate_ela_meta(z, y)
-    level = calculate_ela_level(z, y, quantiles=[0.25], maximize=maximize)
-    distr = calculate_ela_distribution(y)
-    ent = entropic_significance(z, y, seed=seed)
-    el25 = level["ela_level.mcva_lda_25"]
-    eq25 = level["ela_level.mcva_qda_25"]
-    if y_campaign_pred is not None:
+    """Compute fitness features using the same definitions as ``ela_full`` output.
+
+    Always includes the full Muñoz-33 block plus ZoMBI Lipschitz extras, NBC, and
+    ``oob_r2`` so configs can select any ``ALLOWED_FITNESS_NAMES`` subset.
+
+    ``oob_r2`` override: when set (e.g. OOB of RF(g) under ELA(RF_g)), use it
+    instead of campaign-row OOB / campaign R².
+    """
+    x_comp = np.asarray(x_comp, dtype=float)
+    dim = int(x_comp.shape[1])
+    m33 = munoz_table1_features(z, y, x_comp, maximize=maximize, dim=dim)
+    if oob_r2 is not None:
+        oob = float(oob_r2)
+    elif y_campaign_pred is not None:
         oob = feature_campaign_r2(y_campaign, y_campaign_pred)
     else:
         oob = feature_oob_r2(x_campaign, y_campaign)
-    return {
-        "R2_Q": float(meta["ela_meta.quad_simple.adj_r2"]),
-        "CN": float(meta["ela_meta.quad_simple.cond"]),
-        "H_Y": float(calculate_entropy_y(y)),
-        "xi_1": float(ent["entropic.xi_1"]),
-        "gamma_Y": float(distr["ela_distr.skewness"]),
-        "EL25": float(el25),
-        "LQ25": float(el25 / eq25) if eq25 > 1e-12 else float("nan"),
-        "PKS": float(distr["ela_distr.number_of_peaks"]),
+    lip = compute_spatial_lipschitz_features(x_comp, y)
+    nbc = calculate_nbc(x_comp, y, maximize=maximize)
+    out: dict[str, float] = {
+        **{k: float(m33[k]) for k in MUNOZ_33_NAMES},
         "oob_r2": float(oob),
-        "median_lipschitz": float(feature_median_lipschitz(x_comp, y)),
+        **{k: float(v) for k, v in lip.items()},
     }
+    for short, flacco_key in NBC_FLACCO_KEYS.items():
+        out[short] = float(nbc[flacco_key])
+    return out
 
 
 def tier1_vector(features: dict[str, float]) -> np.ndarray:
@@ -173,24 +299,28 @@ def weighted_feature_loss(
 
 
 def extract_tier1_from_characterize(result: dict[str, Any]) -> dict[str, float]:
-    """Pull Tier-1 dict from ``characterize_campaign_surrogate`` or ``ela_full`` JSON."""
+    """Pull fitness-feature dict from ``characterize_campaign_surrogate`` / ``ela_full``."""
     if "feature_groups" in result:
         m = result["feature_groups"]["munoz_33"]
         z = result["feature_groups"]["zombi"]
-        return {
-            "R2_Q": m["R2_Q"],
-            "CN": m["CN"],
-            "H_Y": m["H_Y"],
-            "xi_1": m["xi_1"],
-            "gamma_Y": m["gamma_Y"],
-            "EL25": m["EL25"],
-            "LQ25": m["LQ25"],
-            "PKS": m["PKS"],
-            "oob_r2": z["oob_r2"],
-            "median_lipschitz": z["median_lipschitz"],
-        }
+        out = {name: float(m[name]) for name in MUNOZ_33_NAMES if name in m}
+        if "oob_r2" in z:
+            out["oob_r2"] = float(z["oob_r2"])
+        # Spatial Lipschitz extras (median + interior / tile / regions / …).
+        for name in SPATIAL_ROUGHNESS_NAMES + ("median_lipschitz",):
+            if name in z:
+                out[name] = float(z[name])
+            elif name in m:
+                out[name] = float(m[name])
+        nbc_grp = result["feature_groups"].get("flacco_nbc") or {}
+        for short, flacco_key in NBC_FLACCO_KEYS.items():
+            if flacco_key in nbc_grp:
+                out[short] = float(nbc_grp[flacco_key])
+            elif short in m:
+                out[short] = float(m[short])
+        return out
     feats = result.get("features", result)
-    return {k: float(feats[k]) for k in TIER1_NAMES}
+    return {k: float(feats[k]) for k in ALLOWED_FITNESS_NAMES if k in feats}
 
 
 def load_target_json(path: str | Path) -> dict[str, Any]:

@@ -77,6 +77,15 @@ def calculate_ela_distribution(y: np.ndarray) -> dict[str, float]:
     if n < 4:
         raise ValueError("At least 4 observations required for ela_distr")
 
+    y_std = float(y.std())
+    if y_std < 1e-15 or float(y.max() - y.min()) < 1e-15:
+        return {
+            "ela_distr.skewness": 0.0,
+            "ela_distr.kurtosis": -3.0,
+            "ela_distr.number_of_peaks": 0,
+            "ela_distr.costs_runtime": time.monotonic() - t0,
+        }
+
     y_skew = y - y.mean()
     skewness = float(np.sqrt(n) * (y_skew**3).sum() / ((y_skew**2).sum() ** 1.5) * (1 - 1 / n) ** 1.5)
 
@@ -84,7 +93,15 @@ def calculate_ela_distribution(y: np.ndarray) -> dict[str, float]:
     r = n * (y_kurt**4).sum() / (y_kurt**2).sum() ** 2
     kurtosis = float(r * (1 - 1 / n) ** 2 - 3)
 
-    kernel = gaussian_kde(y)
+    try:
+        kernel = gaussian_kde(y)
+    except (np.linalg.LinAlgError, ValueError):
+        return {
+            "ela_distr.skewness": skewness,
+            "ela_distr.kurtosis": kurtosis,
+            "ela_distr.number_of_peaks": 0,
+            "ela_distr.costs_runtime": time.monotonic() - t0,
+        }
     low_ = y.min() - 3 * kernel.covariance_factor() * y.std()
     upp_ = y.max() + 3 * kernel.covariance_factor() * y.std()
     positions = np.mgrid[low_:upp_:512j]
@@ -210,7 +227,10 @@ def calculate_dispersion(
 
 
 def calculate_fdc(X: np.ndarray, y: np.ndarray, *, maximize: bool = False) -> float:
-    """Fitness-distance correlation (Jones & Forrest 1995)."""
+    """Fitness-distance correlation (Jones & Forrest 1995).
+
+    ``X`` should be compositional coordinates (Euclidean composition distance).
+    """
     y = np.asarray(y, dtype=float).ravel()
     X = np.asarray(X, dtype=float)
     best_i = int(np.argmax(y) if maximize else np.argmin(y))
@@ -218,6 +238,87 @@ def calculate_fdc(X: np.ndarray, y: np.ndarray, *, maximize: bool = False) -> fl
     if np.std(dists) < 1e-15 or np.std(y) < 1e-15:
         return 0.0
     return float(pearsonr(y, dists)[0])
+
+
+def calculate_nbc(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    maximize: bool = False,
+) -> dict[str, float]:
+    """Nearest-Better Clustering features (flacco ``nbc`` / Kerschke et al. 2015).
+
+    Port of flacco ``calculateNearestBetterFlexFeatures`` + ``computeNearestBetterStats``
+    (full Euclidean distance matrix; no RANN ``fast_k`` approximation).
+
+    Call with compositional coordinates so distances are composition-L2 (ZoMBI
+    default). For each sample: nearest-neighbor distance vs nearest-*better*
+    neighbor distance (better = lower objective after signing so minimization is
+    canonical). Global optima with no better neighbor get ``nbDist := nearDist``.
+    """
+    t0 = time.monotonic()
+    X = np.asarray(X, dtype=float)
+    y_raw = np.asarray(y, dtype=float).ravel()
+    if X.ndim != 2 or len(y_raw) != X.shape[0]:
+        raise ValueError("X and y length mismatch for NBC")
+    n = X.shape[0]
+    if n < 3:
+        raise ValueError("At least 3 observations required for nbc")
+
+    # flacco: objectives = (±1)*y so that lower is always better.
+    objectives = (-y_raw) if maximize else y_raw.copy()
+    distmat = squareform(pdist(X, metric="euclidean"))
+    np.fill_diagonal(distmat, np.inf)
+
+    near_dist = np.min(distmat, axis=1)
+    nb_id = np.full(n, -1, dtype=int)
+    nb_dist = np.full(n, np.nan, dtype=float)
+
+    for i in range(n):
+        better = np.where(objectives < objectives[i])[0]
+        if better.size == 0:
+            better = np.where(objectives == objectives[i])[0]
+            better = better[better != i]
+        if better.size == 0:
+            continue
+        j = int(better[np.argmin(distmat[i, better])])
+        nb_id[i] = j
+        nb_dist[i] = float(distmat[i, j])
+
+    # Cure global optima: no better neighbor → treat nbDist as nearDist.
+    missing = nb_id < 0
+    nb_dist[missing] = near_dist[missing]
+
+    nn_dists = near_dist
+    nb_dists = nb_dist
+    dist_ratio = nn_dists / np.maximum(nb_dists, 1e-300)
+
+    to_me_count = np.zeros(n, dtype=float)
+    for j in nb_id:
+        if j >= 0:
+            to_me_count[j] += 1.0
+
+    nn_sd = float(np.std(nn_dists, ddof=1))
+    nb_sd = float(np.std(nb_dists, ddof=1))
+    nn_mean = float(np.mean(nn_dists))
+    nb_mean = float(np.mean(nb_dists))
+    ratio_sd = float(np.std(dist_ratio, ddof=1))
+    ratio_mean = float(np.mean(dist_ratio))
+
+    def _safe_cor(a: np.ndarray, b: np.ndarray) -> float:
+        if np.std(a) < 1e-15 or np.std(b) < 1e-15:
+            return float("nan")
+        return float(pearsonr(a, b)[0])
+
+    # Flex path correlates indegree with the *original* objective column.
+    return {
+        "nbc.nn_nb.sd_ratio": nn_sd / max(nb_sd, 1e-300),
+        "nbc.nn_nb.mean_ratio": nn_mean / max(nb_mean, 1e-300),
+        "nbc.nn_nb.cor": _safe_cor(nn_dists, nb_dists),
+        "nbc.dist_ratio.coeff_var": ratio_sd / max(ratio_mean, 1e-300),
+        "nbc.nb_fitness.cor": _safe_cor(to_me_count, y_raw),
+        "nbc.costs_runtime": time.monotonic() - t0,
+    }
 
 
 def calculate_disp1pct(X: np.ndarray, y: np.ndarray, *, maximize: bool = False) -> float:
@@ -239,7 +340,16 @@ def calculate_disp1pct(X: np.ndarray, y: np.ndarray, *, maximize: bool = False) 
 
 
 def calculate_entropy_y(y: np.ndarray, *, n_bins: int = 32) -> float:
-    counts, _ = np.histogram(y, bins=n_bins)
+    y = np.asarray(y, dtype=float).ravel()
+    y = y[np.isfinite(y)]
+    if y.size < 2:
+        return 0.0
+    y_min = float(y.min())
+    y_max = float(y.max())
+    # Near-constant y (or bootstrap draws of a flat landscape) cannot form finite bins.
+    if not np.isfinite(y_min) or not np.isfinite(y_max) or (y_max - y_min) < 1e-15:
+        return 0.0
+    counts, _ = np.histogram(y, bins=n_bins, range=(y_min, y_max))
     p = counts.astype(float) / max(counts.sum(), 1)
     p = p[p > 0]
     return float(-np.sum(p * np.log(p)))
@@ -343,6 +453,14 @@ def entropic_significance(
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float).ravel()
     d = X.shape[1]
+    if y.size < 2 or float(np.nanmax(y) - np.nanmin(y)) < 1e-15:
+        return {
+            "entropic.xi_1": 0.0,
+            "entropic.xi_2": 0.0,
+            "entropic.xi_D": 0.0,
+            "entropic.sigma_1": 0.0,
+            "entropic.sigma_2": 0.0,
+        }
 
     def _mi_pair(a: np.ndarray, b: np.ndarray) -> float:
         aq = np.quantile(a, np.linspace(0, 1, n_bins + 1)[1:-1])
@@ -403,19 +521,25 @@ def entropic_significance(
 def munoz_table1_features(
     Z: np.ndarray,
     y: np.ndarray,
+    x_comp: np.ndarray,
     *,
     maximize: bool = True,
     dim: int,
 ) -> dict[str, float]:
-    """Muñoz et al. (2019) Table 1 — all 33 named features."""
+    """Muñoz et al. (2019) Table 1 — all 33 named features.
+
+    Meta / level / entropic use ILR coords ``Z`` (match GPSimplex). Distance-based
+    features (FDC, DISP1%, information-content NN tour) use compositional
+    Euclidean distance on ``x_comp``.
+    """
     meta = calculate_ela_meta(Z, y)
     level = calculate_ela_level(Z, y, quantiles=[0.10, 0.25, 0.50], maximize=maximize)
     distr = calculate_ela_distribution(y)
-    ic = calculate_information_content(Z, y)
+    ic = calculate_information_content(x_comp, y)
 
     out: dict[str, float] = {
-        "FDC": calculate_fdc(Z, y, maximize=maximize),
-        "DISP1pct": calculate_disp1pct(Z, y, maximize=maximize),
+        "FDC": calculate_fdc(x_comp, y, maximize=maximize),
+        "DISP1pct": calculate_disp1pct(x_comp, y, maximize=maximize),
         "R2_L": meta["ela_meta.lin_simple.adj_r2"],
         "R2_LI": meta["ela_meta.lin_w_interact.adj_r2"],
         "R2_Q": meta["ela_meta.quad_simple.adj_r2"],
@@ -463,19 +587,27 @@ def compute_all_ela_feature_groups(
     dim: int,
     seed: int = 42,
 ) -> dict[str, Any]:
-    """Full ELA dump: Muñoz-33, flacco classical blocks, ZoMBI extras."""
-    from ela.features import feature_median_lipschitz, feature_oob_r2
+    """Full ELA dump: Muñoz-33, flacco classical blocks, ZoMBI extras.
+
+    Distance features (FDC, DISP, NBC, IC NN-tour, Lipschitz) use compositional
+    Euclidean ``x_comp``. Meta / level / entropic stay in ILR ``Z``.
+    """
+    from ela.features import compute_spatial_lipschitz_features, feature_oob_r2
 
     groups: dict[str, Any] = {}
-    groups["munoz_33"] = munoz_table1_features(Z, y, maximize=maximize, dim=dim)
+    groups["munoz_33"] = munoz_table1_features(
+        Z, y, x_comp, maximize=maximize, dim=dim,
+    )
     groups["flacco_meta"] = calculate_ela_meta(Z, y)
     groups["flacco_distr"] = calculate_ela_distribution(y)
     groups["flacco_level"] = calculate_ela_level(Z, y, maximize=maximize)
-    groups["flacco_dispersion"] = calculate_dispersion(Z, y, maximize=maximize)
-    groups["flacco_ic"] = calculate_information_content(Z, y, seed=seed)
+    groups["flacco_dispersion"] = calculate_dispersion(x_comp, y, maximize=maximize)
+    groups["flacco_nbc"] = calculate_nbc(x_comp, y, maximize=maximize)
+    groups["flacco_ic"] = calculate_information_content(x_comp, y, seed=seed)
     groups["flacco_entropic"] = entropic_significance(Z, y, seed=seed)
+    lip = compute_spatial_lipschitz_features(x_comp, y)
     groups["zombi"] = {
         "oob_r2": feature_oob_r2(x_campaign, y_campaign),
-        "median_lipschitz": feature_median_lipschitz(x_comp, y),
+        **lip,
     }
     return groups

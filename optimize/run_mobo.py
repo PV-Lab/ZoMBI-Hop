@@ -6,6 +6,9 @@ Multi-objective Bayesian optimisation (MOBO) of ZoMBI-Hop hyperparameters.
 Landscapes (``--landscape`` or batch JSON ``"landscape"`` field):
   • ``rf`` (default) — Random-Forest surrogate on a composition CSV (campaign1a)
   • ``synthetic``    — Direct analytic oracle (messy, gaussian, ackley, …)
+  • ``ela``          — Fixed ELA twin from ``ela/runs/ela_3d_<jobid>/best/oracle.py``
+                       (batch JSON: ``job_id`` / ``ela_run``; see
+                       ``optimize/mobo_batch_configs/ela_3d_18080791.json``)
 
 Objectives are selectable via ``--dataset``: RF (default, 3-simplex campaign1a
 surrogate), analytic negated-Ackley benchmarks on the 3-/4-/10-simplex
@@ -237,12 +240,14 @@ from optimize.composition_prediction import physics_simulate_line
 from optimize.mobo_landscapes import (
     LandscapeSpec,
     build_ackley_oracle_landscape,
+    build_ela_landscape,
     build_rf_landscape,
     build_synthetic_landscape,
     composition_column_names,
     infer_composition_columns,
     landscape_from_run_config,
     parse_synthetic_batch_fields,
+    resolve_ela_run_dir,
 )
 from synthetic_data.ackley import Ackley
 from synthetic_data.campaign_datasets import load_metadata, resolve_metadata_path
@@ -731,6 +736,10 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
         cfg["ackley_layout"] = landscape.ackley_layout
         if landscape.synthetic_seed is not None:
             cfg["seed"] = landscape.synthetic_seed
+    if landscape.landscape == "ela":
+        cfg["oracle"] = landscape.oracle
+        if landscape.ela_run:
+            cfg["ela_run"] = landscape.ela_run
     if ensemble_spec is not None:
         cfg["ensemble_random_per_run"] = True
         cfg["ensemble_seed"] = ensemble_spec["seed"]
@@ -904,6 +913,52 @@ def load_batch_config(path: str, script_dir: str) -> dict:
         print(f"  [batch] Synthetic oracle={syn['oracle']} d={syn['dim']} "
               f"layout={syn['layout']} seed={syn['seed']}")
         print(f"  [batch] {len(landscape.true_optima)} planted peaks (direct oracle, no RF)")
+        return {
+            "name":              cfg.get("name") or os.path.splitext(os.path.basename(cfg_path))[0],
+            "landscape":         landscape,
+            "maximize":          maximize,
+            "true_optima":       landscape.true_optima,
+            "max_trials":        cfg.get("max_trials"),
+            "time_limit_hours":  time_limit,
+            "n_init_trials":     cfg.get("n_init_trials", N_INIT_TRIALS),
+            "auto_optima":       None,
+            "config_path":       cfg_path,
+            "csv_path":          None,
+            "objective_column":  None,
+        }
+
+    if landscape_type == "ela":
+        try:
+            ela_run = resolve_ela_run_dir(
+                ela_run=cfg.get("ela_run"),
+                job_id=cfg.get("job_id"),
+                oracle_path=cfg.get("oracle_path"),
+                repo_root=repo_root,
+            )
+        except ValueError as exc:
+            sys.exit(f"--config: {exc}")
+        maximize = bool(cfg.get("maximize", True))
+        true_optima = None
+        if cfg.get("true_optima"):
+            true_optima = [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
+        auto = cfg.get("auto_optima") or {}
+        try:
+            landscape = build_ela_landscape(
+                ela_run,
+                maximize=maximize,
+                true_optima=true_optima,
+                n_peaks=int(auto.get("n_peaks", cfg.get("n_peaks", 3))),
+                min_sep=float(auto.get("min_sep", cfg.get("min_sep", 0.15))),
+                time_limit_hours=time_limit,
+                repo_root=repo_root,
+            )
+        except (FileNotFoundError, ImportError, AttributeError, ValueError) as exc:
+            sys.exit(f"--config: ELA landscape failed: {exc}")
+        print(f"  [batch] ELA twin {ela_run.name}  d={landscape.dim}  "
+              f"oracle={landscape.ela_run}/best/oracle.py")
+        print(f"  [batch] {len(landscape.true_optima)} reference "
+              f"{'maxima' if maximize else 'minima'} "
+              f"({'from JSON' if true_optima else 'auto-detected'})")
         return {
             "name":              cfg.get("name") or os.path.splitext(os.path.basename(cfg_path))[0],
             "landscape":         landscape,
@@ -3701,7 +3756,7 @@ def main() -> None:
                 time_limit_hours=TIME_LIMIT_HOURS,
             )
 
-        if landscape.landscape == "synthetic":
+        if landscape.landscape in ("synthetic", "ela"):
             for i, p in enumerate(landscape.true_optima):
                 print(f"  peak {i + 1}: {np.round(p, 4).tolist()}")
         stop = (

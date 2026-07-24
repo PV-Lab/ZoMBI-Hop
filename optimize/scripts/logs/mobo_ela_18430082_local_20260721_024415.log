@@ -1,0 +1,33 @@
+  [batch] ELA twin ela_3d_18430082  d=3  oracle=/Users/steorra/ZoMBI-Hop/ela/runs/ela_3d_18430082/best/oracle.py
+  [batch] 10 reference maxima (from JSON)
+======================================================================
+ZoMBI-Hop MOBO — BATCH  |  ela_3d_18430082_rbf10
+Device: cpu   |   Sobol init: 8 trials   |   max_trials: unbounded (Ctrl+C)
+======================================================================
+  peak 1: [0.0351, 0.9497, 0.0152]
+  peak 2: [0.3462, 0.1672, 0.4867]
+  peak 3: [0.2255, 0.0121, 0.7624]
+  peak 4: [0.8014, 0.0552, 0.1433]
+  peak 5: [0.5479, 0.4242, 0.0279]
+  peak 6: [0.8548, 0.1109, 0.0343]
+  peak 7: [0.9246, 0.0072, 0.0682]
+  peak 8: [0.0045, 0.9942, 0.0013]
+  peak 9: [0.8399, 0.0086, 0.1514]
+  peak 10: [0.9056, 0.0856, 0.0089]
+  ELA twin (ela_3d_18430082, 3D)  |  time limit/trial: 0.2 h
+  [invocation] mode=batch  device=cpu  time_limit_hours=0.2  max_trials=None
+  [invocation] device: CLI --device cpu -> cpu
+  [invocation] time_limit_hours: batch JSON (0.2) (CLI --time-limit-hours ignored)
+  [invocation] max_trials: unbounded
+  [invocation] n_init_trials: batch JSON (8)
+  [invocation] true_optima: planted by landscape builder (batch JSON)
+
+[run] Output folder: /Users/steorra/ZoMBI-Hop/optimize/runs/mobo_ela_3d_18430082_rbf10_local
+
+======================================================================
+MOBO  |  ELA twin (ela_3d_18430082, 3D)  |  0 re-evaluated seed(s) + 8 Sobol init, then BO until Ctrl+C
+time limit / trial: 0.2 h    Run dir: /Users/steorra/ZoMBI-Hop/optimize/runs/mobo_ela_3d_18430082_rbf10_local
+Hyperparameters (16): ['nat_grad_step', 'nat_grad_max_steps', 'n_restarts', 'raw', 'ucb_beta', 'max_zooms', 'max_iterations', 'top_m_points', 'n_consecutive_converged', 'input_noise_threshold_mult', 'output_noise_threshold_mult', 'max_penalty_radius', 'needle_shrink_factor', 'needle_stop_noise_multiplier', 'paring_spatial_halfnoise', 'paring_y_noise_multiplier']
+======================================================================
+
+[trial 1 | sobol]  nat_grad_step=0.0039  nat_grad_max_steps=184  n_restarts=171  raw=160  ucb_beta=0.3204  max_zooms=8  max_iterations=22  top_m_points=4  n_consecutive_converged=4  input_noise_threshold_mult=2.2279  output_noise_threshold_mult=0.4412  max_penalty_radius=0.8876  needle_shrink_factor=0.6799  needle_stop_noise_multiplier=6.7585  paring_spatial_halfnoise=3.4033  paring_y_noise_multiplier=2.0865

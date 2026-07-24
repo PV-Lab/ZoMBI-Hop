@@ -22,8 +22,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from ela.evolve_context import EvolutionContext, load_context_from_run
-from ela.features import composition_to_ilr, train_rf_surrogate
-from ela.gp_tree import Node, predict_calibrated, predict_raw_clipped, predict_tree, tree_from_jsonable
+from ela.features import composition_to_ilr, rf_transform_predict, train_rf_surrogate
+from ela.gp_tree import Node, parse_expression_calibration, predict_calibrated, predict_raw_clipped, predict_tree, tree_from_jsonable
 from ela.tier1 import TIER1_NAMES
 from visualization.needle_overlay import comp_to_xy, ternary_grid
 
@@ -45,9 +45,22 @@ class LandscapePlotCache:
     vmax: float
     y_min: float
     y_max: float
+    x_rf_train: np.ndarray | None = None
+    z_rf_train: np.ndarray | None = None
+    rf_n_estimators: int = 500
+    rf_seed: int = 42
+    rf_transform: bool = False
 
     @classmethod
-    def build(cls, ctx: EvolutionContext, *, grid_n: int = 100) -> LandscapePlotCache:
+    def build(
+        cls,
+        ctx: EvolutionContext,
+        *,
+        grid_n: int = 100,
+        rf_transform: bool = False,
+        rf_n_estimators: int = 500,
+        rf_seed: int = 42,
+    ) -> LandscapePlotCache:
         grid_pts = ternary_grid(grid_n)
         z_grid = composition_to_ilr(grid_pts)
         rf = train_rf_surrogate(ctx.x_campaign, ctx.y_campaign)
@@ -63,7 +76,31 @@ class LandscapePlotCache:
             vmax=vmax,
             y_min=ctx.y_min,
             y_max=ctx.y_max,
+            x_rf_train=None if ctx.x_rf_train is None else np.asarray(ctx.x_rf_train),
+            z_rf_train=None if ctx.z_rf_train is None else np.asarray(ctx.z_rf_train),
+            rf_n_estimators=int(rf_n_estimators),
+            rf_seed=int(rf_seed),
+            rf_transform=bool(rf_transform),
         )
+
+    def _predict_expression(
+        self,
+        tree: Node,
+        z: np.ndarray,
+        *,
+        paper_mode: bool,
+        calib: tuple[float, float] | None,
+        y_ref: np.ndarray | None,
+    ) -> np.ndarray:
+        if paper_mode:
+            return predict_raw_clipped(tree, z)
+        if calib is not None:
+            y, _ = predict_calibrated(tree, z, calib=calib)
+            return y
+        if y_ref is not None:
+            y, _ = predict_calibrated(tree, z, y_ref=y_ref)
+            return y
+        return predict_tree(tree, z, y_min=self.y_min, y_max=self.y_max)
 
     def plot_generation(
         self,
@@ -78,55 +115,94 @@ class LandscapePlotCache:
         paper_mode: bool = True,
         calib: tuple[float, float] | None = None,
         y_ref: np.ndarray | None = None,
+        rf_transform: bool | None = None,
     ) -> None:
-        """Triptych: RF | best GP | |GP−RF| (diagnostic; RF is λ target reference only)."""
-        if paper_mode:
-            y_evolved = predict_raw_clipped(tree, self.z_grid)
-        elif calib is not None:
-            y_evolved, _ = predict_calibrated(tree, self.z_grid, calib=calib)
-        elif y_ref is not None:
-            y_evolved, _ = predict_calibrated(tree, self.z_grid, y_ref=y_ref)
-        else:
-            y_evolved = predict_tree(tree, self.z_grid, y_min=self.y_min, y_max=self.y_max)
-        residual = np.abs(y_evolved - self.y_target_grid)
-        rmax = float(np.percentile(residual, 99))
+        """Campaign RF | expression g | RF(g) (or residual when RF transform off)."""
+        use_rf = self.rf_transform if rf_transform is None else bool(rf_transform)
+        y_evolved = self._predict_expression(
+            tree, self.z_grid, paper_mode=paper_mode, calib=calib, y_ref=y_ref,
+        )
 
-        fig, axes = plt.subplots(1, 3, figsize=(12.0, 4.2))
-        panels = [
-            (self.y_target_grid, "RF target", "viridis", self.vmin, self.vmax),
-            (y_evolved, "Best GP", "viridis", self.vmin, self.vmax),
-            (residual, "|GP − RF|", "magma", 0.0, rmax),
-        ]
-        for ax, (vals, subtitle, cmap, lo, hi) in zip(axes, panels):
-            _draw_ternary_frame(ax, pad=0.03)
+        if use_rf and self.x_rf_train is not None and self.z_rf_train is not None:
+            y_train = self._predict_expression(
+                tree, self.z_rf_train, paper_mode=paper_mode, calib=calib, y_ref=y_ref,
+            )
+            y_rf_g = rf_transform_predict(
+                self.x_rf_train,
+                y_train,
+                self.grid_pts,
+                n_estimators=self.rf_n_estimators,
+                random_state=self.rf_seed,
+            )
+            gp_lo, gp_hi = _panel_limits(y_evolved, robust=True)
+            rf_g_lo, rf_g_hi = _panel_limits(y_rf_g, robust=True)
+            fig, axes = plt.subplots(1, 3, figsize=(13.2, 4.6))
+            panels = [
+                (self.y_target_grid, "Campaign RF", "viridis", self.vmin, self.vmax, "neither"),
+                (y_evolved, "Expression g(z)", "viridis", gp_lo, gp_hi, "both"),
+                (y_rf_g, "RF(g)", "viridis", rf_g_lo, rf_g_hi, "both"),
+            ]
+            mode_label = "ELA(RF_g)"
+        else:
+            residual = np.abs(y_evolved - self.y_target_grid)
+            gp_lo, gp_hi = _panel_limits(y_evolved, robust=True)
+            rmax = float(np.percentile(residual, 99))
+            if not np.isfinite(rmax) or rmax <= 0.0:
+                rmax = 1e-6
+            fig, axes = plt.subplots(1, 3, figsize=(13.2, 4.6))
+            panels = [
+                (self.y_target_grid, "RF target", "viridis", self.vmin, self.vmax, "neither"),
+                (y_evolved, "Best GP", "viridis", gp_lo, gp_hi, "both"),
+                (residual, "|GP − RF|", "magma", 0.0, rmax, "max"),
+            ]
+            mode_label = "ELA(g)"
+
+        for ax, (vals, subtitle, cmap, lo, hi, extend) in zip(axes, panels):
+            _draw_ternary_frame(ax)
             pc = ax.tripcolor(
                 self.tri, vals, cmap=cmap, vmin=lo, vmax=hi,
                 shading="gouraud", rasterized=True,
             )
             ax.set_title(subtitle, fontsize=9)
-            fig.colorbar(pc, ax=ax, fraction=0.05, pad=0.02)
+            fig.colorbar(pc, ax=ax, fraction=0.046, pad=0.04, extend=extend)
 
         status = "accepted" if accepted else "in progress"
         fig.suptitle(
-            f"gen {generation:03d} | fitness={fitness:.3f} tier1={tier1_loss:.3f} "
-            f"rmse={subspace_rmse:.4f} | {status}",
+            f"gen {generation:03d} | {mode_label} | fitness={fitness:.3f} "
+            f"tier1={tier1_loss:.3f} rmse={subspace_rmse:.4f} | {status}",
             fontsize=10,
         )
-        fig.tight_layout(rect=(0, 0, 1, 0.92))
+        fig.tight_layout(rect=(0, 0.02, 1, 0.90))
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, dpi=110, bbox_inches="tight")
+        fig.savefig(out_path, dpi=110, bbox_inches="tight", pad_inches=0.15)
         plt.close(fig)
+
+
+def _panel_limits(vals: np.ndarray, *, robust: bool = False) -> tuple[float, float]:
+    arr = np.asarray(vals, dtype=float).ravel()
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return 0.0, 1.0
+    if robust and arr.size >= 8:
+        lo, hi = float(np.percentile(arr, 1)), float(np.percentile(arr, 99))
+    else:
+        lo, hi = float(arr.min()), float(arr.max())
+    if hi <= lo:
+        eps = max(abs(lo) * 1e-3, 1e-6)
+        return lo - eps, hi + eps
+    return lo, hi
 
 
 def _draw_ternary_frame(ax: plt.Axes, *, pad: float = 0.04) -> None:
     ax.plot([0, 1, 0.5, 0], [0, 0, _SQRT3_2, 0], "k-", lw=1.2)
     ax.set_aspect("equal")
-    ax.set_xlim(-0.12, 1.12)
-    ax.set_ylim(-0.12, _SQRT3_2 + 0.16)
+    # Extra margins so corner labels clear colorbars / adjacent panels.
+    ax.set_xlim(-0.22, 1.22)
+    ax.set_ylim(-0.24, _SQRT3_2 + 0.20)
     ax.axis("off")
-    ax.text(-pad, -pad, CORNER_LABELS[0], ha="right", va="top", fontsize=9)
-    ax.text(1 + pad, -pad, CORNER_LABELS[1], ha="left", va="top", fontsize=9)
-    ax.text(0.5, _SQRT3_2 + pad, CORNER_LABELS[2], ha="center", va="bottom", fontsize=9)
+    ax.text(0.0, -0.10, CORNER_LABELS[0], ha="center", va="top", fontsize=8)
+    ax.text(1.0, -0.10, CORNER_LABELS[1], ha="center", va="top", fontsize=8)
+    ax.text(0.5, _SQRT3_2 + pad, CORNER_LABELS[2], ha="center", va="bottom", fontsize=8)
 
 
 def _load_expression(run_dir: Path):
@@ -151,6 +227,41 @@ def _shared_vmin_vmax(*arrays: np.ndarray) -> tuple[float, float]:
     return float(np.min(vals)), float(np.max(vals))
 
 
+def plot_ternary_campaign_expression_rf_g(
+    grid_pts: np.ndarray,
+    y_campaign_rf: np.ndarray,
+    y_expression: np.ndarray,
+    y_rf_g: np.ndarray,
+    out_path: Path,
+    *,
+    title: str,
+) -> None:
+    """Campaign RF | expression g(z) | RF(g) on a ternary grid."""
+    rf_lo, rf_hi = _panel_limits(y_campaign_rf)
+    g_lo, g_hi = _panel_limits(y_expression, robust=True)
+    rfg_lo, rfg_hi = _panel_limits(y_rf_g, robust=True)
+
+    xy = comp_to_xy(grid_pts)
+    tri = mtri.Triangulation(xy[:, 0], xy[:, 1])
+
+    fig, axes = plt.subplots(1, 3, figsize=(15.5, 5.6))
+    panels = [
+        (y_campaign_rf, "Campaign RF (real run)", "viridis", rf_lo, rf_hi, "neither"),
+        (y_expression, "Expression g(z)", "viridis", g_lo, g_hi, "both"),
+        (y_rf_g, "RF(g)", "viridis", rfg_lo, rfg_hi, "both"),
+    ]
+    for ax, (vals, subtitle, cmap, lo, hi, extend) in zip(axes, panels):
+        _draw_ternary_frame(ax)
+        pc = ax.tripcolor(tri, vals, cmap=cmap, vmin=lo, vmax=hi, shading="gouraud", rasterized=True)
+        ax.set_title(subtitle, fontsize=10)
+        fig.colorbar(pc, ax=ax, fraction=0.046, pad=0.04, extend=extend)
+
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout(rect=(0, 0.02, 1, 0.94))
+    fig.savefig(out_path, dpi=160, bbox_inches="tight", pad_inches=0.15)
+    plt.close(fig)
+
+
 def plot_ternary_triptych(
     grid_pts: np.ndarray,
     y_target: np.ndarray,
@@ -161,27 +272,30 @@ def plot_ternary_triptych(
 ) -> None:
     """RF target | evolved GP | absolute residual on a ternary grid."""
     residual = np.abs(y_evolved - y_target)
-    vmin, vmax = _shared_vmin_vmax(y_target, y_evolved)
+    rf_lo, rf_hi = _panel_limits(y_target)
+    gp_lo, gp_hi = _panel_limits(y_evolved, robust=True)
     rmax = float(np.percentile(residual, 99))
+    if not np.isfinite(rmax) or rmax <= 0.0:
+        rmax = 1e-6
 
     xy = comp_to_xy(grid_pts)
     tri = mtri.Triangulation(xy[:, 0], xy[:, 1])
 
-    fig, axes = plt.subplots(1, 3, figsize=(15.5, 5.4))
+    fig, axes = plt.subplots(1, 3, figsize=(15.5, 5.6))
     panels = [
-        (y_target, "RF surrogate (target)", "viridis", vmin, vmax),
-        (y_evolved, "Evolved GP landscape", "viridis", vmin, vmax),
-        (residual, "|evolved − RF|", "magma", 0.0, rmax),
+        (y_target, "RF surrogate (target)", "viridis", rf_lo, rf_hi, "neither"),
+        (y_evolved, "Evolved GP landscape", "viridis", gp_lo, gp_hi, "both"),
+        (residual, "|evolved − RF|", "magma", 0.0, rmax, "max"),
     ]
-    for ax, (vals, subtitle, cmap, lo, hi) in zip(axes, panels):
+    for ax, (vals, subtitle, cmap, lo, hi, extend) in zip(axes, panels):
         _draw_ternary_frame(ax)
         pc = ax.tripcolor(tri, vals, cmap=cmap, vmin=lo, vmax=hi, shading="gouraud", rasterized=True)
         ax.set_title(subtitle, fontsize=10)
-        fig.colorbar(pc, ax=ax, fraction=0.046, pad=0.03)
+        fig.colorbar(pc, ax=ax, fraction=0.046, pad=0.04, extend=extend)
 
     fig.suptitle(title, fontsize=11)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
-    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    fig.tight_layout(rect=(0, 0.02, 1, 0.94))
+    fig.savefig(out_path, dpi=160, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
 
 
@@ -334,8 +448,9 @@ def visualize_run(
     with expr_path.open(encoding="utf-8") as f:
         expr_meta = json.load(f)
     tree = tree_from_jsonable(expr_meta["expression"])
-    cal = expr_meta.get("linear_calibration", {})
-    calib = (float(cal.get("a", 1.0)), float(cal.get("b", 0.0)))
+    calib = parse_expression_calibration(
+        expr_meta, linear_calibration=linear_calibration,
+    )
 
     if linear_calibration:
         y_evolved_dense, _ = predict_calibrated(tree, ctx.z_dense, calib=calib)
@@ -357,6 +472,31 @@ def visualize_run(
         viz_dir / "ternary_target_vs_evolved.png",
         title=f"{run_name} — RF target vs evolved GP",
     )
+
+    rf_transform = bool(ctx.metadata.get("rf_transform_features", False))
+    if rf_transform and ctx.x_rf_train is not None and ctx.z_rf_train is not None:
+        if linear_calibration:
+            y_rf_train, _ = predict_calibrated(tree, ctx.z_rf_train, calib=calib)
+        else:
+            y_rf_train = predict_raw_clipped(tree, ctx.z_rf_train)
+        n_est = int(ctx.metadata.get("rf_transform_n_estimators", 500))
+        rf_seed = int(ctx.metadata.get("rf_transform_seed", 42))
+        y_rf_g_grid = rf_transform_predict(
+            ctx.x_rf_train,
+            y_rf_train,
+            grid_pts,
+            n_estimators=n_est,
+            random_state=rf_seed,
+        )
+        plot_ternary_campaign_expression_rf_g(
+            grid_pts,
+            y_target_grid,
+            y_evolved_grid,
+            y_rf_g_grid,
+            viz_dir / "ternary_campaign_expression_rf_g.png",
+            title=f"{run_name} — campaign RF | expression | RF(g)",
+        )
+
     plot_ternary_campaign_overlay(
         grid_pts, y_evolved_grid, ctx.x_campaign, ctx.y_campaign,
         viz_dir / "ternary_campaign_overlay.png",

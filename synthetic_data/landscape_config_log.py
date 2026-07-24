@@ -154,6 +154,8 @@ def dataset_label_for_landscape(landscape: str, *, dim: int | None = None, oracl
         return f"ackley{dim}d"
     if landscape == "synthetic" and oracle:
         return oracle
+    if landscape == "ela":
+        return oracle or "ela"
     if landscape == "rf":
         return "RF"
     return oracle or landscape

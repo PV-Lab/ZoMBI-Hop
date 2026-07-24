@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from ela.evolve import EvolutionConfig, _elitism_count, run_evolution
-from ela.evolve_context import build_context
+from ela.evolve_context import attach_rf_transform_samples, build_context
 from ela.pilot_config import (
     DEFAULT_CONFIG_PATH,
     ResolvedPilotConfig,
@@ -237,6 +237,30 @@ def main(argv: list[str] | None = None) -> int:
         fitness_feature_names=cfg_resolved.fitness_feature_names,
         tier1_weights=cfg_resolved.tier1_weights,
     )
+    if cfg_resolved.rf_transform_features:
+        attach_rf_transform_samples(
+            ctx,
+            n_samples=cfg_resolved.rf_transform_n_samples,
+        )
+        # Perfect surface match target for RF(g) vs campaign RF R².
+        if "rf_vs_campaign_r2" not in ctx.tier1_target:
+            ctx.tier1_target["rf_vs_campaign_r2"] = 1.0
+        log.info(
+            "ELA(RF_g): n_train=%d trees=%d seed=%d",
+            cfg_resolved.rf_transform_n_samples,
+            cfg_resolved.rf_transform_n_estimators,
+            cfg_resolved.rf_transform_seed,
+        )
+    ctx.metadata["allow_rbf"] = cfg_resolved.allow_rbf
+    ctx.metadata["oscillatory_bias"] = cfg_resolved.oscillatory_bias
+    ctx.metadata["rbf_upweight"] = cfg_resolved.rbf_upweight
+    ctx.metadata["rbf_additive_only"] = cfg_resolved.rbf_additive_only
+    ctx.metadata["rbf_min_bumps"] = cfg_resolved.rbf_min_bumps
+    ctx.metadata["rbf_max_bumps"] = cfg_resolved.rbf_max_bumps
+    ctx.metadata["rf_transform_features"] = cfg_resolved.rf_transform_features
+    ctx.metadata["rf_transform_n_samples"] = cfg_resolved.rf_transform_n_samples
+    ctx.metadata["rf_transform_n_estimators"] = cfg_resolved.rf_transform_n_estimators
+    ctx.metadata["rf_transform_seed"] = cfg_resolved.rf_transform_seed
     log.info(
         "λ_T sample_seed=%d (fixed) n_dense=%d eval_workers=%d subspace_threshold=%.5f",
         ctx.sample_seed,
@@ -283,6 +307,12 @@ def main(argv: list[str] | None = None) -> int:
         require_subspace_rmse=cfg_resolved.require_subspace_rmse,
         paper_ga=cfg_resolved.paper_ga,
         paper_mode=cfg_resolved.paper_ga,
+        allow_rbf=cfg_resolved.allow_rbf,
+        oscillatory_bias=cfg_resolved.oscillatory_bias,
+        rbf_upweight=cfg_resolved.rbf_upweight,
+        rbf_additive_only=cfg_resolved.rbf_additive_only,
+        rbf_min_bumps=cfg_resolved.rbf_min_bumps,
+        rbf_max_bumps=cfg_resolved.rbf_max_bumps,
         snapshot_every=cfg_resolved.snapshot_every,
         seed=gp_seed,
         early_reject_subspace_mult=cfg_resolved.early_reject_subspace_mult,
@@ -290,6 +320,9 @@ def main(argv: list[str] | None = None) -> int:
         landscape_viz_every=cfg_resolved.landscape_every,
         landscape_grid_n=cfg_resolved.landscape_grid_n,
         eval_workers=eval_workers,
+        rf_transform_features=cfg_resolved.rf_transform_features,
+        rf_transform_n_estimators=cfg_resolved.rf_transform_n_estimators,
+        rf_transform_seed=cfg_resolved.rf_transform_seed,
         tournament_k=cfg_resolved.tournament_k,
         crossover_prob=cfg_resolved.crossover_prob,
         mutation_prob=cfg_resolved.mutation_prob,
@@ -308,6 +341,12 @@ def main(argv: list[str] | None = None) -> int:
         "elitism": _elitism_count(evo_cfg),
         "max_tree_depth": evo_cfg.max_tree_depth,
         "fitness_stop_threshold": evo_cfg.fitness_stop_threshold,
+        "allow_rbf": evo_cfg.allow_rbf,
+        "oscillatory_bias": evo_cfg.oscillatory_bias,
+        "rbf_upweight": evo_cfg.rbf_upweight,
+        "rbf_additive_only": evo_cfg.rbf_additive_only,
+        "rbf_min_bumps": evo_cfg.rbf_min_bumps,
+        "rbf_max_bumps": evo_cfg.rbf_max_bumps,
     }
     write_manifest(manifest_path, manifest)
     log.info("Run manifest: %s", manifest_path)
