@@ -1252,6 +1252,14 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
             f"zoom={optimizer.current_zoom}, iteration={optimizer.current_iteration}\n"
         )
 
+    # Live-mirror discovered needles into sql/needles.db (optimizing dims → full
+    # 10-col composition, sorted best-first). Rewritten on every needle add; the
+    # immediate sync here reflects any needles already loaded on resume.
+    try:
+        optimizer.data_handler._enable_needles_db(OPTIMIZING_DIMS)
+    except Exception as e:
+        print(f"[ZoMBI] needles.db live-sync setup failed: {e}")
+
     print("=" * 80)
     print("STARTING OPTIMIZATION")
     if MINIMIZE_OBJECTIVE:

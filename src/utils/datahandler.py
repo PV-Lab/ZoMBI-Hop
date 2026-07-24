@@ -238,6 +238,12 @@ class DataHandler:
         self.needle_penalty_radii: Optional[torch.Tensor] = None
         self.needles_results: List[Dict[str, Any]] = []
 
+        # Optional live mirror of the needle list into sql/needles.db (hardware
+        # runs only). Set by the hardware run driver via _enable_needles_db();
+        # left None for synthetic/GUI/test runs, where sync is a no-op.
+        self._needles_db_path: Optional[str] = None
+        self._needles_db_dims: Optional[List[int]] = None
+
         # Per-needle ellipsoid parameters (None entry = fall back to sphere radius).
         # needle_B is shared across all needles (same simplex tangent space).
         self.needle_M_list: List[Optional[torch.Tensor]] = []  # each (d-1, d-1)
@@ -1031,6 +1037,91 @@ class DataHandler:
         })
 
         self._update_penalty_mask()
+        self._sync_needles_db()
+
+    def _enable_needles_db(self, optimizing_dims: List[int],
+                           path: Optional[str] = None) -> None:
+        """Enable live mirroring of the needle list into sql/needles.db.
+
+        ``optimizing_dims`` are the hardware column indices this run optimises
+        (e.g. [0, 8, 9]); needle points are scattered into those columns of the
+        full 10-wide composition row. Called once by the hardware run driver; a
+        no-op mirror otherwise. Immediately syncs so any resume-loaded needles
+        are reflected.
+        """
+        from .needles_db import DEFAULT_NEEDLES_DB_PATH
+        self._needles_db_dims = [int(d) for d in optimizing_dims]
+        self._needles_db_path = str(path) if path is not None else str(DEFAULT_NEEDLES_DB_PATH)
+        # On resume, load_state() restores the needle tensors but not
+        # needles_results (its JSON is legacy/never written), which drops each
+        # needle's radial median. Backfill it from the checkpoint's needles.json
+        # so radial values survive and future live adds stay index-aligned.
+        self._backfill_needles_results_from_checkpoint()
+        self._sync_needles_db()
+
+    def _backfill_needles_results_from_checkpoint(self) -> None:
+        """Rebuild needles_results from the run's needles.json when it is missing
+        entries relative to the needle tensors (i.e. after a resume). No-op if
+        already complete or if the checkpoint cannot be aligned."""
+        n = self.needles.shape[0] if self.needles is not None else 0
+        if n == 0 or len(self.needles_results) >= n:
+            return
+        try:
+            from .needles_db import read_run_dir_needles
+            recs = read_run_dir_needles(getattr(self, "run_dir", None))
+        except Exception:
+            recs = []
+        if len(recs) < n:
+            return  # can't safely align tensors ↔ records; leave as-is
+        rebuilt: List[Dict[str, Any]] = []
+        for i in range(n):
+            r = recs[i] if isinstance(recs[i], dict) else {}
+            rebuilt.append({
+                'point': self.needles[i].clone(),
+                'value': (float(self.needle_vals[i].item())
+                          if self.needle_vals is not None and i < self.needle_vals.shape[0]
+                          else r.get('value')),
+                'median_value': r.get('median_value'),
+                'zoom': r.get('zoom'),
+                'iteration': r.get('iteration'),
+                'reason': r.get('reason'),
+            })
+        self.needles_results = rebuilt
+
+    def _needle_records_for_db(self) -> List[Dict[str, Any]]:
+        """Build DB records from the needle tensors (authoritative for count,
+        point and peak value), attaching the radial median from needles_results
+        by index when available. Robust even if needles_results is incomplete."""
+        n = self.needles.shape[0] if self.needles is not None else 0
+        recs: List[Dict[str, Any]] = []
+        for i in range(n):
+            res = self.needles_results[i] if i < len(self.needles_results) else {}
+            recs.append({
+                'point': self.needles[i],
+                'value': (float(self.needle_vals[i].item())
+                          if self.needle_vals is not None and i < self.needle_vals.shape[0]
+                          else res.get('value')),
+                'median_value': res.get('median_value'),
+            })
+        return recs
+
+    def _sync_needles_db(self) -> None:
+        """Rewrite sql/needles.db from the current needle set (sorted best-first).
+
+        No-op unless _enable_needles_db() has configured a path + dims. Never
+        raises — a DB hiccup must not interrupt the optimizer.
+        """
+        if self._needles_db_path is None or self._needles_db_dims is None:
+            return
+        try:
+            from .needles_db import write_needles
+            write_needles(self._needle_records_for_db(), self._needles_db_dims,
+                          path=self._needles_db_path)
+        except Exception as e:      # noqa: BLE001 — mirroring must not be fatal
+            try:
+                print(f"[needles.db] sync failed: {e}")
+            except Exception:
+                pass
 
     def get_needle_locations(self) -> torch.Tensor:
         """Return (num_needles, d) tensor of needle locations."""

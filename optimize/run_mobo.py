@@ -181,6 +181,7 @@ import os
 import random
 import shlex
 import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -387,7 +388,11 @@ HPARAM_SPACE: dict[str, tuple] = {
     # Acquisition function
     "ucb_beta":                    (0.001,   3.0,   "linear"),
     # Zoom / convergence
-    "max_zooms":                   (2,      10,    "int"),
+    # Lower bound is 3: a needle can only be declared at zoom level 3+
+    # (ZoMBIHop.min_zoom_for_needle), so max_zooms must allow reaching it.
+    "max_zooms":                   (3,      10,    "int"),
+    # Lower bound is 2 so at least min_iters_per_zoom (=2) lines can be sampled
+    # per zoom level before the optimiser may advance or declare a needle.
     "max_iterations":              (2,      30,    "int"),
     "top_m_points":                (2,      8,     "int"),
     "n_consecutive_converged":     (1,      5,    "int"),
@@ -1528,27 +1533,44 @@ def load_seed_hparams(trial_paths: list[str]) -> list[torch.Tensor]:
     stored metrics are ignored. Each becomes a normalised design point that the
     run RE-EVALUATES as a real initial trial (alongside — not instead of — the
     full Sobol init), so the GP learns these known-good configs under the current
-    objective/dataset rather than trusting a copied score. Trials whose hparams
-    don't cover the current HPARAM_SPACE abort the run (stale hyperparameter set).
+    objective/dataset rather than trusting a copied score. Seed dirs that are
+    missing, unreadable, or don't cover the current HPARAM_SPACE (stale set) are
+    skipped with a warning rather than aborting the run; if none survive, the run
+    proceeds with pure Sobol init.
     Returns a list of normalised [0,1] hyperparameter vectors.
     """
     X_seed: list[torch.Tensor] = []
     for p in trial_paths:
         json_path = p if p.lower().endswith(".json") else os.path.join(p, "trial.json")
+        # A seed dir that no longer exists, is unreadable, or predates the current
+        # HPARAM_SPACE is an ops artifact (archived runs get cleaned off scratch),
+        # not a reason to kill the run. Skip it with a warning and keep the rest —
+        # aborting here would exit rc=1, which the fleet babysitter treats as a
+        # fatal crash and stops resubmitting, taking the whole dim's chain down.
         if not os.path.exists(json_path):
-            sys.exit(f"--start-from-best: no trial.json found at {json_path}")
+            # A seed dir may be absent (e.g. a collaborator's run archived away, or a
+            # path that never existed on this account). Skip it rather than aborting:
+            # the full Sobol init still runs, so a missing seed just means one fewer
+            # re-evaluated known-good point, not a dead run/requeue chain.
+            print(f"  [seed] WARNING: no trial.json found at {json_path} — skipping.")
+            continue
         try:
             with open(json_path) as f:
                 data = json.load(f)
         except Exception as exc:
-            sys.exit(f"--start-from-best: {json_path} unreadable ({exc}).")
+            print(f"  [seed] WARNING: {json_path} unreadable ({exc}) — skipping.")
+            continue
         hp = data.get("hparams", {})
         missing = [name for name in HPARAM_NAMES if name not in hp]
         if missing:
-            sys.exit(f"--start-from-best: {json_path} is missing hparams {missing} "
-                     f"(stale hyperparameter set?).")
+            print(f"  [seed] WARNING: {json_path} is missing hparams {missing} "
+                  f"(stale hyperparameter set?) — skipping.")
+            continue
         X_seed.append(hparams_to_norm(hp))
         print(f"  [seed] {p}  (trial {data.get('trial', '?')}) — will be re-evaluated")
+    if trial_paths and not X_seed:
+        print("  [seed] WARNING: none of the requested seed trials were usable; "
+              "falling back to pure Sobol initialisation.")
     return X_seed
 
 
@@ -2491,6 +2513,41 @@ def reseed_ensemble(landscape: LandscapeSpec, config: dict):
     return fn, true_optima, grid_vals
 
 
+def _render_conet_artifacts(trial_dir: str, *, timeout_s: int = 1800) -> None:
+    """Render ``conet.png`` (the run's own samples + discovered needles) and
+    ``conet_uniform.png`` (a uniform-sampling baseline of the same landscape with
+    its true optima starred) for a completed ensemble repeat.
+
+    Each render runs as an isolated subprocess: the CoNet builder fits UMAP on a
+    full N×N distance matrix (>10 GB for ~19k samples), so keeping it out of this
+    process means an OOM, timeout, or crash there is logged and skipped rather than
+    taking the MOBO run down before its metrics.json lands.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    viz = os.path.join(repo_root, "visualization")
+    env = dict(os.environ, MPLBACKEND="Agg")
+    jobs = [
+        ("conet.png", [sys.executable, os.path.join(viz, "plot_10d.py"),
+                       "--run", trial_dir, "--needles",
+                       "--save", os.path.join(trial_dir, "conet.png")]),
+        ("conet_uniform.png", [sys.executable, os.path.join(viz, "uniform_baseline_conet.py"),
+                               "--run", trial_dir,
+                               "--save", os.path.join(trial_dir, "conet_uniform.png")]),
+    ]
+    for name, cmd in jobs:
+        t0 = time.time()
+        try:
+            r = subprocess.run(cmd, env=env, cwd=repo_root, timeout=timeout_s,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if r.returncode == 0:
+                print(f"    [trial] {name} rendered ({time.time() - t0:.0f}s)", flush=True)
+            else:
+                tail = "\n      ".join((r.stdout or "").splitlines()[-3:])
+                print(f"    [trial] {name} render failed rc={r.returncode}:\n      {tail}", flush=True)
+        except Exception as exc:
+            print(f"    [trial] {name} render error: {exc}", flush=True)
+
+
 # ─── Single trial: run ZoMBI on the objective + write all artifacts ────────────
 
 def run_single_trial(
@@ -2732,6 +2789,11 @@ def run_single_trial(
         plot_convergence(os.path.join(trial_dir, "convergence.png"), dh, maximize)
     except Exception as exc:
         print(f"    [trial] static plot failed: {exc}")
+
+    # CoNet artifacts (ensemble runs only: the uniform baseline reconstructs the
+    # landscape from ensemble_config.json). Best-effort, isolated subprocesses.
+    if ensemble_config is not None:
+        _render_conet_artifacts(trial_dir)
 
     if landscape.render_ternary and grid_pts is not None and grid_vals is not None and payloads:
         plots_dir = os.path.join(trial_dir, "plots")

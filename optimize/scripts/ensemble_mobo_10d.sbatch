@@ -45,15 +45,14 @@ RUN_DIR="optimize/runs/mobo_ensemble_10d_job${SLURM_JOB_ID}"
 # new landscape. Modulo keeps it in the int32 range NumPy's RandomState accepts.
 ENSEMBLE_SEED=$(( SLURM_JOB_ID % 2147483647 ))
 
-# Seed with the archived trial_112, plus the 3 best-dist_to_needles trials from the
-# ensemble 10d shared-history pool (all this account's own here, ranked by pareto.py).
+# Seed with the archived trial_112. The 3 best-dist_to_needles trials from the old
+# ensemble 10d pool (job16948660/job16857325) were cleaned off scratch, so they were
+# dropped; re-derive replacements with pareto.py once a fresh 10d pool exists and add
+# them back here. load_seed_hparams() skips any missing seed dir with a warning.
 uv run python optimize/run_mobo.py --dataset ensemble --dim 10 --time-limit 0.7 --share-history \
     --ensemble-seed "$ENSEMBLE_SEED" \
     --start-from-best \
         optimize/runs/archived_runs/mobo_3d_05_06_15_32/trial_112 \
-        optimize/runs/archived_runs/mobo_ensemble_10d_job16948660/trial_2 \
-        optimize/runs/archived_runs/mobo_ensemble_10d_job16948660/trial_4 \
-        optimize/runs/archived_runs/mobo_ensemble_10d_job16857325/trial_2 \
     --run-dir "$RUN_DIR" &
 wait $!
 rc=$?

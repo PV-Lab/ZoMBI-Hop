@@ -19,6 +19,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -59,6 +60,13 @@ except ImportError:
     _BOTORCH_OK = False
 
 from src import ZoMBIHop, LineBO
+from src.core.hparam_live import (
+    LIVE_EDITABLE_NAMES,
+    OVERRIDE_FILENAME as OVERRIDE_HPARAMS_FILENAME,
+    coerce as coerce_hparam,
+    read_effective as read_effective_hparams,
+    write_override as write_override_hparams,
+)
 from src.core.linebo import line_simplex_segment, zero_sum_dirs
 from src.utils.simplex import add_composition_noise, proj_simplex, get_tangent_basis
 from src.utils.datahandler import reconstruct_snapshot_tensors
@@ -823,6 +831,7 @@ class RunBrowserPanel(ttk.Frame):
         ttk.Button(bf, text="Refresh",  width=_bw, command=self.refresh).pack(side="left", padx=2)
         ttk.Button(bf, text="Load",     width=_bw, command=self._load_selected).pack(side="left", padx=2)
         ttk.Button(bf, text="New Run",  width=_bw, command=app.open_new_run_dialog).pack(side="left", padx=2)
+        ttk.Button(bf, text="Adjust",   width=_bw, command=self._adjust_selected).pack(side="left", padx=2)
         ttk.Button(bf, text="Stop Run", width=_bw, command=self._stop_selected,
                    style="Danger.TButton").pack(side="left", padx=2)
         ttk.Button(bf, text="Delete",   width=_bw, command=self._delete_selected,
@@ -896,6 +905,21 @@ class RunBrowserPanel(ttk.Frame):
             messagebox.showinfo("Select", "Click a run first.")
             return
         HardwareResumeDialog(self, self._app, self._runs[sel[0]])
+
+    def _adjust_selected(self):
+        sel = self._lb.curselection()
+        if not sel:
+            messagebox.showinfo("Select", "Click a running run first.")
+            return
+        run_info = self._runs[sel[0]]
+        run_id   = run_info["run_id"]
+        if run_id not in self._app._active_runs:
+            messagebox.showinfo(
+                "Not running",
+                f"{run_id} is not currently running.\n\nHyperparameters can only be "
+                "adjusted on a run that is in flight — start or resume it first.")
+            return
+        LiveHparamsDialog(self, self._app, run_id, run_info["run_dir"])
 
     def _delete_selected(self):
         sel = self._lb.curselection()
@@ -1117,6 +1141,50 @@ class DistancePlotFrame(PlotFrame):
         self.draw()
 
 
+# ── composition-column labels ─────────────────────────────────────────────────
+
+def _read_run_hw_dims(rd: "RunData") -> Optional[list]:
+    """Read a run's hardware optimizing-dim indices (e.g. ``[0, 2, 8, 9]``).
+
+    Looks for a ``dims`` field like ``"0,2,8,9"`` in ``hw_config.json`` then
+    ``config.json`` in the run dir. Returns the parsed integer list, or None if
+    unavailable/malformed. These are the actual column indices in the database,
+    which need not be contiguous (the optimizer only sees a dense 0…d-1 slice).
+    """
+    if rd is None:
+        return None
+    for fname in ("hw_config.json", "config.json"):
+        p = rd.run_dir / fname
+        if not p.exists():
+            continue
+        try:
+            data     = json.loads(p.read_text())
+            dims_raw = data.get("dims", "")
+            if not dims_raw:
+                continue
+            parsed = [int(x.strip()) for x in str(dims_raw).split(",")
+                      if x.strip().lstrip("-").isdigit()]
+            if parsed:
+                return parsed
+        except Exception:
+            pass
+    return None
+
+
+def _run_comp_labels(rd: "RunData") -> list[str]:
+    """Composition-component column headers for a run.
+
+    Uses the real hardware dim indices when known (e.g.
+    ``["x[0]","x[2]","x[8]","x[9]"]``) so columns map back to the database,
+    falling back to a dense ``["x[0]"…"x[d-1]"]`` otherwise.
+    """
+    d = rd.d if rd is not None else 0
+    dims = _read_run_hw_dims(rd)
+    if dims is not None and len(dims) == d:
+        return [f"x[{k}]" for k in dims]
+    return [f"x[{i}]" for i in range(d)]
+
+
 # ── points table ──────────────────────────────────────────────────────────────
 
 class PointsTableFrame(ttk.Frame):
@@ -1133,7 +1201,7 @@ class PointsTableFrame(ttk.Frame):
             return
 
         d    = rd.d
-        cols = ["#"] + [f"x[{i}]" for i in range(d)] + ["Y", "valid"]
+        cols = ["#"] + _run_comp_labels(rd) + ["Y", "valid"]
         tree = ttk.Treeview(self._inner, columns=cols, show="headings", height=22)
         for c in cols:
             tree.heading(c, text=c)
@@ -1193,21 +1261,37 @@ class NeedlesFrame(ttk.Frame):
             return
 
         d    = rd.d
-        ccols = [f"x[{i}]" for i in range(d)]
+        ccols = _run_comp_labels(rd)
         cols  = ["#"] + ccols + ["value", "med_val", "zoom", "iter"]
+        # Friendly display headings + widths (column ids stay short/stable).
+        # "radial median objective" = median objective over all raw measurements
+        # within the needle's paring radius — a noise-robust height estimate.
+        headings = {"value": "objective value",
+                    "med_val": "radial median objective"}
+        widths   = {"value": 115, "med_val": 175}
         self._tree["columns"] = cols
         for c in cols:
-            self._tree.heading(c, text=c)
-            w = 35 if c == "#" else (60 if c.startswith("x[") else 75)
+            self._tree.heading(c, text=headings.get(c, c))
+            w = 35 if c == "#" else (60 if c.startswith("x[") else widths.get(c, 75))
             self._tree.column(c, width=w, anchor="e", minwidth=w)
 
-        for i, n in enumerate(self._data):
+        # Display highest-value needles first. Keep each needle's original index
+        # (in needles.json order) as its "#"/iid so the detail lookup below and
+        # the discovery order both stay intact.
+        def _val_key(item):
+            v = item[1].get("value")
+            if isinstance(v, (int, float)) and not (isinstance(v, float) and math.isnan(v)):
+                return v
+            return float("-inf")
+        order = sorted(enumerate(self._data), key=_val_key, reverse=True)
+
+        for orig_i, n in order:
             pt   = n.get("point", [])
             comp = [f"{v:.4f}" for v in pt]
             val  = f"{n['value']:.5f}"   if n.get("value")        is not None else ""
             mv   = f"{n['median_value']:.5f}" if n.get("median_value") is not None else ""
-            self._tree.insert("", "end", iid=str(i),
-                              values=[str(i)] + comp + [val, mv,
+            self._tree.insert("", "end", iid=str(orig_i),
+                              values=[str(orig_i)] + comp + [val, mv,
                                       n.get("zoom", ""),
                                       n.get("iteration", "")])
 
@@ -1236,6 +1320,7 @@ class GPQueryFrame(ttk.Frame):
         self._gp_rid  = ""
         self._entries: list[tk.StringVar] = []
         self._d_built = 0
+        self._labels_built: list[str] = []
 
         top = ttk.Frame(self)
         top.pack(fill="x", padx=8, pady=6)
@@ -1271,15 +1356,17 @@ class GPQueryFrame(ttk.Frame):
         self._sum_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self._sum_var, foreground="gray").pack(anchor="w", padx=8)
 
-    def _rebuild_entries(self, d: int):
+    def _rebuild_entries(self, d: int, labels: Optional[list[str]] = None):
         for w in self._ef.winfo_children():
             w.destroy()
         self._entries = []
         self._d_built = d
+        self._labels_built = list(labels) if labels is not None else [f"x[{i}]" for i in range(d)]
         n_cols = 4
         for i in range(d):
             r, c = divmod(i, n_cols)
-            ttk.Label(self._ef, text=f"x[{i}]:", width=6).grid(
+            lbl = self._labels_built[i] if i < len(self._labels_built) else f"x[{i}]"
+            ttk.Label(self._ef, text=f"{lbl}:", width=7).grid(
                 row=r, column=2*c, sticky="e", padx=2, pady=1)
             v = tk.StringVar(value=f"{1.0/d:.6f}")
             ttk.Entry(self._ef, textvariable=v, width=10).grid(
@@ -1319,8 +1406,9 @@ class GPQueryFrame(ttk.Frame):
             self._sum_var.set(f"sum = {v.sum():.6f}")
 
     def update_for_run(self, rd: RunData):
-        if rd.d != self._d_built:
-            self._rebuild_entries(max(rd.d, 1))
+        labels = _run_comp_labels(rd)
+        if rd.d != self._d_built or labels != self._labels_built:
+            self._rebuild_entries(max(rd.d, 1), labels)
         if rd.run_id != self._gp_rid:
             with self._gp_lock:
                 self._gp = None
@@ -1732,22 +1820,7 @@ class TernaryPlotFrame(ttk.Frame):
 
     def _read_hw_dims(self, rd: "RunData") -> Optional[list]:
         """Try to read hardware optimizing dims from config files in the run dir."""
-        for fname in ("hw_config.json", "config.json"):
-            p = rd.run_dir / fname
-            if not p.exists():
-                continue
-            try:
-                data     = json.loads(p.read_text())
-                dims_raw = data.get("dims", "")
-                if not dims_raw:
-                    continue
-                parsed = [int(x.strip()) for x in str(dims_raw).split(",")
-                          if x.strip().lstrip("-").isdigit()]
-                if parsed:
-                    return parsed
-            except Exception:
-                pass
-        return None
+        return _read_run_hw_dims(rd)
 
     def _sync_combos(self, labels: list[str], n_cols: int, rd: "RunData"):
         """Rebuild combobox choices and restore any saved selection for this run."""
@@ -1945,6 +2018,36 @@ class TernaryPlotFrame(ttk.Frame):
                 [self._accum_penalized, np.asarray(new_p, bool)])
         return self._accum_pts, self._accum_y, self._accum_penalized
 
+    def _accumulate_full_history(self, n_cols: int):
+        """
+        Seed the accumulator with the snapshot's *full* evaluated history
+        (``rd.X_all``) so the ternary/tetra shows every point, not just the ones
+        the current live source happens to report.
+
+        This matters on **resume**: a resumed run's ``live_plot_state.json`` is
+        rebuilt from the new points collected since the restart, so a fresh app
+        session reading it would otherwise plot only those. The reconstructed
+        snapshot, however, always carries the complete history. De-duplication by
+        composition means this safely unions with the live batch; declared points
+        are never dropped, so the whole run persists.
+
+        Only merged when the snapshot's column count matches ``n_cols`` so the
+        dim ordering lines up — true for compositional runs (d == n_cols), where
+        this bug bites. Subset-dim hardware runs (d > n_cols) are left untouched.
+        """
+        rd = self._last_rd
+        if rd is None or rd.X_all is None:
+            return
+        Xh = np.asarray(rd.X_all, dtype=float)
+        if Xh.ndim != 2 or Xh.shape[0] == 0 or Xh.shape[1] != n_cols:
+            return
+        Yh = (np.asarray(rd.Y_all, dtype=float).ravel()
+              if rd.Y_all is not None and len(rd.Y_all) == Xh.shape[0] else None)
+        penh = (~np.asarray(rd.penalty_mask, dtype=bool)
+                if rd.penalty_mask is not None
+                and len(rd.penalty_mask) == Xh.shape[0] else None)
+        self._accumulate_points(Xh, n_cols, Yh, penh)
+
     def _accumulate_needles(self, needles_data: list) -> list:
         """
         Merge the current needle batch into the per-run needle accumulator and
@@ -2004,7 +2107,10 @@ class TernaryPlotFrame(ttk.Frame):
 
         # ── sampled points (no ground-truth background cloud) ─────────────
         # Accumulate every point seen for this run so the cloud persists for the
-        # whole lifetime of the run (see _accumulate_points).
+        # whole lifetime of the run (see _accumulate_points). Seed from the
+        # snapshot's full history first so resumed runs show all points, not just
+        # the ones collected since the restart.
+        self._accumulate_full_history(4)
         acc_pts, acc_y, _ = self._accumulate_points(X, 4, self._resolve_batch_Y(X))
         if acc_pts.shape[0] > 0 and acc_pts.shape[1] >= 4:
             P = acc_pts[:, :4] @ V
@@ -2205,7 +2311,9 @@ class TernaryPlotFrame(ttk.Frame):
         # ── scatter points ────────────────────────────────────────────────
         # Accumulate every point seen for this run so the scatter persists for
         # the whole lifetime of the run, regardless of what the current source
-        # momentarily reports.
+        # momentarily reports. Seed from the snapshot's full history first so
+        # resumed runs show all points, not just those collected since restart.
+        self._accumulate_full_history(n_cols)
         acc_pts, acc_y, acc_pen = self._accumulate_points(
             X, n_cols, self._resolve_batch_Y(X), self._resolve_batch_penalized(X))
         if self._show_points.get() and acc_pts.shape[0] > 0 and acc_pts.shape[1] > max_col:
@@ -2405,7 +2513,7 @@ class ManualControlFrame(ttk.Frame):
         self._com_var = tk.StringVar(value="COM5")
         ttk.Entry(r1, textvariable=self._com_var, width=9).pack(side="left", padx=(4, 18))
         ttk.Label(r1, text="Baud:").pack(side="left")
-        self._baud_var = tk.IntVar(value=9600)
+        self._baud_var = tk.IntVar(value=115200)
         ttk.Entry(r1, textvariable=self._baud_var, width=8).pack(side="left", padx=4)
 
         r2 = ttk.Frame(fr); r2.pack(fill="x", padx=4, pady=2)
@@ -3002,6 +3110,245 @@ class LiveLogPanel(ttk.LabelFrame):
         self._status_var.set("A:—  Z:—  I:—")
 
 
+class _Tooltip:
+    """Minimal hover tooltip for a Tk widget (no external deps)."""
+
+    def __init__(self, widget, text: str, wraplength: int = 380):
+        self._widget = widget
+        self._text = text
+        self._wrap = wraplength
+        self._tip: Optional[tk.Toplevel] = None
+        self._job: Optional[str] = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _e=None):
+        self._cancel()
+        self._job = self._widget.after(450, self._show)
+
+    def _cancel(self):
+        if self._job:
+            try:
+                self._widget.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+    def _show(self):
+        if self._tip is not None or not self._text:
+            return
+        x = self._widget.winfo_rootx() + 20
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        self._tip = tk.Toplevel(self._widget)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self._tip, text=self._text, justify="left",
+                 background="#ffffe0", relief="solid", borderwidth=1,
+                 font=("Segoe UI", 8), wraplength=self._wrap).pack(ipadx=3, ipady=2)
+
+    def _hide(self, _e=None):
+        self._cancel()
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+
+class LiveHparamsDialog(tk.Toplevel):
+    """
+    Manually change ZoMBI-Hop hyperparameters on a run that is already in flight.
+
+    Values are written to ``<run_dir>/hparams_override.json``; the optimiser
+    consumes them at the top of its next iteration — i.e. between measured lines
+    — and republishes what is actually in force. This dialog watches for that
+    handoff so "Apply" reports *applied*, not merely *requested*. Identical for
+    synthetic (in-process thread) and hardware (subprocess) runs, since the file
+    lives in the shared run directory.
+    """
+
+    _POLL_MS = 700
+
+    def __init__(self, parent, app: "ZoMBIApp", run_id: str, run_dir):
+        super().__init__(parent)
+        self.title(f"Adjust Hyperparameters — {run_id}")
+        self.geometry("560x560")
+        self._app     = app
+        self._run_id  = run_id
+        self._run_dir = Path(run_dir)
+        self._vars: dict[str, tk.StringVar] = {}
+        self._widgets: dict[str, tk.Widget] = {}
+        self._specs: dict[str, tuple] = {}
+        # Exact text last written into each field. A field counts as edited only
+        # if its text differs from this, so untouched fields are never sent (and
+        # float round-tripping, e.g. "0.02" vs 0.02, can't fake a change).
+        self._baseline: dict[str, str] = {}
+        self._effective: dict = {}
+        self._poll_job: Optional[str] = None
+        self._build()
+        self._reload(announce=False)
+        self._poll()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.transient(parent)
+
+    # ── construction ─────────────────────────────────────────────────────
+    def _build(self):
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(top, text="Edit a value and click Apply. Changes take effect on "
+                            "the run's next iteration (between printed lines); "
+                            "in-flight lines are never interrupted.",
+                  foreground="gray", wraplength=520, justify="left").pack(anchor="w")
+
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        for cat, params in HPARAM_CATEGORIES.items():
+            live = [p for p in params if p[0] in LIVE_EDITABLE_NAMES]
+            if not live:
+                continue
+            tab = ttk.Frame(nb)
+            nb.add(tab, text=cat)
+            for row, (name, typ, default, label, desc) in enumerate(live):
+                self._specs[name] = (typ, default, label, desc)
+                lbl = ttk.Label(tab, text=f"{label}:", anchor="w")
+                lbl.grid(row=row, column=0, sticky="w", padx=8, pady=3)
+                var = tk.StringVar(value=str(default))
+                self._vars[name] = var
+                if name == "acquisition_type":
+                    w = ttk.OptionMenu(tab, var, str(default), "ucb", "ei")
+                else:
+                    w = ttk.Entry(tab, textvariable=var, width=16)
+                w.grid(row=row, column=1, sticky="w", padx=4, pady=3)
+                self._widgets[name] = w
+                hint = ttk.Label(tab, text=name, foreground="#999999",
+                                 font=("Consolas", 8))
+                hint.grid(row=row, column=2, sticky="w", padx=6)
+                for target in (lbl, w, hint):
+                    _Tooltip(target, desc)
+            tab.columnconfigure(2, weight=1)
+
+        self._status_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self._status_var, wraplength=520,
+                  justify="left", font=("Segoe UI", 8)).pack(
+            anchor="w", padx=8, pady=(0, 4))
+
+        bf = ttk.Frame(self)
+        bf.pack(fill="x", padx=8, pady=(0, 8))
+        self._apply_btn = ttk.Button(bf, text="Apply", command=self._apply)
+        self._apply_btn.pack(side="left")
+        ttk.Button(bf, text="Revert to in-force",
+                   command=lambda: self._reload(announce=True)).pack(side="left", padx=6)
+        ttk.Button(bf, text="Close", command=self._close).pack(side="right")
+
+    # ── in-force values ──────────────────────────────────────────────────
+    def _read_in_force(self) -> dict:
+        """In-force values: what the optimiser published, else the run's
+        config.json, else the shipped defaults."""
+        eff = read_effective_hparams(self._run_dir)
+        if eff:
+            return eff
+        merged = dict(DEFAULT_HPARAMS)
+        cfg = self._run_dir / "config.json"
+        if cfg.exists():
+            try:
+                data = json.loads(cfg.read_text())
+                merged.update({k: v for k, v in data.items()
+                               if k in LIVE_EDITABLE_NAMES})
+            except Exception:
+                pass
+        return {k: v for k, v in merged.items() if k in LIVE_EDITABLE_NAMES}
+
+    def _set_field(self, name: str, value) -> None:
+        """Write a field and re-baseline it, so it reads as unedited."""
+        txt = str(value)
+        self._vars[name].set(txt)
+        self._baseline[name] = txt
+
+    def _reload(self, announce: bool):
+        self._effective = self._read_in_force()
+        for name in self._vars:
+            if name in self._effective:
+                self._set_field(name, self._effective[name])
+            else:
+                # Nothing in force for this one (partial effective file) — keep
+                # the displayed default and baseline it, so it is only ever sent
+                # if the user actually types something different.
+                self._baseline[name] = self._vars[name].get()
+        if announce:
+            self._status_var.set("Reverted to the values currently in force.")
+
+    def _edited(self) -> dict:
+        """Fields the user actually changed, coerced/validated."""
+        out = {}
+        for name, var in self._vars.items():
+            txt = var.get().strip()
+            if not txt or txt == self._baseline.get(name):
+                continue
+            out[name] = coerce_hparam(name, txt)  # raises ValueError on bad input
+        return out
+
+    # ── apply / confirm ──────────────────────────────────────────────────
+    def _apply(self):
+        if self._run_id not in self._app._active_runs:
+            messagebox.showwarning(
+                "Run not active",
+                f"{self._run_id} is not currently running, so there is nothing to "
+                "change. Start or resume the run first.")
+            return
+        try:
+            hp = self._edited()
+        except (ValueError, TypeError) as exc:
+            messagebox.showerror("Invalid value", str(exc))
+            return
+        if not hp:
+            self._status_var.set("No changes to apply.")
+            return
+        try:
+            write_override_hparams(self._run_dir, hp)
+        except Exception as exc:
+            messagebox.showerror("Could not write override", str(exc))
+            return
+        summary = ", ".join(f"{k}={v}" for k, v in hp.items())
+        self._status_var.set(f"Requested: {summary}\nWaiting for the run to pick "
+                             f"it up at its next iteration…")
+        self._app.log_to_main(f"[hparams] manual change requested for "
+                              f"{self._run_id}: {summary}",
+                              tag="info", run_id=self._run_id)
+
+    def _poll(self):
+        """Watch for the optimiser consuming the override, then show what
+        actually took effect."""
+        pending = (self._run_dir / OVERRIDE_HPARAMS_FILENAME).exists()
+        if not pending:
+            new_eff = self._read_in_force()
+            if new_eff and new_eff != self._effective:
+                changed = {k: v for k, v in new_eff.items()
+                           if self._effective.get(k) != v}
+                self._effective = new_eff
+                try:
+                    focused = self.focus_get()
+                except Exception:
+                    focused = None
+                for name in self._vars:
+                    # Don't yank the field out from under someone mid-edit.
+                    if name in new_eff and self._widgets.get(name) is not focused:
+                        self._set_field(name, new_eff[name])
+                if changed:
+                    self._status_var.set(
+                        "Applied by the run: "
+                        + ", ".join(f"{k}={v}" for k, v in changed.items()))
+        self._poll_job = self.after(self._POLL_MS, self._poll)
+
+    def _close(self):
+        if self._poll_job:
+            try:
+                self.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
+        self.destroy()
+
+
 class NewRunDialog(tk.Toplevel):
     def __init__(self, parent, app: "ZoMBIApp"):
         super().__init__(parent)
@@ -3495,6 +3842,111 @@ class HardwareResumeDialog(tk.Toplevel):
 
 # ── main application window ───────────────────────────────────────────────────
 
+class _WinJobObject:
+    """Windows Job Object with KILL_ON_JOB_CLOSE, used to own a hardware run's
+    whole process tree.
+
+    Assigning ``main.py`` to the job makes the OS treat it and all its (future)
+    descendants — including the serial child that holds COM — as one unit:
+    ``terminate()`` kills them all atomically, and if this handle ever closes
+    (notably if the GUI process itself dies) the OS kills them too. That is what
+    guarantees the serial child is never left orphaned holding the COM port,
+    which would otherwise require physically unplugging it.
+
+    Every method is a best-effort no-op on failure; on non-Windows nothing is
+    created and callers fall back to signal/taskkill handling.
+    """
+
+    def __init__(self):
+        self._h = None
+        self._k32 = None
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes as wt
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateJobObjectW.restype = wt.HANDLE
+            k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            k32.SetInformationJobObject.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD]
+            k32.SetInformationJobObject.restype = wt.BOOL
+            k32.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
+            k32.AssignProcessToJobObject.restype = wt.BOOL
+            k32.TerminateJobObject.argtypes = [wt.HANDLE, wt.UINT]
+            k32.TerminateJobObject.restype = wt.BOOL
+            k32.CloseHandle.argtypes = [wt.HANDLE]
+
+            class _BASIC(ctypes.Structure):
+                _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                            ("PerJobUserTimeLimit", ctypes.c_int64),
+                            ("LimitFlags", wt.DWORD),
+                            ("MinimumWorkingSetSize", ctypes.c_size_t),
+                            ("MaximumWorkingSetSize", ctypes.c_size_t),
+                            ("ActiveProcessLimit", wt.DWORD),
+                            ("Affinity", ctypes.c_size_t),
+                            ("PriorityClass", wt.DWORD),
+                            ("SchedulingClass", wt.DWORD)]
+
+            class _IOC(ctypes.Structure):
+                _fields_ = [(f"c{i}", ctypes.c_uint64) for i in range(6)]
+
+            class _EXT(ctypes.Structure):
+                _fields_ = [("BasicLimitInformation", _BASIC),
+                            ("IoInfo", _IOC),
+                            ("ProcessMemoryLimit", ctypes.c_size_t),
+                            ("JobMemoryLimit", ctypes.c_size_t),
+                            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                            ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+            h = k32.CreateJobObjectW(None, None)
+            if not h:
+                return
+            info = _EXT()
+            info.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+            # 9 == JobObjectExtendedLimitInformation
+            if not k32.SetInformationJobObject(h, 9, ctypes.byref(info), ctypes.sizeof(info)):
+                k32.CloseHandle(h)
+                return
+            self._k32 = k32
+            self._h = h
+        except Exception:
+            self._h = None
+
+    @property
+    def ok(self) -> bool:
+        return self._h is not None
+
+    def assign(self, proc) -> bool:
+        """Put ``proc`` (a subprocess.Popen) into the job. Its future children join too."""
+        if self._h is None or proc is None:
+            return False
+        try:
+            handle = getattr(proc, "_handle", None)
+            if handle is None:
+                return False
+            return bool(self._k32.AssignProcessToJobObject(self._h, int(handle)))
+        except Exception:
+            return False
+
+    def terminate(self, exit_code: int = 1) -> None:
+        if self._h is None:
+            return
+        try:
+            self._k32.TerminateJobObject(self._h, exit_code)
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        if self._h is None:
+            return
+        try:
+            self._k32.CloseHandle(self._h)
+        except Exception:
+            pass
+        self._h = None
+
+
 class ZoMBIApp(tk.Tk):
     def __init__(self, ckpt_dir: str = DEFAULT_CKPT_DIR):
         super().__init__()
@@ -3509,7 +3961,15 @@ class ZoMBIApp(tk.Tk):
         self._active_runs: dict[str, dict] = {}
         # Which run's log is currently shown in the log panel
         self._viewed_run_id: Optional[str] = None
+        # Every hardware-run subprocess (scripts/main.py) we launch. Tracked so we
+        # can kill the whole process tree — including the serial child holding
+        # COM — on stop, before a new launch, and on app close, so the port is
+        # never left orphaned (which would otherwise require unplugging it).
+        self._hw_procs: list[subprocess.Popen] = []
         self._build_ui()
+        # Kill any live hardware process trees before the window closes so COM
+        # is released instead of being held by an orphaned serial child.
+        self.protocol("WM_DELETE_WINDOW", self._on_app_close)
         self._start_poll()
 
     def _build_ui(self):
@@ -3643,6 +4103,111 @@ class ZoMBIApp(tk.Tk):
             label = "▶ Resume" if not ev.is_set() else "⏸ Pause"
             self._pause_btn.config(state="normal", text=label)
 
+    def _terminate_hw_proc_tree(self, proc: "subprocess.Popen | None",
+                                run_id: str | None = None,
+                                graceful: bool = True,
+                                graceful_timeout: float = 20.0):
+        """Terminate a hardware run's whole process *tree* so COM5 is released.
+
+        scripts/main.py spawns a serial child that owns the COM port. On Windows
+        a plain terminate() kills only main.py and orphans that child, which then
+        holds the port until it is physically unplugged. To avoid that:
+
+          • graceful=True → send CTRL_BREAK to main.py's process group so it can
+            shut the serial child down cleanly (closing the port); if it does not
+            exit within graceful_timeout, force-kill the whole tree.
+          • graceful=False → force-kill the tree immediately (used before a new
+            launch and on app close, where we just need the port free now).
+
+        The force path terminates the run's kill-on-close Job Object, which takes
+        down main.py and every descendant atomically — even an already-orphaned
+        serial child (`taskkill /T` can't reach an orphan of a dead parent, so it
+        is only a fallback when no job was established). A dead process's port
+        handle is released by the OS. Safe to call on an already-exited process.
+        """
+        if proc is None:
+            return
+        job = getattr(proc, "_zombi_job", None)
+
+        def _log(msg, tag="info"):
+            try:
+                self.log_to_main(msg, tag=tag, run_id=run_id)
+            except Exception:
+                pass
+
+        def _release_job():
+            if job is not None:
+                job.close()  # drop the handle; tree is already gone by here
+
+        try:
+            if proc.poll() is not None:
+                _release_job()
+                return  # already exited
+            if os.name == "nt":
+                if graceful:
+                    try:
+                        proc.send_signal(signal.CTRL_BREAK_EVENT)
+                        _log("Sent stop signal to hardware run; waiting for COM release…")
+                        proc.wait(timeout=graceful_timeout)
+                        _log("Hardware run stopped cleanly; COM released.", tag="done")
+                        _release_job()
+                        return
+                    except subprocess.TimeoutExpired:
+                        _log("Hardware run did not stop in time — force-killing process tree…",
+                             tag="error")
+                    except Exception as e:
+                        _log(f"Could not signal hardware run ({e}); force-killing…", tag="error")
+                # Force-kill main.py AND its serial/zombi children so COM frees.
+                # The job kills the whole tree atomically even if main.py already
+                # died (taskkill /T can't reach an orphan of a dead parent); fall
+                # back to taskkill only when no job was established.
+                if job is not None and job.ok:
+                    job.terminate()
+                else:
+                    try:
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                       capture_output=True)
+                    except Exception as e:
+                        _log(f"taskkill failed: {e}", tag="error")
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                _release_job()
+            else:
+                # POSIX: terminate (catchable) then hard-kill.
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=graceful_timeout if graceful else 3.0)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        except Exception as e:
+            _log(f"Error stopping hardware run: {e}", tag="error")
+            _release_job()
+
+    def _reap_hw_procs(self, graceful: bool = False):
+        """Force any still-alive hardware process trees to exit, then forget the
+        dead ones. Used before a new launch and on app close so a lingering
+        serial child never keeps COM5 open."""
+        for proc in list(self._hw_procs):
+            try:
+                if proc.poll() is None:
+                    self._terminate_hw_proc_tree(proc, graceful=graceful)
+            except Exception:
+                pass
+        self._hw_procs = [p for p in self._hw_procs if p.poll() is None]
+
+    def _on_app_close(self):
+        """Window-close handler: release COM by killing hardware trees first."""
+        try:
+            self._reap_hw_procs(graceful=False)
+        except Exception:
+            pass
+        self.destroy()
+
     def _register_active_run(self, pause_event: threading.Event, run_id: str,
                              stop_event: threading.Event | None = None,
                              proc: subprocess.Popen | None = None):
@@ -3669,12 +4234,16 @@ class ZoMBIApp(tk.Tk):
         info = self._active_runs.get(run_id)
         if info is None:
             return
-        # Hardware run: terminate the subprocess
+        # Hardware run: stop the whole process tree so the serial child releases
+        # COM (a plain terminate() would orphan it). Runs on a background thread
+        # because the graceful path waits up to ~15s for a clean port close.
         proc = info.get("proc")
         if proc is not None and proc.poll() is None:
-            self.log_to_main(f"Terminating hardware process for {run_id} …",
+            self.log_to_main(f"Stopping hardware process for {run_id} …",
                              tag="info", run_id=run_id)
-            proc.terminate()
+            threading.Thread(
+                target=self._terminate_hw_proc_tree, args=(proc, run_id),
+                kwargs={"graceful": True}, daemon=True).start()
             return
         # Synthetic run: signal the stop event
         stop_ev = info.get("stop_event")
@@ -3769,9 +4338,36 @@ class ZoMBIApp(tk.Tk):
         proc_ref: list[subprocess.Popen | None] = [None]
 
         def _pump():
+            log_fh = None            # persistent <run_dir>/run.log for post-mortem review
             try:
                 import os as _os
+                import time as _time
                 _env = {**_os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+                # Tee the child's stdout/stderr to <run_dir>/run.log so crashes and
+                # tracebacks survive after the (in-memory) GUI log panel is gone.
+                if hw_run_id:
+                    try:
+                        _log_dir = Path(ckpt_dir) / hw_run_id
+                        _log_dir.mkdir(parents=True, exist_ok=True)
+                        log_fh = open(_log_dir / "run.log", "a", encoding="utf-8", errors="replace")
+                        log_fh.write(f"\n===== hardware run launched "
+                                     f"{_time.strftime('%Y-%m-%d %H:%M:%S')} =====\n$ {' '.join(cmd)}\n")
+                        log_fh.flush()
+                    except Exception:
+                        log_fh = None
+                # Make sure no serial child from a previous run is still holding
+                # COM before we start a new one (belt-and-suspenders alongside the
+                # stop/close handlers).
+                app._reap_hw_procs(graceful=False)
+                # Launch main.py in its own process group so we can send it a
+                # CTRL_BREAK for a clean shutdown, and so force-killing its tree
+                # never touches the GUI.
+                _popen_kwargs = {}
+                if os.name == "nt":
+                    _popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                # Kill-on-close job: owns the whole run tree so the serial child
+                # can never orphan COM (also auto-killed by the OS if the GUI dies).
+                _job = _WinJobObject()
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -3781,8 +4377,14 @@ class ZoMBIApp(tk.Tk):
                     bufsize=1,
                     cwd=proj_root,
                     env=_env,
+                    **_popen_kwargs,
                 )
+                # Assign now, before main.py has imported/spawned its serial child,
+                # so that child is captured by the job too.
+                _job.assign(proc)
+                proc._zombi_job = _job
                 proc_ref[0] = proc
+                app._hw_procs.append(proc)
                 if hw_run_id:
                     app.after(0, lambda: app._register_active_run(
                         threading.Event(), hw_run_id, proc=proc))
@@ -3792,6 +4394,12 @@ class ZoMBIApp(tk.Tk):
                         continue
                     rid = hw_run_id
                     app.log_to_main(stripped, run_id=rid)
+                    if log_fh is not None:
+                        try:
+                            log_fh.write(stripped + "\n")
+                            log_fh.flush()   # per-line flush: a hard crash still leaves the log
+                        except Exception:
+                            pass
                     if not uuid:          # only parse UUID for new runs
                         m = _RE_UUID.search(stripped)
                         if m:
@@ -3803,15 +4411,34 @@ class ZoMBIApp(tk.Tk):
                     f"Hardware process exited (rc={rc})",
                     tag="done" if rc == 0 else "error",
                     run_id=hw_run_id)
+                if log_fh is not None:
+                    try:
+                        log_fh.write(f"===== process exited (rc={rc}) "
+                                     f"{_time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+                        log_fh.flush()
+                    except Exception:
+                        pass
                 app.after(0, app.run_browser.refresh)
                 app.after(0, lambda: app.run_browser.set_hw_uuid(None))
                 if hw_run_id:
                     app.after(0, lambda r=hw_run_id: app._unregister_active_run(r))
             except Exception as exc:
                 app.log_to_main(f"ERROR launching hardware: {exc}", tag="error")
+                if log_fh is not None:
+                    try:
+                        log_fh.write(f"ERROR launching hardware: {exc}\n")
+                        log_fh.flush()
+                    except Exception:
+                        pass
                 app.after(0, lambda: app.run_browser.set_hw_uuid(None))
                 if hw_run_id:
                     app.after(0, lambda r=hw_run_id: app._unregister_active_run(r))
+            finally:
+                if log_fh is not None:
+                    try:
+                        log_fh.close()
+                    except Exception:
+                        pass
 
         threading.Thread(target=_pump, daemon=True).start()
 

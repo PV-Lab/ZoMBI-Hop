@@ -27,6 +27,11 @@ _objective_writing = False
 # Last objective packet (dedup: only process/print once per distinct packet)
 _last_objective_vals = None
 _last_objective_comps = None
+# Last objective packet timestamp. DiSCO stamps objective.db with a fresh ts on every
+# write and ships it in the packet; we only ingest a packet whose ts is new, so the
+# ~1 Hz re-sends of identical content don't keep overwriting the DBs. Mirrors the
+# composition path (composition_receiver only writes when compositions.db's ts changes).
+_last_objective_ts = None
 
 
 def _serial_process_signal_handler(signum, frame):
@@ -41,6 +46,11 @@ def _register_signal_handlers_in_serial_process_only() -> None:
     try:
         signal.signal(signal.SIGINT, _serial_process_signal_handler)
         signal.signal(signal.SIGTERM, _serial_process_signal_handler)
+        # Windows Ctrl+Break (how the GUI asks a hardware run to stop). Handling it
+        # here lets the serial child close the COM port cleanly instead of being
+        # killed by the default action with the port still open.
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, _serial_process_signal_handler)
     except (OSError, ValueError):
         pass
 
@@ -544,24 +554,37 @@ def objective_receiver(hz, obj_db_path, mem_db_path, verbose=False, super_verbos
             # ─────────────────────────────────────────────────────────────
 
             comps = pkt.get("comps", None)
+            ts = pkt.get("ts", None)
 
-            # Dedup: only process and print once per distinct packet (avoid filling terminal)
-            global _last_objective_vals, _last_objective_comps
-            try:
-                comps_match = (comps is None and _last_objective_comps is None) or (
-                    comps is not None and _last_objective_comps is not None
-                    and len(comps) == len(_last_objective_comps)
-                    and all(np.allclose(np.asarray(a), np.asarray(b)) for a, b in zip(comps, _last_objective_comps))
+            # Dedup so we only process/write once per distinct packet.
+            global _last_objective_vals, _last_objective_comps, _last_objective_ts
+            if ts is not None:
+                # Timestamp handshake (mirrors composition_receiver): DiSCO bumps
+                # objective.db's ts on every write, so identical ~1 Hz re-sends carry
+                # the SAME ts. Ingest only when the ts is new; this stops the receiver
+                # from continually overwriting objective.db / objective_memory.db with
+                # the same data. New data (new ts) is always processed, so the loop
+                # never stalls on genuinely-new results.
+                if _last_objective_ts is not None and ts == _last_objective_ts:
+                    continue
+            else:
+                # Legacy fallback (packet has no ts): value-based dedup as before.
+                try:
+                    comps_match = (comps is None and _last_objective_comps is None) or (
+                        comps is not None and _last_objective_comps is not None
+                        and len(comps) == len(_last_objective_comps)
+                        and all(np.allclose(np.asarray(a), np.asarray(b)) for a, b in zip(comps, _last_objective_comps))
+                    )
+                except Exception:
+                    comps_match = False
+                vals_match = (
+                    _last_objective_vals is not None
+                    and vals.shape == _last_objective_vals.shape
+                    and np.allclose(vals, _last_objective_vals, rtol=1e-6, atol=1e-8)
                 )
-            except Exception:
-                comps_match = False
-            vals_match = (
-                _last_objective_vals is not None
-                and vals.shape == _last_objective_vals.shape
-                and np.allclose(vals, _last_objective_vals, rtol=1e-6, atol=1e-8)
-            )
-            if vals_match and comps_match:
-                continue
+                if vals_match and comps_match:
+                    continue
+            _last_objective_ts = ts
             _last_objective_vals = vals.copy()
             _last_objective_comps = comps if comps is None else [np.asarray(c).copy() for c in comps]
 
@@ -787,6 +810,97 @@ def composition_sender(ser, hz, comp_db_path, chaos=False, verbose=True, super_v
 # a single queue for all incoming bytes
 _read_queue = queue.Queue()
 
+
+def serial_link_selftest(ser, role, peer, timeout=120.0, ping_period=0.5, grace=2.0):
+    """
+    Bidirectional serial connectivity self-test, run BEFORE the normal reader/sender
+    threads so it has the port to itself. Both peers run the SAME routine (differing
+    role/peer): each repeatedly sends a small JSON 'selftest_ping' and echoes any ping
+    it receives from the peer as a 'selftest_pong'. This side PASSES once it receives a
+    pong — which proves BOTH directions (our ping reached the peer AND the peer's reply
+    reached us). All non-selftest traffic is ignored, and the input buffer is flushed
+    on exit so leftover test bytes never reach the real receivers.
+
+    role/peer: 'zombi'/'disco' (this side / the other). Returns True on success.
+    Both programs must be launched within `timeout` seconds of each other.
+    """
+    print(f"[selftest:{role}] bidirectional link test (peer={peer}, timeout={timeout:.0f}s)…")
+    saved_timeout = ser.timeout
+    try:
+        ser.timeout = 0.2
+    except Exception:
+        pass
+    deadline = time.time() + timeout
+    buf = bytearray()
+    got_ping = False   # received peer's ping  -> our RX works
+    got_pong = False   # received peer's pong  -> full round trip (our TX + RX)
+    pong_time = None
+    seq = 0
+    last_send = 0.0
+    try:
+        while time.time() < deadline:
+            if got_pong and pong_time is None:
+                pong_time = time.time()
+            if pong_time is not None and time.time() - pong_time > grace:
+                break
+            now = time.time()
+            if now - last_send >= ping_period:
+                seq += 1
+                try:
+                    # Pad to ~3.5 KB so the test exercises the SAME multi-chunk reassembly
+                    # path the real ~3 KB objective packets use (a tiny ping would not
+                    # reproduce a large-packet framing/buffering failure).
+                    ser.write((json.dumps({"type": "selftest_ping", "from": role, "seq": seq, "pad": "x" * 3500}) + "\n").encode())
+                    ser.flush()
+                except Exception as e:
+                    print(f"[selftest:{role}] write error: {e!r}")
+                last_send = now
+            try:
+                chunk = ser.read(256)
+            except Exception as e:
+                print(f"[selftest:{role}] read error: {e!r}")
+                chunk = b""
+            if chunk:
+                buf.extend(chunk)
+                if len(buf) > 65536:            # resync guard against a garbled stream
+                    buf = buf[-4096:]
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl == -1:
+                        break
+                    line = bytes(buf[:nl]); buf = buf[nl + 1:]
+                    try:
+                        pkt = json.loads(line.decode("utf-8", "ignore").strip())
+                    except Exception:
+                        continue
+                    t, frm = pkt.get("type"), pkt.get("from")
+                    if t == "selftest_ping" and frm == peer:
+                        got_ping = True
+                        try:
+                            ser.write((json.dumps({"type": "selftest_pong", "from": role, "ack": pkt.get("seq"), "pad": "x" * 3500}) + "\n").encode())
+                            ser.flush()
+                        except Exception:
+                            pass
+                    elif t == "selftest_pong" and frm == peer:
+                        got_pong = True
+    finally:
+        try:
+            ser.timeout = saved_timeout
+        except Exception:
+            pass
+        try:
+            ser.reset_input_buffer()
+        except Exception:
+            pass
+    if got_pong:
+        print(f"[selftest:{role}] ✅ PASS — bidirectional link OK (rx_ping={got_ping}, roundtrip={got_pong})")
+    else:
+        print(f"[selftest:{role}] ❌ FAIL — no round trip in {timeout:.0f}s "
+              f"(rx_ping={got_ping}, roundtrip={got_pong}). Check baud/port and that the "
+              f"{peer} process is running; both sides must start within the timeout window.")
+    return got_pong
+
+
 # ─── ORCHESTRATOR ────────────────────────────────────────────────────────────
 def start_serial_dual_io_shared_port(COM, baud,
                                      obj_hz=5.0,
@@ -797,6 +911,7 @@ def start_serial_dual_io_shared_port(COM, baud,
                                      chaos=False,
                                      verbose=True,
                                      super_verbose=False,
+                                     selftest=True,
                                      parent_shutdown: Optional[Any] = None):
     """
     parent_shutdown: optional multiprocessing.Event; when set (by the parent
@@ -827,6 +942,19 @@ def start_serial_dual_io_shared_port(COM, baud,
         print("[Machine2] Could not open serial port")
         return
 
+    # Verify the link works BOTH ways before starting the real reader/sender threads;
+    # a silent one-directional failure otherwise deadlocks the loop (ZoMBI blocks in
+    # get_y_measurements waiting for an objective it never received). Gated: release the
+    # port and exit if it fails, so the failure is loud rather than a silent stall.
+    if selftest and not serial_link_selftest(ser, role="zombi", peer="disco"):
+        print("[Machine2] ❌ connectivity self-test FAILED — releasing port and exiting "
+              "(fix the link, or pass selftest=False to bypass).")
+        try:
+            ser.close()
+        except Exception:
+            pass
+        return
+
     _register_signal_handlers_in_serial_process_only()
 
     def _parent_requests_stop() -> bool:
@@ -854,6 +982,14 @@ def start_serial_dual_io_shared_port(COM, baud,
                         print(f"[serial_reader] Read chunk: {chunk!r}")
                     consecutive_read_errors = 0  # Reset error counter on successful read
                     buf.extend(chunk)
+                    # Safety: if a corrupted stream loses a newline, buf would grow
+                    # forever and the reader would silently stall (never emitting a
+                    # line). Cap it: on overflow with no newline, drop the stale bytes
+                    # and resync on the next packet boundary rather than hang.
+                    if len(buf) > 262144 and buf.find(b'\n') == -1:
+                        print(f"[serial_reader] ⚠️ {len(buf)} bytes buffered with no newline; "
+                              f"resyncing (dropping stale bytes)")
+                        buf = bytearray()
                     # extract all complete lines
                     while True:
                         nl = buf.find(b'\n')

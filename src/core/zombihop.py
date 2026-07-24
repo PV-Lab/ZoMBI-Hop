@@ -19,6 +19,10 @@ from ..utils.simplex import (
 )
 from ..utils.datahandler import DataHandler
 from ..utils.gp_simplex import GPSimplex
+from .hparam_live import (
+    apply_pending as apply_pending_hparams,
+    write_effective as write_effective_hparams,
+)
 
 
 # --- CUDA optimization settings (when CUDA is available) ---
@@ -122,8 +126,20 @@ class ZoMBIHop:
                  bounds_shrink_factor: float = 0.8,
                  min_axis_noise_mult: float = 2.0,
                  jaccard_window: int = 3,
-                 jaccard_threshold: float = 0.9):
-        """Initialize ZoMBIHop optimizer."""
+                 jaccard_threshold: float = 0.9,
+                 min_zoom_for_needle: int = 2,
+                 min_iters_per_zoom: int = 2):
+        """Initialize ZoMBIHop optimizer.
+
+        Search-discipline constraints (hard, not tuned):
+          * ``min_zoom_for_needle`` — a needle may only be declared once the
+            search has zoomed to this 0-indexed level or deeper (default 2 ⇒
+            zoom level 3+). This also forces the optimiser to zoom in at least
+            ``min_zoom_for_needle + 1`` times before it can localise an optimum.
+          * ``min_iters_per_zoom`` — at least this many objective lines must be
+            sampled at the current zoom level before the optimiser may declare a
+            needle or zoom in/out from it (default 2).
+        """
         self.device = torch.device(device)
         self.dtype = dtype
         self.verbose = verbose
@@ -139,6 +155,8 @@ class ZoMBIHop:
         self.zoom_jaccard_threshold = float(zoom_jaccard_threshold)
         self.bounds_shrink_factor = float(bounds_shrink_factor)
         self.min_axis_noise_mult = float(min_axis_noise_mult)
+        self.min_zoom_for_needle = int(min_zoom_for_needle)
+        self.min_iters_per_zoom = int(min_iters_per_zoom)
 
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
@@ -226,6 +244,25 @@ class ZoMBIHop:
 
         # self.bounds is a convenience alias; always kept in sync with data_handler.bounds
         self.bounds = self.data_handler.bounds
+
+        # Resuming a checkpoint that has no saved bounds (e.g. the run crashed before
+        # writing its first snapshot, so load_state restored only the iteration
+        # counter) leaves data_handler.bounds / current_zoom_bounds — and this alias —
+        # as None. run() then dereferences None at the activation-entry
+        # `bounds = self.bounds.clone()` (and the never_terminate bounds clones).
+        # A snapshotless resume has no zoom region to preserve, so fall back to the
+        # full [0,1]^d simplex — identical to the bounds0 a fresh run builds in
+        # save_init above.
+        if self.bounds is None:
+            full_bounds = torch.zeros(2, d, device=self.device, dtype=self.dtype)
+            full_bounds[1] = 1.0
+            self.bounds = full_bounds
+            self.data_handler.bounds = full_bounds.clone()
+            if self.verbose:
+                print("[ZoMBIHop] Resumed checkpoint had no saved bounds; "
+                      "initialized to the full [0,1]^d simplex.")
+        if self.data_handler.current_zoom_bounds is None:
+            self.data_handler.current_zoom_bounds = self.bounds.clone()
 
         # GP handler
         self.gp_handler = GPSimplex(
@@ -542,6 +579,54 @@ class ZoMBIHop:
         penalty_mask = self.data_handler.add_all_points(X_actual, X_expected, Y.unsqueeze(1))
         return X_actual[penalty_mask], Y[penalty_mask]
 
+    def _space_filling_measurement(self, dh, n_pool: int = 2048,
+                                   max_ref: int = 3000) -> int:
+        """never_terminate fallback for a saturated search: measure one LineBO line
+        through the point of the FULL simplex that is farthest from everything
+        measured so far (greedy maximin / best-candidate space-filling).
+
+        When the normal search can no longer produce a candidate (the whole simplex
+        is penalized and acquisition ascent keeps landing on already-declared
+        needles), this spends the remaining budget on the most under-explored region
+        instead of idling — repeated calls lay down a low-discrepancy, roughly
+        uniform sequence of exploratory lines. Returns the number of new points
+        actually measured (0 only in the degenerate case where the objective
+        returned nothing, which the caller treats as a hard stop).
+        """
+        full_lo = torch.zeros(self.d, device=self.device, dtype=self.dtype)
+        full_hi = torch.ones(self.d, device=self.device, dtype=self.dtype)
+
+        # Uniform candidate pool over the full simplex.
+        pool = self.random_sampler(
+            n_pool, full_lo, full_hi,
+            device=str(self.device), torch_dtype=self.dtype,
+        ).to(device=self.device, dtype=self.dtype)
+
+        # Greedy maximin: pick the pool point whose nearest already-measured point
+        # is farthest away — i.e. the emptiest spot on the map.
+        if dh.X_all_actual is not None and dh.X_all_actual.shape[0] > 0:
+            X_meas = dh.X_all_actual.to(device=self.device, dtype=self.dtype)
+            if X_meas.shape[0] > max_ref:  # bound the distance-matrix footprint
+                sel = torch.randperm(X_meas.shape[0], device=X_meas.device)[:max_ref]
+                X_meas = X_meas[sel]
+            nn_dist = torch.cdist(pool, X_meas).min(dim=1).values  # (n_pool,)
+            center = pool[int(torch.argmax(nn_dist))]
+        else:
+            center = pool[0]
+
+        # LineBO ranks orientations with the acquisition; make sure one exists.
+        if self.gp_handler.acq_fn is None:
+            X, Y = dh.get_gp_data()
+            if X.shape[0] >= 2:
+                self.gp_handler.fit(X, Y)
+                self.gp_handler.create_acquisition(best_f=Y.max().item())
+
+        full_bounds = torch.stack([full_lo, full_hi])
+        before = dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0
+        self._objective_wrapper(center, full_bounds, self.gp_handler.acq_fn)
+        after = dh.X_all_actual.shape[0] if dh.X_all_actual is not None else before
+        return after - before
+
     def run(self, max_activations: int = 5, time_limit_hours: float = None,
             pause_event: Optional[threading.Event] = None,
             never_terminate: bool = False):
@@ -551,11 +636,20 @@ class ZoMBIHop:
         When ``never_terminate`` is True the optimiser is prevented from stopping
         on its own through *any* internal pathway (over-penalisation, activation
         failure with no needles, all-axes-below-noise-floor, or exhausting
-        ``max_activations``). Whenever the algorithm *would* have stopped, it logs
-        a ``[no-stop]`` note, shrinks every needle penalty volume to 30% of its
-        size (i.e. by 70%), resets the search bounds to the full simplex, and
-        keeps sampling. The only ways to end such a run are the user Stop button
-        (``_StopRunRequested``) or the time limit, if one is set.
+        ``max_activations``). For the *heuristic* stops (over-penalisation guess,
+        transient activation failure with no needles) it logs a ``[no-stop]`` note,
+        shrinks every needle penalty volume to 30% of its size (i.e. by 70%), resets
+        the search bounds to the full simplex, and keeps sampling. For the *terminal*
+        stop (recovery exhausted — penalty axes already below the noise floor and no
+        candidate producible) it instead falls back to **space-filling exploration**:
+        it measures a LineBO line through the point of the full simplex farthest from
+        everything measured so far (greedy maximin), so leftover budget/precursor is
+        spent on the emptiest region rather than idling, and repeated calls tile the
+        space roughly uniformly. The only ways to end such a run are the user Stop
+        button (``_StopRunRequested``) or the time limit, if one is set. (A bounded
+        stall counter is retained purely as a safety net for a genuinely un-measurable
+        state — e.g. a persistently singular GP with zero needles — so the process
+        can never hard-spin.)
 
         Returns
         -------
@@ -579,6 +673,40 @@ class ZoMBIHop:
             dh.current_zoom_bounds = full_bounds.clone()
             self.bounds = full_bounds.clone()
 
+        def _spacefill_fallback(context: str) -> bool:
+            """never_terminate terminal-stop fallback: measure one space-filling line
+            (maximin, in the emptiest part of the full simplex) so the run keeps
+            spending budget instead of stopping. Updates loop state; returns True if a
+            measurement was made (caller should ``continue``), False if nothing could
+            be measured (caller should stop, which only happens on a degenerate
+            simplex that can produce no point at all)."""
+            nonlocal global_iteration, stalled_retries, bounds, best_f_local
+            nonlocal start_iteration, data_added_since_last_failure
+            full_bounds = torch.zeros(2, self.d, device=self.device, dtype=self.dtype)
+            full_bounds[1] = 1.0
+            dh.bounds = full_bounds.clone()
+            dh.current_zoom_bounds = full_bounds.clone()
+            self.bounds = full_bounds.clone()
+            n_new = self._space_filling_measurement(dh)
+            if n_new <= 0:
+                self._log(f"  [no-stop] {context}: space-filling fallback produced no "
+                          f"measurement — stopping to avoid a spin loop.")
+                return False
+            global_iteration += 1
+            stalled_retries = 0
+            data_added_since_last_failure = True
+            dh.take_snapshot(f"act{activation}_z{zoom}_i{iteration}_spacefill",
+                             activation=activation, zoom=zoom, iteration=iteration)
+            self._log(f"  [no-stop] {context} — space-filling fallback measured "
+                      f"{n_new} point(s) in the most under-explored region; continuing.")
+            bounds = full_bounds.clone()
+            X, Y = dh.get_gp_data()
+            best_f_local = Y.max().item() if Y.numel() > 0 else best_f_local
+            if X.shape[0] >= 2:
+                self.gp_handler.fit(X, Y)
+            start_iteration = 0
+            return True
+
         if never_terminate:
             # Never exhaust activations on our own — the run only ends via the
             # user Stop button or an explicit time limit.
@@ -591,10 +719,29 @@ class ZoMBIHop:
 
         start_time = time.time() if time_limit_hours is not None else None
 
+        # Publish the in-force hyperparameters (and clear any stale override left
+        # by a previous run of this UUID) so a live retune starts from truth.
+        write_effective_hparams(self)
+        for _chg in apply_pending_hparams(self, log=self._log):
+            self._log(f"  [hparams] {_chg}")
+
         finished = False
         activation, zoom, iteration, _ = dh.get_iteration_state()
         start_activation = activation
         global_iteration = 0
+
+        # Backstop counter for no-measurement loops. The main saturation case is
+        # handled directly below (should_stop → space-filling fallback), but
+        # never_terminate has a second no-measurement path: an activation failure with
+        # zero needles (e.g. a persistently singular GP makes get_candidate return
+        # None) loops through _keep_searching with nothing to shrink. A run only makes
+        # real progress when the objective is measured, so we count consecutive failure
+        # dispatches that gather no new measurement and reset to 0 on any objective
+        # call. If we rack up this many in a row, under never_terminate we force a
+        # space-filling measurement (keeping the "never stop" promise); otherwise we
+        # stop rather than spin.
+        MAX_STALLED_RETRIES = 40
+        stalled_retries = 0
 
         while activation < max_activations and not finished:
             self._log(f"\n{'='*50}")
@@ -658,8 +805,24 @@ class ZoMBIHop:
 
                 start_iteration = iteration if (activation == start_activation and zoom == start_zoom) else 0
 
-                for iteration in range(start_iteration, dh.max_iterations):
+                # Lines sampled at THIS zoom level; gates the min_iters_per_zoom
+                # constraint (needle declaration / zoom-in require ≥ this many).
+                iters_this_zoom = 0
+
+                # Mirrors `for iteration in range(start_iteration, dh.max_iterations)`
+                # exactly (`iteration` holds the last-executed index on exit), but
+                # re-reads dh.max_iterations every pass so a manual change to it
+                # takes effect within this zoom rather than at the next one.
+                _next_iteration = start_iteration
+                while _next_iteration < dh.max_iterations:
+                    iteration = _next_iteration
+                    _next_iteration += 1
                     self._log(f"\n  · iter {iteration+1}/{dh.max_iterations}")
+
+                    # Operator hyperparameter changes, applied between measured lines.
+                    for _chg in apply_pending_hparams(zombi=self, log=self._log):
+                        self._log(f"  [hparams] {_chg}")
+
                     # Time limit check
                     if time_limit_hours is not None:
                         elapsed_hours = (time.time() - start_time) / 3600.0
@@ -706,7 +869,9 @@ class ZoMBIHop:
                         candidate, bounds, self.gp_handler.acq_fn
                     )
                     global_iteration += 1
+                    iters_this_zoom += 1
                     data_added_since_last_failure = True
+                    stalled_retries = 0  # real measurement made → not stalled
                     if self.verbose:
                         if unpenalized_Y.numel() > 0:
                             y_rng = f"Y in [{unpenalized_Y.min().item():.4f}, {unpenalized_Y.max().item():.4f}]"
@@ -760,14 +925,28 @@ class ZoMBIHop:
 
                     # --- Declare needle after N consecutive converged iterations ---
                     if consecutive_converged >= dh.n_consecutive_converged:
-                        needle = self._declare_needle_at_best(
-                            dh, zoom, global_iteration, reason="EI convergence"
-                        )
-                        if needle is not None:
-                            dh.take_snapshot(
-                                f"act{activation}_z{zoom}_i{iteration}_needle", permanent=True
+                        deep_enough = zoom >= self.min_zoom_for_needle
+                        sampled_enough = iters_this_zoom >= self.min_iters_per_zoom
+                        if deep_enough and sampled_enough:
+                            needle = self._declare_needle_at_best(
+                                dh, zoom, global_iteration, reason="EI convergence"
                             )
-                        break
+                            if needle is not None:
+                                dh.take_snapshot(
+                                    f"act{activation}_z{zoom}_i{iteration}_needle", permanent=True
+                                )
+                            break
+                        elif sampled_enough and not deep_enough:
+                            # Converged, but the search is too shallow to declare a
+                            # needle (min_zoom_for_needle). Zoom in further instead.
+                            self._log(
+                                f"  Converged at zoom {zoom+1} < minimum zoom "
+                                f"{self.min_zoom_for_needle+1} for needle — zooming in."
+                            )
+                            consecutive_converged = 0
+                            break
+                        # else: converged but fewer than min_iters_per_zoom lines
+                        # sampled at this zoom — keep sampling until the minimum is met.
 
                     if finished:
                         break
@@ -799,6 +978,27 @@ class ZoMBIHop:
                     break  # advance to next activation
 
                 if activation_failed:
+                    # Backstop (see MAX_STALLED_RETRIES above): reaching the failure
+                    # dispatch means this zoom iteration produced no new measurement
+                    # (get_candidate returned None). Count it; a real objective call
+                    # resets the counter. This catches no-measurement paths that don't
+                    # hit the should_stop fallback below — e.g. an activation failure
+                    # with zero needles (singular GP) that keeps retrying. Under
+                    # never_terminate we honour "never stop" by forcing a space-filling
+                    # measurement (progress) instead of terminating; only a genuinely
+                    # un-measurable simplex (fallback returns 0) stops the run.
+                    stalled_retries += 1
+                    if stalled_retries > MAX_STALLED_RETRIES:
+                        if never_terminate and _spacefill_fallback(
+                                f"{stalled_retries} stalled retries with no measurement"):
+                            continue
+                        self._log(
+                            f"  [terminate] {stalled_retries} consecutive failure "
+                            f"retries with no new objective measurement — the "
+                            f"optimiser cannot produce a candidate; stopping."
+                        )
+                        finished = True
+                        break
                     # Three-way failure dispatch.
                     n_needles = dh.needles.shape[0] if dh.needles is not None else 0
                     if n_needles == 0:
@@ -826,12 +1026,19 @@ class ZoMBIHop:
                     activation_failed = False
                     consecutive_converged = 0
                     if should_stop:
-                        if never_terminate:
-                            _keep_searching("Failure retry exhausted (all axes below noise floor)")
-                            first_failure_handled = False
-                        else:
-                            finished = True
-                            break
+                        # Recovery is exhausted: penalty axes are already below the
+                        # noise floor and the normal search can no longer produce a
+                        # candidate (the simplex is saturated and acquisition ascent
+                        # keeps landing on already-declared needles). Under
+                        # never_terminate, spend leftover budget on space-filling
+                        # exploration instead of stopping; keeping
+                        # first_failure_handled True means the next dispatch is the
+                        # cheap Case-2/3 path, not the expensive ellipsoid recompute.
+                        if never_terminate and _spacefill_fallback(
+                                "simplex saturated (recovery exhausted)"):
+                            continue
+                        finished = True
+                        break
                     # Reload local GP data for the (possibly updated) bounds
                     bounds = dh.bounds.clone()
                     self.bounds = bounds.clone()
@@ -863,7 +1070,7 @@ class ZoMBIHop:
                             if jac > self.zoom_jaccard_threshold:
                                 repeated_jac = jac
                                 break
-                        if repeated_jac > self.zoom_jaccard_threshold:
+                        if repeated_jac > self.zoom_jaccard_threshold and zoom >= self.min_zoom_for_needle:
                             self._log(
                                 f"  → repeated zoom (Jaccard={repeated_jac:.3f}) — forcing needle."
                             )
@@ -879,6 +1086,14 @@ class ZoMBIHop:
                                 f"act{activation}_z{zoom}_jaccard_needle", permanent=True
                             )
                             break  # needle found
+                        elif repeated_jac > self.zoom_jaccard_threshold:
+                            # Repeated region but too shallow to declare a needle
+                            # (min_zoom_for_needle) — advance the zoom anyway.
+                            self._log(
+                                f"  → repeated zoom (Jaccard={repeated_jac:.3f}) but zoom "
+                                f"{zoom+1} < minimum zoom {self.min_zoom_for_needle+1} "
+                                f"for needle — advancing zoom."
+                            )
                         zoom_bounds_history.append(new_bounds.clone())
                         if len(zoom_bounds_history) > dh.max_zooms:
                             zoom_bounds_history.pop(0)

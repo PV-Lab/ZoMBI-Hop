@@ -45,14 +45,15 @@ RUN_DIR="optimize/runs/mobo_ensemble_3d_job${SLURM_JOB_ID}"
 # new landscape. Modulo keeps it in the int32 range NumPy's RandomState accepts.
 ENSEMBLE_SEED=$(( SLURM_JOB_ID % 2147483647 ))
 
-# Seed with the archived trial_112, plus the 3 best-dist_to_needles trials from the
+# Seed with the archived trial_112, plus the best-dist_to_needles trials from the
 # ensemble 3d shared-history pool (own + eve_lal's, ranked by pareto.py). eve_lal's
 # runs are referenced under her archived_runs, matching this account's move.
+# NOTE: own job16948629/trial_33 was cleaned off scratch and dropped; re-derive a
+# replacement with pareto.py from the current 3d pool to get back to 3 seeds.
 uv run python optimize/run_mobo.py --dataset ensemble --dim 3 --time-limit 0.2 --share-history \
     --ensemble-seed "$ENSEMBLE_SEED" \
     --start-from-best \
         optimize/runs/archived_runs/mobo_3d_05_06_15_32/trial_112 \
-        optimize/runs/archived_runs/mobo_ensemble_3d_job16948629/trial_33 \
         /home/eve_lal/orcd/scratch/ZoMBI-Hop/optimize/runs/archived_runs/mobo_ensemble_3d_job16861902/trial_49 \
         /home/eve_lal/orcd/scratch/ZoMBI-Hop/optimize/runs/archived_runs/mobo_ensemble_3d_job16954340/trial_63 \
     --run-dir "$RUN_DIR" &
