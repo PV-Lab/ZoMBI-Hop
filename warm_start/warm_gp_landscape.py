@@ -364,6 +364,64 @@ def warmgp_objective(dim: int, *, seed: int = SEED) -> dict:
     }
 
 
+# ── full-run landscape (evaluation ground truth) ─────────────────────────────
+
+def build_full_landscape(dim: int, *, seed: int = SEED) -> dict:
+    """Fit the length-scale-0.05 GP to a campaign's ENTIRE measured run.
+
+    The evaluation counterpart of :func:`build_warm_landscape`: the same fixed
+    Matern GP and the same campaign, but fit to *every* scored point of the real
+    run rather than only the selected warm-start lines. This is the honest
+    ground-truth surface — "what the campaign actually measured everywhere" — that
+    deployed hyperparameters are scored against, whereas the warm-start GP (limited
+    to the first 15% of lines) is only the surrogate the *tuner* sees. ``seed`` is
+    accepted for signature parity with :func:`build_warm_landscape` but is unused:
+    the full run has no warm-line subset to select, so the surface is deterministic.
+    """
+    dim = int(dim)
+    X, Y, line_id = load_campaign(dim)
+    predict = build_gp_landscape(X, Y, GP_LENGTH_SCALE)
+    return {
+        "dim": dim,
+        "predict": predict,
+        "X_all": X,
+        "Y_all": Y,
+        "line_id_all": line_id,
+        "n_points": int(X.shape[0]),
+        "n_lines": int(np.unique(line_id).size),
+    }
+
+
+def fullgp_objective(dim: int, *, seed: int = SEED) -> dict:
+    """The FULL-run GP landscape packaged as an evaluation objective.
+
+    Mirrors :func:`warmgp_objective` (same keys, same detected-peak reference) but
+    the surface is fit to the whole real campaign via :func:`build_full_landscape`,
+    so its auto-detected peaks are the campaign's true optima — the
+    ``dist_to_needles`` reference deployed hyperparameters are evaluated against.
+    Deterministic; ``seed`` is unused (no warm-line subset).
+    """
+    L = build_full_landscape(dim, seed=seed)
+    predict = L["predict"]
+    grid = simplex_grid(GRID_3D if int(dim) == 3 else GRID_4D, int(dim))
+    z = predict(grid)
+    peaks, _ = detect_peaks(grid, z)
+
+    def fn(x: np.ndarray) -> float:
+        return float(predict(np.asarray(x, dtype=float).reshape(1, -1))[0])
+
+    return {
+        "dim": int(dim),
+        "fn": fn,
+        "predict": predict,
+        "peaks": peaks,
+        "grid_pts": grid if int(dim) == 3 else None,
+        "grid_vals": z if int(dim) == 3 else None,
+        "n_points": L["n_points"],
+        "n_lines": L["n_lines"],
+    }
+
+
 # ── figures ──────────────────────────────────────────────────────────────────
 
 _SQRT3_2 = np.sqrt(3) / 2

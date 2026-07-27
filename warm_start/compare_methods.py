@@ -27,8 +27,13 @@ import csv
 import json
 from pathlib import Path
 
-METHODS = ["static", "dynamic", "mixture"]
-LANDSCAPES = ["warmgp", "ensemble"]
+# baseline = production BEST_HPARAMS.md, no warm-start influence at all (the
+# reference row); static/dynamic/mixture are the warm-start methods.
+METHODS = ["baseline", "static", "dynamic", "mixture"]
+# fullgp = GP fit to the ENTIRE real campaign (the honest ground truth); ensemble =
+# generic re-randomized landscapes. (The warm-start GP is only the tuning surrogate,
+# never an evaluation target.)
+LANDSCAPES = ["fullgp", "ensemble"]
 # (summary key, column header, lower_is_better)
 METRICS = [
     ("dist_to_needles", "dist", True),

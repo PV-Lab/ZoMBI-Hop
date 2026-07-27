@@ -197,6 +197,11 @@ ENSEMBLE_DATASETS = {"ensemble"}
 # Fixed warm-start GP landscape (warm_start/warm_gp_landscape.py via
 # rm.build_warmgp_landscape): the same surface every run, seeded by --warmgp-seed.
 WARMGP_DATASETS = {"warmgp"}
+# Full-run GP landscape (rm.build_fullgp_landscape): the same fixed GP fit to the
+# ENTIRE real campaign (every scored point), not just the warm-start lines. This is
+# the honest evaluation ground truth — the tuner sees the warm-start GP, deployed
+# hparams are scored here. Deterministic (no seed dependence).
+FULLGP_DATASETS = {"fullgp"}
 # ``newRF``: RF surrogate trained on live measurements pulled straight from a
 # ``results`` SQLite DB (same source as visualization/plot_run.py).  Its reference
 # optima are picked interactively (interactive_test_zombi.ExtremaPicker) the first
@@ -204,6 +209,7 @@ WARMGP_DATASETS = {"warmgp"}
 NEWRF_DATASETS = {"newRF"}
 BUILTIN_DATASETS = {"RF", *ACKLEY_BENCHMARKS.keys(), *GAUSSIAN_BENCHMARKS.keys(),
                     *ORACLE_CHOICES, *ENSEMBLE_DATASETS, *WARMGP_DATASETS,
+                    *FULLGP_DATASETS,
                     *NEWRF_DATASETS}
 
 # ─── newRF database source (mirrors visualization/plot_run.py) ──────────────────
@@ -438,6 +444,16 @@ def resolve_dataset(
         print(f"  [dataset] warmgp: warm-start GP landscape dim={dim} "
               f"seed={warmgp_seed} — maximize, {len(spec.true_optima)} GP peak(s)")
         return _landscape_to_ds(spec, "warmgp")
+
+    if dataset == "fullgp":
+        # Full-run GP landscape (GP fit to the ENTIRE real campaign); reference
+        # optima are its auto-detected peaks (rm.build_fullgp_landscape). This is
+        # the evaluation ground truth — deterministic, so warmgp_seed is unused.
+        spec = rm.build_fullgp_landscape(
+            dim, seed=warmgp_seed, time_limit_hours=time_limit_hours)
+        print(f"  [dataset] fullgp: full-run GP landscape dim={dim} "
+              f"— maximize, {len(spec.true_optima)} GP peak(s)")
+        return _landscape_to_ds(spec, "fullgp")
 
     if dataset == "newRF":
         from sklearn.ensemble import RandomForestRegressor
@@ -1075,7 +1091,14 @@ def run_single_eval(
     def snap_wrap(*a, **k):
         orig_snap(*a, **k)
         if dh.X_all_actual is not None:
-            snap_records.append((dh.X_all_actual.shape[0], dh.current_activation, dh.current_zoom))
+            # Capture the current zoom zone's linear size (relative to the full
+            # [0,1]^d domain) as the 4th element, exactly as run_mobo does, so the
+            # duplicate metric can shrink its radius for points sampled inside a zoom
+            # — i.e. so eval scores dup on the SAME definition the tuner optimised.
+            czb = dh.current_zoom_bounds if dh.current_zoom_bounds is not None else dh.bounds
+            zoom_size = rm.zoom_size_fraction(czb) if czb is not None else 1.0
+            snap_records.append((dh.X_all_actual.shape[0], dh.current_activation,
+                                 dh.current_zoom, zoom_size))
     dh.take_snapshot = snap_wrap
 
     interrupted = False
@@ -1097,7 +1120,11 @@ def run_single_eval(
     X_all_np = (dh.X_all_actual.detach().cpu().numpy()
                 if dh.X_all_actual is not None else np.empty((0, dim)))
     dist = rm.metric_dist_to_needles(discovered, true_optima, dim=dim)
-    dup = rm.metric_dup_fraction(X_all_np, dim=dim)
+    # Zoom-scaled duplicate radius (matches run_mobo's trial scoring): points sampled
+    # inside a small zoom zone must be closer to count as duplicates, so zooming isn't
+    # penalised. Without this eval over-reports dup vs. the tuned/selected objective.
+    zoom_sizes = rm._zoom_size_per_point(X_all_np.shape[0], snap_records)
+    dup = rm.metric_dup_fraction(X_all_np, dim=dim, zoom_sizes=zoom_sizes)
     pct_comp = rm.metric_pct_matched_comp(discovered, true_optima, dim=dim)
     print(f"      [run]  iters={call_counter[0]}  dist={dist:.4f}  dup={dup:.4f}"
           f"  pct_comp={pct_comp:.2f}  t={runtime:.1f}s"

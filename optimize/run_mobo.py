@@ -2490,6 +2490,39 @@ def build_warmgp_landscape(
     )
 
 
+def build_fullgp_landscape(
+    dim: int, *, seed: int, time_limit_hours: float | None,
+) -> LandscapeSpec:
+    """``LandscapeSpec`` for the FULL-run GP landscape at ``dim`` (evaluation only).
+
+    Same fixed-length-scale Matern GP as ``build_warmgp_landscape`` but fit to the
+    *entire* real campaign (every scored point), not just the warm-start lines, so
+    its auto-detected peaks are the campaign's true optima — the honest
+    ``dist_to_needles`` reference a deployed hyperparameter set is scored against.
+    The tuner still sees only the warm-start GP; this surface is the ground truth
+    the tuned hyperparameters are *evaluated* on. Deterministic, so ``seed`` is
+    accepted only for signature parity. Tagged ``oracle="fullgp"``.
+    """
+    from warm_start.warm_gp_landscape import fullgp_objective
+
+    o = fullgp_objective(int(dim), seed=int(seed))
+    true_optima = [np.asarray(p, dtype=float) for p in o["peaks"]]
+    grid_pts = grid_vals = None
+    if int(dim) == 3:
+        grid_pts = ternary_grid(TERNARY_GRID_N)
+        grid_vals = o["predict"](grid_pts)
+    print(f"  [dataset] fullgp: full-run GP landscape dim={dim} "
+          f"({o['n_points']} pts / {o['n_lines']} lines, "
+          f"{len(true_optima)} auto-detected peaks)")
+    return LandscapeSpec(
+        landscape="synthetic", dim=int(dim), maximize=True,
+        true_optima=true_optima, fn_callable=o["fn"],
+        grid_pts=grid_pts, grid_vals=grid_vals,
+        time_limit_hours=time_limit_hours, max_activations=float("inf"),
+        oracle="fullgp", synthetic_seed=int(seed),
+    )
+
+
 def reseed_ensemble(landscape: LandscapeSpec, config: dict):
     """Rebuild the Ensemble objective for one trial from a saved ``config``.
 
