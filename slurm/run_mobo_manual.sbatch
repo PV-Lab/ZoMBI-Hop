@@ -164,6 +164,16 @@ _mobo_setup_env
 #   --time-limit 0.5
 # )
 #
+# --- ELA twin (job 18080791 bump-tile) — prefer slurm/run_mobo_ela_18080791.sbatch
+# MOBO_CMD=(
+#   python optimize/run_mobo.py
+#   --no-show
+#   --device cuda
+#   --batch
+#   --config optimize/mobo_batch_configs/ela_3d_18080791.json
+#   --run-dir "optimize/runs/mobo_ela_3d_18080791_job${SLURM_JOB_ID}"
+# )
+#
 # --- Seed from best trial hparams (re-evaluated; Sobol still runs) -----------
 # MOBO_CMD=(
 #   python optimize/run_mobo.py

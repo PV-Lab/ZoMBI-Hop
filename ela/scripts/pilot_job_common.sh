@@ -15,7 +15,7 @@ _pilot_setup_dirs() {
 
 _pilot_configure_parallelism() {
   local cpus="${SLURM_CPUS_PER_TASK:-${PILOT_CPUS:-$(nproc 2>/dev/null || echo 8)}}"
-  local workers="${PILOT_EVAL_WORKERS:-16}"
+  local workers="${PILOT_EVAL_WORKERS:-8}"
   workers=$(( workers > 0 ? workers : 1 ))
   if (( workers > cpus )); then
     workers=$cpus
@@ -49,15 +49,85 @@ _pilot_run_dir_array() {
 }
 
 _pilot_check_data() {
-  local db="${1:-${REPO}/data/2nd_real_run.db}"
-  local target="${2:-${REPO}/data/2nd_real_run_ela_full.json}"
+  local db="${1:-}"
+  local target="${2:-}"
+  local cfg
+  cfg="$(_pilot_default_config)"
+
+  # Prefer db/target from the active pilot config when not passed explicitly.
+  if [[ (-z "${db}" || -z "${target}") && -f "${cfg}" ]]; then
+    local resolved
+    resolved="$(
+      python - "${REPO}" "${cfg}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo, cfg_path = Path(sys.argv[1]), Path(sys.argv[2])
+cfg = json.loads(cfg_path.read_text())
+data = cfg.get("data") or {}
+db = data.get("db") or "data/2nd_real_run.db"
+target = data.get("target") or "data/2nd_real_run_ela_full.json"
+db_p = Path(db)
+tgt_p = Path(target)
+if not db_p.is_absolute():
+    db_p = repo / db_p
+if not tgt_p.is_absolute():
+    tgt_p = repo / tgt_p
+print(db_p)
+print(tgt_p)
+PY
+    )"
+    if [[ -z "${db}" ]]; then
+      db="$(printf '%s\n' "${resolved}" | sed -n '1p')"
+    fi
+    if [[ -z "${target}" ]]; then
+      target="$(printf '%s\n' "${resolved}" | sed -n '2p')"
+    fi
+  fi
+  db="${db:-${REPO}/data/2nd_real_run.db}"
+  target="${target:-${REPO}/data/2nd_real_run_ela_full.json}"
+
   if [[ ! -f "${db}" ]]; then
-    echo "FATAL: campaign DB missing: ${db}" >&2
-    echo "  data/ is gitignored — rsync from your workstation:" >&2
-    echo "  rsync -av data/2nd_real_run.db login:~/orcd/scratch/ZoMBI-Hop/data/" >&2
+    echo "FATAL: campaign data missing: ${db}" >&2
+    echo "  data/ is gitignored — rsync from your workstation." >&2
     return 1
   fi
-  python - "${db}" <<'PY'
+
+  case "${db}" in
+    *.csv|*.CSV)
+      python - "${db}" <<'PY'
+import csv
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+size_mb = path.stat().st_size / (1024 * 1024)
+with open(path, newline="", encoding="utf-8") as f:
+    reader = csv.DictReader(f)
+    if reader.fieldnames is None:
+        raise SystemExit(f"FATAL: empty CSV: {path}")
+    names = set(reader.fieldnames)
+    need = {"FAPbI3", "MAPbI3", "MAPbBr3", "Objective"}
+    missing = sorted(need - names)
+    if missing:
+        raise SystemExit(f"FATAL: {path} missing columns {missing}")
+    n = 0
+    for row in reader:
+        try:
+            vals = [float(row[c]) for c in ("FAPbI3", "MAPbI3", "MAPbBr3", "Objective")]
+        except (TypeError, ValueError):
+            continue
+        if any(v != v for v in vals):
+            continue
+        n += 1
+if n < 100:
+    raise SystemExit(f"FATAL: only {n} complete campaign rows in {path} (expected ~639)")
+print(f"csv OK: {path.name} rows={n} size={size_mb:.1f}MB")
+PY
+      ;;
+    *)
+      python - "${db}" <<'PY'
 import sqlite3
 import sys
 from pathlib import Path
@@ -86,6 +156,9 @@ if n < 100:
     raise SystemExit(f"FATAL: only {n} complete campaign rows in {db} (expected ~644)")
 print(f"db OK: {db.name} rows={n} size={size_mb:.1f}MB")
 PY
+      ;;
+  esac
+
   if [[ ! -f "${target}" ]]; then
     echo "Tier-1 target missing; generating from ${db} (one-time, ~1-2 min)..."
     python "${REPO}/ela/compute_lambda_target.py" \
@@ -158,7 +231,7 @@ _pilot_append_viz_flags() {
 
 _pilot_append_worker_flags() {
   local -n _cmd=$1
-  _cmd+=(--eval-workers "${PILOT_EVAL_WORKERS:-16}")
+  _cmd+=(--eval-workers "${PILOT_EVAL_WORKERS:-8}")
 }
 
 _pilot_append_seed_flags() {

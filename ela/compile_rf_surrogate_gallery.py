@@ -628,14 +628,18 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     gallery_path = runs_root / "ela_rf_surrogate_gallery.html"
 
-    runs = sorted(
-        [
-            path for path in runs_root.glob("ela_3d_*")
-            if path.is_dir()
-            and any((path / "evolution" / "landscapes").glob("gen_*.png"))
-        ],
-        key=lambda path: int(path.name.split("_")[-1]),
-    )
+    job_pat = re.compile(r"^ela_3d_(\d+)$")
+    runs = []
+    for path in runs_root.glob("ela_3d_*"):
+        if not path.is_dir():
+            continue
+        match = job_pat.match(path.name)
+        if not match:
+            continue
+        if not any((path / "evolution" / "landscapes").glob("gen_*.png")):
+            continue
+        runs.append(path)
+    runs.sort(key=lambda path: int(path.name.split("_")[-1]))
     if args.limit is not None:
         runs = runs[: args.limit]
 

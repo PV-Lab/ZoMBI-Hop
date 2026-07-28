@@ -947,6 +947,11 @@ def load_batch_config(path: str, script_dir: str) -> dict:
         if cfg.get("true_optima"):
             true_optima = [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
         auto = cfg.get("auto_optima") or {}
+        use_rf_g = bool(
+            cfg.get("use_rf_g")
+            or cfg.get("rf_transform")
+            or str(cfg.get("objective", "")).lower() in ("rf_g", "rf(g)", "ela_rf_g")
+        )
         try:
             landscape = build_ela_landscape(
                 ela_run,
@@ -956,11 +961,13 @@ def load_batch_config(path: str, script_dir: str) -> dict:
                 min_sep=float(auto.get("min_sep", cfg.get("min_sep", 0.15))),
                 time_limit_hours=time_limit,
                 repo_root=repo_root,
+                use_rf_g=use_rf_g,
             )
         except (FileNotFoundError, ImportError, AttributeError, ValueError) as exc:
             sys.exit(f"--config: ELA landscape failed: {exc}")
+        obj_tag = "RF(g)" if use_rf_g else "raw g(z)"
         print(f"  [batch] ELA twin {ela_run.name}  d={landscape.dim}  "
-              f"oracle={landscape.ela_run}/best/oracle.py")
+              f"objective={obj_tag}  oracle={landscape.oracle}")
         print(f"  [batch] {len(landscape.true_optima)} reference "
               f"{'maxima' if maximize else 'minima'} "
               f"({'from JSON' if true_optima else 'auto-detected'})")

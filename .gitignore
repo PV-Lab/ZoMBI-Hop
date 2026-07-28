@@ -10,6 +10,7 @@ llm/data/*
 llm/results/*
 ela/runs/*
 visualization/*.png
+warm_start/*
 warm_start/optima_finder/*.png
 warm_start/runs/*
 warm_start/optima_finder_gp/*

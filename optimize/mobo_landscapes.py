@@ -316,6 +316,47 @@ def load_ela_oracle_module(run_dir: Path):
     return mod
 
 
+def build_ela_rf_g_predict(run_dir: Path):
+    """Fit RF(g) for an ELA(RF_g) run; return ``predict_composition(X)->(N,)``.
+
+    Matches the fitness / viz recipe: evaluate the evolved expression on the
+    run's fixed ``x_rf_train``, fit an RF, predict on query compositions.
+    Requires ``samples.npz`` with ``x_rf_train`` / ``z_rf_train`` and a
+    recoverable expression (``best/expression.json`` or latest snapshot).
+    """
+    from sklearn.ensemble import RandomForestRegressor
+
+    from ela.compile_rf_surrogate_gallery import load_landscape_source
+    from ela.evolve_context import load_context_from_run
+
+    run_dir = Path(run_dir)
+    ctx = load_context_from_run(run_dir)
+    if ctx.x_rf_train is None or ctx.z_rf_train is None:
+        raise ValueError(
+            f"{run_dir.name}: rf_transform / RF(g) requested but x_rf_train "
+            "missing in samples.npz"
+        )
+    landscape = load_landscape_source(run_dir)
+    n_est = int(ctx.metadata.get("rf_transform_n_estimators", 500))
+    rf_seed = int(ctx.metadata.get("rf_transform_seed", 42))
+    y_train = np.asarray(landscape.predict(ctx.z_rf_train), dtype=float).ravel()
+    rf = RandomForestRegressor(
+        n_estimators=n_est,
+        n_jobs=1,
+        random_state=rf_seed,
+        bootstrap=True,
+    )
+    rf.fit(ctx.x_rf_train, y_train)
+
+    def predict_composition(x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        return np.asarray(rf.predict(x), dtype=float).ravel()
+
+    return predict_composition
+
+
 def _ela_scalar_fn(predict_composition) -> ObjectiveFn:
     def fn(x: np.ndarray) -> float:
         x = np.asarray(x, dtype=float).ravel()
@@ -397,20 +438,32 @@ def build_ela_landscape(
     grid_n: int = 80,
     time_limit_hours: float | None = 0.4,
     repo_root: str | None = None,
+    use_rf_g: bool = False,
 ) -> LandscapeSpec:
     """Load a fixed ELA twin oracle and build a MOBO ``LandscapeSpec``.
 
     Peaks are taken from ``true_optima`` when provided; otherwise greedily
     detected on the run's dense Sobol sample (``X_dense.npy``) or a ternary grid.
+
+    When ``use_rf_g`` is True, the objective is the ELA(RF_g) surface (RF fit on
+    the evolved expression at the run's fixed RF-train sample), not raw ``g(z)``
+    from ``best/oracle.py``.
     """
     run_dir = resolve_ela_run_dir(ela_run=str(ela_run), repo_root=repo_root)
-    mod = load_ela_oracle_module(run_dir)
-    fn = _ela_scalar_fn(mod.predict_composition)
+    if use_rf_g:
+        predict = build_ela_rf_g_predict(run_dir)
+        fn = _ela_scalar_fn(predict)
+        oracle_label = f"{run_dir.name}:RF(g)"
+    else:
+        mod = load_ela_oracle_module(run_dir)
+        predict = mod.predict_composition
+        fn = _ela_scalar_fn(predict)
+        oracle_label = run_dir.name
 
     dense_x = run_dir / "X_dense.npy"
     if dense_x.is_file():
         sample_pts = np.load(dense_x)
-        sample_vals = np.asarray(mod.predict_composition(sample_pts), dtype=float).ravel()
+        sample_vals = np.asarray(predict(sample_pts), dtype=float).ravel()
         dim = int(sample_pts.shape[1])
     else:
         dim = 3
@@ -437,7 +490,7 @@ def build_ela_landscape(
     grid_pts = grid_vals = None
     if dim == 3:
         grid_pts = ternary_grid(grid_n)
-        grid_vals = np.array([fn(x) for x in grid_pts], dtype=float)
+        grid_vals = np.asarray(predict(grid_pts), dtype=float).ravel()
 
     return LandscapeSpec(
         landscape="ela",
@@ -449,7 +502,7 @@ def build_ela_landscape(
         grid_vals=grid_vals,
         time_limit_hours=0.4 if time_limit_hours is None else time_limit_hours,
         max_activations=float("inf"),
-        oracle=run_dir.name,
+        oracle=oracle_label,
         ela_run=str(run_dir),
     )
 
