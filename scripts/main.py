@@ -82,7 +82,8 @@ def start_serial(parent_shutdown: "multiprocessing.synchronize.Event"):
 
 
 def start_zombi(resume_uuid=None, optimizing_dims=None, checkpoint_dir=None,
-                hparams_path=None, new_run_uuid=None):
+                hparams_path=None, new_run_uuid=None,
+                bounds_lo=None, bounds_hi=None):
     try:
         time.sleep(2)
         if resume_uuid:
@@ -91,7 +92,8 @@ def start_zombi(resume_uuid=None, optimizing_dims=None, checkpoint_dir=None,
             print("[ZoMBI Process] Starting ZoMBI-Hop v2 (DB-driven)...")
         run_zombi_main(resume_uuid=resume_uuid, optimizing_dims=optimizing_dims,
                        checkpoint_dir=checkpoint_dir, hparams_path=hparams_path,
-                       new_run_uuid=new_run_uuid)
+                       new_run_uuid=new_run_uuid,
+                       bounds_lo=bounds_lo, bounds_hi=bounds_hi)
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
@@ -124,6 +126,12 @@ def main():
                         help="Resume UUID (omit for new run, 'list' to show runs)")
     parser.add_argument("--dims", default=None,
                         help="Comma-separated dimension indices to optimise, e.g. 0,8,9")
+    parser.add_argument("--bounds-lo", default=None, dest="bounds_lo",
+                        help="Comma-separated per-dim lower bounds aligned to --dims "
+                             "(e.g. 0,0,0). Omit ⇒ 0 for every dim.")
+    parser.add_argument("--bounds-hi", default=None, dest="bounds_hi",
+                        help="Comma-separated per-dim upper bounds aligned to --dims "
+                             "(e.g. 0.3,1,1). Omit ⇒ 1 for every dim.")
     parser.add_argument("--checkpoint-dir", default=None,
                         help="Directory to save run checkpoints")
     parser.add_argument("--hparams", default=None,
@@ -143,6 +151,17 @@ def main():
         except ValueError:
             print(f"[Main] Invalid --dims value: {args.dims!r}. Expected comma-separated ints.")
             sys.exit(1)
+    def _parse_bounds(raw, name):
+        if not raw:
+            return None
+        try:
+            return [float(x.strip()) for x in raw.split(",")]
+        except ValueError:
+            print(f"[Main] Invalid {name} value: {raw!r}. Expected comma-separated floats.")
+            sys.exit(1)
+
+    bounds_lo = _parse_bounds(args.bounds_lo, "--bounds-lo")
+    bounds_hi = _parse_bounds(args.bounds_hi, "--bounds-hi")
     checkpoint_dir = args.checkpoint_dir
     hparams_path = args.hparams
     new_run_uuid = args.run_uuid if resume_uuid is None else None
@@ -228,7 +247,8 @@ def main():
     )
     p_zombi = multiprocessing.Process(target=start_zombi,
                                       args=(resume_uuid, optimizing_dims, checkpoint_dir,
-                                            hparams_path, new_run_uuid),
+                                            hparams_path, new_run_uuid,
+                                            bounds_lo, bounds_hi),
                                       name="ZoMBI")
 
     zombi_finished_normally = False

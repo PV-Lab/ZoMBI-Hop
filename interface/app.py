@@ -258,9 +258,9 @@ from src.default_hparams import DEFAULT_HPARAMS, DEFAULT_HPARAMS_PROVENANCE
 
 
 # ── synthetic-run helpers ─────────────────────────────────────────────────────
-# The objective itself comes from optimize/evaluate.resolve_dataset (RF surrogate
-# + analytic Ackleys); these helpers turn a scalar objective into the LineBO/
-# ZoMBI machinery and are dimension-general.
+# The objective is a random Ensemble landscape (synthetic_data/ensemble.py), which
+# generalises to any dimensionality; these helpers turn that scalar objective into
+# the LineBO/ZoMBI machinery and are dimension-general.
 
 def _make_sim_obj(fn_callable, device, dtype, *, maximize: bool):
     def _obj(endpoints: torch.Tensor):
@@ -337,6 +337,30 @@ def _gen_init_data(fn_callable, d: int, maximize: bool):
     if not xa:
         raise RuntimeError("Could not generate any initial simplex lines.")
     return (torch.cat(xa), torch.cat(xe), torch.cat(yl).reshape(-1, 1))
+
+
+def _gen_init_data_box(fn_callable, bounds: torch.Tensor, maximize: bool):
+    """Seed observations drawn uniformly from the box-constrained simplex.
+
+    Unlike ``_gen_init_data`` (which lays down LineBO lines over the full simplex),
+    this samples points from ``simplex ∩ [bounds[0], bounds[1]]`` via
+    ``random_simplex``, so a tightened search box (e.g. a dim capped at 0.3) is
+    respected from the very first seed. Expected == actual (no physics blur) so the
+    seeds stay strictly inside the box; multiplicative output noise is still added.
+    """
+    from src.utils.simplex import random_simplex
+    lo, hi = bounds[0].clone(), bounds[1].clone()
+    n_init = max(N_INIT_LINES, 1) * NUM_EXPERIMENTS
+    pts = random_simplex(n_init, lo, hi, device=str(DEVICE),
+                         torch_dtype=DTYPE).to(device=DEVICE, dtype=DTYPE)
+    if pts.shape[0] == 0:
+        raise RuntimeError(
+            "Could not sample any initial points inside the search box — the "
+            "box may be infeasible on the simplex (check the per-dim min/max).")
+    raw = np.array([fn_callable(x) for x in pts.detach().cpu().numpy()], float)
+    yt = torch.tensor(raw if maximize else -raw, dtype=DTYPE, device=DEVICE)
+    yt = yt + torch.randn_like(yt) * (OUTPUT_NOISE_FRAC * yt.abs())
+    return pts, pts.clone(), yt.reshape(-1, 1)
 
 
 def _write_synth_live_state(run_dir, dh, cur_lines, prior_lines) -> None:
@@ -625,6 +649,7 @@ class RunData:
         self.needles: Optional[np.ndarray]       = None  # (k, d)
         self.needle_vals: Optional[np.ndarray]   = None  # (k,)
         self.needle_indices: Optional[np.ndarray]= None  # (k,) int
+        self.activation_starts: Optional[np.ndarray] = None  # (a,) int sample idx
         self.needles_json: list                  = []
         self.summary: dict                       = {}
         self.d: int                              = 0
@@ -652,6 +677,45 @@ class RunData:
 def _list_snapshots(run_dir: Path) -> list[str]:
     snap_dir = run_dir / "snapshots"
     return sorted(s.name for s in snap_dir.iterdir() if s.is_dir()) if snap_dir.exists() else []
+
+
+_ACT_RE = re.compile(r"_act(\d+)")
+
+
+def _activation_starts(run_dir: Path, snapshot_name: str) -> np.ndarray:
+    """Sample indices at which each *new* activation's points begin.
+
+    Replays the delta snapshots up to ``snapshot_name`` (the same traversal
+    ``reconstruct_snapshot_tensors`` uses) and records the cumulative point count
+    each time the ``actN`` number in the snapshot-dir name increments. The leading
+    0 (init / activation 0) is dropped so callers get only the interior reset
+    boundaries. Empty for legacy full-copy runs with no per-snapshot deltas."""
+    snap_dir = run_dir / "snapshots"
+    if not snap_dir.is_dir():
+        return np.array([], dtype=int)
+    starts: list[int] = []
+    n_seen = 0
+    cur_act: Optional[int] = None
+    for sdir in sorted(s for s in snap_dir.iterdir() if s.is_dir()):
+        delta_path = sdir / "delta.pt"
+        if delta_path.exists():
+            try:
+                d = torch.load(str(delta_path), map_location="cpu", weights_only=False)
+                x_new = d.get("X_new")
+                n_new = int(x_new.shape[0]) if isinstance(x_new, torch.Tensor) else 0
+            except Exception:
+                n_new = 0
+        else:
+            n_new = 0
+        m = _ACT_RE.search(sdir.name)
+        act = int(m.group(1)) if m else cur_act
+        if act is not None and act != cur_act and n_new > 0:
+            starts.append(n_seen)
+            cur_act = act
+        n_seen += n_new
+        if sdir.name == snapshot_name:
+            break
+    return np.array(sorted({s for s in starts if s > 0}), dtype=int)
 
 
 def load_run(run_dir: Path, snapshot_name: Optional[str] = None) -> RunData:
@@ -700,6 +764,8 @@ def load_run(run_dir: Path, snapshot_name: Optional[str] = None) -> RunData:
         ni = s.get("needle_indices")
         if ni is not None:
             rd.needle_indices = ni.long().numpy().ravel()
+
+        rd.activation_starts = _activation_starts(run_dir, snapshot_name)
 
         # Trust region (current zoom bounds, fall back to full bounds) +
         # per-needle penalty-ellipsoid params, for the ternary overlays.
@@ -1085,11 +1151,28 @@ class ConvergencePlotFrame(PlotFrame):
         else:
             ax.scatter(idx, Y, s=10, alpha=0.65, color="steelblue", label="obs", zorder=2)
 
-        # Running best spans every observation, penalized or not.
-        running_best = np.maximum.accumulate(Y)
-
-        ax.plot(idx, running_best, color="darkorange", lw=1.8,
-                label="running best", zorder=4)
+        # Running best, reset at every activation: each activation is a fresh
+        # ZoMBI search phase, so the envelope accumulates only within the current
+        # phase rather than over the whole run. Boundaries are the activations'
+        # first sample indices; each [start, end) slice gets its own cumulative
+        # max, drawn as an independent orange segment.
+        act_starts = rd.activation_starts
+        if act_starts is None or len(act_starts) == 0:
+            act_starts = np.array([], dtype=int)
+        else:
+            act_starts = act_starts[(act_starts > 0) & (act_starts < len(Y))]
+        bounds = np.concatenate(([0], act_starts))
+        ends = np.concatenate((act_starts, [len(Y)]))
+        labeled = False
+        for start, end in zip(bounds, ends):
+            if end <= start:
+                continue
+            seg_best = np.maximum.accumulate(Y[start:end])
+            kw = dict(color="darkorange", lw=1.8, zorder=4)
+            if not labeled:
+                kw["label"] = "running best (reset per activation)"
+                labeled = True
+            ax.plot(idx[start:end], seg_best, **kw)
 
         if rd.needle_indices is not None and len(rd.needle_indices) > 0:
             labeled = False
@@ -3349,6 +3432,90 @@ class LiveHparamsDialog(tk.Toplevel):
         self.destroy()
 
 
+class DimSelector(ttk.Frame):
+    """Grid of dim checkboxes (0…N-1); each *active* dim reveals min/max entry
+    boxes to its right. This replaces the old comma-separated "optimizing dims"
+    text field: the set of checked boxes selects which dims are optimised, and the
+    per-dim min/max define that dim's search box (default [0, 1]).
+
+    Defaults: dims 0, 8 and 9 active, every bound [0, 1] — matching the historical
+    ``"0,8,9"`` default while letting a dim be restricted to e.g. [0, 0.3]."""
+
+    N_DIMS = 10
+    DEFAULT_ACTIVE = (0, 8, 9)
+
+    def __init__(self, parent, n_dims: int = N_DIMS,
+                 default_active=DEFAULT_ACTIVE):
+        super().__init__(parent)
+        self._active_vars: list[tk.BooleanVar] = []
+        self._min_vars: list[tk.StringVar] = []
+        self._max_vars: list[tk.StringVar] = []
+        self._min_entries: list[ttk.Entry] = []
+        self._max_entries: list[ttk.Entry] = []
+
+        ttk.Label(self, text="optimise", foreground="gray").grid(
+            row=0, column=0, sticky="w", padx=2)
+        ttk.Label(self, text="min", foreground="gray").grid(row=0, column=1, padx=2)
+        ttk.Label(self, text="max", foreground="gray").grid(row=0, column=2, padx=2)
+
+        for i in range(n_dims):
+            av = tk.BooleanVar(value=(i in default_active))
+            mn = tk.StringVar(value="0.0")
+            mx = tk.StringVar(value="1.0")
+            r = i + 1
+            ttk.Checkbutton(self, text=f"dim {i}", variable=av,
+                            command=lambda i=i: self._sync_row(i)).grid(
+                row=r, column=0, sticky="w", padx=2, pady=1)
+            me = ttk.Entry(self, textvariable=mn, width=6)
+            xe = ttk.Entry(self, textvariable=mx, width=6)
+            me.grid(row=r, column=1, padx=2, pady=1)
+            xe.grid(row=r, column=2, padx=2, pady=1)
+            self._active_vars.append(av)
+            self._min_vars.append(mn)
+            self._max_vars.append(mx)
+            self._min_entries.append(me)
+            self._max_entries.append(xe)
+            self._sync_row(i)
+
+    def _sync_row(self, i: int) -> None:
+        """Show the min/max entries only while dim ``i`` is checked."""
+        if self._active_vars[i].get():
+            self._min_entries[i].grid()
+            self._max_entries[i].grid()
+        else:
+            self._min_entries[i].grid_remove()
+            self._max_entries[i].grid_remove()
+
+    def selected_dims(self) -> list[int]:
+        return [i for i, v in enumerate(self._active_vars) if v.get()]
+
+    def dims_csv(self) -> str:
+        return ",".join(str(i) for i in self.selected_dims())
+
+    def bounds_for_selected(self) -> tuple[list[float], list[float]]:
+        """(lo, hi) lists aligned to ``selected_dims()``.
+
+        Raises ValueError (with a user-facing message) on an empty selection or a
+        min/max that is non-numeric or violates 0 ≤ min < max ≤ 1."""
+        dims = self.selected_dims()
+        if not dims:
+            raise ValueError("Select at least one dimension to optimise.")
+        lo: list[float] = []
+        hi: list[float] = []
+        for i in dims:
+            try:
+                a = float(self._min_vars[i].get())
+                b = float(self._max_vars[i].get())
+            except ValueError:
+                raise ValueError(f"dim {i}: min/max must be numbers.")
+            if not (0.0 <= a < b <= 1.0):
+                raise ValueError(
+                    f"dim {i}: need 0 ≤ min < max ≤ 1 (got [{a}, {b}]).")
+            lo.append(a)
+            hi.append(b)
+        return lo, hi
+
+
 class NewRunDialog(tk.Toplevel):
     def __init__(self, parent, app: "ZoMBIApp"):
         super().__init__(parent)
@@ -3370,29 +3537,22 @@ class NewRunDialog(tk.Toplevel):
         nb.add(tf, text="Synthetic")
 
         row = 0
-        ttk.Label(tf, text="Dataset:", anchor="w").grid(
+        ttk.Label(tf, text="Landscape:", anchor="w").grid(
             row=row, column=0, sticky="w", padx=8, pady=4)
-        # Datasets mirror optimize/evaluate.py (RF surrogate + analytic Ackleys).
-        self._ds_var = tk.StringVar(value="ackley3d")
-        ttk.OptionMenu(tf, self._ds_var, "ackley3d",
-                       "RF", "ackley3d", "ackley4d", "ackley10d",
-                       command=lambda _v: self._sync_ds_fields()).grid(
-            row=row, column=1, sticky="w", padx=4)
-        ttk.Label(tf, text="(dimension is set by the dataset)",
-                  foreground="gray").grid(row=row, column=2, sticky="w")
+        # Synthetic mode uses a random Ensemble landscape (synthetic_data/ensemble.py),
+        # which generalises to any dimensionality — a fresh landscape is drawn each run.
+        ttk.Label(tf, text="random Ensemble (a fresh landscape each run)",
+                  foreground="gray").grid(row=row, column=1, columnspan=2, sticky="w")
 
         row += 1
-        ttk.Label(tf, text="Ackley variant:").grid(
-            row=row, column=0, sticky="w", padx=8)
-        from synthetic_data.ackley import Ackley as _Ackley
-        self._variant_var = tk.StringVar(value="realistic")
-        self._variant_menu = ttk.OptionMenu(
-            tf, self._variant_var, "realistic", *sorted(_Ackley.VARIANTS))
-        self._variant_menu.grid(row=row, column=1, sticky="w", padx=4)
-
-        # RF source (mobo_* dir) is hardcoded to the default surrogate run; the
-        # max number of activations is hardcoded to infinite (run until stopped).
-        self._rf_src_default = str(_HERE.parent / "optimize" / "runs" / "mobo_05_06_15_32")
+        ttk.Label(tf, text="Dimensions:").grid(
+            row=row, column=0, sticky="nw", padx=8, pady=4)
+        # Same dim selector as the hardware tab: the number of checked dims sets
+        # the Ensemble's dimensionality d, and each active dim's min/max is its
+        # search box (default [0, 1]) — so non-unit boxes (e.g. [0, 0.3]) can be
+        # exercised synthetically before a hardware run.
+        self._syn_dims = DimSelector(tf)
+        self._syn_dims.grid(row=row, column=1, columnspan=2, sticky="w", padx=4, pady=2)
 
         row += 1
         ttk.Label(tf, text="Output directory:").grid(
@@ -3419,9 +3579,6 @@ class NewRunDialog(tk.Toplevel):
                   foreground="gray").grid(row=row, column=0, columnspan=3,
                                           sticky="w", padx=8)
 
-        # Enable/disable the variant / RF-source rows to match the dataset.
-        self._sync_ds_fields()
-
         # ── hardware tab ───────────────────────────────────────────────────
         hw = ttk.Frame(nb)
         nb.add(hw, text="Hardware")
@@ -3434,11 +3591,10 @@ class NewRunDialog(tk.Toplevel):
             row=hrow, column=1, sticky="w", padx=4)
 
         hrow += 1
-        ttk.Label(hw, text="Optimizing dims (comma-sep):").grid(
-            row=hrow, column=0, sticky="w", padx=8, pady=4)
-        self._hw_dims_var = tk.StringVar(value="0,8,9")
-        ttk.Entry(hw, textvariable=self._hw_dims_var, width=20).grid(
-            row=hrow, column=1, sticky="w", padx=4)
+        ttk.Label(hw, text="Optimizing dims:").grid(
+            row=hrow, column=0, sticky="nw", padx=8, pady=4)
+        self._hw_dims = DimSelector(hw)
+        self._hw_dims.grid(row=hrow, column=1, sticky="w", padx=4, pady=2)
 
         hrow += 1
         ttk.Label(hw, text="Script path:").grid(
@@ -3497,13 +3653,6 @@ class NewRunDialog(tk.Toplevel):
         if d:
             self._outdir_var.set(d)
 
-    def _sync_ds_fields(self):
-        """Enable only the inputs relevant to the chosen dataset."""
-        ds = self._ds_var.get()
-        is_rf = (ds == "RF")
-        # Ackley variant applies to the analytic datasets only.
-        self._variant_menu.config(state="disabled" if is_rf else "normal")
-
     def _browse_hw_script(self):
         p = filedialog.askopenfilename(
             initialdir=str(Path(self._hw_script_var.get()).parent),
@@ -3549,17 +3698,20 @@ class NewRunDialog(tk.Toplevel):
                 hp.update(loaded)
             max_act  = float("inf")   # hardcoded: run until stopped
             outdir   = self._outdir_var.get()
-            dataset  = self._ds_var.get()
-            variant  = self._variant_var.get()
-            rf_src   = self._rf_src_default   # hardcoded default surrogate run
+            # Dim selection + per-dim search box. d = number of checked dims; the
+            # Ensemble landscape is drawn for that d, and bounds_lo/hi become the
+            # optimiser's search box (default [0, 1], but e.g. [0, 0.3] is allowed).
+            sel_dims       = self._syn_dims.selected_dims()
+            bounds_lo, bounds_hi = self._syn_dims.bounds_for_selected()
+            d              = len(sel_dims)
         except Exception as exc:
             messagebox.showerror("Config error", str(exc))
             return
 
         app = self._app
-        app.log_to_main(f"Starting synthetic: dataset={dataset}"
-                        + (f" variant={variant}" if dataset != "RF" else "")
-                        + f", max_act={max_act}", tag="info")
+        app.log_to_main(f"Starting synthetic: random Ensemble landscape, d={d} "
+                        f"(dims {sel_dims}), max_act={max_act}", tag="info")
+        app.log_to_main(f"  bounds: lo={bounds_lo} hi={bounds_hi}", tag="info")
         app.log_to_main(f"  outdir: {outdir}", tag="info")
 
         # Pre-generate the UUID and register the run NOW so it appears in the
@@ -3584,27 +3736,29 @@ class NewRunDialog(tk.Toplevel):
             old_stdout = sys.stdout
             sys.stdout = _LogStream(_log, real_stdout=old_stdout)
             try:
-                # Resolve the objective from optimize/evaluate.py so the GUI shares
-                # the exact RF surrogate + analytic Ackley datasets the benchmark
-                # harness uses. Imported lazily (pulls run_mobo) only on Start.
+                # A fresh random Ensemble landscape (synthetic_data/ensemble.py),
+                # built for this run's dimensionality d. The Ensemble generalises to
+                # any d and its predict() is a maximization objective.
                 try:
-                    import optimize.evaluate as _ev
+                    from synthetic_data.ensemble import (
+                        Ensemble, random_ensemble_config)
+                    from src.utils.simplex import random_simplex
                 except Exception as exc:
-                    _log(f"ERROR: could not import optimize/evaluate.py: {exc}", tag="error")
+                    _log(f"ERROR: could not import ensemble: {exc}", tag="error")
                     return
-                # resolve_dataset may sys.exit() on bad RF config — catch that too.
-                try:
-                    ds = _ev.resolve_dataset(dataset, rf_src, variant)
-                except SystemExit as exc:
-                    _log(f"ERROR resolving dataset {dataset!r}: {exc}", tag="error")
-                    return
-                fn_obj   = ds["fn"]
-                maximize = ds["maximize"]
-                d        = ds["dim"]
-                _log(f"  dataset={dataset} d={d} maximize={maximize}", tag="info")
+                land_seed = int(uuid4().int % (2**31))   # random landscape each run
+                cfg = random_ensemble_config(d, index=0, seed=land_seed)
+                ens = Ensemble(**cfg)
+                maximize = True
+                fn_obj = lambda x, _e=ens: float(np.asarray(_e.predict(np.asarray(x, float)[None]), float).ravel()[0])
+                _log(f"  ensemble landscape: d={d} seed={land_seed} "
+                     f"({len(ens.centers)} true optima)", tag="info")
 
-                X_a, X_e, Y_i = _gen_init_data(fn_obj, d, maximize)
-                _log(f"  init: {X_a.shape[0]} pts", tag="info")
+                # Search box from the dim selector (lo/hi aligned to the d dims).
+                bnds = torch.tensor([bounds_lo, bounds_hi], device=DEVICE, dtype=DTYPE)
+
+                X_a, X_e, Y_i = _gen_init_data_box(fn_obj, bnds, maximize)
+                _log(f"  init: {X_a.shape[0]} pts (within search box)", tag="info")
                 sim_obj  = _make_sim_obj(fn_obj, DEVICE, DTYPE, maximize=maximize)
                 plot_state: dict = {"line_0": None, "line_1": None}
                 base_obj = _make_linebo_wrapper(sim_obj, d, DEVICE, DTYPE,
@@ -3654,6 +3808,7 @@ class NewRunDialog(tk.Toplevel):
                     verbose=True,
                     device=str(DEVICE),
                     dtype=DTYPE,
+                    bounds=bnds,
                     run_uuid=new_uuid,
                     resume=False,
                     checkpoint_dir=outdir,
@@ -3708,9 +3863,17 @@ class NewRunDialog(tk.Toplevel):
         threading.Thread(target=_run, daemon=True).start()
 
     def _start_hardware(self):
+        try:
+            dims_raw = self._hw_dims.dims_csv()
+            bounds_lo, bounds_hi = self._hw_dims.bounds_for_selected()
+        except ValueError as exc:
+            messagebox.showerror("Config error", str(exc))
+            return
         self._app.launch_hardware_process(
             uuid         = self._uuid_var.get().strip() or None,
-            dims_raw     = self._hw_dims_var.get().strip(),
+            dims_raw     = dims_raw,
+            bounds_lo    = ",".join(f"{v:g}" for v in bounds_lo),
+            bounds_hi    = ",".join(f"{v:g}" for v in bounds_hi),
             script       = self._hw_script_var.get(),
             python       = self._hw_python_var.get(),
             ckpt_dir     = self._app.ckpt_dir,
@@ -4287,6 +4450,8 @@ class ZoMBIApp(tk.Tk):
         self,
         uuid:         str | None = None,
         dims_raw:     str        = "",
+        bounds_lo:    str | None = None,
+        bounds_hi:    str | None = None,
         script:       str | None = None,
         python:       str | None = None,
         ckpt_dir:     str | None = None,
@@ -4296,6 +4461,10 @@ class ZoMBIApp(tk.Tk):
 
         uuid         – resume UUID (None = new run)
         dims_raw     – comma-separated dim indices, e.g. "0,8,9"
+        bounds_lo    – comma-separated per-dim lower bounds aligned to dims_raw
+                       (e.g. "0,0,0"); None ⇒ optimizer defaults to 0 for each dim
+        bounds_hi    – comma-separated per-dim upper bounds aligned to dims_raw
+                       (e.g. "0.3,1,1"); None ⇒ optimizer defaults to 1 for each dim
         script       – path to main.py
         python       – python executable
         ckpt_dir     – checkpoint directory (defaults to self.ckpt_dir)
@@ -4315,6 +4484,10 @@ class ZoMBIApp(tk.Tk):
         cmd = [python, script] + ([uuid] if uuid else [])
         if dims_raw:
             cmd += ["--dims", dims_raw]
+        if bounds_lo:
+            cmd += ["--bounds-lo", bounds_lo]
+        if bounds_hi:
+            cmd += ["--bounds-hi", bounds_hi]
         cmd += ["--checkpoint-dir", ckpt_dir]
         if hparams_path:
             cmd += ["--hparams", hparams_path]
@@ -4330,7 +4503,8 @@ class ZoMBIApp(tk.Tk):
         hw_run_id = f"run_{known_uuid}" if known_uuid else None
         if known_uuid:
             run_dir = Path(ckpt_dir) / hw_run_id
-            self.after(0, lambda rd=run_dir, d=dims_raw: self.track_new_run(rd, hw_dims=d))
+            self.after(0, lambda rd=run_dir, d=dims_raw, lo=bounds_lo, hi=bounds_hi:
+                       self.track_new_run(rd, hw_dims=d, hw_bounds_lo=lo, hw_bounds_hi=hi))
 
         _RE_UUID = re.compile(r"Starting new trial with UUID:\s*(\S+)", re.IGNORECASE)
         app = self
@@ -4442,11 +4616,15 @@ class ZoMBIApp(tk.Tk):
 
         threading.Thread(target=_pump, daemon=True).start()
 
-    def track_new_run(self, run_dir, hw_dims: str = "", hw: bool = True):
+    def track_new_run(self, run_dir, hw_dims: str = "", hw: bool = True,
+                      hw_bounds_lo: str | None = None,
+                      hw_bounds_hi: str | None = None):
         """Register a just-started run so the poll loop watches it from the first snapshot.
 
         hw : True for hardware runs (writes hw_config.json + shows the green HW-run
              indicator). False for in-process synthetic runs.
+        hw_bounds_lo / hw_bounds_hi : comma-separated per-dim search-box bounds
+             aligned to ``hw_dims`` (persisted so a Resume can restore the box).
         """
         run_dir_path = Path(run_dir)
         # Ensure the directory and a stub config.json exist so scan_runs() lists
@@ -4457,9 +4635,25 @@ class ZoMBIApp(tk.Tk):
             cfg_path.write_text(json.dumps(
                 {"status": "running", "source": "hardware" if hw else "synthetic"}))
         if hw:
-            # Write hw_config.json with dims so Resume dialog can pre-fill them.
+            # Write hw_config.json with dims (and search-box bounds) so the Resume
+            # dialog can pre-fill them and the run can restore its box on resume.
+            # Preserve any bounds already saved (e.g. a resume that doesn't re-send
+            # them) rather than clobbering them.
             hw_cfg = run_dir_path / "hw_config.json"
-            hw_cfg.write_text(json.dumps({"dims": hw_dims, "source": "hardware"}))
+            cfg = {"dims": hw_dims, "source": "hardware"}
+            existing = {}
+            if hw_cfg.exists():
+                try:
+                    existing = json.loads(hw_cfg.read_text())
+                except Exception:
+                    existing = {}
+            lo = hw_bounds_lo or existing.get("bounds_lo")
+            hi = hw_bounds_hi or existing.get("bounds_hi")
+            if lo:
+                cfg["bounds_lo"] = lo
+            if hi:
+                cfg["bounds_hi"] = hi
+            hw_cfg.write_text(json.dumps(cfg))
 
         try:
             rd = load_run(run_dir_path)
