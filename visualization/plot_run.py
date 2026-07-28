@@ -897,6 +897,34 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
                 marks={0.5: "0.5", 1.0: "1", 2.0: "2", 3.0: "3"},
             ),
 
+            # Color-scale override: when checked, the viridis (vmin, vmax) is
+            # taken from the two inputs below instead of the data percentiles.
+            dcc.Checklist(
+                id="color-override",
+                options=[{"label": " Override color scale", "value": "on"}],
+                value=[],
+                style={"marginTop": "12px"},
+            ),
+            html.Div(
+                style={"display": "flex", "gap": "8px", "marginTop": "6px"},
+                children=[
+                    html.Div(children=[
+                        html.Label("Min", style={"fontSize": "12px", "color": "#666"}),
+                        dcc.Input(
+                            id="color-min", type="number", debounce=True,
+                            style={"width": "100%", "boxSizing": "border-box"},
+                        ),
+                    ], style={"flex": 1}),
+                    html.Div(children=[
+                        html.Label("Max", style={"fontSize": "12px", "color": "#666"}),
+                        dcc.Input(
+                            id="color-max", type="number", debounce=True,
+                            style={"width": "100%", "boxSizing": "border-box"},
+                        ),
+                    ], style={"flex": 1}),
+                ],
+            ),
+
             # Auto-rotate controls (only affect the 3D d=4 tetrahedron; a no-op
             # for the flat d=3 ternary, which has no scene camera).
             html.Label("3D auto-rotate", style=label_style),
@@ -1021,8 +1049,12 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         Input("n-estimators", "value"),
         Input("gp-length-scale", "value"),
         Input("scale", "value"),
+        Input("color-override", "value"),
+        Input("color-min", "value"),
+        Input("color-max", "value"),
     )
-    def _render(source_type, run_name, db_name, db_value, background, show_points, gn, ntrees, gp_ls, scale):
+    def _render(source_type, run_name, db_name, db_value, background, show_points,
+                gn, ntrees, gp_ls, scale, color_override, color_min, color_max):
         try:
             if source_type == "run":
                 if not run_name:
@@ -1034,12 +1066,23 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
                     return no_update, "No database / value column selected."
                 X, Y, labels, title = load_db_dataset(_resolve_db_path(db_name), db_value)
                 value_name = db_value
+
+            # Manual color-scale override: only applied when the box is checked
+            # and both bounds are valid (min < max); otherwise fall back to the
+            # data-derived percentile limits inside build_figure.
+            color_limits = None
+            if color_override and color_min is not None and color_max is not None:
+                lo, hi = float(color_min), float(color_max)
+                if hi > lo:
+                    color_limits = (lo, hi)
+
             fig = build_figure(
                 X, Y, labels,
                 grid_n=int(gn), n_estimators=int(ntrees),
                 title=title, value_name=value_name,
                 background=background, show_points=bool(show_points),
                 gp_length_scale=float(gp_ls), scale=float(scale),
+                color_limits=color_limits,
             )
             diagram = "tetrahedron (d=4)" if X.shape[1] == 4 else "ternary (d=3)"
             status = (
