@@ -194,13 +194,23 @@ ACKLEY_BENCHMARKS = {"ackley3d": 3, "ackley4d": 4, "ackley10d": 10}
 GAUSSIAN_BENCHMARKS = {"gaussian3d": 3, "gaussian4d": 4, "gaussian10d": 10}
 # Layered ``Ensemble`` objective: re-randomized per run (see random_ensemble_config).
 ENSEMBLE_DATASETS = {"ensemble"}
+# Fixed warm-start GP landscape (warm_start/warm_gp_landscape.py via
+# rm.build_warmgp_landscape): the same surface every run, seeded by --warmgp-seed.
+WARMGP_DATASETS = {"warmgp"}
+# Full-run GP landscape (rm.build_fullgp_landscape): the same fixed GP fit to the
+# ENTIRE real campaign (every scored point), not just the warm-start lines. This is
+# the honest evaluation ground truth — the tuner sees the warm-start GP, deployed
+# hparams are scored here. Deterministic (no seed dependence).
+FULLGP_DATASETS = {"fullgp"}
 # ``newRF``: RF surrogate trained on live measurements pulled straight from a
 # ``results`` SQLite DB (same source as visualization/plot_run.py).  Its reference
 # optima are picked interactively (interactive_test_zombi.ExtremaPicker) the first
 # time and cached to ``newRF_optima.json`` so later runs can supply ``--runs-path``.
 NEWRF_DATASETS = {"newRF"}
 BUILTIN_DATASETS = {"RF", *ACKLEY_BENCHMARKS.keys(), *GAUSSIAN_BENCHMARKS.keys(),
-                    *ORACLE_CHOICES, *ENSEMBLE_DATASETS, *NEWRF_DATASETS}
+                    *ORACLE_CHOICES, *ENSEMBLE_DATASETS, *WARMGP_DATASETS,
+                    *FULLGP_DATASETS,
+                    *NEWRF_DATASETS}
 
 # ─── newRF database source (mirrors visualization/plot_run.py) ──────────────────
 DEFAULT_DB = "2nd_real_run.db"
@@ -423,8 +433,28 @@ def resolve_dataset(
     db_minimize: bool = False,
     optima_json: str | None = None,
     out_dir: str | None = None,
+    warmgp_seed: int = 0,
 ) -> dict:
     """Build the objective + reference optima for ``dataset``."""
+    if dataset == "warmgp":
+        # Fixed warm-start GP landscape; reference optima are its auto-detected
+        # GP peaks (rm.build_warmgp_landscape / warm_start.warm_gp_landscape).
+        spec = rm.build_warmgp_landscape(
+            dim, seed=warmgp_seed, time_limit_hours=time_limit_hours)
+        print(f"  [dataset] warmgp: warm-start GP landscape dim={dim} "
+              f"seed={warmgp_seed} — maximize, {len(spec.true_optima)} GP peak(s)")
+        return _landscape_to_ds(spec, "warmgp")
+
+    if dataset == "fullgp":
+        # Full-run GP landscape (GP fit to the ENTIRE real campaign); reference
+        # optima are its auto-detected peaks (rm.build_fullgp_landscape). This is
+        # the evaluation ground truth — deterministic, so warmgp_seed is unused.
+        spec = rm.build_fullgp_landscape(
+            dim, seed=warmgp_seed, time_limit_hours=time_limit_hours)
+        print(f"  [dataset] fullgp: full-run GP landscape dim={dim} "
+              f"— maximize, {len(spec.true_optima)} GP peak(s)")
+        return _landscape_to_ds(spec, "fullgp")
+
     if dataset == "newRF":
         from sklearn.ensemble import RandomForestRegressor
 
@@ -1061,7 +1091,14 @@ def run_single_eval(
     def snap_wrap(*a, **k):
         orig_snap(*a, **k)
         if dh.X_all_actual is not None:
-            snap_records.append((dh.X_all_actual.shape[0], dh.current_activation, dh.current_zoom))
+            # Capture the current zoom zone's linear size (relative to the full
+            # [0,1]^d domain) as the 4th element, exactly as run_mobo does, so the
+            # duplicate metric can shrink its radius for points sampled inside a zoom
+            # — i.e. so eval scores dup on the SAME definition the tuner optimised.
+            czb = dh.current_zoom_bounds if dh.current_zoom_bounds is not None else dh.bounds
+            zoom_size = rm.zoom_size_fraction(czb) if czb is not None else 1.0
+            snap_records.append((dh.X_all_actual.shape[0], dh.current_activation,
+                                 dh.current_zoom, zoom_size))
     dh.take_snapshot = snap_wrap
 
     interrupted = False
@@ -1083,7 +1120,11 @@ def run_single_eval(
     X_all_np = (dh.X_all_actual.detach().cpu().numpy()
                 if dh.X_all_actual is not None else np.empty((0, dim)))
     dist = rm.metric_dist_to_needles(discovered, true_optima, dim=dim)
-    dup = rm.metric_dup_fraction(X_all_np, dim=dim)
+    # Zoom-scaled duplicate radius (matches run_mobo's trial scoring): points sampled
+    # inside a small zoom zone must be closer to count as duplicates, so zooming isn't
+    # penalised. Without this eval over-reports dup vs. the tuned/selected objective.
+    zoom_sizes = rm._zoom_size_per_point(X_all_np.shape[0], snap_records)
+    dup = rm.metric_dup_fraction(X_all_np, dim=dim, zoom_sizes=zoom_sizes)
     pct_comp = rm.metric_pct_matched_comp(discovered, true_optima, dim=dim)
     print(f"      [run]  iters={call_counter[0]}  dist={dist:.4f}  dup={dup:.4f}"
           f"  pct_comp={pct_comp:.2f}  t={runtime:.1f}s"
@@ -1319,6 +1360,7 @@ def evaluate_dataset(
             db_minimize=args.db_minimize,
             optima_json=args.optima_json,
             out_dir=out_dir,
+            warmgp_seed=args.warmgp_seed,
         )
         rerun_cfg = _build_rerun_config(
             dataset, ds, runs_path=runs_path, trial_nums=trial_nums,
@@ -1327,6 +1369,20 @@ def evaluate_dataset(
 
     with open(os.path.join(out_dir, "rerun_config.json"), "w") as f:
         json.dump(rerun_cfg, f, indent=2)
+
+    # DYNAMIC method: --dynamic-alt-hparams-json arms an every-`period`-iteration
+    # alternation between the trial's hparams (the WARM-tuned set) and this
+    # alternate set (BEST_HPARAMS). Loaded once; armed around each run below.
+    dynamic_alt = None
+    if getattr(args, "dynamic_alt_hparams_json", None):
+        _alt = json.loads(open(args.dynamic_alt_hparams_json).read())
+        dynamic_alt = _alt.get("hparams", _alt) if isinstance(_alt, dict) else None
+        if not dynamic_alt:
+            sys.exit(f"--dynamic-alt-hparams-json: no hparams in "
+                     f"{args.dynamic_alt_hparams_json}")
+        print(f"  [dynamic] alternating every {args.dynamic_period} iters with "
+              f"{len(dynamic_alt)} alternate hparam(s) from "
+              f"{args.dynamic_alt_hparams_json}")
 
     total = len(trial_nums) * args.num_runs
     done = 0
@@ -1366,9 +1422,17 @@ def evaluate_dataset(
                     log_x=args.log_x,
                     log_y=args.log_y,
                 )
-                res = run_single_eval(
-                    hparams, run_ds, dataset, run_dir, time_limit_min, **eval_kwargs,
-                )
+                if dynamic_alt is not None:
+                    from warm_start import dynamic_hparams as dyn
+                    dyn.arm(hparams, dynamic_alt, period=args.dynamic_period)
+                try:
+                    res = run_single_eval(
+                        hparams, run_ds, dataset, run_dir, time_limit_min, **eval_kwargs,
+                    )
+                finally:
+                    if dynamic_alt is not None:
+                        from warm_start import dynamic_hparams as dyn
+                        dyn.disarm()
                 per_trial[trial_num].append({
                     "run": k,
                     "dist_to_needles": round(res["dist"], 6),
@@ -1430,6 +1494,16 @@ def main() -> None:
     parser.add_argument("--optima-json", default=None, metavar="PATH",
                         help="newRF: JSON with a 'true_optima' list to use as the "
                              "reference set (skips the interactive picker).")
+    parser.add_argument("--warmgp-seed", type=int, default=0,
+                        help="Seed for the warmgp dataset's warm-start GP landscape "
+                             "(default: 0; matches the tuning jobs).")
+    parser.add_argument("--dynamic-alt-hparams-json", default=None, metavar="PATH",
+                        help="DYNAMIC method: alternate the trial's (WARM-tuned) "
+                             "hparams with the hparams in this JSON every "
+                             "--dynamic-period iterations (trial.json-style or flat).")
+    parser.add_argument("--dynamic-period", type=int, default=10,
+                        help="Iterations per block for --dynamic-alt-hparams-json "
+                             "(default: 10).")
     parser.add_argument("--dim", type=int, default=3,
                         help="Simplex dimension for synthetic oracles (default: 3).")
     parser.add_argument("--layout", default="2", choices=["1", "2", "3"],

@@ -14,6 +14,7 @@ warm_start/*
 warm_start/optima_finder/*.png
 warm_start/runs/*
 warm_start/optima_finder_gp/*
+warm_start/pareto_plots/*
 
 # UV artifacts
 .python-version
