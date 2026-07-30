@@ -1084,7 +1084,8 @@ def _load_needles_for_plot(
 
 def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None = None,
                    checkpoint_dir: str | None = None, hparams_path: str | None = None,
-                   new_run_uuid: str | None = None):
+                   new_run_uuid: str | None = None,
+                   bounds_lo: list | None = None, bounds_hi: list | None = None):
     """Run DB-driven ZoMBI-Hop loop (new or resume).
 
     hparams_path : optional path to a trial.json-style JSON file whose 'hparams'
@@ -1092,6 +1093,11 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
     new_run_uuid : optional caller-provided UUID for a *new* run. Lets the GUI
         pre-create and display the run directory the moment the run is launched,
         before any data has been collected. Ignored when resuming.
+    bounds_lo / bounds_hi : optional per-dim lower/upper search-box bounds aligned
+        to OPTIMIZING_DIMS (default 0 / 1 for every dim). A tightened box — e.g. a
+        dim capped at 0.3 — constrains sampling, zoom-resets and space-filling to
+        that box. On resume, if omitted, they are restored from the run's
+        hw_config.json so the box survives across resumes.
     """
     global OPTIMIZING_DIMS
     if optimizing_dims is not None:
@@ -1115,15 +1121,32 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
     dimensions = len(OPTIMIZING_DIMS)
     device = torch.device(DEVICE)
     dtype = torch.float64
-    bounds = torch.zeros((2, dimensions), device=device, dtype=dtype)
-    bounds[0] = 0.0
-    bounds[1] = 1.0
 
     if checkpoint_dir is not None:
         ckpt_path = Path(checkpoint_dir)
     else:
         ckpt_path = Path("actual_runs") / "checkpoints"
     ckpt_path.mkdir(parents=True, exist_ok=True)
+
+    # Per-dim search box (2, dimensions). Defaults to the full [0,1] simplex, but a
+    # caller (GUI) may pass a tightened box; on resume, restore it from hw_config.json
+    # so the box persists. Bounds are aligned to OPTIMIZING_DIMS order.
+    if (bounds_lo is None or bounds_hi is None) and resume_uuid is not None:
+        try:
+            _hw = ckpt_path / f"run_{resume_uuid}" / "hw_config.json"
+            if _hw.exists():
+                _cfg = json.loads(_hw.read_text())
+                if bounds_lo is None and _cfg.get("bounds_lo"):
+                    bounds_lo = [float(x) for x in str(_cfg["bounds_lo"]).split(",")]
+                if bounds_hi is None and _cfg.get("bounds_hi"):
+                    bounds_hi = [float(x) for x in str(_cfg["bounds_hi"]).split(",")]
+        except Exception as _e:
+            print(f"[ZoMBI] Could not restore bounds from hw_config.json: {_e}")
+    bounds = torch.zeros((2, dimensions), device=device, dtype=dtype)
+    bounds[0] = torch.tensor(bounds_lo, device=device, dtype=dtype) if bounds_lo else 0.0
+    bounds[1] = torch.tensor(bounds_hi, device=device, dtype=dtype) if bounds_hi else 1.0
+    if bounds_lo or bounds_hi:
+        print(f"[ZoMBI] Search box: lo={bounds[0].tolist()} hi={bounds[1].tolist()}")
 
     resume_plot_data: Tuple[List[float], List[float], List[np.ndarray]] | None = None
     needle_plot_points: List[Dict[str, float]] = []
@@ -1209,6 +1232,7 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
             Y_init=Y_init,
             device=str(device),
             dtype=dtype,
+            bounds=bounds,
             run_uuid=new_run_uuid,
             resume=False,
             checkpoint_dir=str(ckpt_path),
@@ -1236,6 +1260,7 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
             Y_init=torch.zeros(0, 1, device=device, dtype=dtype),
             device=str(device),
             dtype=dtype,
+            bounds=bounds,
             run_uuid=resume_uuid,
             checkpoint_dir=str(ckpt_path),
             num_iterations_saved=50,
