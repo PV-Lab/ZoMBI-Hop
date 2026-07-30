@@ -1985,8 +1985,17 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
     fig.clear()
 
 
-def plot_convergence(path: str, dh, maximize: bool) -> None:
-    """Save a convergence plot: all Y values, running best, needle vlines."""
+def plot_convergence(path: str, dh, maximize: bool,
+                     activations: np.ndarray | None = None) -> None:
+    """Save a convergence plot: all Y values, running best, needle vlines.
+
+    ``activations``: optional per-sample activation id (same length/order as
+    ``dh.Y_all``). When given, the running-best envelope is **reset at every
+    activation boundary** — i.e. each activation gets its own best-so-far sawtooth
+    rather than one globally-monotone curve. This shows how much each fresh
+    activation re-explores instead of coasting on an earlier activation's peak.
+    Passing ``None`` keeps the original single global running best.
+    """
     Y_all = dh.Y_all.detach().cpu().numpy().ravel()
     if Y_all.size == 0:
         return
@@ -2013,10 +2022,32 @@ def plot_convergence(path: str, dh, maximize: bool) -> None:
     # a real objective measurement, so it must be able to raise the best-so-far.
     # Penalization only governs where MOBO samples next, not what counts as
     # observed — so it must not be excluded from the convergence envelope.
-    running_best = np.maximum.accumulate(Y_all)
-
-    ax.plot(idx, running_best, color="darkorange", lw=1.8,
-            label="running best", zorder=4)
+    if activations is not None and len(activations) == len(Y_all):
+        # Reset the accumulate at each activation boundary: independent per-activation
+        # bests (a sawtooth), so each fresh activation starts its envelope over. Each
+        # activation's envelope is drawn as its OWN line segment — no connecting
+        # segment bridges the boundary, so the running best is fully disconnected
+        # across activations.
+        acts = np.asarray(activations).ravel()
+        best_label = "running best (reset/activation)"
+        start = 0
+        labeled = False
+        for i in range(1, len(Y_all) + 1):
+            if i == len(Y_all) or acts[i] != acts[start]:
+                seg_best = np.maximum.accumulate(Y_all[start:i])
+                ax.plot(idx[start:i], seg_best, color="darkorange", lw=1.8,
+                        label=(None if labeled else best_label), zorder=4,
+                        drawstyle="steps-post")
+                labeled = True
+                # dashed guide at each activation boundary
+                if i < len(Y_all):
+                    ax.axvline(float(i) - 0.5, color="#888888", alpha=0.35,
+                               lw=0.7, ls=":", zorder=1)
+                start = i
+    else:
+        running_best = np.maximum.accumulate(Y_all)
+        ax.plot(idx, running_best, color="darkorange", lw=1.8,
+                label="running best", zorder=4, drawstyle="steps-post")
 
     if needle_indices is not None:
         labeled = False

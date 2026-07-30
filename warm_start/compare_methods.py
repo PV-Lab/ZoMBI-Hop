@@ -9,8 +9,8 @@ warm-start GP landscape and on re-randomized ensemble landscapes, writing an
 ``eval/<method>/<landscape>/rerun_summary.json``. This script reads those summaries
 and reports, per (method × landscape), the mean ± std across runs of the metrics
 that matter — dist_to_needles (lower = closer to the true peaks), dup_fraction,
-pct_matched_comp, runtime — so the methods can be compared on the task they were
-tuned for and on generic landscapes at once.
+runtime — so the methods can be compared on the task they were tuned for and on
+generic landscapes at once.
 
 Writes ``comparison.md`` and ``comparison.csv`` into the base dir and prints the
 table. Pure stdlib (json) — no torch/pandas — so it is cheap to run after the jobs.
@@ -38,7 +38,6 @@ LANDSCAPES = ["fullgp", "ensemble"]
 METRICS = [
     ("dist_to_needles", "dist", True),
     ("dup_fraction", "dup", True),
-    ("pct_matched_comp", "pct_matched", False),
     ("runtime_s", "runtime_s", True),
 ]
 
@@ -88,8 +87,7 @@ def write_markdown(rows: list[dict], path: Path) -> None:
             cells.append(_fmt(r.get(f"{key}_mean"), r.get(f"{key}_std")))
         lines.append("| " + " | ".join(cells) + " |")
     lines.append("")
-    lines.append("_dist_to_needles / dup_fraction / runtime: lower is better; "
-                 "pct_matched: higher is better._")
+    lines.append("_dist_to_needles / dup_fraction / runtime: lower is better._")
     path.write_text("\n".join(lines) + "\n")
 
 

@@ -233,6 +233,16 @@ class _TopKReached(Exception):
     """Internal signal: ``--top-k`` needles found, stop this run early."""
 
 
+class _LineBudgetReached(Exception):
+    """Internal signal: ``--max-lines`` measured lines reached, stop this run.
+
+    Each ZoMBI iteration = one ``obj_wrapper`` call = one measured LineBO line, so
+    capping the objective-call count fixes the number of lines every run samples
+    (init lines are a fixed deterministic preamble on top). The time limit still
+    applies as a secondary safety cap.
+    """
+
+
 # ─── Reference optima ───────────────────────────────────────────────────────────
 
 def load_true_optima_json(path: str) -> list[np.ndarray]:
@@ -842,19 +852,24 @@ def write_needles_csv(path: str, dh, cols: list[str], dim: int) -> None:
     pd.DataFrame(rows, columns=columns).to_csv(path, index=False)
 
 
-def write_point_cloud_html(path: str, ackley_fn, dh, last_payload: dict) -> None:
-    """Render the final ZoMBI state over the 4-simplex Ackley cloud (one HTML).
+def write_point_cloud_html(path: str, predict_fn, peaks, dh, last_payload: dict) -> None:
+    """Render the final ZoMBI state over the 4-simplex objective cloud (one HTML).
 
     Uses ``synthetic_data/plot``'s overlay API.  Pared points, needle markers,
     and the last LineBO lines are all exact (plain simplex compositions);
     needle penalisation ellipsoids are intentionally omitted because the run's
     tangent basis differs from the Helmert ILR basis the overlay assumes.
+
+    ``predict_fn`` maps an (N, 4) composition array to (N,) objective values (an
+    Ackley/Ensemble ``.predict`` or a GP-landscape batch predictor). ``peaks`` is an
+    (M, 4) array of reference optima to mark. Generalised beyond Ackley so the
+    fullgp / ensemble evaluation landscapes all render a 4D cloud.
     """
     import plotly.graph_objects as go
     import synthetic_data.plot_ackley as pc4
 
     comp = pc4.build_simplex_lattice(pc4.GRID_N)
-    obj = ackley_fn.predict(comp)
+    obj = np.asarray(predict_fn(comp), dtype=float).ravel()
     xyz = pc4.to_3d(comp)
     obj_min, obj_max = float(obj.min()), float(obj.max())
 
@@ -867,16 +882,19 @@ def write_point_cloud_html(path: str, ackley_fn, dh, last_payload: dict) -> None
                     size=pc4.MARKER_SIZE, opacity=pc4.MARKER_OPACITY,
                     showscale=True, colorbar=dict(title="Objective")),
     )
-    peaks_xyz = pc4.to_3d(np.array(ackley_fn.centers))
-    peaks_trace = go.Scatter3d(
-        x=peaks_xyz[:, 0], y=peaks_xyz[:, 1], z=peaks_xyz[:, 2], mode="markers",
-        name="known peak",
-        marker=dict(symbol="diamond", color="red", size=6, line=dict(color="white", width=1)),
-        hoverinfo="name",
-    )
-    fig = go.Figure(data=[cloud, pc4.tetra_edges_trace(), pc4.vertex_labels_trace(), peaks_trace])
+    peaks_arr = np.asarray(peaks, dtype=float) if peaks is not None else np.empty((0, 4))
+    fig_data = [cloud, pc4.tetra_edges_trace(), pc4.vertex_labels_trace()]
+    if peaks_arr.size:
+        peaks_xyz = pc4.to_3d(peaks_arr)
+        fig_data.append(go.Scatter3d(
+            x=peaks_xyz[:, 0], y=peaks_xyz[:, 1], z=peaks_xyz[:, 2], mode="markers",
+            name="known peak",
+            marker=dict(symbol="diamond", color="red", size=6, line=dict(color="white", width=1)),
+            hoverinfo="name",
+        ))
+    fig = go.Figure(data=fig_data)
     fig.update_layout(
-        title="ZoMBI-Hop final state on the 4-simplex (negated Ackley) point cloud",
+        title="ZoMBI-Hop final state on the 4-simplex objective point cloud",
         scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False),
                    zaxis=dict(visible=False), aspectmode="data"),
         legend=dict(x=0.0, y=1.0), width=pc4.FIG_W, height=pc4.FIG_H,
@@ -992,6 +1010,9 @@ def run_single_eval(
     time_limit_min: float,
     *,
     top_k: int | None = None,
+    max_lines: int | None = None,
+    final_frame_only: bool = False,
+    coverage: bool = False,
     no_video: bool = False,
     no_convergence_plot: bool = False,
     log_x: bool = False,
@@ -1049,6 +1070,10 @@ def run_single_eval(
             n_needles = needles.shape[0] if needles is not None else 0
             if n_needles >= top_k:
                 raise _TopKReached(n_needles)
+        # Hard line budget: each obj_wrapper call is one measured line, so stopping
+        # here after `max_lines` calls fixes the number of lines every run samples.
+        if max_lines is not None and call_counter[0] >= max_lines:
+            raise _LineBudgetReached(call_counter[0])
         return x_req, x_act, y
 
     try:
@@ -1104,9 +1129,12 @@ def run_single_eval(
     interrupted = False
     t0 = time.time()
     try:
-        optimizer.run(max_activations=float("inf"), time_limit_hours=time_limit_min / 60.0)
+        optimizer.run(max_activations=float("inf"), time_limit_hours=time_limit_min / 60.0,
+                      never_terminate=True)
     except _TopKReached as stop:
         print(f"      [run] top-k reached: {int(stop.args[0])} needle(s) found — stopping early")
+    except _LineBudgetReached as stop:
+        print(f"      [run] line budget reached: {int(stop.args[0])} measured line(s) — stopping.")
     except KeyboardInterrupt:
         interrupted = True
         print("\n      [run] interrupted — writing artifacts before exit …")
@@ -1147,7 +1175,12 @@ def run_single_eval(
         rm.plot_hparam_edge_proximity(
             os.path.join(out_dir, "hparam_edge_proximity.png"),
             rm.hparams_to_norm(hparams))
-        rm.plot_convergence(os.path.join(out_dir, "convergence.png"), dh, maximize)
+        # Per-sample activation ids (from the snapshot records) so the convergence
+        # plot resets its running-best envelope at each activation boundary.
+        n_y = int(dh.Y_all.shape[0]) if dh.Y_all is not None else 0
+        conv_acts, _ = rm._activation_zoom_per_point(n_y, snap_records)
+        rm.plot_convergence(os.path.join(out_dir, "convergence.png"), dh, maximize,
+                            activations=conv_acts)
     except Exception as exc:
         print(f"      [run] static plot failed: {exc}")
 
@@ -1163,31 +1196,90 @@ def run_single_eval(
 
     try:
         if dim == 3 and ds.get("grid_pts") is not None and ds.get("grid_vals") is not None:
-            plots_dir = os.path.join(out_dir, "plots")
-            os.makedirs(plots_dir, exist_ok=True)
             ref_title = (
                 "Reference: oracle landscape"
                 if ds.get("landscape") == "synthetic" else
                 "Reference: RF landscape" if dataset == "RF" else
                 f"Reference: {dataset} landscape"
             )
-            print(f"      [run] rendering {len(payloads)} ternary frames …", flush=True)
-            for p in payloads:
-                rm.render_frame(p, ds["grid_pts"], ds["grid_vals"], true_optima, maximize,
-                                os.path.join(plots_dir, f"iter_{p['iter_num'] - 1:04d}.png"),
-                                ref_title=ref_title)
-            if not no_video and mv is not None:
-                try:
-                    mv.make_video_from_dir(plots_dir, os.path.join(out_dir, "zombihop_timelapse.mp4"))
-                except Exception as exc:
-                    print(f"      [run] video assembly failed: {exc}")
-        elif dim == 4 and ds.get("ackley_fn") is not None:
+            if final_frame_only:
+                # Only the FINAL ternary frame, written straight into out_dir (no
+                # plots/ subdir, no timelapse video).
+                if payloads:
+                    p = payloads[-1]
+                    print("      [run] rendering final ternary frame …", flush=True)
+                    rm.render_frame(p, ds["grid_pts"], ds["grid_vals"], true_optima, maximize,
+                                    os.path.join(out_dir, f"iter_{p['iter_num'] - 1:04d}.png"),
+                                    ref_title=ref_title)
+            else:
+                plots_dir = os.path.join(out_dir, "plots")
+                os.makedirs(plots_dir, exist_ok=True)
+                print(f"      [run] rendering {len(payloads)} ternary frames …", flush=True)
+                for p in payloads:
+                    rm.render_frame(p, ds["grid_pts"], ds["grid_vals"], true_optima, maximize,
+                                    os.path.join(plots_dir, f"iter_{p['iter_num'] - 1:04d}.png"),
+                                    ref_title=ref_title)
+                if not no_video and mv is not None:
+                    try:
+                        mv.make_video_from_dir(plots_dir, os.path.join(out_dir, "zombihop_timelapse.mp4"))
+                    except Exception as exc:
+                        print(f"      [run] video assembly failed: {exc}")
+        elif dim == 4:
+            # Final-state interactive 4-simplex cloud. Works for the Ackley/Ensemble
+            # oracles (batch .predict + .centers) and for the GP landscapes (fullgp),
+            # whose fn is single-point — wrap it into a batch predictor and mark the
+            # true optima as peaks.
             last_payload = payloads[-1] if payloads else None
-            print("      [run] rendering 4D point-cloud HTML …", flush=True)
-            write_point_cloud_html(os.path.join(out_dir, "point_cloud.html"),
-                                   ds["ackley_fn"], dh, last_payload)
+            predict_fn = peaks = None
+            if ds.get("ackley_fn") is not None:
+                predict_fn = ds["ackley_fn"].predict
+                peaks = np.asarray(ds["ackley_fn"].centers, dtype=float)
+            elif ds.get("fn") is not None:
+                _f = ds["fn"]
+                predict_fn = lambda comp: np.array([float(_f(np.asarray(x, dtype=float)))
+                                                    for x in np.asarray(comp, dtype=float)])
+                peaks = (np.asarray(true_optima, dtype=float) if true_optima is not None
+                         and len(true_optima) else np.empty((0, dim)))
+            if predict_fn is not None:
+                print("      [run] rendering 4D point-cloud HTML …", flush=True)
+                write_point_cloud_html(os.path.join(out_dir, "point_cloud.html"),
+                                       predict_fn, peaks, dh, last_payload)
     except Exception as exc:
         print(f"      [run] landscape render failed: {exc}")
+
+    # Coverage plot (3D ternary / 4D tetrahedron): background ground-truth grid + all
+    # sampled points, exactly like optimize/coverage_plot.py. Self-contained — write
+    # the per-trial ground truth (npz) and a minimal config into out_dir, then reuse
+    # save_coverage_image. For 3D we reuse the dataset's prebuilt grid; for 4D (where
+    # fullgp/ensemble carry no grid) we build a simplex grid and evaluate the objective
+    # on it (batch predictor if available, else the single-point fn — ~sub-second).
+    if coverage and dim in (3, 4):
+        try:
+            import coverage_plot
+            cov_grid_pts = ds.get("grid_pts")
+            cov_grid_vals = ds.get("grid_vals")
+            if cov_grid_pts is None or cov_grid_vals is None:
+                cov_grid_pts = (coverage_plot.tetra_grid(coverage_plot.GRID_N_4D)
+                                if dim == 4 else coverage_plot.ternary_grid())
+                if ds.get("ackley_fn") is not None:
+                    cov_grid_vals = np.asarray(ds["ackley_fn"].predict(cov_grid_pts),
+                                               dtype=float)
+                else:
+                    _cf = ds["fn"]
+                    cov_grid_vals = np.array([float(_cf(np.asarray(x, dtype=float)))
+                                              for x in cov_grid_pts])
+            np.savez(os.path.join(out_dir, "coverage_ground_truth.npz"),
+                     grid_pts=np.asarray(cov_grid_pts, dtype=float),
+                     grid_vals=np.asarray(cov_grid_vals, dtype=float),
+                     true_optima=(np.asarray(true_optima, dtype=float)
+                                  if true_optima is not None and len(true_optima)
+                                  else np.empty((0, dim))))
+            with open(os.path.join(out_dir, "run_config.json"), "w") as f:
+                json.dump({"dataset": dataset, "dim": dim, "maximize": maximize}, f)
+            coverage_plot.save_coverage_image(out_dir)
+            print(f"      [run] coverage plot -> {os.path.join(out_dir, 'coverage.png')}")
+        except Exception as exc:
+            print(f"      [run] coverage plot failed: {exc}")
 
     metrics = {
         "dist_to_needles": round(dist, 6),
@@ -1417,6 +1509,9 @@ def evaluate_dataset(
             try:
                 eval_kwargs = dict(
                     top_k=args.top_k,
+                    max_lines=args.max_lines,
+                    final_frame_only=args.final_frame_only,
+                    coverage=args.coverage,
                     no_video=args.no_video,
                     no_convergence_plot=args.no_convergence_plot,
                     log_x=args.log_x,
@@ -1518,6 +1613,17 @@ def main() -> None:
                              "the background stays below the optima (default: 0.2).")
     parser.add_argument("--device", choices=("cpu", "cuda"), default=None,
                         help="Override compute device.")
+    parser.add_argument("--max-lines", type=int, default=None,
+                        help="Hard-cap each run at this many measured lines (one per "
+                             "ZoMBI iteration / obj call). Fixes the #lines every run "
+                             "samples; the --time-limit-min cap still applies.")
+    parser.add_argument("--final-frame-only", action="store_true",
+                        help="3D: write only the FINAL ternary frame (iter_*.png) into "
+                             "the run dir; skip the plots/ subdir and the timelapse MP4.")
+    parser.add_argument("--coverage", action="store_true",
+                        help="Also write a coverage.png (ground-truth grid + all sampled "
+                             "points), like optimize/coverage_plot.py. 3D ternary / 4D "
+                             "tetrahedron.")
     parser.add_argument("--no-video", action="store_true", help="Skip timelapse MP4 assembly.")
     parser.add_argument("--no-convergence-plot", action="store_true",
                         help="Skip convergence_metrics.png panel plot.")
