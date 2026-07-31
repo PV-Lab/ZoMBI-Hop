@@ -207,9 +207,14 @@ FULLGP_DATASETS = {"fullgp"}
 # optima are picked interactively (interactive_test_zombi.ExtremaPicker) the first
 # time and cached to ``newRF_optima.json`` so later runs can supply ``--runs-path``.
 NEWRF_DATASETS = {"newRF"}
+# ``accordion``: the FIXED hand-placed ``Ensemble`` used by the paper's summary
+# figure (visualization/accordion.py — three optima, one per ternary corner).
+# Unlike ``ensemble`` this is the *same* surface for every run, so a set of runs
+# is directly comparable and one can be picked for the figure.
+ACCORDION_DATASETS = {"accordion"}
 BUILTIN_DATASETS = {"RF", *ACKLEY_BENCHMARKS.keys(), *GAUSSIAN_BENCHMARKS.keys(),
                     *ORACLE_CHOICES, *ENSEMBLE_DATASETS, *WARMGP_DATASETS,
-                    *FULLGP_DATASETS,
+                    *FULLGP_DATASETS, *ACCORDION_DATASETS,
                     *NEWRF_DATASETS}
 
 # ─── newRF database source (mirrors visualization/plot_run.py) ──────────────────
@@ -446,6 +451,27 @@ def resolve_dataset(
     warmgp_seed: int = 0,
 ) -> dict:
     """Build the objective + reference optima for ``dataset``."""
+    if dataset == "accordion":
+        # The paper summary figure's fixed landscape: three hand-placed optima,
+        # one per ternary corner (visualization/accordion.build_landscape).
+        # Deterministic — every run sees the identical surface, so ``--num-runs``
+        # repeats (or parallel single-run jobs) differ only in the optimizer's own
+        # randomness and can be compared directly when picking one for the figure.
+        from visualization.accordion import build_landscape
+
+        fn = build_landscape()
+        grid_pts = rm.ternary_grid(rm.TERNARY_GRID_N)
+        spec = rm.LandscapeSpec(
+            landscape="synthetic", dim=3, maximize=True,
+            true_optima=[np.asarray(c, dtype=float) for c in fn.centers],
+            fn_callable=fn, grid_pts=grid_pts, grid_vals=fn.predict(grid_pts),
+            time_limit_hours=time_limit_hours, oracle="accordion",
+            synthetic_seed=int(fn.seed),
+        )
+        print(f"  [dataset] accordion: fixed 3-simplex accordion landscape "
+              f"— maximize, {len(spec.true_optima)} corner optima")
+        return _landscape_to_ds(spec, "accordion", variant="accordion")
+
     if dataset == "warmgp":
         # Fixed warm-start GP landscape; reference optima are its auto-detected
         # GP peaks (rm.build_warmgp_landscape / warm_start.warm_gp_landscape).
