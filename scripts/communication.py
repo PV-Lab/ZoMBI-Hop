@@ -41,6 +41,20 @@ def _serial_process_signal_handler(signum, frame):
     _shutdown_flag.set()
 
 
+def _is_access_denied(exc: BaseException) -> bool:
+    """Did opening the port fail because another process already holds it?
+
+    pyserial wraps the Win32 error in a SerialException whose text is
+    ``could not open port 'COM5': PermissionError(13, 'Access is denied.', None, 5)``,
+    so the errno is not directly reachable — match on the text as well as on a
+    chained PermissionError.
+    """
+    if isinstance(exc, PermissionError) or isinstance(getattr(exc, "__cause__", None), PermissionError):
+        return True
+    text = str(exc).lower()
+    return "access is denied" in text or "permissionerror" in text
+
+
 def _register_signal_handlers_in_serial_process_only() -> None:
     """Call once from `start_serial_dual_io_shared_port` in the serial subprocess."""
     try:
@@ -922,40 +936,93 @@ def start_serial_dual_io_shared_port(COM, baud,
     # Ensure SQL directory exists
     os.makedirs(os.path.dirname(obj_db), exist_ok=True)
 
-    # 1) open the port with retry logic
+    # ── cleanup infrastructure FIRST ──────────────────────────────────────────
+    # Everything that closes the port is installed before the port is opened, and
+    # therefore before the (up to 120 s) link self-test. Registering it after the
+    # self-test — as this used to — left a long window in which the port was open
+    # with no signal handler and no atexit hook, so a Stop / Ctrl-Break during the
+    # link test killed the process with COM still open and orphaned the port.
     ser = None
+    _threads: list[tuple[threading.Thread, str]] = []
+    _cleanup_done = False
+
+    def _cleanup():
+        _shutdown_flag.set()
+        for t, label in _threads:
+            if t is not None and t.is_alive():
+                t.join(timeout=4.0)
+                if t.is_alive():
+                    print(f"[Machine2] [{label}] still alive after join timeout")
+        time.sleep(0.15)
+        try:
+            if ser and ser.is_open and hasattr(ser, "cancel_read"):
+                ser.cancel_read()
+        except Exception:
+            pass
+        # Drop any half-received frame so the next session does not inherit a
+        # partial packet from this one.
+        for buf_reset in ("reset_input_buffer", "reset_output_buffer"):
+            try:
+                if ser and ser.is_open:
+                    getattr(ser, buf_reset)()
+            except Exception:
+                pass
+        try:
+            if ser and ser.is_open:
+                ser.close()
+        except Exception as e:
+            print(f"[Machine2] Error closing serial: {e!r}")
+        print(f"[Machine2] PORT_CLOSED {COM}", flush=True)
+        print("[Machine2] Serial port released; cleanup complete", flush=True)
+
+    def _cleanup_once():
+        nonlocal _cleanup_done
+        if _cleanup_done:
+            return
+        _cleanup_done = True
+        _cleanup()
+
+    atexit.register(_cleanup_once)
+    _register_signal_handlers_in_serial_process_only()
+
+    # 1) open the port with retry logic
     max_port_retries = 5
+    released_stale = False
     for attempt in range(max_port_retries):
+        if _shutdown_flag.is_set():
+            print(f"[Machine2] Stop requested while waiting for {COM}; giving up.")
+            break
         try:
             ser = serial.Serial(COM, baud, timeout=0.1, write_timeout=5.0)
             print(f"[Machine2] Opened {COM}@{baud}")
+            print(f"[Machine2] PORT_OPEN {COM}@{baud}", flush=True)
             break
         except serial.SerialException as e:
+            # "Access is denied" means some other process still holds the port —
+            # in practice a ZoMBI serial process that outlived its parent. Kill it
+            # instead of making the user unplug the adapter. Tried once, early, so
+            # the remaining retries can succeed.
+            if not released_stale and _is_access_denied(e):
+                released_stale = True
+                print(f"[Machine2] {COM} is held by another process — attempting to "
+                      f"release it (this replaces unplugging the adapter)…", flush=True)
+                try:
+                    from scripts.com_port import release_port
+                    release_port(COM, log=lambda m: print(m, flush=True))
+                except Exception as rel_err:
+                    print(f"[Machine2] Could not auto-release {COM}: {rel_err!r}")
+                continue
             if attempt < max_port_retries - 1:
                 print(f"[Machine2] Failed to open {COM} (attempt {attempt+1}): {e}")
                 time.sleep(2.0)
             else:
                 print(f"[Machine2] Failed to open {COM} after {max_port_retries} attempts: {e}")
-                return
 
     if ser is None:
+        print(f"[Machine2] PORT_FAIL {COM}", flush=True)
         print("[Machine2] Could not open serial port")
+        atexit.unregister(_cleanup_once)
         return
-
-    # Verify the link works BOTH ways before starting the real reader/sender threads;
-    # a silent one-directional failure otherwise deadlocks the loop (ZoMBI blocks in
-    # get_y_measurements waiting for an objective it never received). Gated: release the
-    # port and exit if it fails, so the failure is loud rather than a silent stall.
-    if selftest and not serial_link_selftest(ser, role="zombi", peer="disco"):
-        print("[Machine2] ❌ connectivity self-test FAILED — releasing port and exiting "
-              "(fix the link, or pass selftest=False to bypass).")
-        try:
-            ser.close()
-        except Exception:
-            pass
-        return
-
-    _register_signal_handlers_in_serial_process_only()
 
     def _parent_requests_stop() -> bool:
         if parent_shutdown is None:
@@ -1021,57 +1088,44 @@ def start_serial_dual_io_shared_port(COM, baud,
         if super_verbose:
             print("[serial_reader] Shutdown complete")
     
-    reader_thread = threading.Thread(target=_serial_reader, daemon=True)
-    reader_thread.start()
-
-    # 4) launch your existing two workers
-    t_o = threading.Thread(
-        target=objective_receiver,
-        args=(obj_hz, obj_db, mem_db, verbose),
-        daemon=True
-    )
-    t_c = threading.Thread(
-        target=composition_sender,
-        args=(ser, comp_hz, comp_db, chaos, verbose),
-        daemon=True
-    )
-    
-    t_o.start()
-    t_c.start()
-
-    def _cleanup():
-        _shutdown_flag.set()
-        for t, label in ((reader_thread, "serial_reader"), (t_o, "objective_receiver"), (t_c, "composition_sender")):
-            if t is not None and t.is_alive():
-                t.join(timeout=4.0)
-                if t.is_alive():
-                    print(f"[Machine2] [{label}] still alive after join timeout")
-        time.sleep(0.15)
-        try:
-            if ser and ser.is_open and hasattr(ser, "cancel_read"):
-                ser.cancel_read()
-        except Exception:
-            pass
-        try:
-            if ser and ser.is_open:
-                ser.close()
-        except Exception as e:
-            print(f"[Machine2] Error closing serial: {e!r}")
-        print("[Machine2] Serial port released; cleanup complete")
-
-    _cleanup_done = False
-
-    def _cleanup_once():
-        nonlocal _cleanup_done
-        if _cleanup_done:
-            return
-        _cleanup_done = True
-        _cleanup()
-
-    atexit.register(_cleanup_once)
-
-    # 5) block until shutdown or error
+    # Everything from here on runs with the port open, so it all lives under one
+    # try/finally: no exit path — self-test failure, a dead thread, an unhandled
+    # exception, a signal — can leave COM held.
     try:
+        # 2) Verify the link works BOTH ways before starting the real reader/sender
+        # threads; a silent one-directional failure otherwise deadlocks the loop
+        # (ZoMBI blocks in get_y_measurements waiting for an objective it never
+        # received). Gated: exit if it fails, so the failure is loud rather than a
+        # silent stall. The port is released by the finally below.
+        if selftest and not serial_link_selftest(ser, role="zombi", peer="disco"):
+            print("[Machine2] LINK_FAIL", flush=True)
+            print("[Machine2] ❌ connectivity self-test FAILED — releasing port and exiting "
+                  "(fix the link, or pass selftest=False to bypass).")
+            return
+        print("[Machine2] LINK_OK", flush=True)
+
+        reader_thread = threading.Thread(target=_serial_reader, daemon=True)
+        reader_thread.start()
+        _threads.append((reader_thread, "serial_reader"))
+
+        # 4) launch your existing two workers
+        t_o = threading.Thread(
+            target=objective_receiver,
+            args=(obj_hz, obj_db, mem_db, verbose),
+            daemon=True
+        )
+        t_c = threading.Thread(
+            target=composition_sender,
+            args=(ser, comp_hz, comp_db, chaos, verbose),
+            daemon=True
+        )
+
+        t_o.start()
+        t_c.start()
+        _threads.append((t_o, "objective_receiver"))
+        _threads.append((t_c, "composition_sender"))
+
+        # 5) block until shutdown or error
         while not _shutdown_flag.is_set() and not _parent_requests_stop():
             # Check if threads are still alive
             if not reader_thread.is_alive():

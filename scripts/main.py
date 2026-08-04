@@ -32,7 +32,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.initialize_databases import initialize_db
 from scripts.communication import start_serial_dual_io_shared_port
 from scripts import communication
+from scripts.com_port import OWNER_ENV_VAR
 from scripts.run_zombi_main import run_zombi_main
+
+#: The port this launcher's serial child owns.
+SERIAL_PORT = "COM5"
 
 
 def list_runs_and_exit():
@@ -69,7 +73,7 @@ def start_serial(parent_shutdown: "multiprocessing.synchronize.Event"):
     """Child process: opens COM; parent sets parent_shutdown to release the port."""
     try:
         start_serial_dual_io_shared_port(
-            COM="COM5",
+            COM=SERIAL_PORT,
             baud=115200,
             obj_hz=1.0,
             comp_hz=1.0,
@@ -221,6 +225,14 @@ def main():
 
     multiprocessing.set_start_method("spawn", force=True)
 
+    # Tag this process — and therefore every spawned child, which inherits the
+    # environment block — as the owner of SERIAL_PORT. scripts/com_port.py reads
+    # this to identify a stale serial process holding the port, which is what lets
+    # the next run reclaim COM without physically replugging the adapter. The
+    # serial worker's own command line is just multiprocessing's `spawn_main`
+    # bootstrap, so the environment marker is the only reliable fingerprint.
+    os.environ[OWNER_ENV_VAR] = SERIAL_PORT
+
     p_serial = multiprocessing.Process(
         target=start_serial,
         args=(shutdown,),
@@ -326,7 +338,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help', 'help']:
         print(__doc__)
         print("\nCurrent configuration:")
-        print(f"  Serial port: COM5")
+        print(f"  Serial port: {SERIAL_PORT}")
         print(f"  Checkpoint directory: actual_runs/checkpoints/")
         print(f"  Device: {'CUDA' if __import__('torch').cuda.is_available() else 'CPU'}")
         sys.exit(0)

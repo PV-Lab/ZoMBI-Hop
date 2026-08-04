@@ -2426,6 +2426,13 @@ try:
 except ImportError:
     _SERIAL_OK = False
 
+# Port-ownership tools: identify and kill a stale ZoMBI serial process that is
+# still holding the COM port, instead of requiring the adapter to be replugged.
+try:
+    from scripts import com_port as _com_port
+except Exception:
+    _com_port = None
+
 
 class ManualControlFrame(ttk.Frame):
     """
@@ -2445,6 +2452,9 @@ class ManualControlFrame(ttk.Frame):
 
     N_DIMS = 10
 
+    #: how often "Randomize" rewrites the compositions, in seconds
+    RANDOMIZE_PERIOD_S = 60
+
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
         self._proc: Optional[subprocess.Popen] = None
@@ -2453,7 +2463,10 @@ class ManualControlFrame(ttk.Frame):
         self._end_vars:   list[tk.StringVar] = []
         self._start_sum_var = tk.StringVar(value="")
         self._end_sum_var   = tk.StringVar(value="")
+        self._rand_var  = tk.BooleanVar(value=False)
+        self._rand_job: Optional[str] = None
         self._build_ui()
+        self.bind("<Destroy>", self._on_destroy, add="+")
 
     # ── layout ────────────────────────────────────────────────────────────
 
@@ -2508,6 +2521,10 @@ class ManualControlFrame(ttk.Frame):
         self._disc_btn = ttk.Button(r3, text="■ Disconnect",
                                     command=self._disconnect, state="disabled")
         self._disc_btn.pack(side="left", padx=4)
+        # Software equivalent of unplugging the adapter: kills a stale ZoMBI
+        # serial process that is still holding the port.
+        ttk.Button(r3, text="⟳ Release port",
+                   command=self._release_port).pack(side="left", padx=4)
         self._conn_sv = tk.StringVar(value="○  Disconnected")
         self._conn_lbl = ttk.Label(r3, textvariable=self._conn_sv,
                                    foreground="#880000", font=("Consolas", 9))
@@ -2567,6 +2584,20 @@ class ManualControlFrame(ttk.Frame):
                   text="← writes to compositions.db; hardware starts sending immediately",
                   foreground="gray", font=("TkDefaultFont", 8)).pack(side="left")
 
+        rf = ttk.Frame(parent)
+        rf.pack(fill="x", padx=6, pady=(0, 4))
+        cb = ttk.Checkbutton(
+            rf, text=f"Randomize every {self.RANDOMIZE_PERIOD_S} s",
+            variable=self._rand_var, command=self._toggle_randomize)
+        cb.pack(side="left")
+        self._rand_sv = tk.StringVar(value="")
+        ttk.Label(rf, textvariable=self._rand_sv, foreground="gray",
+                  font=("TkDefaultFont", 8)).pack(side="left", padx=8)
+        ToolTip(cb, "Draws new random inlet/outlet compositions on the simplex and "
+                    "writes them to compositions.db on a timer. Each write bumps the "
+                    "DB timestamp, so the serial process picks them up and starts "
+                    "sending immediately — same path as ▶ Update.")
+
     def _build_display(self, parent):
         fr = ttk.LabelFrame(parent, text="Currently Sending  (serial log)")
         fr.pack(fill="both", expand=True, padx=6, pady=(2, 6))
@@ -2604,37 +2635,147 @@ class ManualControlFrame(ttk.Frame):
 
         try:
             env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+            # Tag the child as the owner of this port so a later run can find and
+            # reclaim it if it is ever left behind (scripts/com_port.py).
+            if _com_port is not None:
+                env[_com_port.OWNER_ENV_VAR] = com
+            # Own process group + kill-on-close job, exactly like a hardware run:
+            # the group lets Disconnect send CTRL_BREAK for a clean ser.close(),
+            # and the job guarantees the OS reaps this child if the GUI dies —
+            # without it, closing the app orphaned this process and it kept the
+            # port open until the adapter was physically unplugged.
+            _popen_kwargs = {}
+            if os.name == "nt":
+                _popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            job = _WinJobObject()
             self._proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                encoding="utf-8", errors="replace", bufsize=1, cwd=proj, env=env)
+                encoding="utf-8", errors="replace", bufsize=1, cwd=proj, env=env,
+                **_popen_kwargs)
+            job.assign(self._proc)
+            self._proc._zombi_job = job
         except Exception as exc:
             messagebox.showerror("Launch failed", str(exc))
             return
 
-        self._set_conn_state(connected=True)
+        self._set_conn_state("connecting", f"{com} @ {baud}")
         self._append_display(
             f"{'─'*60}\n"
-            f"[{self._ts()}] Connected: {com} @ {baud} baud\n",
+            f"[{self._ts()}] Connecting: {com} @ {baud} baud …\n",
             tag="header")
 
+        proc = self._proc
+
         def _pump():
-            for line in self._proc.stdout:
+            for line in proc.stdout:
                 s = line.rstrip()
-                if s:
-                    tag = "error" if "error" in s.lower() else "serial"
-                    self.after(0, lambda msg=s, t=tag: self._append_display(msg + "\n", t))
-            self.after(0, self._on_proc_exit)
+                if not s:
+                    continue
+                tag = "error" if "error" in s.lower() else "serial"
+                self.after(0, lambda msg=s, t=tag: self._append_display(msg + "\n", t))
+                # Drive the indicator from what the serial process actually did,
+                # not from "Popen returned". Previously the tab said "Connected"
+                # the instant the process launched, so a port that was denied or a
+                # link self-test that never completed still read as connected.
+                if "PORT_OPEN" in s:
+                    self.after(0, lambda: self._set_conn_state("testing", com))
+                elif "LINK_OK" in s:
+                    self.after(0, lambda: self._set_conn_state("connected", com))
+                elif "LINK_FAIL" in s or "PORT_FAIL" in s:
+                    self.after(0, lambda: self._set_conn_state("failed", com))
+            try:
+                self.after(0, self._on_proc_exit)
+            except tk.TclError:
+                pass          # window already destroyed (app closing)
 
         threading.Thread(target=_pump, daemon=True).start()
         self._schedule_proc_poll()
 
     def _disconnect(self):
-        if self._proc is not None:
+        """Stop the serial child cleanly so it closes the COM port itself.
+
+        A plain terminate() here was a hard TerminateProcess: the child never ran
+        its atexit/finally handler, so ser.close() never happened. Send
+        CTRL_BREAK first (the serial process handles SIGBREAK and closes the
+        port), and fall back to killing its job object. Runs on a background
+        thread because the graceful path waits for the close to finish.
+        """
+        proc = self._proc
+        if proc is None:
+            self._on_proc_exit()
+            return
+        self._disc_btn.config(state="disabled")
+        self._set_conn_state("disconnecting", self._com_var.get().strip())
+
+        def _stop():
+            app = self.winfo_toplevel()
             try:
-                self._proc.terminate()
+                app._terminate_hw_proc_tree(proc, graceful=True, graceful_timeout=12.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            self.after(0, self._on_proc_exit)
+
+        threading.Thread(target=_stop, daemon=True).start()
+
+    def stop_serial(self, graceful: bool = True, timeout: float = 12.0) -> None:
+        """Synchronously stop the serial child, if any. Safe to call from the app's
+        close handler and before a hardware run takes over the port."""
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            self._proc = None
+            return
+        try:
+            self.winfo_toplevel()._terminate_hw_proc_tree(
+                proc, graceful=graceful, graceful_timeout=timeout)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=3)
             except Exception:
                 pass
-        self._on_proc_exit()
+        self._proc = None
+
+    def _release_port(self):
+        """Manual escape hatch: reclaim the port from a stale serial process.
+
+        Does in software what unplugging the USB adapter does. Only ever kills
+        ZoMBI's own serial processes.
+        """
+        com = self._com_var.get().strip()
+        if _com_port is None:
+            messagebox.showerror("Unavailable",
+                                 "scripts/com_port.py could not be imported.")
+            return
+        if self._proc is not None and self._proc.poll() is None:
+            messagebox.showinfo(
+                "Already connected",
+                f"This tab is connected to {com}. Use ■ Disconnect for a clean "
+                f"shutdown — Release port is for reclaiming a port left behind by "
+                f"a previous session.")
+            return
+        self._append_display(f"[{self._ts()}] Releasing {com} …\n", tag="header")
+
+        def _work():
+            def log(msg):
+                self.after(0, lambda m=str(msg): self._append_display(m + "\n", "serial"))
+            try:
+                ok = _com_port.release_port(com, log=log)
+                state = _com_port.port_is_free(com)
+            except Exception as e:
+                log(f"release failed: {e!r}")
+                ok, state = False, None
+            if ok or state is True:
+                log(f"✅ {com} is free.")
+            elif state is None:
+                log(f"❌ {com} is not present — plug the adapter in.")
+            else:
+                log(f"❌ {com} is still held by a program ZoMBI did not start. "
+                    f"Close it, or run:  python -m scripts.com_port {com} --restart-device")
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _schedule_proc_poll(self):
         self._poll_job = self.after(2000, self._check_proc)
@@ -2649,22 +2790,37 @@ class ManualControlFrame(ttk.Frame):
         if self._poll_job:
             self.after_cancel(self._poll_job)
             self._poll_job = None
-        self._proc = None
-        self._set_conn_state(connected=False)
+        proc, self._proc = self._proc, None
+        # Closing the job handle reaps anything left in the tree (KILL_ON_JOB_CLOSE).
+        job = getattr(proc, "_zombi_job", None) if proc is not None else None
+        if job is not None:
+            try:
+                job.close()
+            except Exception:
+                pass
+        self._set_conn_state("disconnected")
         self._append_display(
             f"[{self._ts()}] Serial connection closed.\n", tag="header")
 
-    def _set_conn_state(self, connected: bool):
-        if connected:
-            self._conn_sv.set("●  Connected")
-            self._conn_lbl.config(foreground="#007700")
-            self._conn_btn.config(state="disabled")
-            self._disc_btn.config(state="normal")
-        else:
-            self._conn_sv.set("○  Disconnected")
-            self._conn_lbl.config(foreground="#880000")
-            self._conn_btn.config(state="normal" if _SERIAL_OK else "disabled")
-            self._disc_btn.config(state="disabled")
+    #: label text / colour / (connect-enabled, disconnect-enabled) per state
+    _CONN_STATES = {
+        "disconnected":  ("○  Disconnected",          "#880000", True,  False),
+        "connecting":    ("◌  Opening port …",        "#886600", False, True),
+        "testing":       ("◍  Port open, testing link …", "#886600", False, True),
+        "connected":     ("●  Connected",             "#007700", False, True),
+        "failed":        ("✕  Link FAILED",           "#880000", False, True),
+        "disconnecting": ("◌  Disconnecting …",       "#886600", False, False),
+    }
+
+    def _set_conn_state(self, state: str, detail: str = ""):
+        label, colour, can_connect, can_disconnect = self._CONN_STATES[state]
+        if detail and state not in ("disconnected",):
+            label = f"{label}  ({detail})"
+        self._conn_sv.set(label)
+        self._conn_lbl.config(foreground=colour)
+        self._conn_btn.config(
+            state="normal" if (can_connect and _SERIAL_OK) else "disabled")
+        self._disc_btn.config(state="normal" if can_disconnect else "disabled")
 
     # ── composition helpers ────────────────────────────────────────────────
 
@@ -2710,23 +2866,32 @@ class ManualControlFrame(ttk.Frame):
 
     # ── update (write to DB) ──────────────────────────────────────────────
 
-    def _do_update(self):
+    def _do_update(self, quiet: bool = False) -> bool:
+        """Write the current inlet/outlet pair to compositions.db.
+
+        `quiet` is for the Randomize timer: it normalizes without asking and
+        reports failures in the log instead of raising modal dialogs at the
+        user every 60 s. Returns True if the DB write succeeded.
+        """
         start = self._get_comp(is_start=True)
         end   = self._get_comp(is_start=False)
 
         if start is None or end is None:
-            messagebox.showerror("Invalid input",
-                                 "All 10 values in both rows must be valid numbers.")
-            return
+            msg = "All 10 values in both rows must be valid numbers."
+            if quiet:
+                self._append_display(f"[{self._ts()}] {msg}\n", tag="error")
+            else:
+                messagebox.showerror("Invalid input", msg)
+            return False
 
         s_sum, e_sum = start.sum(), end.sum()
         needs_norm = abs(s_sum - 1.0) > 0.01 or abs(e_sum - 1.0) > 0.01
         if needs_norm:
-            if not messagebox.askyesno(
+            if not quiet and not messagebox.askyesno(
                     "Sum ≠ 1",
                     f"Inlet sum = {s_sum:.6f}\nOutlet sum = {e_sum:.6f}\n\n"
                     f"Normalize both to 1 before sending?"):
-                return
+                return False
             if s_sum > 0: start = start / s_sum
             if e_sum > 0: end   = end   / e_sum
         else:
@@ -2756,9 +2921,13 @@ class ManualControlFrame(ttk.Frame):
                 db_path=comp_db,
             )
         except Exception as exc:
-            messagebox.showerror("Write failed",
-                                 f"Could not write to:\n{comp_db}\n\n{exc}")
-            return
+            if quiet:
+                self._append_display(
+                    f"[{self._ts()}] Write failed ({comp_db}): {exc}\n", tag="error")
+            else:
+                messagebox.showerror("Write failed",
+                                     f"Could not write to:\n{comp_db}\n\n{exc}")
+            return False
 
         # ── update the display ─────────────────────────────────────────────
         def _fmt(arr: np.ndarray) -> str:
@@ -2787,6 +2956,64 @@ class ManualControlFrame(ttk.Frame):
             var.set(f"{val:.6f}")
         for var, val in zip(self._end_vars, end):
             var.set(f"{val:.6f}")
+        return True
+
+    # ── randomize timer ────────────────────────────────────────────────────
+
+    def _toggle_randomize(self):
+        """On/off switch for the periodic random-composition writer."""
+        if self._rand_var.get():
+            self._append_display(
+                f"[{self._ts()}] Randomize ON — new compositions every "
+                f"{self.RANDOMIZE_PERIOD_S} s.\n", tag="header")
+            self._randomize_tick()          # fire once immediately
+        else:
+            self._cancel_randomize()
+            self._rand_sv.set("")
+            self._append_display(f"[{self._ts()}] Randomize OFF.\n", tag="header")
+
+    def _cancel_randomize(self):
+        if self._rand_job:
+            try:
+                self.after_cancel(self._rand_job)
+            except (tk.TclError, ValueError):
+                pass
+            self._rand_job = None
+
+    def _randomize_tick(self):
+        """Draw a random inlet/outlet pair, write it, and re-arm the timer.
+
+        The write bumps the timestamp in compositions.db, which is all the
+        serial process needs — it reloads and starts sending on its own.
+        """
+        self._rand_job = None
+        if not self._rand_var.get():
+            return
+
+        # Uniform over the 10-component simplex (Dirichlet with all alphas = 1).
+        for vars_ in (self._start_vars, self._end_vars):
+            for var, val in zip(vars_, np.random.dirichlet(np.ones(self.N_DIMS))):
+                var.set(f"{val:.6f}")
+
+        ok = self._do_update(quiet=True)
+        if not ok:
+            # Don't keep retrying a broken write on a timer.
+            self._rand_var.set(False)
+            self._rand_sv.set("stopped after a failed write")
+            self._append_display(
+                f"[{self._ts()}] Randomize OFF (write failed).\n", tag="error")
+            return
+
+        nxt = datetime.datetime.now() + datetime.timedelta(
+            seconds=self.RANDOMIZE_PERIOD_S)
+        self._rand_sv.set(f"next at {nxt.strftime('%H:%M:%S')}")
+        self._rand_job = self.after(self.RANDOMIZE_PERIOD_S * 1000,
+                                    self._randomize_tick)
+
+    def _on_destroy(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+        self._cancel_randomize()
 
     # ── display helpers ────────────────────────────────────────────────────
 
@@ -3938,10 +4165,26 @@ class ZoMBIApp(tk.Tk):
                 pass
         self._hw_procs = [p for p in self._hw_procs if p.poll() is None]
 
+    def release_com_owners(self, graceful: bool = False):
+        """Stop everything this GUI started that can hold the COM port.
+
+        Both owners must be covered: hardware runs (scripts/main.py + its serial
+        child) and the Manual Control tab (scripts/serial_only.py). The Manual
+        Control process used to be missed here, so closing the app left it alive
+        holding COM until the adapter was physically unplugged.
+        """
+        manual = getattr(self, "_manual", None)
+        if manual is not None:
+            try:
+                manual.stop_serial(graceful=graceful)
+            except Exception:
+                pass
+        self._reap_hw_procs(graceful=graceful)
+
     def _on_app_close(self):
-        """Window-close handler: release COM by killing hardware trees first."""
+        """Window-close handler: release COM by stopping every serial owner first."""
         try:
-            self._reap_hw_procs(graceful=False)
+            self.release_com_owners(graceful=False)
         except Exception:
             pass
         self.destroy()
@@ -4081,6 +4324,11 @@ class ZoMBIApp(tk.Tk):
                 import os as _os
                 import time as _time
                 _env = {**_os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+                # Mark the whole run tree as owning the port, so a later launch can
+                # identify and reclaim it if this one is ever left behind (main.py
+                # re-sets this for its spawned serial child too).
+                if _com_port is not None:
+                    _env[_com_port.OWNER_ENV_VAR] = "COM5"
                 # Tee the child's stdout/stderr to <run_dir>/run.log so crashes and
                 # tracebacks survive after the (in-memory) GUI log panel is gone.
                 if hw_run_id:
@@ -4093,10 +4341,17 @@ class ZoMBIApp(tk.Tk):
                         log_fh.flush()
                     except Exception:
                         log_fh = None
-                # Make sure no serial child from a previous run is still holding
-                # COM before we start a new one (belt-and-suspenders alongside the
-                # stop/close handlers).
-                app._reap_hw_procs(graceful=False)
+                # Make sure nothing else is still holding COM before we start a new
+                # run (belt-and-suspenders alongside the stop/close handlers). This
+                # covers BOTH a serial child from a previous run and the Manual
+                # Control tab — leaving Manual Control connected used to guarantee
+                # "PermissionError(13, 'Access is denied.')" on the run's serial child.
+                _manual = getattr(app, "_manual", None)
+                if _manual is not None and getattr(_manual, "_proc", None) is not None:
+                    app.log_to_main("Manual Control holds the COM port — disconnecting "
+                                    "it so the hardware run can take over…",
+                                    tag="info", run_id=hw_run_id)
+                app.release_com_owners(graceful=False)
                 # Launch main.py in its own process group so we can send it a
                 # CTRL_BREAK for a clean shutdown, and so force-killing its tree
                 # never touches the GUI.
