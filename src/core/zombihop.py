@@ -19,6 +19,10 @@ from ..utils.simplex import (
 )
 from ..utils.datahandler import DataHandler
 from ..utils.gp_simplex import GPSimplex
+from .hparam_live import (
+    apply_pending as apply_pending_hparams,
+    write_effective as write_effective_hparams,
+)
 
 
 # --- CUDA optimization settings (when CUDA is available) ---
@@ -31,7 +35,11 @@ if torch.cuda.is_available():
 
 
 def _is_global_bounds(bounds: torch.Tensor, eps: float = 0.01) -> bool:
-    """True when bounds essentially span the full simplex (all-zeros lower, all-ones upper)."""
+    """True when bounds essentially span the full [0,1]^d simplex.
+
+    Module-level convenience for the default full simplex. Inside ``ZoMBIHop`` use
+    ``self._is_global_bounds`` instead — it compares against the run's configured
+    search box (``self.full_bounds``), which may be tighter than [0,1]^d."""
     return bounds[0].max().item() < eps and bounds[1].min().item() > 1.0 - eps
 
 
@@ -102,6 +110,7 @@ class ZoMBIHop:
                  nat_grad_max_steps: int = 50,
                  device: str = 'cuda',
                  dtype: torch.dtype = torch.float64,
+                 bounds: Optional[torch.Tensor] = None,
                  run_uuid: Optional[str] = None,
                  resume: Optional[bool] = None,
                  checkpoint_dir: Optional[str] = 'zombihop_checkpoints',
@@ -141,6 +150,22 @@ class ZoMBIHop:
         self.verbose = verbose
 
         d = X_init_actual.shape[1]
+
+        # Per-dimension search box (2, d): row 0 = lower, row 1 = upper. Defaults to
+        # the full [0,1]^d simplex, but callers may pass a tighter box (e.g. a dim
+        # constrained to [0, 0.3]). Every "reset to the full simplex" throughout the
+        # optimiser resets to THIS box, and _is_global_bounds tests against it — so a
+        # tightened box is the true global region, not [0,1]^d.
+        if bounds is None:
+            full_bounds = torch.zeros(2, d, device=self.device, dtype=self.dtype)
+            full_bounds[1] = 1.0
+        else:
+            full_bounds = torch.as_tensor(bounds, device=self.device, dtype=self.dtype).clone()
+            assert full_bounds.shape == (2, d), \
+                f"bounds must be (2, {d}); got {tuple(full_bounds.shape)}"
+            assert (full_bounds[1] >= full_bounds[0]).all(), \
+                "bounds upper row must be >= lower row for every dimension"
+        self.full_bounds = full_bounds
 
         self._needle_plot_points_ref = needle_plot_points_ref
         self.ellipsoid_drop_fraction = ellipsoid_drop_fraction
@@ -234,8 +259,7 @@ class ZoMBIHop:
             assert Y_init.shape[1] == 1, "Y_init must be (n, 1)"
             assert X_init_actual.shape[0] == X_init_expected.shape[0] == Y_init.shape[0]
 
-            bounds0 = torch.zeros(2, d, device=self.device, dtype=self.dtype)
-            bounds0[1] = 1.0
+            bounds0 = self.full_bounds.clone()
             self.data_handler.save_init(X_init_actual, X_init_expected, Y_init, bounds0)
 
         # self.bounds is a convenience alias; always kept in sync with data_handler.bounds
@@ -250,13 +274,11 @@ class ZoMBIHop:
         # full [0,1]^d simplex — identical to the bounds0 a fresh run builds in
         # save_init above.
         if self.bounds is None:
-            full_bounds = torch.zeros(2, d, device=self.device, dtype=self.dtype)
-            full_bounds[1] = 1.0
-            self.bounds = full_bounds
-            self.data_handler.bounds = full_bounds.clone()
+            self.bounds = self.full_bounds.clone()
+            self.data_handler.bounds = self.full_bounds.clone()
             if self.verbose:
                 print("[ZoMBIHop] Resumed checkpoint had no saved bounds; "
-                      "initialized to the full [0,1]^d simplex.")
+                      "initialized to the full search box.")
         if self.data_handler.current_zoom_bounds is None:
             self.data_handler.current_zoom_bounds = self.bounds.clone()
 
@@ -299,6 +321,17 @@ class ZoMBIHop:
     @property
     def d(self) -> int:
         return self.data_handler.d
+
+    def _is_global_bounds(self, bounds: torch.Tensor, eps: float = 0.01) -> bool:
+        """True when ``bounds`` essentially equals the configured search box.
+
+        Generalises the module-level ``_is_global_bounds`` (which assumes the box
+        is [0,1]^d) to the run's actual ``self.full_bounds``, so a tightened box —
+        e.g. a dimension capped at 0.3 — is correctly recognised as the global
+        region rather than looking permanently "zoomed in"."""
+        fb = self.full_bounds
+        return (torch.abs(bounds[0] - fb[0]).max().item() < eps and
+                torch.abs(bounds[1] - fb[1]).max().item() < eps)
 
     def _all_needle_axes_below_min(self, dh) -> bool:
         """True when every semi-axis is below min_axis_noise_mult × input_noise."""
@@ -460,13 +493,11 @@ class ZoMBIHop:
                 "distance": distance,
             })
 
-        # Reset to full simplex for the next activation
-        d = self.d
-        full_bounds = torch.zeros(2, d, device=self.device, dtype=self.dtype)
-        full_bounds[1] = 1.0
+        # Reset to the full search box for the next activation
+        full_bounds = self.full_bounds.clone()
         self.bounds = full_bounds
         dh.bounds = full_bounds.clone()
-        self._log(f"  → bounds reset to full simplex for next activation")
+        self._log(f"  → bounds reset to full search box for next activation")
 
         return needle_X
 
@@ -589,10 +620,10 @@ class ZoMBIHop:
         actually measured (0 only in the degenerate case where the objective
         returned nothing, which the caller treats as a hard stop).
         """
-        full_lo = torch.zeros(self.d, device=self.device, dtype=self.dtype)
-        full_hi = torch.ones(self.d, device=self.device, dtype=self.dtype)
+        full_lo = self.full_bounds[0].clone()
+        full_hi = self.full_bounds[1].clone()
 
-        # Uniform candidate pool over the full simplex.
+        # Uniform candidate pool over the full search box.
         pool = self.random_sampler(
             n_pool, full_lo, full_hi,
             device=str(self.device), torch_dtype=self.dtype,
@@ -663,8 +694,7 @@ class ZoMBIHop:
                 dh.shrink_all_needle_radii(0.30)
             except Exception as _e:
                 self._log(f"  [no-stop] shrink_all_needle_radii failed: {_e}")
-            full_bounds = torch.zeros(2, self.d, device=self.device, dtype=self.dtype)
-            full_bounds[1] = 1.0
+            full_bounds = self.full_bounds.clone()
             dh.bounds = full_bounds.clone()
             dh.current_zoom_bounds = full_bounds.clone()
             self.bounds = full_bounds.clone()
@@ -678,8 +708,7 @@ class ZoMBIHop:
             simplex that can produce no point at all)."""
             nonlocal global_iteration, stalled_retries, bounds, best_f_local
             nonlocal start_iteration, data_added_since_last_failure
-            full_bounds = torch.zeros(2, self.d, device=self.device, dtype=self.dtype)
-            full_bounds[1] = 1.0
+            full_bounds = self.full_bounds.clone()
             dh.bounds = full_bounds.clone()
             dh.current_zoom_bounds = full_bounds.clone()
             self.bounds = full_bounds.clone()
@@ -714,6 +743,12 @@ class ZoMBIHop:
             self._log(f"Starting optimization. CUDA memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
         start_time = time.time() if time_limit_hours is not None else None
+
+        # Publish the in-force hyperparameters (and clear any stale override left
+        # by a previous run of this UUID) so a live retune starts from truth.
+        write_effective_hparams(self)
+        for _chg in apply_pending_hparams(self, log=self._log):
+            self._log(f"  [hparams] {_chg}")
 
         finished = False
         activation, zoom, iteration, _ = dh.get_iteration_state()
@@ -782,7 +817,7 @@ class ZoMBIHop:
                 # Use local GP data when zoomed in so GP posterior is tight
                 # within the active region and EI drops to signal convergence.
                 _t0 = time.time()
-                if _is_global_bounds(bounds):
+                if self._is_global_bounds(bounds):
                     X, Y = dh.get_gp_data()
                 else:
                     X, Y = dh.get_zoom_gp_data(bounds)
@@ -799,8 +834,20 @@ class ZoMBIHop:
                 # constraint (needle declaration / zoom-in require ≥ this many).
                 iters_this_zoom = 0
 
-                for iteration in range(start_iteration, dh.max_iterations):
+                # Mirrors `for iteration in range(start_iteration, dh.max_iterations)`
+                # exactly (`iteration` holds the last-executed index on exit), but
+                # re-reads dh.max_iterations every pass so a manual change to it
+                # takes effect within this zoom rather than at the next one.
+                _next_iteration = start_iteration
+                while _next_iteration < dh.max_iterations:
+                    iteration = _next_iteration
+                    _next_iteration += 1
                     self._log(f"\n  · iter {iteration+1}/{dh.max_iterations}")
+
+                    # Operator hyperparameter changes, applied between measured lines.
+                    for _chg in apply_pending_hparams(zombi=self, log=self._log):
+                        self._log(f"  [hparams] {_chg}")
+
                     # Time limit check
                     if time_limit_hours is not None:
                         elapsed_hours = (time.time() - start_time) / 3600.0
@@ -834,7 +881,7 @@ class ZoMBIHop:
                     # Local reference point: best unpenalized within the active
                     # bounds so convergence is measured against local progress,
                     # not a global high from a different region.
-                    if _is_global_bounds(bounds):
+                    if self._is_global_bounds(bounds):
                         prev_best_X, prev_best_Y, _ = dh.get_best_unpenalized()
                     else:
                         prev_best_X, prev_best_Y, _ = dh.get_best_in_bounds(bounds)
@@ -867,7 +914,7 @@ class ZoMBIHop:
                     self._log(f"  [time] snapshot: {time.time()-_t0:.2f}s")
 
                     _t0 = time.time()
-                    if _is_global_bounds(bounds):
+                    if self._is_global_bounds(bounds):
                         X, Y = dh.get_gp_data()
                     else:
                         X, Y = dh.get_zoom_gp_data(bounds)
@@ -945,8 +992,7 @@ class ZoMBIHop:
                         if never_terminate:
                             _keep_searching(f"Too much area penalized: {penalized_pct:.2f}%")
                         elif max_activations == float("inf"):
-                            full_bounds = torch.zeros(2, self.d, device=self.device, dtype=self.dtype)
-                            full_bounds[1] = 1.0
+                            full_bounds = self.full_bounds.clone()
                             dh.bounds = full_bounds
                             self.bounds = full_bounds.clone()
                             self._log(f"Too much area penalized: {penalized_pct:.2f}%. Zooming out.")
@@ -1020,7 +1066,7 @@ class ZoMBIHop:
                     # Reload local GP data for the (possibly updated) bounds
                     bounds = dh.bounds.clone()
                     self.bounds = bounds.clone()
-                    if _is_global_bounds(bounds):
+                    if self._is_global_bounds(bounds):
                         X, Y = dh.get_gp_data()
                     else:
                         X, Y = dh.get_zoom_gp_data(bounds)
@@ -1039,7 +1085,7 @@ class ZoMBIHop:
                     # MC Jaccard guard: force-declare if the new bounds still heavily
                     # overlap the previous zoom (determine_new_bounds may have exhausted
                     # all windows; this catches the residual repeated-region case).
-                    if not _is_global_bounds(new_bounds):
+                    if not self._is_global_bounds(new_bounds):
                         repeated_jac = 0.0
                         for prev_bounds in zoom_bounds_history:
                             jac = _bounds_jaccard_simplex(

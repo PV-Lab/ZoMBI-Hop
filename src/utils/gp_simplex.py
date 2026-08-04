@@ -229,11 +229,81 @@ class GPSimplex:
         self.gp: Optional[SingleTaskGP] = None
         self.mll = None
         self.acq_fn = None
+        # Warm-start seed prior (opt-in; see set_seed_prior). When unset the GP
+        # learns one shared noise level, which is the historical behaviour.
+        self._seed_keys: Optional[set] = None
+        self._seed_var: float = 0.0
+        self._real_var: float = 0.0
+        self._last_is_seed: Optional[torch.Tensor] = None
         self._last_computed_lambda = None  # Track auto-computed lambda for logging
         self._tangent_basis: Optional[torch.Tensor] = None  # cached (d, d-1)
         self.comp_std: Optional[torch.Tensor] = None  # per-dimension composition std from last fit
 
     _JITTER_SCHEDULE = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2]
+
+    # Coordinate rounding used to recognise a seed point among the GP's training
+    # rows.  Paring only ever *copies* raw points (datahandler stores clones, never
+    # centroids), so a seed's coordinates survive the pipeline bit-for-bit and a
+    # rounded-tuple key matches exactly.  1e-12 is far below any physical
+    # composition difference yet well above float64 round-trip error.
+    _SEED_KEY_DECIMALS = 12
+
+    def _seed_key(self, row: torch.Tensor) -> tuple:
+        return tuple(round(float(v), self._SEED_KEY_DECIMALS) for v in row)
+
+    def set_seed_prior(
+        self,
+        seed_X: Optional[torch.Tensor],
+        seed_var: float,
+        real_var: float,
+    ) -> None:
+        """Declare warm-start seed points that carry a larger observation noise.
+
+        A warm-start seed is scored on only part of the objective (e.g. bandgap and
+        photoconductance, with the stability third not yet measurable), so it is an
+        unreliable stand-in for the true value.  Registering the seeds here makes
+        :meth:`fit` hand BoTorch a *per-point* noise vector — ``seed_var`` for these
+        rows, ``real_var`` for everything else — instead of one learned shared noise.
+
+        The GP then uses the seeds to shape its guess where it has nothing else, but
+        never becomes confident there, so the acquisition still wants to measure
+        those regions for real and a later clean measurement easily overrules a seed.
+
+        Passing ``seed_X=None`` (or an empty tensor) clears the prior and restores
+        the learned-noise behaviour exactly.
+        """
+        if seed_X is None or seed_X.numel() == 0:
+            self._seed_keys = None
+            self._seed_var = self._real_var = 0.0
+            return
+        if not (seed_var > 0.0 and real_var > 0.0):
+            raise ValueError("seed_var and real_var must both be positive")
+        seed_X = seed_X.to(device=self.device, dtype=self.dtype)
+        self._seed_keys = {self._seed_key(r) for r in seed_X}
+        self._seed_var = float(seed_var)
+        self._real_var = float(real_var)
+        if self.verbose:
+            print(f"  [GP] seed prior: {len(self._seed_keys)} seed pts, "
+                  f"seed_var={seed_var:.3e} real_var={real_var:.3e} "
+                  f"({seed_var / real_var:.1f}x)")
+
+    def _train_Yvar(self, X: torch.Tensor) -> Optional[torch.Tensor]:
+        """Per-point observation variance for `X`, or None when no prior is set.
+
+        Also records which rows were seeds, so :meth:`get_output_noise` can report
+        the real-point noise in the model's own units.
+        """
+        if not self._seed_keys:
+            self._last_is_seed = None
+            return None
+        is_seed = torch.tensor(
+            [self._seed_key(row) in self._seed_keys for row in X],
+            device=self.device, dtype=torch.bool)
+        self._last_is_seed = is_seed
+        var = torch.where(is_seed,
+                          torch.tensor(self._seed_var, device=self.device, dtype=self.dtype),
+                          torch.tensor(self._real_var, device=self.device, dtype=self.dtype))
+        return var.reshape(-1, 1)
 
     def fit(self, X: torch.Tensor, Y: torch.Tensor):
         """
@@ -253,6 +323,10 @@ class GPSimplex:
         self.comp_std = comp_std
         X_norm = X / comp_std
 
+        # Built from the *unjittered* X: jitter perturbs coordinates and would stop
+        # seeds matching the registry, silently dropping the prior on a recovery pass.
+        train_Yvar = self._train_Yvar(X)
+
         _t0 = time.time()
         last_exc: Exception | None = None
         for jitter in [0.0, *self._JITTER_SCHEDULE]:
@@ -262,7 +336,8 @@ class GPSimplex:
                     X_fit = X_norm + noise
                 else:
                     X_fit = X_norm
-                self.gp = SingleTaskGP(X_fit, Y)
+                self.gp = (SingleTaskGP(X_fit, Y) if train_Yvar is None
+                           else SingleTaskGP(X_fit, Y, train_Yvar=train_Yvar))
                 self._apply_lengthscale_floor(comp_std)
                 self.mll = ExactMarginalLogLikelihood(self.gp.likelihood, self.gp)
                 fit_gpytorch_mll(self.mll)
@@ -346,10 +421,30 @@ class GPSimplex:
         return posterior.mean, posterior.variance
 
     def get_output_noise(self) -> float:
-        """Get average output noise from the GP."""
+        """Get the output noise scale used as the convergence floor.
+
+        With a seed prior active the likelihood is a *fixed*-noise one, so the mean
+        of ``noise_covar.noise`` is the mean of our own per-point variances — it
+        drifts up purely with the fraction of seed points in the training set.  That
+        value feeds the convergence noise floor (zombihop.py), so using it would make
+        a warm-started run converge on a different, seed-dependent threshold than a
+        cold one and confound any comparison of the two.  The floor should reflect
+        what a *real* measurement is worth, so average over the real points only.
+
+        Read back off the model rather than returning ``self._real_var`` directly:
+        BoTorch may standardize outcomes, in which case the stored noise is in
+        standardized units.  Returning the raw variance would report a different
+        *unit* from the no-prior branch, which is the same confound in another guise.
+        """
         if self.gp is None:
             return 0.0
-        return self.gp.likelihood.noise_covar.noise.mean().item()
+        noise = self.gp.likelihood.noise_covar.noise
+        is_seed = getattr(self, "_last_is_seed", None)
+        if self._seed_keys and is_seed is not None:
+            real = noise.reshape(-1)[~is_seed.reshape(-1)]
+            if real.numel() > 0:
+                return real.mean().item()
+        return noise.mean().item()
 
     def expected_improvement(self, x: torch.Tensor, best_f: float) -> float:
         """E[max(f(x) - best_f, 0)] under the GP posterior at x (maximization).

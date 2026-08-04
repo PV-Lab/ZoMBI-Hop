@@ -178,6 +178,7 @@ import os
 import random
 import shlex
 import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -257,7 +258,19 @@ DATASET_DIMS = {"RF": 3, "ackley3d": 3, "ackley4d": 4, "ackley10d": 10}
 # not a fixed-dim entry in DATASET_DIMS.
 ENSEMBLE_DATASET = "ensemble"
 ENSEMBLE_DEFAULT_DIM = 3
-DATASET_CHOICES = sorted([*DATASET_DIMS, ENSEMBLE_DATASET])
+# Warm-start GP tuning targets (see warm_start/warm_gp_landscape.py):
+#   warmgp   — the FIXED warm-start GP landscape, scored every trial. Tunes the
+#              hyperparameters used by BOTH the static and dynamic warm-start
+#              deployments (they differ only at runtime, not in what is tuned).
+#   mixture  — warmgp AND a re-randomized ensemble landscape, metrics averaged, so
+#              the tuned hyperparameters are good on the warm start and on generic
+#              landscapes at once.
+# Both are dimension-parameterized via --dim (valid dims: whatever
+# warm_start.warm_gp_landscape has a campaign for — 3 and 4).
+WARMGP_DATASET = "warmgp"
+MIXTURE_DATASET = "mixture"
+DATASET_CHOICES = sorted([*DATASET_DIMS, ENSEMBLE_DATASET,
+                          WARMGP_DATASET, MIXTURE_DATASET])
 
 # ─── Global config ────────────────────────────────────────────────────────────
 
@@ -1972,8 +1985,17 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
     fig.clear()
 
 
-def plot_convergence(path: str, dh, maximize: bool) -> None:
-    """Save a convergence plot: all Y values, running best, needle vlines."""
+def plot_convergence(path: str, dh, maximize: bool,
+                     activations: np.ndarray | None = None) -> None:
+    """Save a convergence plot: all Y values, running best, needle vlines.
+
+    ``activations``: optional per-sample activation id (same length/order as
+    ``dh.Y_all``). When given, the running-best envelope is **reset at every
+    activation boundary** — i.e. each activation gets its own best-so-far sawtooth
+    rather than one globally-monotone curve. This shows how much each fresh
+    activation re-explores instead of coasting on an earlier activation's peak.
+    Passing ``None`` keeps the original single global running best.
+    """
     Y_all = dh.Y_all.detach().cpu().numpy().ravel()
     if Y_all.size == 0:
         return
@@ -2000,10 +2022,32 @@ def plot_convergence(path: str, dh, maximize: bool) -> None:
     # a real objective measurement, so it must be able to raise the best-so-far.
     # Penalization only governs where MOBO samples next, not what counts as
     # observed — so it must not be excluded from the convergence envelope.
-    running_best = np.maximum.accumulate(Y_all)
-
-    ax.plot(idx, running_best, color="darkorange", lw=1.8,
-            label="running best", zorder=4)
+    if activations is not None and len(activations) == len(Y_all):
+        # Reset the accumulate at each activation boundary: independent per-activation
+        # bests (a sawtooth), so each fresh activation starts its envelope over. Each
+        # activation's envelope is drawn as its OWN line segment — no connecting
+        # segment bridges the boundary, so the running best is fully disconnected
+        # across activations.
+        acts = np.asarray(activations).ravel()
+        best_label = "running best (reset/activation)"
+        start = 0
+        labeled = False
+        for i in range(1, len(Y_all) + 1):
+            if i == len(Y_all) or acts[i] != acts[start]:
+                seg_best = np.maximum.accumulate(Y_all[start:i])
+                ax.plot(idx[start:i], seg_best, color="darkorange", lw=1.8,
+                        label=(None if labeled else best_label), zorder=4,
+                        drawstyle="steps-post")
+                labeled = True
+                # dashed guide at each activation boundary
+                if i < len(Y_all):
+                    ax.axvline(float(i) - 0.5, color="#888888", alpha=0.35,
+                               lw=0.7, ls=":", zorder=1)
+                start = i
+    else:
+        running_best = np.maximum.accumulate(Y_all)
+        ax.plot(idx, running_best, color="darkorange", lw=1.8,
+                label="running best", zorder=4, drawstyle="steps-post")
 
     if needle_indices is not None:
         labeled = False
@@ -2443,6 +2487,73 @@ def build_ensemble_landscape(
     )
 
 
+def build_warmgp_landscape(
+    dim: int, *, seed: int, time_limit_hours: float | None,
+) -> LandscapeSpec:
+    """``LandscapeSpec`` for the FIXED warm-start GP landscape at ``dim``.
+
+    Unlike the ensemble objective this landscape is NOT re-randomized per trial:
+    it is the GP fit to a real campaign's warm-start lines (deterministic in
+    ``seed``), and its auto-detected peaks are the ``dist_to_needles`` reference.
+    Tagged ``landscape="synthetic"`` / ``oracle="warmgp"`` so the dim-3 run still
+    renders the ternary coverage plot and resume can recognise it.
+    """
+    from warm_start.warm_gp_landscape import warmgp_objective
+
+    o = warmgp_objective(int(dim), seed=int(seed))
+    true_optima = [np.asarray(p, dtype=float) for p in o["peaks"]]
+    # Peaks come from the dense detection grid inside warmgp_objective; the render
+    # grid here is the standard coarse ternary lattice (dim 3 only), matching the
+    # ensemble path's rendering cost.
+    grid_pts = grid_vals = None
+    if int(dim) == 3:
+        grid_pts = ternary_grid(TERNARY_GRID_N)
+        grid_vals = o["predict"](grid_pts)
+    print(f"  [dataset] warmgp: warm-start GP landscape dim={dim} "
+          f"({o['n_warm_lines']} warm lines {o['picked_lines']}, "
+          f"{len(true_optima)} auto-detected peaks, seed={seed})")
+    return LandscapeSpec(
+        landscape="synthetic", dim=int(dim), maximize=True,
+        true_optima=true_optima, fn_callable=o["fn"],
+        grid_pts=grid_pts, grid_vals=grid_vals,
+        time_limit_hours=time_limit_hours, max_activations=float("inf"),
+        oracle="warmgp", synthetic_seed=int(seed),
+    )
+
+
+def build_fullgp_landscape(
+    dim: int, *, seed: int, time_limit_hours: float | None,
+) -> LandscapeSpec:
+    """``LandscapeSpec`` for the FULL-run GP landscape at ``dim`` (evaluation only).
+
+    Same fixed-length-scale Matern GP as ``build_warmgp_landscape`` but fit to the
+    *entire* real campaign (every scored point), not just the warm-start lines, so
+    its auto-detected peaks are the campaign's true optima — the honest
+    ``dist_to_needles`` reference a deployed hyperparameter set is scored against.
+    The tuner still sees only the warm-start GP; this surface is the ground truth
+    the tuned hyperparameters are *evaluated* on. Deterministic, so ``seed`` is
+    accepted only for signature parity. Tagged ``oracle="fullgp"``.
+    """
+    from warm_start.warm_gp_landscape import fullgp_objective
+
+    o = fullgp_objective(int(dim), seed=int(seed))
+    true_optima = [np.asarray(p, dtype=float) for p in o["peaks"]]
+    grid_pts = grid_vals = None
+    if int(dim) == 3:
+        grid_pts = ternary_grid(TERNARY_GRID_N)
+        grid_vals = o["predict"](grid_pts)
+    print(f"  [dataset] fullgp: full-run GP landscape dim={dim} "
+          f"({o['n_points']} pts / {o['n_lines']} lines, "
+          f"{len(true_optima)} auto-detected peaks)")
+    return LandscapeSpec(
+        landscape="synthetic", dim=int(dim), maximize=True,
+        true_optima=true_optima, fn_callable=o["fn"],
+        grid_pts=grid_pts, grid_vals=grid_vals,
+        time_limit_hours=time_limit_hours, max_activations=float("inf"),
+        oracle="fullgp", synthetic_seed=int(seed),
+    )
+
+
 def reseed_ensemble(landscape: LandscapeSpec, config: dict):
     """Rebuild the Ensemble objective for one trial from a saved ``config``.
 
@@ -2455,6 +2566,41 @@ def reseed_ensemble(landscape: LandscapeSpec, config: dict):
     if landscape.dim == 3 and landscape.grid_pts is not None:
         grid_vals = fn.predict(landscape.grid_pts)
     return fn, true_optima, grid_vals
+
+
+def _render_conet_artifacts(trial_dir: str, *, timeout_s: int = 1800) -> None:
+    """Render ``conet.png`` (the run's own samples + discovered needles) and
+    ``conet_uniform.png`` (a uniform-sampling baseline of the same landscape with
+    its true optima starred) for a completed ensemble repeat.
+
+    Each render runs as an isolated subprocess: the CoNet builder fits UMAP on a
+    full N×N distance matrix (>10 GB for ~19k samples), so keeping it out of this
+    process means an OOM, timeout, or crash there is logged and skipped rather than
+    taking the MOBO run down before its metrics.json lands.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    viz = os.path.join(repo_root, "visualization")
+    env = dict(os.environ, MPLBACKEND="Agg")
+    jobs = [
+        ("conet.png", [sys.executable, os.path.join(viz, "plot_10d.py"),
+                       "--run", trial_dir, "--needles",
+                       "--save", os.path.join(trial_dir, "conet.png")]),
+        ("conet_uniform.png", [sys.executable, os.path.join(viz, "uniform_baseline_conet.py"),
+                               "--run", trial_dir,
+                               "--save", os.path.join(trial_dir, "conet_uniform.png")]),
+    ]
+    for name, cmd in jobs:
+        t0 = time.time()
+        try:
+            r = subprocess.run(cmd, env=env, cwd=repo_root, timeout=timeout_s,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if r.returncode == 0:
+                print(f"    [trial] {name} rendered ({time.time() - t0:.0f}s)", flush=True)
+            else:
+                tail = "\n      ".join((r.stdout or "").splitlines()[-3:])
+                print(f"    [trial] {name} render failed rc={r.returncode}:\n      {tail}", flush=True)
+        except Exception as exc:
+            print(f"    [trial] {name} render error: {exc}", flush=True)
 
 
 # ─── Single trial: run ZoMBI on the objective + write all artifacts ────────────
@@ -2699,6 +2845,11 @@ def run_single_trial(
     except Exception as exc:
         print(f"    [trial] static plot failed: {exc}")
 
+    # CoNet artifacts (ensemble runs only: the uniform baseline reconstructs the
+    # landscape from ensemble_config.json). Best-effort, isolated subprocesses.
+    if ensemble_config is not None:
+        _render_conet_artifacts(trial_dir)
+
     if landscape.render_ternary and grid_pts is not None and grid_vals is not None and payloads:
         plots_dir = os.path.join(trial_dir, "plots")
         os.makedirs(plots_dir, exist_ok=True)
@@ -2789,6 +2940,7 @@ def evaluate_hparams(
     *,
     ackley_variant: str | None = None,
     ensemble_spec: dict | None = None,
+    warm_landscape: LandscapeSpec | None = None,
 ) -> dict:
     """Evaluate one hyperparameter set and return the metrics MOBO scores against.
 
@@ -2804,6 +2956,12 @@ def evaluate_hparams(
     config is saved (per-run ``ensemble_config.json`` + the ``ensemble_configs``
     list in ``trial.json``). The returned ``runtime``/``n_iters`` are summed over
     the repeats (whole-trial cost), and ``repeats`` holds each repeat's metrics.
+
+    ``warm_landscape`` turns this into the **mixture** evaluation: the ensemble
+    repeats run as above, then the SAME hyperparameters are scored once on the
+    fixed warm-start GP landscape (``trial_<n>/run_warm/``), and the two are blended
+    50/50 per metric — ensemble-mean vs. warm-start — so the tuned hyperparameters
+    are good on both. Requires ``ensemble_spec`` (mixture = ensemble ⊕ warm start).
     """
     if ensemble_spec is None:
         return run_single_trial(
@@ -2855,23 +3013,67 @@ def evaluate_hparams(
         # repeat killed mid-run leaves no metrics.json and is re-run on resume.
         _atomic_write_text(ckpt, json.dumps(rep, indent=2))
 
-    dist = float(np.mean([r["dist"] for r in repeats]))
-    dup = float(np.mean([r["dup"] for r in repeats]))
-    avg_t = float(np.mean([r["avg_time_per_iter"] for r in repeats]))
+    ens_dist = float(np.mean([r["dist"] for r in repeats]))
+    ens_dup = float(np.mean([r["dup"] for r in repeats]))
+    ens_avg_t = float(np.mean([r["avg_time_per_iter"] for r in repeats]))
     runtime = float(np.sum([r["runtime"] for r in repeats]))
     n_iters = int(np.sum([r["n_iters"] for r in repeats]))
     # Average sample count per landscape, parallel to the other three averaged
     # MOBO metrics (so the points penalty stays on a single-run scale). A repeat
     # that sampled nothing makes the mean's penalty finite, but the n_iters guard
     # in the main loop still rejects an all-zero trial before it reaches the GP.
-    n_points = float(np.mean([r["n_points"] for r in repeats]))
+    ens_n_points = float(np.mean([r["n_points"] for r in repeats]))
     print(f"    [trial] ensemble avg over {n_repeats} landscapes — "
+          f"dist={ens_dist:.4f}  dup={ens_dup:.4f}  t/iter={ens_avg_t:.3f}s  "
+          f"points={ens_n_points:.1f}")
+
+    if warm_landscape is None:
+        return {
+            "dist": ens_dist, "dup": ens_dup, "runtime": runtime,
+            "avg_time_per_iter": ens_avg_t, "n_iters": n_iters,
+            "n_points": ens_n_points, "payloads": [], "ackley_seed": None,
+            "ensemble_config": None, "ensemble_configs": configs, "repeats": repeats,
+        }
+
+    # ── mixture: one warm-start eval, then blend 50/50 with the ensemble mean. ──
+    # Stored under run_warm/ with run index 0 (ensemble repeats use 1..N), so a
+    # requeue reuses a finished warm eval exactly like a finished ensemble repeat.
+    warm_dir = os.path.join(trial_dir, "run_warm")
+    warm_ckpt = os.path.join(warm_dir, "metrics.json")
+    warm = _load_repeat_metrics(warm_ckpt, 0)
+    if warm is not None:
+        print("    [mixture] warm-start eval already complete — reusing (resume)",
+              flush=True)
+    else:
+        if os.path.isdir(warm_dir):
+            shutil.rmtree(warm_dir, ignore_errors=True)
+        print("    [mixture] warm-start eval", flush=True)
+        rw = run_single_trial(hparams, warm_landscape, warm_dir)
+        warm = {
+            "run": 0,
+            "dist": round(rw["dist"], 6),
+            "dup": round(rw["dup"], 6),
+            "avg_time_per_iter": round(rw["avg_time_per_iter"], 4),
+            "runtime": round(rw["runtime"], 3),
+            "n_iters": int(rw["n_iters"]),
+            "n_points": int(rw["n_points"]),
+        }
+        _atomic_write_text(warm_ckpt, json.dumps(warm, indent=2))
+
+    dist = 0.5 * (ens_dist + warm["dist"])
+    dup = 0.5 * (ens_dup + warm["dup"])
+    avg_t = 0.5 * (ens_avg_t + warm["avg_time_per_iter"])
+    runtime += warm["runtime"]
+    n_iters += int(warm["n_iters"])
+    n_points = 0.5 * (ens_n_points + warm["n_points"])
+    print(f"    [trial] mixture blend (ensemble ⊕ warm) — "
           f"dist={dist:.4f}  dup={dup:.4f}  t/iter={avg_t:.3f}s  points={n_points:.1f}")
     return {
         "dist": dist, "dup": dup, "runtime": runtime,
         "avg_time_per_iter": avg_t, "n_iters": n_iters, "n_points": n_points,
         "payloads": [], "ackley_seed": None,
-        "ensemble_config": None, "ensemble_configs": configs, "repeats": repeats,
+        "ensemble_config": None, "ensemble_configs": configs,
+        "repeats": repeats + [warm],
     }
 
 
@@ -2966,7 +3168,8 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
              max_trials=None, seed_X=None, X_prior=None, Y_prior=None, *,
              n_init_trials: int = N_INIT_TRIALS,
              ackley_variant: str | None = None,
-             ensemble_spec: dict | None = None) -> None:
+             ensemble_spec: dict | None = None,
+             warm_landscape: LandscapeSpec | None = None) -> None:
     """Unbounded MOBO loop, writing trials into a fresh ``run_dir``."""
     bounds = torch.zeros(2, N_HPARAMS, dtype=DTYPE, device=DEVICE)
     bounds[1] = 1.0
@@ -3168,7 +3371,8 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
 
                 res = evaluate_hparams(
                     hparams, landscape, trial_dir, trial_num,
-                    ackley_variant=ackley_variant, ensemble_spec=ensemble_spec)
+                    ackley_variant=ackley_variant, ensemble_spec=ensemble_spec,
+                    warm_landscape=warm_landscape)
 
                 # A trial that completed zero ZoMBI iterations (e.g. ZoMBI
                 # crashed before the first iteration; the crash is swallowed in
@@ -3465,6 +3669,7 @@ def _launch_run(runs_dir, landscape: LandscapeSpec, max_trials,
                 dataset: str | None = None,
                 ackley_variant: str | None = None,
                 ensemble_spec: dict | None = None,
+                warm_landscape: LandscapeSpec | None = None,
                 invocation: dict | None = None) -> None:
     """Create a fresh runs/mobo_* folder, persist its config, and run MOBO."""
     if run_dir is None:
@@ -3485,7 +3690,7 @@ def _launch_run(runs_dir, landscape: LandscapeSpec, max_trials,
     run_mobo(landscape, run_dir, max_trials=max_trials,
              seed_X=seed_X, X_prior=X_prior, Y_prior=Y_prior,
              n_init_trials=n_init_trials, ackley_variant=ackley_variant,
-             ensemble_spec=ensemble_spec)
+             ensemble_spec=ensemble_spec, warm_landscape=warm_landscape)
 
 
 
@@ -3546,6 +3751,11 @@ def main() -> None:
                              f"--dataset ensemble; the four metrics are averaged "
                              f"across them to reduce landscape noise (default: "
                              f"{ENSEMBLE_N_REPEATS}).")
+    parser.add_argument("--warmgp-seed", type=int, default=0,
+                        help="seed for the warm-start GP landscape (--dataset "
+                             "warmgp / mixture): selects which campaign lines form "
+                             "the warm start and the landscape they induce "
+                             "(default: 0).")
     parser.add_argument("--resume-from", metavar="RUN_DIR", default=None,
                         help="Resume from a SPECIFIC run: trust its stored metrics "
                              "as prior history (no re-evaluation), reuse its config.")
@@ -4088,6 +4298,83 @@ def main() -> None:
                     run_dir=run_dir_override, n_init_trials=n_init,
                     dataset=ENSEMBLE_DATASET, ensemble_spec=ensemble_spec,
                     invocation=invocation)
+        return
+
+    if args.dataset == WARMGP_DATASET:
+        # Static + dynamic warm-start tuning: the fixed warm-start GP landscape,
+        # scored once per trial (no ensemble repeats). The two deployments share
+        # this one tuning job — they differ only at runtime, not in what is tuned.
+        dim = args.dim if args.dim is not None else 3
+        print("=" * 70)
+        print(f"ZoMBI-Hop MOBO — dataset warmgp (fixed warm-start GP)  dim={dim}")
+        print(f"Device: {DEVICE}   |   time limit/trial: {TIME_LIMIT_HOURS} h")
+        print("=" * 70)
+        landscape = build_warmgp_landscape(
+            dim, seed=args.warmgp_seed, time_limit_hours=TIME_LIMIT_HOURS)
+        resolutions = [
+            f"dataset: CLI --dataset warmgp (fixed warm-start GP, dim {dim})",
+            f"warmgp_seed: {args.warmgp_seed}",
+            f"time_limit_hours: {'CLI' if time_limit_override is not None else 'default'} "
+            f"({TIME_LIMIT_HOURS})",
+        ]
+        resolutions.append(
+            f"device: CLI --device {args.device} -> {DEVICE}" if args.device
+            else f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}")
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="dataset_warmgp", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
+        _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
+                    run_dir=run_dir_override, n_init_trials=n_init,
+                    dataset=WARMGP_DATASET, invocation=invocation)
+        return
+
+    if args.dataset == MIXTURE_DATASET:
+        # Mixture tuning: each trial is scored on BOTH a re-randomized ensemble
+        # landscape (the standard N-repeat average) AND the fixed warm-start GP,
+        # blended 50/50, so the tuned hyperparameters are good on both.
+        dim = args.dim if args.dim is not None else 3
+        print("=" * 70)
+        print(f"ZoMBI-Hop MOBO — dataset mixture (ensemble ⊕ warm-start GP)  dim={dim}")
+        print(f"Device: {DEVICE}   |   time limit/trial: {TIME_LIMIT_HOURS} h")
+        print("=" * 70)
+        landscape = build_ensemble_landscape(
+            dim, optima_margin=args.ensemble_margin, seed=args.ensemble_seed,
+            time_limit_hours=TIME_LIMIT_HOURS)
+        warm_landscape = build_warmgp_landscape(
+            dim, seed=args.warmgp_seed, time_limit_hours=TIME_LIMIT_HOURS)
+        ensemble_spec = {
+            "dim": dim, "optima_margin": args.ensemble_margin,
+            "seed": args.ensemble_seed, "n_repeats": args.ensemble_repeats,
+        }
+        lo, hi = optima_count_range(dim)
+        resolutions = [
+            f"dataset: CLI --dataset mixture (ensemble ⊕ warm-start GP, dim {dim})",
+            f"ensemble_seed: {args.ensemble_seed}   ensemble_margin: {args.ensemble_margin}"
+            f"   ensemble_repeats: {args.ensemble_repeats}   (n_optima in [{lo}, {hi}])",
+            f"warmgp_seed: {args.warmgp_seed}",
+            f"time_limit_hours: {'CLI' if time_limit_override is not None else 'default'} "
+            f"({TIME_LIMIT_HOURS})",
+        ]
+        resolutions.append(
+            f"device: CLI --device {args.device} -> {DEVICE}" if args.device
+            else f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}")
+        invocation = build_invocation_log(
+            argv=sys.argv, run_mode="dataset_mixture", cli=_cli_snapshot(args),
+            effective=_effective_run_settings(
+                landscape, max_trials=max_trials, n_init_trials=n_init,
+                runs_dir=runs_dir, run_dir=run_dir_override,
+            ),
+            resolutions=resolutions,
+        )
+        _launch_run(runs_dir, landscape, max_trials, seed_X=seed_X,
+                    run_dir=run_dir_override, n_init_trials=n_init,
+                    dataset=MIXTURE_DATASET, ensemble_spec=ensemble_spec,
+                    warm_landscape=warm_landscape, invocation=invocation)
         return
 
     if args.dataset != "RF":
