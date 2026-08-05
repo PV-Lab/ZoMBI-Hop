@@ -298,29 +298,59 @@ def weighted_feature_loss(
     return loss, errs
 
 
+def _json_feature_float(value: Any) -> float | None:
+    """Coerce a JSON feature value to float; ``null``/non-numeric → None.
+
+    ``save_lambda_target`` writes NaN/Inf as JSON null, so loaders must tolerate
+    None (common for dim-dependent roughness extras on higher simplices).
+    """
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out
+
+
 def extract_tier1_from_characterize(result: dict[str, Any]) -> dict[str, float]:
     """Pull fitness-feature dict from ``characterize_campaign_surrogate`` / ``ela_full``."""
     if "feature_groups" in result:
         m = result["feature_groups"]["munoz_33"]
         z = result["feature_groups"]["zombi"]
-        out = {name: float(m[name]) for name in MUNOZ_33_NAMES if name in m}
+        out: dict[str, float] = {}
+        for name in MUNOZ_33_NAMES:
+            if name not in m:
+                continue
+            val = _json_feature_float(m[name])
+            if val is not None:
+                out[name] = val
         if "oob_r2" in z:
-            out["oob_r2"] = float(z["oob_r2"])
+            val = _json_feature_float(z["oob_r2"])
+            if val is not None:
+                out["oob_r2"] = val
         # Spatial Lipschitz extras (median + interior / tile / regions / …).
         for name in SPATIAL_ROUGHNESS_NAMES + ("median_lipschitz",):
-            if name in z:
-                out[name] = float(z[name])
-            elif name in m:
-                out[name] = float(m[name])
+            raw = z[name] if name in z else m.get(name)
+            val = _json_feature_float(raw)
+            if val is not None:
+                out[name] = val
         nbc_grp = result["feature_groups"].get("flacco_nbc") or {}
         for short, flacco_key in NBC_FLACCO_KEYS.items():
-            if flacco_key in nbc_grp:
-                out[short] = float(nbc_grp[flacco_key])
-            elif short in m:
-                out[short] = float(m[short])
+            raw = nbc_grp[flacco_key] if flacco_key in nbc_grp else m.get(short)
+            val = _json_feature_float(raw)
+            if val is not None:
+                out[short] = val
         return out
     feats = result.get("features", result)
-    return {k: float(feats[k]) for k in ALLOWED_FITNESS_NAMES if k in feats}
+    out = {}
+    for k in ALLOWED_FITNESS_NAMES:
+        if k not in feats:
+            continue
+        val = _json_feature_float(feats[k])
+        if val is not None:
+            out[k] = val
+    return out
 
 
 def load_target_json(path: str | Path) -> dict[str, Any]:

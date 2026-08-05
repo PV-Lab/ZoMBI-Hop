@@ -12,8 +12,8 @@ Pipeline (mirrors ``2nd_real_run.db`` → RF → dense λ_T / ela_full):
 Usage
 -----
   conda activate zombi-hop-linebo
-  python ela/build_run_rf_surrogate.py --run data/run_9dfe
-  python ela/build_run_rf_surrogate.py --run data/run_9dfe --full
+  python ela/build_run_rf_surrogate.py --run runs/run_9dfe
+  python ela/build_run_rf_surrogate.py --run runs/run_9dfe --full
 """
 from __future__ import annotations
 
@@ -38,12 +38,13 @@ def _resolve_run_dir(run_arg: str | Path) -> Path:
     p = Path(run_arg)
     if p.is_dir():
         return p.resolve()
-    cand = ROOT / "data" / p.name
-    if cand.is_dir():
-        return cand.resolve()
-    cand = ROOT / "data" / f"run_{p.name}"
-    if cand.is_dir():
-        return cand.resolve()
+    for base in (ROOT / "runs", ROOT / "data"):
+        cand = base / p.name
+        if cand.is_dir():
+            return cand.resolve()
+        cand = base / f"run_{p.name}"
+        if cand.is_dir():
+            return cand.resolve()
     raise FileNotFoundError(f"Run directory not found: {run_arg}")
 
 
@@ -164,8 +165,8 @@ def main() -> None:
         description="Build scaled RF surrogate from a ZoMBI hardware run.",
     )
     parser.add_argument(
-        "--run", default="data/run_9dfe",
-        help="Run directory (or name under data/)",
+        "--run", default="runs/run_9dfe",
+        help="Run directory (or name under runs/ or data/)",
     )
     parser.add_argument("--out-stem", default=None,
                         help="Output stem under data/ (default: run dir name)")
@@ -179,10 +180,11 @@ def main() -> None:
     run_dir = _resolve_run_dir(args.run)
     stem = args.out_stem or run_dir.name
     out_dir = ROOT / "data"
+    analysis_dir = out_dir / "analysis"
     out_csv = out_dir / f"{stem}.csv"
     out_db = out_dir / f"{stem}.db"
     out_meta = out_dir / f"{stem}_rf_meta.json"
-    out_joblib = out_dir / f"{stem}_RF_trained.joblib"
+    out_joblib = analysis_dir / f"{stem}_RF_trained.joblib"
     out_lambda = out_dir / f"{stem}_lambda_target.json"
     out_ela = out_dir / f"{stem}_ela_full.json"
 
@@ -260,6 +262,7 @@ def main() -> None:
 
     if not args.no_rf_joblib:
         import joblib
+        analysis_dir.mkdir(parents=True, exist_ok=True)
 
         joblib.dump(
             {

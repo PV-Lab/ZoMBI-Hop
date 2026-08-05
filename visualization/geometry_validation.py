@@ -18,7 +18,7 @@ Usage
 -----
   python visualization/geometry_validation.py
   python visualization/geometry_validation.py --db data/2nd_real_run.db \\
-      --out-dir data/2nd_real_run_geometry
+      --out-dir data/analysis/2nd_real_run_geometry
 """
 from __future__ import annotations
 
@@ -496,7 +496,7 @@ def main() -> None:
 
     db_path = _resolve_db_path(args.db)
     properties = [p.strip() for p in args.properties.split(",") if p.strip()]
-    out_dir = args.out_dir or (db_path.parent / f"{db_path.stem}_geometry")
+    out_dir = args.out_dir or (ROOT / "data" / "analysis" / f"{db_path.stem}_geometry")
 
     X, ys = load_db_compositions_and_properties(db_path, properties)
     X_geom = load_db_compositions(db_path)

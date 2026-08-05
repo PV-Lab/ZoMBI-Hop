@@ -1,0 +1,54 @@
+{
+  "db_path": "data/run_9dfe.db",
+  "objective_column": "Objective",
+  "maximize": true,
+  "dim": 4,
+  "n_campaign": 1236,
+  "n_dense_sample": 4096,
+  "sample_seed": 42,
+  "input_noise": 0.064,
+  "y_campaign_range": [
+    0.391666666667,
+    0.926503817479
+  ],
+  "y_dense_range": [
+    0.46125360546106964,
+    0.8456656872370467
+  ],
+  "features": {
+    "R2_Q": 0.02263573952181064,
+    "CN": 0.08287865936564523,
+    "H_Y": 2.983800360995792,
+    "xi_1": 0.123846641474246,
+    "gamma_Y": -0.6338987337782012,
+    "EL25": 0.75,
+    "LQ25": 1.0165457485446634,
+    "PKS": 13.0,
+    "oob_r2": 0.6128669381680845,
+    "median_lipschitz": 0.21399896975748137,
+    "interior_median_lipschitz": 0.6371260031984636,
+    "lipschitz_p20": 0.031096495808667607,
+    "lipschitz_p80": 0.7554753685259541,
+    "edge_interior_lip_ratio": 0.37314950856954615,
+    "ma_region_median_lipschitz": 0.22079072220237772,
+    "fa_region_median_lipschitz": 0.20759990777327636,
+    "br_region_median_lipschitz": 0.15392803234936533,
+    "local_lipschitz_cv": null,
+    "tile_min_median_lipschitz": 0.10598528288151693
+  },
+  "csv_path": "data/run_9dfe.csv",
+  "composition_columns": [
+    "Comp1",
+    "Comp2",
+    "Comp3",
+    "Comp4"
+  ],
+  "optimizing_dims": [
+    0,
+    2,
+    8,
+    9
+  ],
+  "run_uuid": "9dfe",
+  "source": "composition_log.jsonl measured+y"
+}

@@ -1147,7 +1147,14 @@ def run_single_eval(
         rm.plot_hparam_edge_proximity(
             os.path.join(out_dir, "hparam_edge_proximity.png"),
             rm.hparams_to_norm(hparams))
-        rm.plot_convergence(os.path.join(out_dir, "convergence.png"), dh, maximize)
+        n_pts = int(dh.Y_all.shape[0]) if dh.Y_all is not None else 0
+        act_arr, _ = rm._activation_zoom_per_point(n_pts, snap_records)
+        rm.plot_convergence(
+            os.path.join(out_dir, "convergence.png"),
+            dh,
+            maximize,
+            activations=act_arr if n_pts else None,
+        )
     except Exception as exc:
         print(f"      [run] static plot failed: {exc}")
 

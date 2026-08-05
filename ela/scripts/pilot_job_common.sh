@@ -39,13 +39,19 @@ _pilot_setup_env() {
 }
 
 # Run dirs — Slurm jobs use stable names keyed on SLURM_JOB_ID:
-#   ela/runs/ela_3d_<SLURM_JOB_ID>
+#   ela/runs/ela_3d_<SLURM_JOB_ID>   (default)
+#   ela/runs/ela_4d_<SLURM_JOB_ID>   (PILOT_DIM=4)
+_pilot_run_prefix() {
+  local dim="${PILOT_DIM:-3}"
+  echo "ela_${dim}d"
+}
+
 _pilot_run_dir_slurm() {
-  echo "${PILOT_RUN_ROOT}/ela_3d_${SLURM_JOB_ID}"
+  echo "${PILOT_RUN_ROOT}/$(_pilot_run_prefix)_${SLURM_JOB_ID}"
 }
 
 _pilot_run_dir_array() {
-  echo "${PILOT_RUN_ROOT}/ela_3d_${SLURM_JOB_ID}"
+  echo "${PILOT_RUN_ROOT}/$(_pilot_run_prefix)_${SLURM_JOB_ID}"
 }
 
 _pilot_check_data() {
@@ -90,7 +96,7 @@ PY
 
   if [[ ! -f "${db}" ]]; then
     echo "FATAL: campaign data missing: ${db}" >&2
-    echo "  data/ is gitignored — rsync from your workstation." >&2
+    echo "  Sync allowlisted data/ files from your workstation (see .gitignore)." >&2
     return 1
   fi
 
@@ -134,11 +140,6 @@ from pathlib import Path
 
 db = Path(sys.argv[1])
 size_mb = db.stat().st_size / (1024 * 1024)
-if size_mb < 1.0:
-    raise SystemExit(
-        f"FATAL: {db} is only {size_mb:.2f} MB (expected ~5.5 MB). "
-        "Copy the real campaign DB from your workstation."
-    )
 
 con = sqlite3.connect(db)
 tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")]
@@ -147,14 +148,40 @@ if "results" not in tables:
         f"FATAL: {db} has no 'results' table (found: {tables or 'none'}). "
         "Copy the real campaign DB from your workstation."
     )
-n = con.execute(
-    'SELECT COUNT(*) FROM results WHERE "FAPbI3" IS NOT NULL '
-    'AND "MAPbI3" IS NOT NULL AND "MAPbBr3" IS NOT NULL AND "Objective" IS NOT NULL'
-).fetchone()[0]
+schema = [r[1] for r in con.execute("PRAGMA table_info(results)")]
+legacy = ["FAPbI3", "MAPbI3", "MAPbBr3"]
+comp_cols = []
+i = 1
+while f"Comp{i}" in schema:
+    comp_cols.append(f"Comp{i}")
+    i += 1
+if "Objective" not in schema:
+    raise SystemExit(f"FATAL: {db} results table missing Objective (cols={schema})")
+
+if all(c in schema for c in legacy):
+    # 3D perovskite campaign DB (2nd_real_run): large file, FA/MA/Br columns.
+    if size_mb < 1.0:
+        raise SystemExit(
+            f"FATAL: {db} is only {size_mb:.2f} MB (expected ~5.5 MB). "
+            "Copy the real campaign DB from your workstation."
+        )
+    where = " AND ".join(f'"{c}" IS NOT NULL' for c in legacy + ["Objective"])
+    n = con.execute(f"SELECT COUNT(*) FROM results WHERE {where}").fetchone()[0]
+    expected = "~644"
+elif len(comp_cols) >= 2:
+    # Generic Comp1..CompN campaign (e.g. 4D run_9dfe): row-count check only.
+    where = " AND ".join(f'"{c}" IS NOT NULL' for c in comp_cols + ["Objective"])
+    n = con.execute(f"SELECT COUNT(*) FROM results WHERE {where}").fetchone()[0]
+    expected = f">=100 (d={len(comp_cols)})"
+else:
+    raise SystemExit(
+        f"FATAL: {db} has neither FAPbI3/MAPbI3/MAPbBr3 nor Comp1..CompN "
+        f"(cols={schema})"
+    )
 con.close()
 if n < 100:
-    raise SystemExit(f"FATAL: only {n} complete campaign rows in {db} (expected ~644)")
-print(f"db OK: {db.name} rows={n} size={size_mb:.1f}MB")
+    raise SystemExit(f"FATAL: only {n} complete campaign rows in {db} (expected {expected})")
+print(f"db OK: {db.name} rows={n} size={size_mb:.2f}MB dim_hint={len(comp_cols) or 3}")
 PY
       ;;
   esac

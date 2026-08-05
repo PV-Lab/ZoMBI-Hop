@@ -1,0 +1,87 @@
+{
+  "name": "structure-hparams-4d",
+  "description": "Compact structure feature set for ZoMBI hparam-gym landscapes (rotation OK). ELA features evaluated on RF(g). Same fitness as structure-hparams-3d. Target: run_9dfe. No rf_vs_campaign_r2. Submit: sbatch ela/scripts/run_pilot_structure_4d.sbatch",
+
+  "mode": "anchored",
+
+  "data": {
+    "db": "data/run_9dfe.db",
+    "target": "data/run_9dfe_ela_full.json"
+  },
+
+  "fitness": {
+    "munoz_8_fitness": false,
+    "fitness_features": [
+      "PKS",
+      "FDC",
+      "DISP1pct",
+      "Hmax",
+      "median_lipschitz",
+      "gamma_Y",
+      "EL25",
+      "LQ25",
+      "R2_Q",
+      "CN"
+    ],
+    "tier1_weights": {
+      "median_lipschitz": 3.0,
+      "gamma_Y": 2.0,
+      "FDC": 1.5,
+      "DISP1pct": 1.5,
+      "PKS": 1.5,
+      "Hmax": 1.5,
+      "EL25": 0.75,
+      "LQ25": 0.75,
+      "R2_Q": 0.75,
+      "CN": 0.5
+    },
+    "alpha_subspace": 0.0,
+    "beta_complexity": 0.001,
+    "tier1_gamma": 2.0,
+    "linearity_penalty_gamma": 0.0,
+    "subspace_rmse_frac": 0.02,
+    "tier1_acceptance_median_rel": 0.1,
+    "linear_calibration": false,
+    "require_subspace_rmse": false,
+    "rf_transform_features": true,
+    "rf_transform_n_samples": 1236,
+    "rf_transform_n_estimators": 500,
+    "rf_transform_seed": 42
+  },
+
+  "ga": {
+    "paper_ga": false,
+    "allow_rbf": false,
+    "oscillatory_bias": false,
+    "population": 400,
+    "generations": 100,
+    "tournament_k": 10,
+    "crossover_prob": 0.6,
+    "mutation_prob": 0.3,
+    "direct_transfer_prob": 0.1,
+    "elitism_frac": 0.1,
+    "max_tree_depth": 12,
+    "fitness_stop_threshold": 0.001,
+    "early_reject_subspace_mult": 0.0
+  },
+
+  "sampling": {
+    "n_dense": null
+  },
+
+  "viz": {
+    "snapshot_every": 1,
+    "landscape_viz": false,
+    "landscape_every": 1,
+    "landscape_grid_n": 100,
+    "post_viz": true,
+    "grid_n": 36
+  },
+
+  "runtime": {
+    "eval_workers": null,
+    "log_level": "INFO",
+    "seed": null,
+    "quick": false
+  }
+}

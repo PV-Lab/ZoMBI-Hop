@@ -1,0 +1,40 @@
+{
+  "run_dir": "runs/run_9dfe",
+  "run_uuid": "9dfe",
+  "optimizing_dims": [
+    0,
+    2,
+    8,
+    9
+  ],
+  "dim": 4,
+  "n_points": 1236,
+  "n_length_mismatches": 0,
+  "source": "composition_log.jsonl measured+y",
+  "hw_config": {
+    "dims": "0,2,8,9",
+    "source": "hardware"
+  },
+  "csv_path": "data/run_9dfe.csv",
+  "db_path": "data/run_9dfe.db",
+  "composition_columns": [
+    "Comp1",
+    "Comp2",
+    "Comp3",
+    "Comp4"
+  ],
+  "n_estimators": 500,
+  "random_state": 42,
+  "y_campaign_range": [
+    0.391666666667,
+    0.926503817479
+  ],
+  "y_dense_range": [
+    0.46125360546106964,
+    0.8456656872370467
+  ],
+  "n_dense_sample": 4096,
+  "lambda_target": "data/run_9dfe_lambda_target.json",
+  "ela_full": "data/run_9dfe_ela_full.json",
+  "rf_joblib": "data/analysis/run_9dfe_RF_trained.joblib"
+}

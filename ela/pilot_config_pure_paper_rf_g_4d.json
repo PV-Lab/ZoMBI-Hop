@@ -1,0 +1,137 @@
+{
+  "name": "pure-paper-rf-g-4d",
+  "description": "Same as ela_3d_18535497 (Muñoz S1 paper GA + ELA(RF_g) on Muñoz-33 + oob_r2 + rf_vs_campaign_r2, equal weights), retargeted to the 4D real run (run_9dfe). Ternary landscape plots disabled (4-simplex). Submit: PILOT_CONFIG=ela/pilot_config_pure_paper_rf_g_4d.json sbatch ela/scripts/run_pilot_4d.sbatch",
+
+  "mode": "pure_paper",
+
+  "data": {
+    "db": "data/run_9dfe.db",
+    "target": "data/run_9dfe_ela_full.json"
+  },
+
+  "fitness": {
+    "munoz_8_fitness": false,
+    "fitness_features": [
+      "FDC",
+      "DISP1pct",
+      "R2_L",
+      "R2_LI",
+      "R2_Q",
+      "R2_QI",
+      "beta_min",
+      "beta_max",
+      "CN",
+      "EL10",
+      "EQ10",
+      "LQ10",
+      "ET10",
+      "EL25",
+      "EQ25",
+      "LQ25",
+      "ET25",
+      "EL50",
+      "EQ50",
+      "LQ50",
+      "ET50",
+      "gamma_Y",
+      "H_Y",
+      "kappa_Y",
+      "PKS",
+      "Hmax",
+      "eps_S",
+      "M0",
+      "xi_D",
+      "xi_1",
+      "xi_2",
+      "sigma_1",
+      "sigma_2",
+      "oob_r2",
+      "rf_vs_campaign_r2"
+    ],
+    "tier1_weights": {
+      "FDC": 1.0,
+      "DISP1pct": 1.0,
+      "R2_L": 1.0,
+      "R2_LI": 1.0,
+      "R2_Q": 1.0,
+      "R2_QI": 1.0,
+      "beta_min": 1.0,
+      "beta_max": 1.0,
+      "CN": 1.0,
+      "EL10": 1.0,
+      "EQ10": 1.0,
+      "LQ10": 1.0,
+      "ET10": 1.0,
+      "EL25": 1.0,
+      "EQ25": 1.0,
+      "LQ25": 1.0,
+      "ET25": 1.0,
+      "EL50": 1.0,
+      "EQ50": 1.0,
+      "LQ50": 1.0,
+      "ET50": 1.0,
+      "gamma_Y": 1.0,
+      "H_Y": 1.0,
+      "kappa_Y": 1.0,
+      "PKS": 1.0,
+      "Hmax": 1.0,
+      "eps_S": 1.0,
+      "M0": 1.0,
+      "xi_D": 1.0,
+      "xi_1": 1.0,
+      "xi_2": 1.0,
+      "sigma_1": 1.0,
+      "sigma_2": 1.0,
+      "oob_r2": 1.0,
+      "rf_vs_campaign_r2": 1.0
+    },
+    "linear_calibration": false,
+    "require_subspace_rmse": false,
+    "alpha_subspace": 0.0,
+    "beta_complexity": 0.001,
+    "tier1_gamma": 1.0,
+    "linearity_penalty_gamma": 0.0,
+    "subspace_rmse_frac": 0.02,
+    "tier1_acceptance_median_rel": 0.1,
+    "rf_transform_features": true,
+    "rf_transform_n_samples": 650,
+    "rf_transform_n_estimators": 500,
+    "rf_transform_seed": 42
+  },
+
+  "ga": {
+    "paper_ga": true,
+    "allow_rbf": false,
+    "oscillatory_bias": false,
+    "population": 400,
+    "generations": 100,
+    "tournament_k": 10,
+    "crossover_prob": 0.6,
+    "mutation_prob": 0.3,
+    "direct_transfer_prob": 0.1,
+    "elitism_frac": 0.1,
+    "max_tree_depth": 10,
+    "fitness_stop_threshold": 0.001,
+    "early_reject_subspace_mult": 0.0
+  },
+
+  "sampling": {
+    "n_dense": null
+  },
+
+  "viz": {
+    "snapshot_every": 1,
+    "landscape_viz": false,
+    "landscape_every": 1,
+    "landscape_grid_n": 100,
+    "post_viz": true,
+    "grid_n": 36
+  },
+
+  "runtime": {
+    "eval_workers": null,
+    "log_level": "INFO",
+    "seed": null,
+    "quick": false
+  }
+}

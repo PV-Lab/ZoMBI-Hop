@@ -452,6 +452,7 @@ class ZoMBIHop:
             B=B_ellipsoid,
             needle_median_value=needle_median,
             reason=reason,
+            activation=int(getattr(dh, "current_activation", 0) or 0),
         )
 
         if self._needle_plot_points_ref is not None:

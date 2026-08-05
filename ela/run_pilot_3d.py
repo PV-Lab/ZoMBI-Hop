@@ -402,7 +402,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     log.info("Artifacts: %s", run_dir)
 
-    if cfg_resolved.post_viz:
+    if cfg_resolved.post_viz and int(ctx.dim) == 4:
+        try:
+            from ela.visualize_pilot_4d import visualize_run as visualize_run_4d
+
+            viz_dir = visualize_run_4d(run_dir, grid_n=min(cfg_resolved.grid_n, 44))
+            log.info("Visualization (4D): %s", viz_dir)
+        except Exception:
+            log.exception("4D visualization failed")
+    elif cfg_resolved.post_viz and int(ctx.dim) != 3:
+        log.warning(
+            "post_viz requested but dim=%d; only 3D ternary / 4D tetrahedron "
+            "summary plots are supported — skipping",
+            ctx.dim,
+        )
+    elif cfg_resolved.post_viz:
         try:
             viz_dir = visualize_run(run_dir, grid_n=cfg_resolved.grid_n)
             log.info("Visualization: %s", viz_dir)

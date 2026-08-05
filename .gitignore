@@ -2,38 +2,71 @@
 *.err
 *.out
 
+# ---------------------------------------------------------------------------
+# data/ — default ignore, allowlist only what must sync
+# ---------------------------------------------------------------------------
 data/*
+# Source campaigns + small ELA targets (keep in sync)
+!data/2nd_real_run.db
+!data/campaign1a.csv
+!data/run_9dfe.db
+!data/run_9dfe.csv
+!data/*_ela_full.json
+!data/*_lambda_target.json
+!data/run_9dfe_rf_meta.json
+!data/zombi-hop.png
+# (data/analysis/, data/legacy/, models, plots stay ignored via data/*)
+
+# ---------------------------------------------------------------------------
+# Hardware / interactive / optimizer run dumps
+# ---------------------------------------------------------------------------
+runs/
+actual_runs/
+old_stuff/
+results_2000/
+test_rfs/
+interactive_testing/*
+!interactive_testing/*.py
+
 optimize/pareto_front.png
+optimize/variance*
+optimize/runs/*
+# Leave the progress json so we can resume training
+!optimize/runs/mobo_*/mobo_progress.json
+!optimize/runs/mobo_*/run_config.json
+
+ela/runs/*
 hyperparameters/*
 htem/datasets/*
 llm/data/*
 llm/results/*
-ela/runs/*
 visualization/*.png
-warm_start/*
+synthetic_data/*.html
+
+# ---------------------------------------------------------------------------
+# warm_start/ — keep code; ignore sweep / basin / landscape artifacts
+# ---------------------------------------------------------------------------
+warm_start/runs/
+warm_start/optima_finder*/
+warm_start/basin_finder*/
+warm_start/optima_finder_gp/
+warm_start/pareto_plots/
 warm_start/optima_finder/*.png
-warm_start/runs/*
-warm_start/optima_finder_gp/*
-warm_start/pareto_plots/*
+warm_start/warm_gp_landscape/*.png
+warm_start/warm_gp_landscape/*.json
+
+# ---------------------------------------------------------------------------
+# Local scratch / backups
+# ---------------------------------------------------------------------------
+*.bak
+tmp_*.py
+noise.png
 
 # UV artifacts
 .python-version
 pyproject.toml
 requirements_clean.txt
 uv.lock
-
-data/campaign1a.csv
-optimize/variance*
-synthetic_data/*.html
-
-interactive_testing/*
-!interactive_testing/*.py
-runs/run_*/
-optimize/runs/*
-
-# Leave the progress json so we can resume training
-!optimize/runs/mobo_*/mobo_progress.json
-!optimize/runs/mobo_*/run_config.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -60,23 +93,20 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+.mplconfig/
 
-# SQLite DBs (runtime artifacts)
+# SQLite DBs (runtime artifacts outside allowlisted data/)
 sql/*.db
 
-# Checkpoints / runs (runtime artifacts)
-actual_runs/
-old_stuff/
-results_2000/
-test_rfs/
-
-# Large binaries
+# Checkpoints / large binaries / model caches
 *.pt
 *.pth
 *.pkl
 *.pickle
+*.joblib
 *.h5
 *.hdf5
 
 # babysitter runtime state (logs, crash reports, cooldown stamps, lock)
 optimize/scripts/.babysitter/
+optimize/scripts/logs/

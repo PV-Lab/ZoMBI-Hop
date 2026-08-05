@@ -9,6 +9,10 @@ Landscapes (``--landscape`` or batch JSON ``"landscape"`` field):
   • ``ela``          — Fixed ELA twin from ``ela/runs/ela_3d_<jobid>/best/oracle.py``
                        (batch JSON: ``job_id`` / ``ela_run``; see
                        ``optimize/mobo_batch_configs/ela_3d_18080791.json``)
+  • ``ela_multi``    — Same hyperparameters scored on several fixed ELA twins
+                       (batch JSON: ``"landscape": "ela_multi"``, ``"members": [...]``);
+                       the three MOBO metrics are averaged across members so one
+                       hparam set is tuned for all of them at once
 
 Objectives are selectable via ``--dataset``: RF (default, 3-simplex campaign1a
 surrogate), analytic negated-Ackley benchmarks on the 3-/4-/10-simplex
@@ -190,6 +194,7 @@ import warnings
 import numpy as np
 import torch
 import pandas as pd
+from pathlib import Path
 from sklearn.ensemble import RandomForestRegressor
 from scipy.optimize import minimize as sp_minimize
 from scipy.spatial import ConvexHull
@@ -717,10 +722,14 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
                      dataset: str | None = None,
                      ackley_variant: str | None = None,
                      ensemble_spec: dict | None = None,
+                     member_landscapes: list[LandscapeSpec] | None = None,
                      invocation: dict | None = None) -> None:
     """Persist the static run state needed for a fully non-interactive resume."""
     cfg = {
-        "landscape":       landscape.landscape,
+        "landscape":       (
+            "ela_multi" if member_landscapes and len(member_landscapes) >= 2
+            else landscape.landscape
+        ),
         "dim":             landscape.dim,
         "maximize":        bool(landscape.maximize),
         "true_optima":     [list(map(float, np.asarray(t).ravel())) for t in landscape.true_optima],
@@ -757,6 +766,20 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
         cfg["oracle"] = landscape.oracle
         if landscape.ela_run:
             cfg["ela_run"] = landscape.ela_run
+    if member_landscapes and len(member_landscapes) >= 2:
+        cfg["dataset"] = "ela_multi"
+        cfg["members"] = [
+            {
+                "ela_run": ls.ela_run,
+                "oracle": ls.oracle,
+                "maximize": bool(ls.maximize),
+                "true_optima": [
+                    list(map(float, np.asarray(t).ravel())) for t in ls.true_optima
+                ],
+            }
+            for ls in member_landscapes
+        ]
+        cfg["ela_n_members"] = len(member_landscapes)
     if ensemble_spec is not None:
         cfg["ensemble_random_per_run"] = True
         cfg["ensemble_seed"] = ensemble_spec["seed"]
@@ -874,6 +897,41 @@ def auto_detect_rf_optima(
     return chosen
 
 
+def _build_ela_landscape_from_cfg(
+    cfg: dict,
+    *,
+    repo_root: str,
+    time_limit: float | None,
+) -> LandscapeSpec:
+    """Build one ELA ``LandscapeSpec`` from a batch JSON (or ela_multi member)."""
+    ela_run = resolve_ela_run_dir(
+        ela_run=cfg.get("ela_run"),
+        job_id=cfg.get("job_id"),
+        oracle_path=cfg.get("oracle_path"),
+        repo_root=repo_root,
+    )
+    maximize = bool(cfg.get("maximize", True))
+    true_optima = None
+    if cfg.get("true_optima"):
+        true_optima = [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
+    auto = cfg.get("auto_optima") or {}
+    use_rf_g = bool(
+        cfg.get("use_rf_g")
+        or cfg.get("rf_transform")
+        or str(cfg.get("objective", "")).lower() in ("rf_g", "rf(g)", "ela_rf_g")
+    )
+    return build_ela_landscape(
+        ela_run,
+        maximize=maximize,
+        true_optima=true_optima,
+        n_peaks=int(auto.get("n_peaks", cfg.get("n_peaks", 3))),
+        min_sep=float(auto.get("min_sep", cfg.get("min_sep", 0.15))),
+        time_limit_hours=time_limit,
+        repo_root=repo_root,
+        use_rf_g=use_rf_g,
+    )
+
+
 def load_batch_config(path: str, script_dir: str) -> dict:
     """Load a headless run config JSON (paths resolved relative to repo root)."""
     cfg_path = os.path.abspath(path)
@@ -944,42 +1002,74 @@ def load_batch_config(path: str, script_dir: str) -> dict:
             "objective_column":  None,
         }
 
-    if landscape_type == "ela":
-        try:
-            ela_run = resolve_ela_run_dir(
-                ela_run=cfg.get("ela_run"),
-                job_id=cfg.get("job_id"),
-                oracle_path=cfg.get("oracle_path"),
-                repo_root=repo_root,
+    if landscape_type == "ela_multi":
+        members_cfg = cfg.get("members")
+        if not isinstance(members_cfg, list) or len(members_cfg) < 2:
+            sys.exit(
+                "--config: landscape 'ela_multi' requires 'members': [ {...}, {...} ] "
+                "with at least two ELA twin entries."
             )
-        except ValueError as exc:
-            sys.exit(f"--config: {exc}")
+        # Top-level maximize / use_rf_g / objective apply as defaults for members
+        # that omit those keys.
+        defaults = {
+            "maximize": cfg.get("maximize", True),
+            "use_rf_g": cfg.get("use_rf_g"),
+            "rf_transform": cfg.get("rf_transform"),
+            "objective": cfg.get("objective"),
+        }
+        member_landscapes: list[LandscapeSpec] = []
+        for i, raw in enumerate(members_cfg):
+            if not isinstance(raw, dict):
+                sys.exit(f"--config: members[{i}] must be an object.")
+            mcfg = {**defaults, **raw}
+            # Prefer an explicit per-member maximize when present.
+            if "maximize" not in raw and "maximize" in defaults:
+                mcfg["maximize"] = defaults["maximize"]
+            try:
+                ls = _build_ela_landscape_from_cfg(
+                    mcfg, repo_root=repo_root, time_limit=time_limit)
+            except (FileNotFoundError, ImportError, AttributeError, ValueError) as exc:
+                sys.exit(f"--config: ela_multi members[{i}] failed: {exc}")
+            member_landscapes.append(ls)
+            tag = Path(ls.ela_run).name if ls.ela_run else f"member_{i}"
+            print(f"  [batch] ela_multi[{i}] {tag}  d={ls.dim}  "
+                  f"oracle={ls.oracle}  n_optima={len(ls.true_optima)}")
+        dims = {ls.dim for ls in member_landscapes}
+        if len(dims) != 1:
+            sys.exit(f"--config: ela_multi members must share dim; got {sorted(dims)}")
+        landscape = member_landscapes[0]
+        print(f"  [batch] ela_multi: averaging MOBO metrics over "
+              f"{len(member_landscapes)} fixed ELA twins per trial")
+        return {
+            "name":              cfg.get("name") or os.path.splitext(os.path.basename(cfg_path))[0],
+            "landscape":         landscape,
+            "member_landscapes": member_landscapes,
+            "maximize":          bool(landscape.maximize),
+            "true_optima":       landscape.true_optima,
+            "max_trials":        cfg.get("max_trials"),
+            "time_limit_hours":  time_limit,
+            "n_init_trials":     cfg.get("n_init_trials", N_INIT_TRIALS),
+            "auto_optima":       None,
+            "config_path":       cfg_path,
+            "csv_path":          None,
+            "objective_column":  None,
+        }
+
+    if landscape_type == "ela":
         maximize = bool(cfg.get("maximize", True))
-        true_optima = None
-        if cfg.get("true_optima"):
-            true_optima = [np.asarray(t, dtype=float) for t in cfg["true_optima"]]
-        auto = cfg.get("auto_optima") or {}
-        use_rf_g = bool(
+        try:
+            landscape = _build_ela_landscape_from_cfg(
+                cfg, repo_root=repo_root, time_limit=time_limit)
+        except (FileNotFoundError, ImportError, AttributeError, ValueError) as exc:
+            sys.exit(f"--config: ELA landscape failed: {exc}")
+        true_optima = cfg.get("true_optima")
+        obj_tag = "RF(g)" if (
             cfg.get("use_rf_g")
             or cfg.get("rf_transform")
             or str(cfg.get("objective", "")).lower() in ("rf_g", "rf(g)", "ela_rf_g")
-        )
-        try:
-            landscape = build_ela_landscape(
-                ela_run,
-                maximize=maximize,
-                true_optima=true_optima,
-                n_peaks=int(auto.get("n_peaks", cfg.get("n_peaks", 3))),
-                min_sep=float(auto.get("min_sep", cfg.get("min_sep", 0.15))),
-                time_limit_hours=time_limit,
-                repo_root=repo_root,
-                use_rf_g=use_rf_g,
-            )
-        except (FileNotFoundError, ImportError, AttributeError, ValueError) as exc:
-            sys.exit(f"--config: ELA landscape failed: {exc}")
-        obj_tag = "RF(g)" if use_rf_g else "raw g(z)"
-        print(f"  [batch] ELA twin {ela_run.name}  d={landscape.dim}  "
-              f"objective={obj_tag}  oracle={landscape.oracle}")
+        ) else "raw g(z)"
+        print(f"  [batch] ELA twin {Path(landscape.ela_run).name if landscape.ela_run else '?'}  "
+              f"d={landscape.dim}  objective={obj_tag}  oracle={landscape.oracle}")
         print(f"  [batch] {len(landscape.true_optima)} reference "
               f"{'maxima' if maximize else 'minima'} "
               f"({'from JSON' if true_optima else 'auto-detected'})")
@@ -1427,9 +1517,19 @@ def _run_signature(cfg: dict) -> dict:
     before comparing, so older ensemble configs are still classified by their folder
     family. Fields absent in older configs come back as ``None`` and simply have to
     match ``None`` on both sides. Kept in sync with ``pareto._run_signature``.
+
+    ``ela_multi`` must win over a per-member ``oracle`` tag: joint-twin runs write
+    ``landscape="ela_multi"`` plus the first member's oracle for provenance, and
+    falling through to that oracle would incorrectly pool them with single-twin
+    ``ela`` MOBO runs (different objective — not averaged across members).
     """
+    landscape = cfg.get("landscape")
+    if landscape == "ela_multi" or cfg.get("dataset") == "ela_multi":
+        dataset = "ela_multi"
+    else:
+        dataset = cfg.get("dataset") or cfg.get("oracle") or landscape
     return {
-        "dataset": cfg.get("dataset") or cfg.get("oracle") or cfg.get("landscape"),
+        "dataset": dataset,
         "dim": int(cfg["dim"]) if cfg.get("dim") is not None else None,
         "time_limit_hours": cfg.get("time_limit_hours"),
         "maximize": bool(cfg.get("maximize", False)),
@@ -2047,8 +2147,50 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
     fig.clear()
 
 
-def plot_convergence(path: str, dh, maximize: bool) -> None:
-    """Save a convergence plot: all Y values, running best, needle vlines."""
+def running_best_per_activation(
+    Y: np.ndarray,
+    activations: np.ndarray | None = None,
+) -> np.ndarray:
+    """Running best of ``Y``, resetting at each activation boundary.
+
+    ``Y`` is always in higher-is-better orientation (minimize runs store negated
+    values). Penalized points still count — same rule as the global envelope.
+    When ``activations`` is None, falls back to a single global cummax.
+    """
+    Y = np.asarray(Y, dtype=float).ravel()
+    if Y.size == 0:
+        return Y.copy()
+    if activations is None:
+        return np.maximum.accumulate(Y)
+    act = np.asarray(activations).ravel()
+    if act.shape[0] != Y.shape[0]:
+        raise ValueError(
+            f"activations length {act.shape[0]} != Y length {Y.shape[0]}"
+        )
+    out = np.empty_like(Y)
+    # Preserve chronological order within each activation (points are stored
+    # sequentially, so flatnonzero is enough).
+    for a in np.unique(act):
+        idx = np.flatnonzero(act == a)
+        out[idx] = np.maximum.accumulate(Y[idx])
+    return out
+
+
+def plot_convergence(
+    path: str,
+    dh,
+    maximize: bool,
+    *,
+    activations: np.ndarray | None = None,
+) -> None:
+    """Save a convergence plot: all Y values, running best, needle vlines.
+
+    Running best **resets at each activation** when ``activations`` is given
+    (per-point activation ids, same length as ``Y``). Segments are drawn
+    separately so the line does not connect across hops. Without activations the
+    envelope is a single global cummax (legacy). Needle discoveries are marked
+    with a dotted red vertical line.
+    """
     Y_all = dh.Y_all.detach().cpu().numpy().ravel()
     if Y_all.size == 0:
         return
@@ -2075,16 +2217,42 @@ def plot_convergence(path: str, dh, maximize: bool) -> None:
     # a real objective measurement, so it must be able to raise the best-so-far.
     # Penalization only governs where MOBO samples next, not what counts as
     # observed — so it must not be excluded from the convergence envelope.
-    running_best = np.maximum.accumulate(Y_all)
-
-    ax.plot(idx, running_best, color="darkorange", lw=1.8,
-            label="running best", zorder=4)
+    # Reset per activation so each hop's local climb is visible; plot each
+    # activation as its own segment so a reset does not draw a connecting jump.
+    running_best = running_best_per_activation(Y_all, activations)
+    rb_label = (
+        "running best (per activation)" if activations is not None else "running best"
+    )
+    if activations is not None:
+        act = np.asarray(activations).ravel()
+        boundaries = np.flatnonzero(act[1:] != act[:-1]) + 1
+        starts = np.concatenate([[0], boundaries])
+        ends = np.concatenate([boundaries, [len(Y_all)]])
+        labeled_rb = False
+        for s, e in zip(starts, ends):
+            if e <= s:
+                continue
+            kw = dict(color="darkorange", lw=1.8, zorder=4)
+            if not labeled_rb:
+                kw["label"] = rb_label
+                labeled_rb = True
+            ax.plot(idx[s:e], running_best[s:e], **kw)
+        labeled_act = False
+        for b in boundaries:
+            kw = dict(color="0.55", alpha=0.45, lw=0.8, ls=":")
+            if not labeled_act:
+                kw["label"] = "activation start"
+                labeled_act = True
+            ax.axvline(float(b), **kw)
+    else:
+        ax.plot(idx, running_best, color="darkorange", lw=1.8,
+                label=rb_label, zorder=4)
 
     if needle_indices is not None:
         labeled = False
         for ni in needle_indices:
             if 0 <= ni < len(Y_all):
-                kw = dict(color="crimson", alpha=0.55, lw=0.9, ls="--")
+                kw = dict(color="crimson", alpha=0.85, lw=1.2, ls=":")
                 if not labeled:
                     kw["label"] = "needle found"
                     labeled = True
@@ -2092,13 +2260,96 @@ def plot_convergence(path: str, dh, maximize: bool) -> None:
 
     ax.set_xlabel("Sample index")
     ax.set_ylabel("Objective Y")
-    ax.set_title(f"Convergence  ({len(Y_all)} pts, "
+    n_act = (len(np.unique(activations)) if activations is not None else None)
+    act_bit = f", {n_act} activations" if n_act is not None else ""
+    ax.set_title(f"Convergence  ({len(Y_all)} pts{act_bit}, "
                  f"{len(needle_indices) if needle_indices is not None else 0} needles)",
                  fontsize=9)
     ax.legend(fontsize=7, loc="lower right")
     fig.tight_layout()
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_convergence_from_points_csv(
+    points_csv: str,
+    out_path: str | None = None,
+    *,
+    maximize: bool = True,
+) -> str | None:
+    """Rebuild ``convergence.png`` from a trial ``points.csv`` (activation reset).
+
+    Uses columns ``Y``, ``activation``, optional ``penalized``. Needle sample
+    indices are reconstructed from a sibling ``needles.csv`` by nearest
+    composition match (falling back to per-activation last point). Returns the
+    written path, or None if the CSV is unusable.
+    """
+    import pandas as pd
+
+    points_csv = os.path.abspath(points_csv)
+    trial_dir = os.path.dirname(points_csv)
+    out_path = out_path or os.path.join(trial_dir, "convergence.png")
+    try:
+        df = pd.read_csv(points_csv)
+    except Exception as exc:
+        print(f"  [recompile] skip {points_csv}: {exc}")
+        return None
+    if "Y" not in df.columns:
+        print(f"  [recompile] skip {points_csv}: no Y column")
+        return None
+    Y = df["Y"].to_numpy(dtype=float)
+    if Y.size == 0:
+        return None
+    activations = (
+        df["activation"].to_numpy(dtype=int) if "activation" in df.columns else None
+    )
+    pm = None
+    if "penalized" in df.columns:
+        # points.csv stores penalized as 1/0; plot uses True=valid mask.
+        pm = ~(df["penalized"].to_numpy(dtype=bool))
+
+    # Lightweight stand-in for a data handler so we can reuse plot_convergence.
+    class _DH:
+        pass
+
+    dh = _DH()
+    dh.Y_all = torch.as_tensor(Y)
+    dh.needle_indices = None
+    # Reconstruct needle sample indices from needles.csv:
+    #   1) nearest composition match in points.csv (robust when activation is NaN)
+    #   2) else last point of each needle's activation (when activation is present)
+    needles_csv = os.path.join(trial_dir, "needles.csv")
+    if os.path.isfile(needles_csv):
+        try:
+            nd = pd.read_csv(needles_csv)
+            idxs: list[int] = []
+            comp_cols = [c for c in ("FA", "MA", "Br") if c in df.columns and c in nd.columns]
+            if len(comp_cols) >= 2 and len(nd) > 0:
+                X = df[comp_cols].to_numpy(dtype=float)
+                for _, row in nd.iterrows():
+                    pt = np.asarray([row[c] for c in comp_cols], dtype=float)
+                    if np.any(~np.isfinite(pt)):
+                        continue
+                    d2 = ((X - pt) ** 2).sum(axis=1)
+                    idxs.append(int(np.argmin(d2)))
+            elif activations is not None and "activation" in nd.columns:
+                for a in nd["activation"].dropna().astype(int):
+                    hit = np.flatnonzero(activations == a)
+                    if hit.size:
+                        idxs.append(int(hit[-1]))
+            if idxs:
+                dh.needle_indices = torch.as_tensor(idxs, dtype=torch.long)
+        except Exception:
+            pass
+
+    def _mask():
+        if pm is None:
+            return None
+        return torch.as_tensor(pm)
+
+    dh.get_penalty_mask = _mask  # type: ignore[attr-defined]
+    plot_convergence(out_path, dh, maximize, activations=activations)
+    return out_path
 
 
 # ─── Per-trial artifact writers ────────────────────────────────────────────────
@@ -2371,7 +2622,8 @@ def _auto_generate_plots(trial_dir: str, dim: int) -> None:
         try:
             import coverage_plot
             coverage_plot.save_coverage_image(trial_dir)
-        except Exception as exc:
+        except BaseException as exc:
+            # coverage_plot may sys.exit on missing run_config — never abort the trial.
             print(f"    [trial] coverage_plot failed: {exc}")
 
 
@@ -2721,9 +2973,20 @@ def run_single_trial(
     # triggers an OOM kill. At dim ≥ 4 no frames are drawn, so heavy fields are
     # never kept.
     keep_heavy = landscape.render_ternary
+    # When set, render every iteration's ternary frame (with zoom bounds) during
+    # the run — used for timelapse rebuilds. Default stays final-frame-only to
+    # avoid the O(n_iters) wall-clock / RAM cost on long MOBO jobs.
+    save_all_frames = os.environ.get("ZOMBI_SAVE_ALL_FRAMES", "").strip().lower() in (
+        "1", "true", "yes",
+    )
     HEAVY_PAYLOAD_KEYS = (
         "pared_X", "pared_Y", "needle_M_list", "needle_B", "bounds", "gp_grid_vals",
     )
+    plots_dir_live = os.path.join(trial_dir, "plots")
+    if save_all_frames and landscape.render_ternary:
+        os.makedirs(plots_dir_live, exist_ok=True)
+        print("    [trial] ZOMBI_SAVE_ALL_FRAMES=1 — rendering every iteration "
+              "(zoom bounds timelapse)", flush=True)
 
     def obj_wrapper(x_tell, bounds, acq_fn):
         x_req, x_act, y = inner(x_tell, bounds, acq_fn)
@@ -2741,8 +3004,9 @@ def run_single_trial(
             n_points_before=(dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0),
         )
         if keep_heavy:
-            # Drop heavy fields from the prior payload — only the final one is rendered.
-            if payloads:
+            # Drop heavy fields from the prior payload — only the final one is
+            # rendered (unless ZOMBI_SAVE_ALL_FRAMES renders+strips live below).
+            if payloads and not save_all_frames:
                 for k in HEAVY_PAYLOAD_KEYS:
                     payloads[-1].pop(k, None)
             xp, yp = dh.X_pared, dh.Y_pared
@@ -2763,6 +3027,23 @@ def run_single_trial(
                               if dim == 3 else None),
             )
         payloads.append(payload)
+        if save_all_frames and keep_heavy and dim == 3 and grid_pts is not None:
+            try:
+                ref_title = (
+                    "Reference: oracle landscape"
+                    if landscape.landscape == "synthetic"
+                    else "Reference: RF landscape"
+                )
+                render_frame(
+                    payload, grid_pts, grid_vals, true_optima, maximize,
+                    os.path.join(plots_dir_live, f"iter_{payload['iter_num'] - 1:04d}.png"),
+                    ref_title=ref_title,
+                )
+            except Exception as exc:
+                print(f"    [trial] live frame {payload['iter_num']} failed: {exc}",
+                      flush=True)
+            for k in HEAVY_PAYLOAD_KEYS:
+                payload.pop(k, None)
         # Sample memory inside the timed loop so a mid-run RAM spike (which can
         # OOM-kill the job before the post-run summary prints) is visible.
         if call_counter[0] % MEM_LOG_EVERY == 0:
@@ -2872,7 +3153,14 @@ def run_single_trial(
     try:
         plot_dist_from_centre(os.path.join(trial_dir, "dist_from_centre.png"), dh, maximize)
         plot_line_length_hist(os.path.join(trial_dir, "line_length_hist.png"), payloads)
-        plot_convergence(os.path.join(trial_dir, "convergence.png"), dh, maximize)
+        n_pts = int(dh.Y_all.shape[0]) if dh.Y_all is not None else 0
+        act_arr, _ = _activation_zoom_per_point(n_pts, snap_records)
+        plot_convergence(
+            os.path.join(trial_dir, "convergence.png"),
+            dh,
+            maximize,
+            activations=act_arr if n_pts else None,
+        )
     except Exception as exc:
         print(f"    [trial] static plot failed: {exc}")
 
@@ -2884,24 +3172,28 @@ def run_single_trial(
     if landscape.render_ternary and grid_pts is not None and grid_vals is not None and payloads:
         plots_dir = os.path.join(trial_dir, "plots")
         os.makedirs(plots_dir, exist_ok=True)
-        # Only render the final iteration's frame per run — the full per-iteration
-        # sweep dominates wall-clock (each frame re-plots the accumulated cloud, so
-        # cost grows with iteration count). Videos are built separately (make_videos.py).
-        p = payloads[-1]
-        print("    [trial] rendering final ternary frame …", flush=True)
-        try:
-            ref_title = (
-                "Reference: oracle landscape"
-                if landscape.landscape == "synthetic"
-                else "Reference: RF landscape"
-            )
-            render_frame(
-                p, grid_pts, grid_vals, true_optima, maximize,
-                os.path.join(plots_dir, f"iter_{p['iter_num'] - 1:04d}.png"),
-                ref_title=ref_title,
-            )
-        except Exception as exc:
-            print(f"    [trial] frame {p['iter_num']} failed: {exc}")
+        # Default: only the final iteration (full sweep is O(n_iters) and dominated
+        # MOBO wall-clock). ZOMBI_SAVE_ALL_FRAMES=1 renders live in obj_wrapper.
+        if not save_all_frames:
+            p = payloads[-1]
+            print("    [trial] rendering final ternary frame …", flush=True)
+            try:
+                ref_title = (
+                    "Reference: oracle landscape"
+                    if landscape.landscape == "synthetic"
+                    else "Reference: RF landscape"
+                )
+                render_frame(
+                    p, grid_pts, grid_vals, true_optima, maximize,
+                    os.path.join(plots_dir, f"iter_{p['iter_num'] - 1:04d}.png"),
+                    ref_title=ref_title,
+                )
+            except Exception as exc:
+                print(f"    [trial] frame {p['iter_num']} failed: {exc}")
+        else:
+            n_frames = len(glob.glob(os.path.join(plots_dir, "iter_*.png")))
+            print(f"    [trial] all-frames mode: {n_frames} iter_*.png already on disk",
+                  flush=True)
 
     if dim == 4 and hasattr(fn_callable, "predict"):
         try:
@@ -2926,6 +3218,11 @@ def run_single_trial(
     # over run until Slurm OOM-kills the job (see _reclaim_memory).
     dh.take_snapshot = orig_snap        # break the snap_wrap closure over dh
     dh_ref[0] = None
+    gp_ref[0] = None
+    # Drop heavy payload tensors before reclaim (result keeps only light fields).
+    for p in payloads:
+        for k in HEAVY_PAYLOAD_KEYS:
+            p.pop(k, None)
     del optimizer, dh, sim_obj, inner, snap_records
     _reclaim_memory()
 
@@ -2972,11 +3269,13 @@ def evaluate_hparams(
     ackley_variant: str | None = None,
     ensemble_spec: dict | None = None,
     warm_landscape: LandscapeSpec | None = None,
+    member_landscapes: list[LandscapeSpec] | None = None,
 ) -> dict:
     """Evaluate one hyperparameter set and return the metrics MOBO scores against.
 
-    For every dataset except the re-randomized ``ensemble``, this is a single
-    ``run_single_trial`` writing its artifacts straight into ``trial_dir``.
+    For every dataset except the re-randomized ``ensemble`` / fixed ``ela_multi``,
+    this is a single ``run_single_trial`` writing its artifacts straight into
+    ``trial_dir``.
 
     For ``ensemble`` it instead evaluates the same hyperparameters on
     ``ENSEMBLE_N_REPEATS`` independently randomized landscapes — each in its own
@@ -2988,12 +3287,76 @@ def evaluate_hparams(
     list in ``trial.json``). The returned ``runtime``/``n_iters`` are summed over
     the repeats (whole-trial cost), and ``repeats`` holds each repeat's metrics.
 
+    For ``ela_multi`` (``member_landscapes`` with ≥2 fixed ELA twins) the same
+    average-over-``run_<k>`` pattern is used, but each ``k`` is a fixed twin rather
+    than a freshly randomized ensemble draw — so one hparam set is scored jointly
+    on all members.
+
     ``warm_landscape`` turns this into the **mixture** evaluation: the ensemble
     repeats run as above, then the SAME hyperparameters are scored once on the
     fixed warm-start GP landscape (``trial_<n>/run_warm/``), and the two are blended
     50/50 per metric — ensemble-mean vs. warm-start — so the tuned hyperparameters
     are good on both. Requires ``ensemble_spec`` (mixture = ensemble ⊕ warm start).
     """
+    if member_landscapes is not None and len(member_landscapes) >= 2:
+        os.makedirs(trial_dir, exist_ok=True)
+        n_members = len(member_landscapes)
+        configs: list[dict] = []
+        repeats: list[dict] = []
+        for k, ls in enumerate(member_landscapes, start=1):
+            meta = {
+                "ela_run": ls.ela_run,
+                "oracle": ls.oracle,
+                "n_optima": len(ls.true_optima),
+            }
+            configs.append(meta)
+            run_dir = os.path.join(trial_dir, f"run_{k}")
+            ckpt = os.path.join(run_dir, "metrics.json")
+            tag = Path(ls.ela_run).name if ls.ela_run else f"member_{k}"
+
+            cached = _load_repeat_metrics(ckpt, k)
+            if cached is not None:
+                print(f"    [ela_multi {k}/{n_members} {tag}] already complete — "
+                      f"reusing saved metrics (resume)", flush=True)
+                repeats.append(cached)
+                continue
+
+            if os.path.isdir(run_dir):
+                shutil.rmtree(run_dir, ignore_errors=True)
+            print(f"    [ela_multi {k}/{n_members} {tag}]", flush=True)
+            r = run_single_trial(
+                hparams, ls, run_dir, ackley_variant=ackley_variant)
+            rep = {
+                "run": k,
+                "ela_run": ls.ela_run,
+                "dist": round(r["dist"], 6),
+                "dup": round(r["dup"], 6),
+                "avg_time_per_iter": round(r["avg_time_per_iter"], 4),
+                "runtime": round(r["runtime"], 3),
+                "n_iters": int(r["n_iters"]),
+                "n_points": int(r["n_points"]),
+            }
+            repeats.append(rep)
+            _atomic_write_text(ckpt, json.dumps(rep, indent=2))
+            del r
+            _reclaim_memory()
+
+        ens_dist = float(np.mean([r["dist"] for r in repeats]))
+        ens_dup = float(np.mean([r["dup"] for r in repeats]))
+        ens_avg_t = float(np.mean([r["avg_time_per_iter"] for r in repeats]))
+        runtime = float(np.sum([r["runtime"] for r in repeats]))
+        n_iters = int(np.sum([r["n_iters"] for r in repeats]))
+        ens_n_points = float(np.mean([r["n_points"] for r in repeats]))
+        print(f"    [trial] ela_multi avg over {n_members} twins — "
+              f"dist={ens_dist:.4f}  dup={ens_dup:.4f}  t/iter={ens_avg_t:.3f}s  "
+              f"points={ens_n_points:.1f}")
+        return {
+            "dist": ens_dist, "dup": ens_dup, "runtime": runtime,
+            "avg_time_per_iter": ens_avg_t, "n_iters": n_iters,
+            "n_points": ens_n_points, "payloads": [], "ackley_seed": None,
+            "ensemble_config": None, "ensemble_configs": configs, "repeats": repeats,
+        }
+
     if ensemble_spec is None:
         return run_single_trial(
             hparams, landscape, trial_dir, ackley_variant=ackley_variant)
@@ -3200,7 +3563,8 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
              n_init_trials: int = N_INIT_TRIALS,
              ackley_variant: str | None = None,
              ensemble_spec: dict | None = None,
-             warm_landscape: LandscapeSpec | None = None) -> None:
+             warm_landscape: LandscapeSpec | None = None,
+             member_landscapes: list[LandscapeSpec] | None = None) -> None:
     """Unbounded MOBO loop, writing trials into a fresh ``run_dir``."""
     bounds = torch.zeros(2, N_HPARAMS, dtype=DTYPE, device=DEVICE)
     bounds[1] = 1.0
@@ -3345,13 +3709,18 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
             trial_num = n_done + 1
             trial_dir = os.path.join(run_dir, f"trial_{trial_num}")
             pending_path = os.path.join(trial_dir, "pending.json")
-            # An ensemble trial whose folder exists with a saved pending.json but
-            # no trial.json was interrupted partway through its repeats. Resume it
-            # with the IDENTICAL hyperparameters (a BO re-proposal would differ
-            # from the GP, mixing hparams across the averaged repeats), letting
-            # evaluate_hparams reuse the completed run_<k> and run only the rest.
-            resume_pending = (
+            # An ensemble / ela_multi trial whose folder exists with a saved
+            # pending.json but no trial.json was interrupted partway through its
+            # repeats. Resume it with the IDENTICAL hyperparameters (a BO
+            # re-proposal would differ from the GP, mixing hparams across the
+            # averaged repeats), letting evaluate_hparams reuse the completed
+            # run_<k> and run only the rest.
+            multi_eval = (
                 ensemble_spec is not None
+                or (member_landscapes is not None and len(member_landscapes) >= 2)
+            )
+            resume_pending = (
+                multi_eval
                 and os.path.exists(pending_path)
                 and not os.path.exists(os.path.join(trial_dir, "trial.json"))
             )
@@ -3366,6 +3735,11 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                 elif use_init:
                     x_new = init_design[n_done][0].detach().cpu().clone()
                 else:
+                    # Free ZoMBI leftovers before the MOBO GP / qLogNEHVI step —
+                    # ela_multi trials leave a large CUDA allocator footprint.
+                    _reclaim_memory()
+                    log_resource_usage(
+                        f"before MOBO propose (n_obs={len(X_prior) + len(X_obs)})")
                     X_t = torch.stack(X_prior + X_obs).to(DEVICE)
                     Y_t = torch.stack(Y_prior + Y_obs).to(DEVICE)
                     span = (Y_t.max(dim=0).values - Y_t.min(dim=0).values).clamp(min=1e-6)
@@ -3377,12 +3751,45 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                     )
                     mll = ExactMarginalLogLikelihood(model.likelihood, model)
                     fit_gpytorch_mll(mll)
-                    acq = qLogNEHVI(model=model, ref_point=ref_point, X_baseline=X_t)
-                    candidate, _ = optimize_acqf(
-                        acq_function=acq, bounds=bounds.to(DEVICE), q=1,
-                        num_restarts=N_MOBO_RESTARTS, raw_samples=N_MOBO_SAMPLES,
+                    # prune_baseline keeps only likely Pareto points in X_baseline
+                    # — critical once --share-history grows the observation set.
+                    acq = qLogNEHVI(
+                        model=model, ref_point=ref_point, X_baseline=X_t,
+                        prune_baseline=True,
                     )
+                    # Shrink raw_samples / batch_limit on CUDA OOM rather than
+                    # aborting the whole MOBO chain.
+                    raw_samples = N_MOBO_SAMPLES
+                    batch_limit = 5
+                    candidate = None
+                    last_oom: BaseException | None = None
+                    while raw_samples >= 32 and batch_limit >= 1:
+                        try:
+                            candidate, _ = optimize_acqf(
+                                acq_function=acq, bounds=bounds.to(DEVICE), q=1,
+                                num_restarts=N_MOBO_RESTARTS, raw_samples=raw_samples,
+                                options={"batch_limit": batch_limit, "maxiter": 200},
+                            )
+                            last_oom = None
+                            break
+                        except torch.cuda.OutOfMemoryError as oom:
+                            last_oom = oom
+                            print(f"    [mobo] CUDA OOM in optimize_acqf "
+                                  f"(raw_samples={raw_samples}, "
+                                  f"batch_limit={batch_limit}); retrying smaller …",
+                                  flush=True)
+                            candidate = None
+                            _reclaim_memory()
+                            if batch_limit > 1:
+                                batch_limit = max(1, batch_limit // 2)
+                            else:
+                                raw_samples //= 2
+                    if candidate is None:
+                        raise last_oom if last_oom is not None else RuntimeError(
+                            "optimize_acqf failed without a candidate")
                     x_new = candidate.squeeze(0).detach().cpu()
+                    del candidate, acq, mll, model, X_t, Y_t
+                    _reclaim_memory()
 
                 hparams = norm_to_hparams(x_new)
                 hp_str = "  ".join(f"{k}={round(v,4) if isinstance(v,float) else v}"
@@ -3390,11 +3797,11 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                 print(f"\n[trial {trial_num} | {phase}]  {hp_str}", flush=True)
 
                 # Persist the chosen hyperparameters BEFORE running any (costly)
-                # ensemble repeat, so a requeue mid-trial resumes these exact
+                # multi-landscape repeat, so a requeue mid-trial resumes these exact
                 # hparams and reuses already-finished repeats. Only meaningful for
-                # the multi-repeat ensemble dataset (single-eval datasets rewrite
-                # the trial dir wholesale and cannot resume mid-trial).
-                if ensemble_spec is not None and not resume_pending:
+                # multi-eval datasets (single-eval datasets rewrite the trial dir
+                # wholesale and cannot resume mid-trial).
+                if multi_eval and not resume_pending:
                     os.makedirs(trial_dir, exist_ok=True)
                     _atomic_write_text(pending_path, json.dumps(
                         {"trial": trial_num, "phase": phase,
@@ -3403,7 +3810,8 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                 res = evaluate_hparams(
                     hparams, landscape, trial_dir, trial_num,
                     ackley_variant=ackley_variant, ensemble_spec=ensemble_spec,
-                    warm_landscape=warm_landscape)
+                    warm_landscape=warm_landscape,
+                    member_landscapes=member_landscapes)
 
                 # A trial that completed zero ZoMBI iterations (e.g. ZoMBI
                 # crashed before the first iteration; the crash is swallowed in
@@ -3701,10 +4109,14 @@ def _launch_run(runs_dir, landscape: LandscapeSpec, max_trials,
                 ackley_variant: str | None = None,
                 ensemble_spec: dict | None = None,
                 warm_landscape: LandscapeSpec | None = None,
+                member_landscapes: list[LandscapeSpec] | None = None,
                 invocation: dict | None = None) -> None:
     """Create a fresh runs/mobo_* folder, persist its config, and run MOBO."""
     if run_dir is None:
-        run_dir = unique_run_dir(runs_dir, _run_dir_prefix(dataset, landscape.dim))
+        prefix = _run_dir_prefix(dataset, landscape.dim)
+        if member_landscapes and len(member_landscapes) >= 2:
+            prefix = f"mobo_ela_multi_{landscape.dim}d"
+        run_dir = unique_run_dir(runs_dir, prefix)
     else:
         os.makedirs(run_dir, exist_ok=True)
     if invocation is not None:
@@ -3715,13 +4127,15 @@ def _launch_run(runs_dir, landscape: LandscapeSpec, max_trials,
         n_init_trials=n_init_trials,
         dataset=dataset, ackley_variant=ackley_variant,
         ensemble_spec=ensemble_spec,
+        member_landscapes=member_landscapes,
         invocation=invocation,
     )
     print(f"\n[run] Output folder: {run_dir}")
     run_mobo(landscape, run_dir, max_trials=max_trials,
              seed_X=seed_X, X_prior=X_prior, Y_prior=Y_prior,
              n_init_trials=n_init_trials, ackley_variant=ackley_variant,
-             ensemble_spec=ensemble_spec, warm_landscape=warm_landscape)
+             ensemble_spec=ensemble_spec, warm_landscape=warm_landscape,
+             member_landscapes=member_landscapes)
 
 
 
@@ -3890,7 +4304,10 @@ def main() -> None:
         n_init = batch.get("n_init_trials") or args.n_init_trials or N_INIT_TRIALS
         _apply_runtime_overrides(
             device=args.device,
-            time_limit_hours=batch.get("time_limit_hours") or time_limit_override,
+            time_limit_hours=(
+                time_limit_override if time_limit_override is not None
+                else batch.get("time_limit_hours")
+            ),
         )
         max_trials = (
             args.max_trials
@@ -3905,13 +4322,23 @@ def main() -> None:
         print("=" * 70)
 
         optima_note = ""
+        member_landscapes = batch.get("member_landscapes")
         if batch.get("landscape") is not None:
             landscape = batch["landscape"]
-            if landscape.time_limit_hours is None and TIME_LIMIT_HOURS is not None:
-                pass  # Ackley uses max_activations
-            elif batch.get("time_limit_hours") is not None:
-                landscape.time_limit_hours = batch["time_limit_hours"]
-            optima_note = "true_optima: planted by landscape builder (batch JSON)"
+            # Prefer CLI --time-limit when given; else batch JSON; else leave as built.
+            tl = time_limit_override if time_limit_override is not None else batch.get("time_limit_hours")
+            if tl is not None:
+                landscape.time_limit_hours = float(tl)
+                if member_landscapes:
+                    for ls in member_landscapes:
+                        ls.time_limit_hours = float(tl)
+            if member_landscapes and len(member_landscapes) >= 2:
+                optima_note = (
+                    f"true_optima: per-member needles from batch JSON "
+                    f"({len(member_landscapes)} ELA twins; metrics averaged)"
+                )
+            else:
+                optima_note = "true_optima: planted by landscape builder (batch JSON)"
         else:
             csv_path = batch["csv_path"]
             obj_col = batch["objective_column"]
@@ -3964,14 +4391,30 @@ def main() -> None:
             )
 
         if landscape.landscape in ("synthetic", "ela"):
-            for i, p in enumerate(landscape.true_optima):
-                print(f"  peak {i + 1}: {np.round(p, 4).tolist()}")
+            if member_landscapes and len(member_landscapes) >= 2:
+                for mi, ls in enumerate(member_landscapes):
+                    tag = Path(ls.ela_run).name if ls.ela_run else f"member_{mi}"
+                    print(f"  member {mi + 1}/{len(member_landscapes)}: {tag}")
+                    for i, p in enumerate(ls.true_optima):
+                        print(f"    peak {i + 1}: {np.round(p, 4).tolist()}")
+            else:
+                for i, p in enumerate(landscape.true_optima):
+                    print(f"  peak {i + 1}: {np.round(p, 4).tolist()}")
         stop = (
             f"time limit/trial: {landscape.time_limit_hours} h"
             if landscape.time_limit_hours is not None
             else f"max_activations/trial: {landscape.max_activations}"
         )
-        print(f"  {landscape.label}  |  {stop}")
+        if member_landscapes and len(member_landscapes) >= 2:
+            print(f"  ELA multi ({len(member_landscapes)} twins)  |  "
+                  f"{stop} per twin  |  metrics averaged")
+        else:
+            print(f"  {landscape.label}  |  {stop}")
+
+        seed_X: list[torch.Tensor] = []
+        if args.start_from_best:
+            print("\n[seed] Loading 'start from best' hyperparameters to re-evaluate …")
+            seed_X = load_seed_hparams(args.start_from_best)
 
         resolutions: list[str] = []
         if args.device:
@@ -3980,15 +4423,10 @@ def main() -> None:
             resolutions.append(
                 f"device: auto (cuda_available={torch.cuda.is_available()}) -> {DEVICE}"
             )
-        if batch.get("time_limit_hours") is not None:
-            resolutions.append(
-                f"time_limit_hours: batch JSON ({batch['time_limit_hours']}) "
-                f"(CLI --time-limit-hours ignored)"
-                if time_limit_override is not None else
-                f"time_limit_hours: batch JSON ({batch['time_limit_hours']})"
-            )
-        elif time_limit_override is not None:
+        if time_limit_override is not None:
             resolutions.append(f"time_limit_hours: CLI ({time_limit_override})")
+        elif batch.get("time_limit_hours") is not None:
+            resolutions.append(f"time_limit_hours: batch JSON ({batch['time_limit_hours']})")
         else:
             resolutions.append(f"time_limit_hours: default ({TIME_LIMIT_HOURS})")
         if args.max_trials is not None:
@@ -4005,6 +4443,10 @@ def main() -> None:
             resolutions.append(f"n_init_trials: default ({n_init})")
         if optima_note:
             resolutions.append(optima_note)
+        if member_landscapes and len(member_landscapes) >= 2:
+            resolutions.append(
+                f"ela_multi: average dist/dup/time over {len(member_landscapes)} fixed twins"
+            )
 
         invocation = build_invocation_log(
             argv=sys.argv,
@@ -4018,8 +4460,10 @@ def main() -> None:
         )
         _launch_run(
             runs_dir, landscape, max_trials,
+            seed_X=seed_X,
             batch_name=batch_name, batch_config_path=batch_config_path,
             run_dir=run_dir_override, n_init_trials=n_init,
+            member_landscapes=member_landscapes,
             invocation=invocation,
         )
         return

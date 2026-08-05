@@ -19,11 +19,12 @@ import csv
 import glob
 import os
 import re
+import shutil
+import subprocess
 import sys
 
 import numpy as np
 
-import imageio.v2 as iio
 from PIL import Image as PILImage, ImageDraw, ImageFont
 
 VIDEO_TARGET_DURATION_S = 60.0
@@ -33,6 +34,75 @@ VIDEO_MAX_FPS           = 60.0
 POINTS_PER_ITERATION = 24
 N_INIT_LINES         = 2
 INIT_POINTS          = N_INIT_LINES * POINTS_PER_ITERATION
+
+
+def _read_rgb(path: str) -> np.ndarray:
+    """Load an RGB uint8 frame (imageio if present, else Pillow)."""
+    try:
+        import imageio.v2 as iio
+        return iio.imread(path)[:, :, :3]
+    except Exception:
+        return np.asarray(PILImage.open(path).convert("RGB"))
+
+
+def _write_mp4_imageio(frames: list[np.ndarray], out_path: str, fps: float) -> bool:
+    try:
+        import imageio.v2 as iio
+    except ImportError:
+        return False
+    try:
+        iio.mimwrite(out_path, frames, fps=fps, codec="libx264", macro_block_size=None)
+        return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+    except Exception as exc:
+        print(f"    [video] imageio failed: {exc}")
+        return False
+
+
+def _write_mp4_cv2(frames: list[np.ndarray], out_path: str, fps: float) -> bool:
+    try:
+        import cv2
+    except ImportError:
+        return False
+    h, w = frames[0].shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h))
+    if not writer.isOpened():
+        return False
+    try:
+        for img in frames:
+            writer.write(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+    return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+
+
+def _write_mp4_ffmpeg(frames: list[np.ndarray], out_path: str, fps: float) -> bool:
+    """Pipe raw RGB frames to system ffmpeg (no imageio needed)."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    h, w = frames[0].shape[:2]
+    cmd = [
+        ffmpeg, "-y",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{w}x{h}", "-r", f"{fps:.4f}",
+        "-i", "-",
+        "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        out_path,
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        assert proc.stdin is not None
+        for img in frames:
+            proc.stdin.write(np.ascontiguousarray(img, dtype=np.uint8).tobytes())
+        proc.stdin.close()
+        rc = proc.wait(timeout=600)
+    except Exception as exc:
+        print(f"    [video] ffmpeg failed: {exc}")
+        return False
+    return rc == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0
 
 
 def resolve_run_dir(arg: str, runs_dir: str) -> str:
@@ -86,8 +156,8 @@ def _stamp_counter(img: np.ndarray, text: str) -> np.ndarray:
 def make_video_from_dir(plots_dir: str, out_path: str) -> bool:
     """Compile iter_*.png frames in plots_dir into a ~60s MP4 at out_path.
 
-    Returns True on success. Tries imageio+ffmpeg (h264) then OpenCV; both paths
-    verify the output is non-empty, since ffmpeg/cv2 can fail without raising.
+    Returns True on success. Tries imageio+ffmpeg, then OpenCV, then system
+    ffmpeg CLI. Verifies the output is non-empty.
     """
     frames = sorted(glob.glob(os.path.join(plots_dir, "iter_*.png")))
     if not frames:
@@ -100,10 +170,7 @@ def make_video_from_dir(plots_dir: str, out_path: str) -> bool:
         h, w = img.shape[:2]
         return img[: h - (h % 2), : w - (w % 2)]
 
-    def _ok() -> bool:
-        return os.path.exists(out_path) and os.path.getsize(out_path) > 0
-
-    imgs = [iio.imread(f)[:, :, :3] for f in frames]
+    imgs = [_read_rgb(f) for f in frames]
     h, w = imgs[0].shape[:2]
     fixed = []
     for i, img in enumerate(imgs):
@@ -113,11 +180,17 @@ def make_video_from_dir(plots_dir: str, out_path: str) -> bool:
         if n_pts > 0:
             img = _stamp_counter(img, f"Points sampled: {n_pts}")
         fixed.append(_even(img))
-    iio.mimwrite(out_path, fixed, fps=fps, codec="libx264", macro_block_size=None)
-    if not _ok():
-        raise RuntimeError("imageio/ffmpeg produced an empty file")
-    print(f"    [video] {out_path}  ({len(frames)} frames @ {fps:.2f} fps)")
-    return True
+
+    for writer, name in (
+        (_write_mp4_imageio, "imageio"),
+        (_write_mp4_cv2, "cv2"),
+        (_write_mp4_ffmpeg, "ffmpeg"),
+    ):
+        if writer(fixed, out_path, fps):
+            print(f"    [video] {out_path}  ({len(frames)} frames @ {fps:.2f} fps via {name})")
+            return True
+    print(f"    [video] FAILED to write {out_path} (tried imageio, cv2, ffmpeg)")
+    return False
 
 
 def regenerate_videos(run_dir: str, force: bool = False) -> None:

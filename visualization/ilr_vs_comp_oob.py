@@ -15,7 +15,7 @@ Usage
 -----
   python visualization/ilr_vs_comp_oob.py
   python visualization/ilr_vs_comp_oob.py --db data/2nd_real_run.db \\
-      --out-dir data/2nd_real_run_ilr_vs_comp
+      --out-dir data/analysis/2nd_real_run_ilr_vs_comp
 """
 from __future__ import annotations
 
@@ -212,7 +212,7 @@ def main() -> None:
 
     db_path = _resolve_db_path(args.db)
     properties = [p.strip() for p in args.properties.split(",") if p.strip()]
-    out_dir = args.out_dir or (db_path.parent / f"{db_path.stem}_ilr_vs_comp")
+    out_dir = args.out_dir or (ROOT / "data" / "analysis" / f"{db_path.stem}_ilr_vs_comp")
 
     X, ys = load_db_all_properties(db_path, properties)
     results = compare_spaces(X, ys, args.n_estimators)

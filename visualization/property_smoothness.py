@@ -15,7 +15,7 @@ Usage
 -----
   conda activate zombi-hop
   python visualization/property_smoothness.py
-  python visualization/property_smoothness.py --db data/2nd_real_run.db --out-dir data/2nd_real_run_smoothness
+  python visualization/property_smoothness.py --db data/2nd_real_run.db --out-dir data/analysis/2nd_real_run_smoothness
 """
 from __future__ import annotations
 
@@ -344,7 +344,7 @@ def main() -> None:
 
     db_path = _resolve_db_path(args.db)
     properties = [p.strip() for p in args.properties.split(",") if p.strip()]
-    out_dir = args.out_dir or (db_path.parent / f"{db_path.stem}_smoothness")
+    out_dir = args.out_dir or (ROOT / "data" / "analysis" / f"{db_path.stem}_smoothness")
 
     print(f"Database   : {db_path}")
     print(f"Properties : {properties}")

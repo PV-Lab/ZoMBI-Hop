@@ -622,7 +622,12 @@ def run_evolution(
 
     pop = _init_population(rng, ctx, cfg)
     landscape_cache = None
-    if cfg.landscape_viz:
+    if cfg.landscape_viz and int(ctx.dim) != 3:
+        logger.warning(
+            "landscape_viz requested but dim=%d; ternary plots only support 3D — skipping",
+            ctx.dim,
+        )
+    elif cfg.landscape_viz:
         from ela.visualize_pilot_3d import LandscapePlotCache
 
         logger.info("Building landscape plot cache (grid_n=%d)", cfg.landscape_grid_n)

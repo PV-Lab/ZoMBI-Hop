@@ -236,9 +236,16 @@ def _run_signature(cfg: dict) -> dict:
     a ZoMBI run of the same dataset/dim. Fields absent in older configs come back as
     ``None`` and simply have to match ``None`` on both sides. Kept in sync with
     ``run_mobo._run_signature``.
+
+    ``ela_multi`` must win over a per-member ``oracle`` (see run_mobo._run_signature).
     """
+    landscape = cfg.get("landscape")
+    if landscape == "ela_multi" or cfg.get("dataset") == "ela_multi":
+        dataset = "ela_multi"
+    else:
+        dataset = cfg.get("dataset") or cfg.get("oracle") or landscape
     return {
-        "dataset": cfg.get("dataset") or cfg.get("oracle") or cfg.get("landscape"),
+        "dataset": dataset,
         "dim": int(cfg["dim"]) if cfg.get("dim") is not None else None,
         "time_limit_hours": cfg.get("time_limit_hours"),
         "maximize": bool(cfg.get("maximize", False)),

@@ -11,7 +11,9 @@ import numpy as np
 import torch
 from scipy.spatial import cKDTree
 
-UNMATCHED_PENALTY = 10.0
+# Soft unmatched cost ≈ half the 3-simplex L2 diameter (√2 / 2).
+# Legacy value was 10.0, which made |n_disc − n_opt| dominate geometry.
+UNMATCHED_PENALTY = 0.7071067811865476  # ≈ √2 / 2
 MATCH_RADIUS = 0.05
 # Input-noise scale (per-component composition std) used for the duplicate-sample
 # radius; matched to the measured average input noise of data/2nd_real_run.db.

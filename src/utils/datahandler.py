@@ -995,6 +995,7 @@ class DataHandler:
         B: Optional[torch.Tensor] = None,
         needle_median_value: Optional[float] = None,
         reason: Optional[str] = None,
+        activation: Optional[int] = None,
     ):
         """Record a discovered needle (local optimum) and update penalty mask.
 
@@ -1027,10 +1028,13 @@ class DataHandler:
             elif self.needle_B is None:
                 self.needle_B = get_tangent_basis(self.d, self.device, self.dtype)
 
+        if activation is None:
+            activation = int(getattr(self, "current_activation", 0) or 0)
         self.needles_results.append({
             'point': needle.clone(),
             'value': needle_value,
             'median_value': needle_median_value,
+            'activation': int(activation),
             'zoom': zoom,
             'iteration': iteration,
             'reason': reason,

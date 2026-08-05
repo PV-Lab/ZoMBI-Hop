@@ -972,7 +972,7 @@ def deterministic_physics_extraction(experiment,use_physics_mod=True,use_j0=True
 # first d modules; the remaining modules stay at zero and are ignored on the way
 # back out.
 
-# Print parameters for the simulated hardware (mirrors optimize/debugging.py).
+# Print parameters for the simulated hardware.
 PHYSICS_PLATE              = "Front"
 PHYSICS_MAX_FLOW           = 490
 PHYSICS_START_STEP         = 0
@@ -1013,7 +1013,7 @@ def physics_simulate_line(
         physics model produces (``total_num_drops``); if it differs the result is
         linearly resampled to ``num_points``.
     plate, max_flow, start_step, grad_interval_time :
-        Hardware print parameters (defaults mirror optimize/debugging.py).
+        Hardware print parameters.
     device, dtype :
         If torch is available the result is returned as a torch tensor on this
         device/dtype; otherwise a numpy array is returned.

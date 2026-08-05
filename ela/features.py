@@ -205,7 +205,7 @@ def load_campaign_rows(
             raise RuntimeError(
                 f"{db_path.resolve()} has no 'results' table (found: {tables or 'none'}; "
                 f"size={db_path.stat().st_size} bytes). "
-                "data/ is gitignored — copy the real ~5.5 MB campaign DB from your workstation:\n"
+                "Allowlisted campaign DBs live under data/ (see .gitignore). Sync with:\n"
                 "  rsync -av --progress data/2nd_real_run.db "
                 "eve_lal@login007:~/orcd/scratch/ZoMBI-Hop/data/"
             ) from exc
