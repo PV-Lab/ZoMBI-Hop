@@ -78,6 +78,11 @@ The ``Ensemble`` class exposes ``predict(X)`` with the scikit-learn-style
 ``(N, d) -> (N,)`` signature, plus ``known_maxima`` and ``centers`` like
 ``Ackley``.
 
+``CartesianEnsemble`` is the same objective on the unit box ``[0, 1]^dim``
+instead of the simplex — every knob keeps its meaning, only the domain changes.
+At ``dim=2`` it gives a square landscape that draws as an ordinary height map
+(the simplex cannot: a 2-simplex is just a line segment).
+
 Example
 -------
     from synthetic_data.ensemble import Ensemble
@@ -343,14 +348,26 @@ def _anisotropy_scale(dim: int, strength: float, seed: int) -> np.ndarray:
 
 
 def _negated_ackley_env01(X: np.ndarray, center: np.ndarray, b: float,
-                          axis_scale: np.ndarray) -> np.ndarray:
-    """Anisotropic negated-Ackley envelope rescaled to ``[0, 1]`` (1 at ``center``)."""
+                          axis_scale: np.ndarray,
+                          smoothing: float = 0.0) -> np.ndarray:
+    """Anisotropic negated-Ackley envelope rescaled to ``[0, 1]`` (1 at ``center``).
+
+    ``exp(-b * r)`` has a cusp at ``r = 0``, which is what makes a basin render as
+    a spike in 3D.  ``smoothing`` (``k``, dimensionless) rounds that tip off by
+    replacing the distance with ``sqrt(r^2 + (k/b)^2) - k/b``: still exactly 1 at
+    the center and asymptotically the same decay far away, but locally quadratic,
+    i.e. a Gaussian cap of width ``~sqrt(k)/b``.  Working in ``u = b * r`` keeps
+    the amount of rounding *visually* the same at any ``basin_width``.
+    """
     X = np.atleast_2d(np.asarray(X, dtype=float))
     center = np.asarray(center, dtype=float).reshape(1, -1)
     delta = (X - center) * axis_scale.reshape(1, -1)
     d_eff = delta.shape[1]
-    # ``exp(-b * rms_delta)`` is 1 at the center and decays to 0 far away.
-    return np.exp(-b * np.sqrt(np.sum(delta ** 2, axis=1) / d_eff))
+    u = b * np.sqrt(np.sum(delta ** 2, axis=1) / d_eff)
+    k = max(float(smoothing), 0.0)
+    if k > 0.0:
+        return np.exp(-(np.sqrt(u * u + k * k) - k))
+    return np.exp(-u)
 
 
 def _point_segment_dist(X: np.ndarray, p: np.ndarray, q: np.ndarray) -> np.ndarray:
@@ -392,6 +409,13 @@ class Ensemble:
     dim : int
         Simplex dimensionality (>= 2).
     n_optima, basin_width : true (strong) optima count and Ackley sharpness ``b``.
+    basin_smoothing : float
+        Rounds the cusp at the tip of every negated-Ackley basin (true *and* weak
+        optima) so a peak reads as a hill rather than a spike; ``0`` (the default)
+        keeps the original cusped shape.  Scale-free: the visual amount of
+        rounding does not change with ``basin_width``.  Roughly, the top of a
+        basin becomes a Gaussian cap spanning ``~sqrt(basin_smoothing)`` in units
+        of ``basin_width``, so ~1 is a gentle rounding and ~4 a broad dome.
     optima_margin : float
         Normalized gap in ``[0, 0.5]`` guaranteeing the background's upward
         excursions stay at or below ``_PEAK * (1 - 2*optima_margin)`` while the
@@ -408,6 +432,10 @@ class Ensemble:
         in ``[0, optima_cluster_spread]`` before optima are drawn around it, so
         ``0`` reproduces the tight on-feature hug and higher values let optima
         sit progressively further off the corner/edge/face toward the interior.
+    pinned_optima : array-like ``(k, dim)`` or None
+        Explicit optima compositions placed *in addition* to the ``n_optima``
+        randomly sampled ones.  They are prepended to the sampled basins, so the
+        greedy ``input_noise`` paring always tags them as true optima first.
     n_weak, weak_width, weak_amp : weak-optima (distractor) count, sharpness, and
         prominence in ``[0, 1]`` (fraction of the full basin height).  Each weak
         optimum is randomly a bump or a pit (see ``neg_frac``).
@@ -444,12 +472,14 @@ class Ensemble:
         # true optima
         n_optima: int = 4,
         basin_width: float = 65.0,
+        basin_smoothing: float = 0.0,
         optima_margin: float = 0.2,
         # optima placement / clustering
         optima_layout: str = "scatter",
         n_optima_clusters: int = 3,
         optima_cluster_conc: float = 80.0,
         optima_cluster_spread: float = 0.0,
+        pinned_optima: np.ndarray | None = None,
         # weak optima (distractors)
         n_weak: int = 6,
         weak_width: float = 120.0,
@@ -487,6 +517,7 @@ class Ensemble:
 
         self.optima_margin = float(np.clip(optima_margin, 0.0, 0.5))
         self.basin_width = float(basin_width)
+        self.basin_smoothing = max(0.0, float(basin_smoothing))
         self.optima_layout = str(optima_layout)
         self.n_optima_clusters = max(1, int(n_optima_clusters))
         self.optima_cluster_conc = max(1e-3, float(optima_cluster_conc))
@@ -514,10 +545,18 @@ class Ensemble:
         # placed basin (all of them shape the landscape); ``centers`` is the
         # subset advertised as true optima after paring out near-duplicates.
         self.peak_centers = self._sample_optima(int(n_optima))
+        if pinned_optima is not None and len(pinned_optima):
+            pinned = np.atleast_2d(np.asarray(pinned_optima, dtype=float))
+            if pinned.shape[1] != self.dim:
+                raise ValueError(
+                    f"pinned_optima must have {self.dim} columns "
+                    f"(got {pinned.shape[1]}).")
+            # Prepended so the greedy paring below tags them as true optima first.
+            self.peak_centers = np.vstack([pinned, self.peak_centers])
         self._true_mask = self._tag_true_optima(self.peak_centers, self.input_noise)
         self.centers = self.peak_centers[self._true_mask]
-        self.weak_centers = self._sample_simplex(int(n_weak), _SEED_WEAK)
-        self.plateau_centers = self._sample_simplex(int(n_plateaus), _SEED_PLATEAUS)
+        self.weak_centers = self._sample_points(int(n_weak), _SEED_WEAK)
+        self.plateau_centers = self._sample_points(int(n_plateaus), _SEED_PLATEAUS)
         self.ridges = self._sample_ridges(int(n_ridges))
 
         # Per-instance signs (+1 raises, -1 lowers) for the signed features.
@@ -539,7 +578,7 @@ class Ensemble:
         # Estimate the raw range for the symmetric [0, 1] map.  Include the true
         # centers so the analytic peak anchors the top of the range.
         rng = np.random.default_rng(12345)
-        samples = rng.dirichlet(np.ones(dim), size=_RANGE_SAMPLES)
+        samples = self._sample_domain(_RANGE_SAMPLES, rng)
         if len(self.peak_centers):
             samples = np.vstack([samples, self.peak_centers])
         final = self._predict_raw(samples)
@@ -548,13 +587,73 @@ class Ensemble:
         # Symmetric scale around the neutral level (raw 0 -> output 0.5).
         self._scale = max(abs(self._raw_min), abs(self._raw_max), 1e-12)
 
+    # ── Domain hooks ────────────────────────────────────────────────────────
+    # Everything below that is specific to the *shape* of the input domain goes
+    # through one of these, so :class:`CartesianEnsemble` can move the whole
+    # layered objective onto the unit box by overriding them and nothing else.
+
+    @property
+    def _centroid(self) -> np.ndarray:
+        """Centre of the domain (the simplex barycentre)."""
+        return np.full(self.dim, 1.0 / self.dim)
+
+    def _sample_domain(self, n: int, rng) -> np.ndarray:
+        """``n`` points drawn uniformly over the domain, as ``(n, dim)``."""
+        return rng.dirichlet(np.ones(self.dim), size=n)
+
+    def _project_domain(self, x: np.ndarray) -> np.ndarray:
+        """Pull an arbitrary point back onto the domain."""
+        return _project_simplex(x)
+
+    def _ridge_direction(self, rng) -> np.ndarray:
+        """Random (unnormalized) direction a ridge segment may run along.
+
+        Sum-zero, so the segment stays tangent to the simplex.
+        """
+        d = rng.standard_normal(self.dim)
+        return d - d.mean()
+
+    def _cluster_draw(self, seed_pt: np.ndarray, rng) -> np.ndarray:
+        """One optimum drawn around the cluster seed ``seed_pt``."""
+        return rng.dirichlet(self.optima_cluster_conc * seed_pt)
+
+    def _region_target_point(self, region: str, rng) -> np.ndarray:
+        """One point on ``region`` of the simplex (a corner / edge / facet /
+        the centroid); anything else falls back to a uniform draw."""
+        d = self.dim
+        if region == "middle":
+            return np.full(d, 1.0 / d)
+        if region == "corners":
+            t = np.zeros(d)
+            t[rng.integers(d)] = 1.0
+            return t
+        if region == "edges":
+            a, b = rng.choice(d, size=2, replace=False)
+            w = rng.random()
+            t = np.zeros(d)
+            t[a], t[b] = w, 1.0 - w
+            return t
+        if region == "faces":
+            # A point on a random facet {x_j = 0}: Dirichlet on the rest.
+            j = rng.integers(d)
+            t = rng.dirichlet(np.ones(d))
+            t[j] = 0.0
+            s = t.sum()
+            return t / s if s > 1e-12 else np.full(d, 1.0 / d)
+        return rng.dirichlet(np.ones(d))
+
+    def _finalize_region_target(self, t: np.ndarray) -> np.ndarray:
+        """Nudge a region target off the exact boundary (it is used as a
+        Dirichlet concentration, which needs strictly positive entries)."""
+        return t + 1e-3
+
     # ── Placement helpers ───────────────────────────────────────────────────
 
-    def _sample_simplex(self, n: int, seed_offset: int) -> np.ndarray:
+    def _sample_points(self, n: int, seed_offset: int) -> np.ndarray:
         if n <= 0:
             return np.empty((0, self.dim), dtype=float)
         rng = np.random.default_rng(self.seed + seed_offset)
-        return rng.dirichlet(np.ones(self.dim), size=n)
+        return self._sample_domain(n, rng)
 
     def _region_targets(self, n: int, region: str, rng, spread: float = 0.0) -> np.ndarray:
         """``n`` points on/near ``region`` of the simplex (used as cluster seeds).
@@ -566,34 +665,15 @@ class Ensemble:
         one cluster layout some optima can hug the feature while others sit looser.
         """
         d = self.dim
-        eps = 1e-3
-        centroid = np.full(d, 1.0 / d)
+        centroid = self._centroid
         spread = float(np.clip(spread, 0.0, 1.0))
         out = np.empty((n, d), dtype=float)
         for i in range(n):
-            if region == "middle":
-                t = np.full(d, 1.0 / d)
-            elif region == "corners":
-                t = np.zeros(d)
-                t[rng.integers(d)] = 1.0
-            elif region == "edges":
-                a, b = rng.choice(d, size=2, replace=False)
-                w = rng.random()
-                t = np.zeros(d)
-                t[a], t[b] = w, 1.0 - w
-            elif region == "faces":
-                # A point on a random facet {x_j = 0}: Dirichlet on the rest.
-                j = rng.integers(d)
-                t = rng.dirichlet(np.ones(d))
-                t[j] = 0.0
-                s = t.sum()
-                t = t / s if s > 1e-12 else np.full(d, 1.0 / d)
-            else:  # scatter / unknown
-                t = rng.dirichlet(np.ones(d))
+            t = self._region_target_point(region, rng)
             if spread > 0.0:
                 pull = float(rng.random()) * spread
                 t = (1.0 - pull) * t + pull * centroid
-            out[i] = t + eps
+            out[i] = self._finalize_region_target(t)
         return out
 
     def _sample_optima(self, n: int) -> np.ndarray:
@@ -602,7 +682,7 @@ class Ensemble:
             return np.empty((0, self.dim), dtype=float)
         rng = np.random.default_rng(self.seed + _SEED_OPTIMA)
         if self.optima_layout not in REGION_MODES:
-            return rng.dirichlet(np.ones(self.dim), size=n)
+            return self._sample_domain(n, rng)
         # Clustered placement: seed a few cluster centers in the chosen region,
         # then draw each optimum tightly around a randomly assigned cluster.
         crng = np.random.default_rng(self.seed + _SEED_CLUSTERS)
@@ -612,8 +692,7 @@ class Ensemble:
         assign = rng.integers(n_clusters, size=n)
         centers = np.empty((n, self.dim), dtype=float)
         for k in range(n):
-            alpha = self.optima_cluster_conc * seeds[assign[k]]
-            centers[k] = rng.dirichlet(alpha)
+            centers[k] = self._cluster_draw(seeds[assign[k]], rng)
         return centers
 
     def _tag_true_optima(self, centers: np.ndarray, min_dist: float) -> np.ndarray:
@@ -642,24 +721,23 @@ class Ensemble:
 
     def _sample_ridges(self, n: int) -> list[tuple[np.ndarray, np.ndarray]]:
         """``n`` segments of controlled length: a random midpoint plus a random
-        tangent direction, endpoints offset by ``ridge_length`` and reprojected
-        onto the simplex."""
+        direction, endpoints offset by ``ridge_length`` and reprojected back
+        onto the domain."""
         if n <= 0:
             return []
         rng = np.random.default_rng(self.seed + _SEED_RIDGES)
         half = 0.5 * self.ridge_length
         ridges = []
         for _ in range(n):
-            m = rng.dirichlet(np.ones(self.dim))
-            d = rng.standard_normal(self.dim)
-            d -= d.mean()  # tangent to the simplex (sum-zero)
+            m = self._sample_domain(1, rng)[0]
+            d = self._ridge_direction(rng)
             nrm = float(np.linalg.norm(d))
             if nrm < 1e-9:
                 p = q = m
             else:
                 d /= nrm
-                p = _project_simplex(m - half * d)
-                q = _project_simplex(m + half * d)
+                p = self._project_domain(m - half * d)
+                q = self._project_domain(m + half * d)
             ridges.append((p, q))
         return ridges
 
@@ -671,7 +749,8 @@ class Ensemble:
         if not len(self.peak_centers):
             return np.full(X.shape[0], _BASE)
         env = np.stack(
-            [_negated_ackley_env01(X, c, self.basin_width, self.axis_scale)
+            [_negated_ackley_env01(X, c, self.basin_width, self.axis_scale,
+                                   self.basin_smoothing)
              for c in self.peak_centers],
             axis=0,
         ).max(axis=0)
@@ -715,7 +794,8 @@ class Ensemble:
             up = np.zeros(X.shape[0])
             down = np.zeros(X.shape[0])
             for c, s in zip(self.weak_centers, self.weak_signs):
-                env = _negated_ackley_env01(X, c, self.weak_width, self.axis_scale)
+                env = _negated_ackley_env01(X, c, self.weak_width, self.axis_scale,
+                                            self.basin_smoothing)
                 contrib = self.weak_amp * _SPAN * env
                 if s > 0:
                     up = np.maximum(up, contrib)
@@ -795,8 +875,95 @@ class Ensemble:
         return [(c.copy(), float(self.predict(c.reshape(1, -1))[0])) for c in self.centers]
 
     def __repr__(self) -> str:  # pragma: no cover
-        return (f"Ensemble(dim={self.dim}, n_optima={len(self.centers)}"
+        return (f"{type(self).__name__}(dim={self.dim}, n_optima={len(self.centers)}"
                 f"/{len(self.peak_centers)} true/peaks, "
                 f"layout={self.optima_layout!r}, n_weak={len(self.weak_centers)}, "
                 f"n_ridges={len(self.ridges)}, n_plateaus={len(self.plateau_centers)}, "
                 f"edge_region={self.edge_region!r}, seed={self.seed})")
+
+
+# ── Cartesian variant ────────────────────────────────────────────────────────
+
+class CartesianEnsemble(Ensemble):
+    """The same layered objective, on the unit box ``[0, 1]^dim`` instead of the
+    simplex.
+
+    Every knob means exactly what it means on the simplex; only the *domain*
+    changes, via the hooks in :class:`Ensemble`.  ``dim=2`` gives a square
+    landscape that can be drawn as an ordinary height map (see
+    ``synthetic_data/plot_ensemble.py``), which the simplex version cannot: a
+    2-simplex is a line segment, so every feature would collapse onto it.
+
+    The region modes keep their names against the box's own geometry:
+    ``"corners"`` are its ``2**dim`` vertices, ``"edges"`` its edges, ``"faces"``
+    its facets (the whole boundary), and ``"middle"`` its centre.
+    """
+
+    @property
+    def _centroid(self) -> np.ndarray:
+        return np.full(self.dim, 0.5)
+
+    def _sample_domain(self, n: int, rng) -> np.ndarray:
+        return rng.random((n, self.dim))
+
+    def _project_domain(self, x: np.ndarray) -> np.ndarray:
+        return np.clip(np.asarray(x, dtype=float), 0.0, 1.0)
+
+    def _ridge_direction(self, rng) -> np.ndarray:
+        # No sum-zero constraint here: the box is full-dimensional.
+        return rng.standard_normal(self.dim)
+
+    def _cluster_draw(self, seed_pt: np.ndarray, rng) -> np.ndarray:
+        # ``Dirichlet(conc * p)`` has per-axis variance ``p(1-p)/(conc+1)``; the
+        # box has no such sum-1 coupling, so draw an isotropic Gaussian of the
+        # same width taken at ``p = 1/2`` and clip back into the box.  Higher
+        # concentration still means tighter clusters.
+        sd = float(np.sqrt(0.25 / (self.optima_cluster_conc + 1.0)))
+        return self._project_domain(seed_pt + sd * rng.standard_normal(self.dim))
+
+    def _region_target_point(self, region: str, rng) -> np.ndarray:
+        d = self.dim
+        if region == "middle":
+            return np.full(d, 0.5)
+        if region == "corners":
+            return rng.integers(2, size=d).astype(float)
+        if region == "edges":
+            # An edge of the box: every axis pinned to a vertex but one, which
+            # runs free along the edge.
+            t = rng.integers(2, size=d).astype(float)
+            t[rng.integers(d)] = float(rng.random())
+            return t
+        if region == "faces":
+            # A facet {x_j = 0 or 1}: free on every other axis.
+            t = rng.random(d)
+            t[rng.integers(d)] = float(rng.integers(2))
+            return t
+        return rng.random(d)
+
+    def _finalize_region_target(self, t: np.ndarray) -> np.ndarray:
+        # Kept strictly inside the box (the simplex version's outward nudge would
+        # push a corner target past 1).
+        return np.clip(t, 1e-3, 1.0 - 1e-3)
+
+    def _region_proximity(self, X: np.ndarray, region: str, reach: float) -> np.ndarray:
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+        if region == "middle":
+            Xs = X * self.axis_scale.reshape(1, -1)
+            c = (self._centroid * self.axis_scale).reshape(1, -1)
+            d = np.linalg.norm(Xs - c, axis=1)
+            return _smoothstep(1.0 - d / reach)
+        # Distance along each axis to the nearer of that axis' two faces.  The
+        # nearest corner rounds every coordinate, the nearest edge rounds all but
+        # the one furthest from a face, and the nearest facet is the closest
+        # single axis — so all three distances fall out of ``m`` directly and no
+        # 2**dim vertex enumeration is needed.
+        m = np.minimum(X, 1.0 - X) * self.axis_scale.reshape(1, -1)
+        if region == "corners":
+            d = np.linalg.norm(m, axis=1)
+        elif region == "edges":
+            d = np.sqrt(np.maximum((m ** 2).sum(axis=1) - (m ** 2).max(axis=1), 0.0))
+        elif region == "faces":
+            d = m.min(axis=1)
+        else:
+            return np.zeros(X.shape[0])
+        return _smoothstep(1.0 - d / reach)

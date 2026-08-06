@@ -498,6 +498,19 @@ def _color_limits(
     return vmin, vmax
 
 
+def _dropped_title(label: str, scale: float) -> str:
+    """Axis title text preceded by a blank spacer line, to push it further down.
+
+    Plotly fixes the ternary axis-title offset at ``tickfont size + ticklen + 3``
+    below the tick numbers (see ``drawAxes`` in plotly.js) and exposes no
+    standoff, so the two bottom corner titles collide with the corner tick
+    labels. A leading blank line whose font size we control adds exactly the
+    extra gap we want, and it scales with the rest of the fonts.
+    """
+    gap = max(int(round(12 * scale)), 1)
+    return f"<span style='font-size:{gap}px'> </span><br>{label}"
+
+
 def _bg_marker_size(grid_n: int) -> float:
     """Marker size that keeps the background grid visually gap-free as grid_n grows.
 
@@ -521,6 +534,7 @@ def build_ternary_figure(
     show_points: bool = True,
     gp_length_scale: float = 0.3,
     scale: float = 1.0,
+    plot_size: float = 0.80,
     color_limits: tuple[float, float] | None = None,
 ):
     """Interactive Plotly ternary: optional interpolated background + points overlay.
@@ -530,6 +544,10 @@ def build_ternary_figure(
 
     ``scale`` multiplies the measured-point marker size, corner-label fonts and
     the objective colorbar fonts (the triangle geometry itself is unchanged).
+
+    ``plot_size`` is the fraction of the figure width given to the triangle; the
+    colorbar is parked just past it. Lowering it shrinks the triangle relative
+    to the colorbar (the d=4 tetrahedron gets the same effect from zooming).
 
     ``color_limits`` forces the viridis (vmin, vmax); pass it when two figures
     must share one colour scale, else it is derived from this figure's data.
@@ -553,7 +571,7 @@ def build_ternary_figure(
     # Pulled in toward the plot (x) and enlarged (thicker + taller, bigger fonts).
     colorbar = dict(
         title=dict(text=value_name, font=dict(size=14 * scale)),
-        thickness=28, len=0.9, x=0.86, xpad=0,
+        thickness=28, len=0.9, x=min(plot_size + 0.06, 0.98), xpad=0,
         tickfont=dict(size=14 * scale),
     )
 
@@ -610,12 +628,18 @@ def build_ternary_figure(
         font=dict(size=15),
         ternary=dict(
             sum=1,
-            aaxis=dict(title=labels[2], **axis_common),   # top
-            baxis=dict(title=labels[0], **axis_common),   # bottom-left
-            caxis=dict(title=labels[1], **axis_common),   # bottom-right
+            aaxis=dict(title=labels[2], **axis_common),                    # top
+            baxis=dict(title=_dropped_title(labels[0], scale), **axis_common),  # bottom-left
+            caxis=dict(title=_dropped_title(labels[1], scale), **axis_common),  # bottom-right
             bgcolor="white",
+            # Triangle occupies this slice of the figure; the colorbar sits just
+            # past its right edge, so shrinking the domain shrinks the plot
+            # relative to the colorbar.
+            domain=dict(x=[0.0, plot_size], y=[0.0, 1.0]),
         ),
-        margin=dict(l=60, r=40, t=90, b=80),
+        # Bottom margin has to hold the tick numbers, the spacer line and the
+        # corner titles, all of which scale with `scale`.
+        margin=dict(l=int(40 + 40 * scale), r=40, t=90, b=int(60 + 45 * scale)),
         height=720,
     )
     return fig
@@ -769,7 +793,12 @@ def build_quaternary_figure(
 def build_figure(X: np.ndarray, Y: np.ndarray, labels: tuple[str, ...], **kwargs):
     """Dispatch to the ternary (d=3) or quaternary tetrahedron (d=4) builder."""
     d = X.shape[1]
+    # plot_size only applies to the flat ternary; the d=4 scene is sized by the
+    # camera, so zooming already covers it.
+    plot_size = kwargs.pop("plot_size", None)
     if d == 3:
+        if plot_size is not None:
+            kwargs["plot_size"] = plot_size
         return build_ternary_figure(X, Y, labels, **kwargs)
     if d == 4:
         return build_quaternary_figure(X, Y, labels, **kwargs)
@@ -895,6 +924,14 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
             dcc.Slider(
                 id="scale", min=0.5, max=3.0, step=0.1, value=1.0,
                 marks={0.5: "0.5", 1.0: "1", 2.0: "2", 3.0: "3"},
+            ),
+
+            # d=3 only: triangle width vs the colorbar. The d=4 tetrahedron is
+            # sized by the scene camera, so scroll-zoom already does this.
+            html.Label("Plot size vs colorbar (d=3)", style=label_style),
+            dcc.Slider(
+                id="plot-size", min=0.4, max=0.95, step=0.05, value=0.80,
+                marks={0.4: "small", 0.7: "0.7", 0.95: "large"},
             ),
 
             # Color-scale override: when checked, the viridis (vmin, vmax) is
@@ -1049,12 +1086,14 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         Input("n-estimators", "value"),
         Input("gp-length-scale", "value"),
         Input("scale", "value"),
+        Input("plot-size", "value"),
         Input("color-override", "value"),
         Input("color-min", "value"),
         Input("color-max", "value"),
     )
     def _render(source_type, run_name, db_name, db_value, background, show_points,
-                gn, ntrees, gp_ls, scale, color_override, color_min, color_max):
+                gn, ntrees, gp_ls, scale, plot_size, color_override, color_min,
+                color_max):
         try:
             if source_type == "run":
                 if not run_name:
@@ -1082,7 +1121,7 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
                 title=title, value_name=value_name,
                 background=background, show_points=bool(show_points),
                 gp_length_scale=float(gp_ls), scale=float(scale),
-                color_limits=color_limits,
+                plot_size=float(plot_size), color_limits=color_limits,
             )
             diagram = "tetrahedron (d=4)" if X.shape[1] == 4 else "ternary (d=3)"
             status = (

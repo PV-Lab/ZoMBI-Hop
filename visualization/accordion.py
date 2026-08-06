@@ -74,7 +74,7 @@ LANDSCAPE_SEED = 3
 # WIDTH: the negated-Ackley sharpness ``b`` in ``exp(-b * rms_delta)``.  SMALLER is
 # WIDER (a broad hill), larger is a narrow spike.  Ensemble's own random sweep
 # draws this from (2.2, 15.0); 6.5 sits in the middle.
-BASIN_WIDTH = 20
+BASIN_WIDTH = 4
 # STRENGTH: how far the optima stand above the background, NOT their height — the
 # true optima are pinned to the top of the raw field by construction (``_PEAK``)
 # and cannot be raised.  What this does is cap every upward background excursion at
@@ -179,7 +179,7 @@ def build_landscape(*, inset: float = CORNER_INSET, jitter: float = CORNER_JITTE
         # distractors / texture
         n_weak=5, weak_width=100.0, weak_amp=0.045,
         n_ridges=2, ridge_width=0.1, ridge_amp=0.35, ridge_length=0.6,
-        noise_freq=12.0, noise_amp=200.0, noise_octaves=4,
+        noise_freq=13, noise_amp=500.0, noise_octaves=2,
         n_plateaus=0, plateau_radius=0.10, plateau_amp=0.40,
         edge_region="middle", edge_amp=0.30, edge_reach=0.45,
         aniso_strength=0,
