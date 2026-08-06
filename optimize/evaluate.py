@@ -1317,6 +1317,18 @@ def run_single_eval(
     }
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
+
+    # CoNet pair, ensemble runs only: the uniform baseline that defines the shared UMAP
+    # frame is rebuilt from ensemble_config.json, which the caller wrote into this run
+    # dir. Same helper run_mobo uses, so both produce the same artifact set.
+    #
+    # Deliberately AFTER metrics.json: the render is an isolated subprocess with a
+    # 30-minute timeout on an N×N UMAP, so it is the most likely thing to blow the job's
+    # wall-time. Writing the metrics first means a lost render costs a plot, not the
+    # measurement the run existed to produce.
+    if os.path.isfile(os.path.join(out_dir, "ensemble_config.json")):
+        rm._render_conet_artifacts(out_dir)
+
     if interrupted:
         raise KeyboardInterrupt
     return {
@@ -1437,6 +1449,20 @@ def evaluate_dataset(
     is_ensemble = dataset in ENSEMBLE_DATASETS
     ens_dim = int(syn_defaults.get("dim", args.dim))
 
+    # Explicit Sobol landscape indices, one per repeat, shared by every trial (see the
+    # run loop). None -> the default per-(trial, run) indexing.
+    landscape_indices = None
+    if getattr(args, "ensemble_landscape_indices", None):
+        landscape_indices = [int(t.strip()) for t in
+                             str(args.ensemble_landscape_indices).split(",") if t.strip()]
+        if not landscape_indices:
+            raise SystemExit("--ensemble-landscape-indices parsed to an empty list")
+        if len(landscape_indices) != args.num_runs:
+            raise SystemExit(
+                f"--ensemble-landscape-indices has {len(landscape_indices)} entries but "
+                f"--num-runs is {args.num_runs}; give exactly one index per repeat so "
+                "every trial is scored on the same landscape set")
+
     if is_ensemble:
         # No single shared landscape: each run gets a fresh randomized Ensemble
         # (built in the run loop below), so true_optima vary per run.
@@ -1451,6 +1477,7 @@ def evaluate_dataset(
             "ensemble_random_per_run": True,
             "ensemble_seed": args.ensemble_seed,
             "ensemble_optima_margin": args.ensemble_margin,
+            "ensemble_landscape_indices": landscape_indices,
             "runs_path": runs_path,
             "trials": trial_nums,
             "num_runs": args.num_runs,
@@ -1524,6 +1551,14 @@ def evaluate_dataset(
                 # Reproducible per (trial, run): same --ensemble-seed regenerates
                 # the identical landscape sequence; ensemble_config.json records it.
                 idx = int(trial_num) * 1024 + int(k)
+                if landscape_indices is not None:
+                    # --ensemble-landscape-indices: the landscape depends ONLY on the
+                    # repeat number, not on the trial. That makes run k the SAME
+                    # landscape for every hyperparameter set in this invocation, which
+                    # is what lets several configs be compared head-to-head rather than
+                    # each being scored on its own draw (the default indexing above
+                    # deliberately varies the landscape per trial).
+                    idx = landscape_indices[(k - 1) % len(landscape_indices)]
                 ens_cfg = random_ensemble_config(
                     ens_dim, idx, seed=int(args.ensemble_seed),
                     optima_margin=args.ensemble_margin)
@@ -1631,6 +1666,13 @@ def main() -> None:
                         help="Peak layout for synthetic oracles (default: 2).")
     parser.add_argument("--seed", type=int, default=42,
                         help="RNG seed for synthetic oracles (default: 42).")
+    parser.add_argument("--ensemble-landscape-indices", default=None,
+                        help="Comma-separated Sobol landscape indices, ONE PER --num-runs "
+                             "repeat, used for every trial in this invocation. By default "
+                             "the landscape index is trial*1024+run, so different trials see "
+                             "different landscapes; pin them here to score several "
+                             "hyperparameter sets head-to-head on the SAME landscapes "
+                             "(e.g. optimize/showdown.py).")
     parser.add_argument("--ensemble-seed", type=int, default=0,
                         help="Master seed for per-run 'ensemble' randomization "
                              "(same value reproduces the landscape sequence; default: 0).")

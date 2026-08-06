@@ -543,13 +543,15 @@ class CoNetUnavailable(Exception):
     """Raised when the CoNet cannot be built (missing umap-learn / networkx, or too little data)."""
 
 
-def _apply_gap_layout(E_raw, gap_reach, knee_frac=CN_GAP_KNEE_FRAC):
-    """Reshape a raw UMAP embedding: squash radii beyond knee_frac*r50 toward gap_reach*r50 (smooth tanh
-    rolloff), then PCA-orient (major axis -> x, deterministic sign). Pure post-process on the embedding —
-    NO UMAP re-fit — so the UI 'CLUSTER DIST' knob can reshape the map live. The scale is the MEDIAN
-    radius r50 of the main mass (robust: NOT inflated by the satellite population the way r90 is), so
-    gap_reach is in intuitive 'core-radius' units: smaller pulls far satellites (e.g. resampled CsPbI3)
-    in tight, larger lets them spread out to the natural UMAP distance."""
+def fit_gap_layout(E_raw, gap_reach, knee_frac=CN_GAP_KNEE_FRAC):
+    """Derive the gap-squash + PCA-orientation parameters of a raw UMAP embedding.
+
+    Split out of ``_apply_gap_layout`` so the SAME warp can be replayed on points that were not part of
+    the fit (see ``paired_conet``: real-run samples embedded out-of-sample into a uniform baseline's
+    frame must land under the identical transform, or the two maps are not comparable). Returns the
+    parameter dict ``apply_gap_layout`` consumes; every quantity here is a property of the fitted point
+    set (robust centre/radius, rotation, sign convention, final recentring) and none of it may be
+    recomputed on the new points."""
     E = np.asarray(E_raw, float).copy()
     ctr = np.median(E, axis=0)
     d = E - ctr
@@ -563,11 +565,77 @@ def _apply_gap_layout(E_raw, gap_reach, knee_frac=CN_GAP_KNEE_FRAC):
         rn = knee + span * np.tanh((r[far] - knee) / span)     # excess -> saturates at (cap - knee)
         E[far] = ctr + d[far] * (rn / r[far])[:, None]
     _, R = np.linalg.eigh(np.cov(E.T))                         # canonical orientation (major axis -> x)
-    E = E @ R[:, ::-1]
-    for k in (0, 1):
-        if np.sum(E[:, k] ** 3) < 0:
-            E[:, k] = -E[:, k]
-    return E - E.mean(0)
+    R = R[:, ::-1]
+    E = E @ R
+    # Freeze the deterministic sign convention and the final recentring as fixed numbers rather than
+    # re-deriving them: on a different point set the skew test could flip the other way, which would
+    # mirror one map relative to the other.
+    signs = np.array([-1.0 if np.sum(E[:, k] ** 3) < 0 else 1.0 for k in (0, 1)])
+    E = E * signs
+    return {"ctr": ctr, "scale": scale, "knee": knee, "cap": cap,
+            "R": R, "signs": signs, "mean": E.mean(0)}
+
+
+def apply_gap_layout(E_raw, params):
+    """Replay a fitted gap-squash + orientation warp (see ``fit_gap_layout``) on arbitrary points."""
+    E = np.asarray(E_raw, float).copy()
+    ctr, knee, cap = params["ctr"], params["knee"], params["cap"]
+    d = E - ctr
+    r = np.hypot(d[:, 0], d[:, 1])
+    far = r > knee
+    if params["scale"] > 0 and far.any() and cap > knee:
+        span = cap - knee
+        rn = knee + span * np.tanh((r[far] - knee) / span)
+        E[far] = ctr + d[far] * (rn / r[far])[:, None]
+    return (E @ params["R"]) * params["signs"] - params["mean"]
+
+
+def _apply_gap_layout(E_raw, gap_reach, knee_frac=CN_GAP_KNEE_FRAC):
+    """Reshape a raw UMAP embedding: squash radii beyond knee_frac*r50 toward gap_reach*r50 (smooth tanh
+    rolloff), then PCA-orient (major axis -> x, deterministic sign). Pure post-process on the embedding —
+    NO UMAP re-fit — so the UI 'CLUSTER DIST' knob can reshape the map live. The scale is the MEDIAN
+    radius r50 of the main mass (robust: NOT inflated by the satellite population the way r90 is), so
+    gap_reach is in intuitive 'core-radius' units: smaller pulls far satellites (e.g. resampled CsPbI3)
+    in tight, larger lets them spread out to the natural UMAP distance."""
+    return apply_gap_layout(E_raw, fit_gap_layout(E_raw, gap_reach, knee_frac))
+
+
+def fit_purity_layout(E, comp, thr=CN_PURITY_THR, gamma=CN_PURITY_GAMMA, clip=CN_PURITY_CLIP):
+    """Derive the per-component pure-core anchors the purity warp pivots about.
+
+    Split out of ``_apply_purity_layout`` for the same reason as ``fit_gap_layout``: replaying the warp
+    on out-of-sample points requires the anchors of the FITTED set, since anchors recomputed on a
+    different set would pivot the two maps about different centres."""
+    E = np.asarray(E, float)
+    dom = comp.argmax(1); purity = comp.max(1)
+    A = np.zeros((comp.shape[1], 2))
+    for c in range(comp.shape[1]):
+        sel = dom == c
+        if not sel.any():
+            continue
+        w = np.clip(purity[sel], 1e-3, None) ** 2          # weight toward the PURE members -> core anchor
+        A[c] = np.average(E[sel], axis=0, weights=w)
+    return {"anchors": A, "thr": thr, "gamma": gamma, "clip": clip}
+
+
+def apply_purity_layout(E, comp, params):
+    """Replay a fitted purity warp (see ``fit_purity_layout``) on arbitrary points.
+
+    A point whose dominant component was never dominant in the fitted set has a zero anchor; those
+    components are left unwarped rather than pivoted about the origin."""
+    thr = params["thr"]
+    if thr is None or thr <= 0:
+        return np.asarray(E, float)
+    E = np.asarray(E, float).copy()
+    A, clip, gamma = params["anchors"], params["clip"], params["gamma"]
+    dom = comp.argmax(1); purity = comp.max(1)
+    seen = np.abs(A).sum(1) > 0
+    ok = seen[dom]
+    v = E[ok] - A[dom[ok]]
+    factor = ((1.0 - purity[ok]) / max(1.0 - thr, 1e-6)) ** gamma   # p=thr -> 1; p=1 -> 0; p<thr -> >1
+    factor = np.clip(factor, clip[0], clip[1])
+    E[ok] = A[dom[ok]] + v * factor[:, None]
+    return E
 
 
 def _apply_purity_layout(E, comp, thr=CN_PURITY_THR, gamma=CN_PURITY_GAMMA, clip=CN_PURITY_CLIP):
@@ -577,31 +645,29 @@ def _apply_purity_layout(E, comp, thr=CN_PURITY_THR, gamma=CN_PURITY_GAMMA, clip
     compositions. Cheap post-process; thr <= 0 returns E unchanged (revert to the plurality layout)."""
     if thr is None or thr <= 0:
         return np.asarray(E, float)
-    E = np.asarray(E, float).copy()
-    dom = comp.argmax(1); purity = comp.max(1)
-    A = np.zeros((comp.shape[1], 2))
-    for c in range(comp.shape[1]):
-        sel = dom == c
-        if not sel.any():
-            continue
-        w = np.clip(purity[sel], 1e-3, None) ** 2          # weight toward the PURE members -> core anchor
-        A[c] = np.average(E[sel], axis=0, weights=w)
-    v = E - A[dom]
-    factor = ((1.0 - purity) / max(1.0 - thr, 1e-6)) ** gamma   # p=thr -> 1; p=1 -> 0; p<thr -> >1
-    factor = np.clip(factor, clip[0], clip[1])
-    return A[dom] + v * factor[:, None]
+    return apply_purity_layout(E, comp, fit_purity_layout(E, comp, thr, gamma, clip))
 
 
 def build_conet_structure(comp, comp_names, resp, iters, resp_names,
                           min_dist=CN_UMAP_MD, gap_reach=CN_GAP_REACH,
-                          purity_thr=CN_PURITY_THR):
+                          purity_thr=CN_PURITY_THR, frame=None):
     """Build the co-occurrence-network structure from composition only.
 
     comp        (N, C) row-normalized composition fractions of the ACTIVE components
     comp_names  list of C component names (used only for colours/labels)
     resp        (N, R) response values (may contain NaN); coloured per panel
+    frame       optional pre-fitted map frame (see below) — reuse an existing embedding instead of
+                fitting a new UMAP, so two datasets can be drawn in ONE shared coordinate system
+
     Returns an M dict consumed by the CoNet drawing helpers. Raises CoNetUnavailable if the optional
-    heavy dependencies are absent or there is too little data to embed."""
+    heavy dependencies are absent or there is too little data to embed.
+
+    ``M['frame']`` carries everything needed to place further points on this same map: the raw
+    embedding's gap/purity warp parameters and the component colour assignment. Passing that dict back
+    in as *frame* (together with an ``E_raw`` for the new points, since UMAP fitted on a precomputed
+    distance matrix cannot ``.transform()`` out-of-sample points — see ``paired_conet``) skips the UMAP
+    fit entirely and reuses the fitted warp and colours verbatim. Without that reuse two CoNets of the
+    same landscape get independently-fitted embeddings and are not comparable."""
     try:
         import umap
         import networkx as nx
@@ -625,24 +691,38 @@ def build_conet_structure(comp, comp_names, resp, iters, resp_names,
         np.fill_diagonal(S, 0.0)
 
     A = (S / (S.max() + 1e-12)) ** CN_BETA
-    Dmat = 1.0 - A; np.fill_diagonal(Dmat, 0.0)
-    nn = min(CN_UMAP_NN, max(2, N - 1))
-    import warnings
-    with warnings.catch_warnings():
-        # expected umap-learn chatter, silenced narrowly: we pass a precomputed distance matrix on
-        # purpose (inverse_transform is never used), and n_jobs=1 matches what seeding forces anyway.
-        warnings.filterwarnings("ignore", message="using precomputed metric.*")
-        warnings.filterwarnings("ignore", message="n_jobs value.*overridden to 1")
-        with _Progress(f"UMAP embedding ({N} nodes)"):
-            E = umap.UMAP(n_neighbors=nn, min_dist=min_dist, spread=CN_UMAP_SPREAD,
-                          random_state=CN_SEED, metric="precomputed", n_jobs=1).fit_transform(Dmat)
-    # Cache the RAW embedding + the gap-squashed/PCA-oriented layout so the PURITY knob can re-warp the
-    # map without a UMAP re-fit; then apply the purity warp for the current threshold.
-    E_raw = E - E.mean(0)
-    E_gap = _apply_gap_layout(E_raw, gap_reach)
-    E = _apply_purity_layout(E_gap, comp, purity_thr)
-    # colours assigned from the FINAL layout: nearby components get similar hues, far ones dissimilar
-    ccolor = _assign_colors_by_space(list(comp_names), E, dom)
+    if frame is None:
+        Dmat = 1.0 - A; np.fill_diagonal(Dmat, 0.0)
+        nn = min(CN_UMAP_NN, max(2, N - 1))
+        import warnings
+        with warnings.catch_warnings():
+            # expected umap-learn chatter, silenced narrowly: we pass a precomputed distance matrix on
+            # purpose (inverse_transform is never used), and n_jobs=1 matches what seeding forces anyway.
+            warnings.filterwarnings("ignore", message="using precomputed metric.*")
+            warnings.filterwarnings("ignore", message="n_jobs value.*overridden to 1")
+            with _Progress(f"UMAP embedding ({N} nodes)"):
+                E = umap.UMAP(n_neighbors=nn, min_dist=min_dist, spread=CN_UMAP_SPREAD,
+                              random_state=CN_SEED, metric="precomputed", n_jobs=1).fit_transform(Dmat)
+        # Cache the RAW embedding + the gap-squashed/PCA-oriented layout so the PURITY knob can re-warp
+        # the map without a UMAP re-fit; then apply the purity warp for the current threshold.
+        E_raw = E - E.mean(0)
+        gap_p = fit_gap_layout(E_raw, gap_reach)
+        E_gap = apply_gap_layout(E_raw, gap_p)
+        pur_p = fit_purity_layout(E_gap, comp, purity_thr)
+        E = apply_purity_layout(E_gap, comp, pur_p)
+        # colours assigned from the FINAL layout: nearby components get similar hues, far ones dissimilar
+        ccolor = _assign_colors_by_space(list(comp_names), E, dom)
+        frame = {"gap": gap_p, "purity": pur_p, "ccolor": ccolor}
+    else:
+        # Reuse a fitted frame: the caller supplies these points' raw embedding (placed into the fitted
+        # map out-of-sample) and we replay the fitted warps and colours. Nothing here is re-derived from
+        # the new points, which is exactly what keeps the two maps in one coordinate system.
+        E_raw = np.asarray(frame["E_raw"], float)
+        if len(E_raw) != N:
+            raise CoNetUnavailable(f"frame E_raw has {len(E_raw)} rows, expected {N}")
+        E_gap = apply_gap_layout(E_raw, frame["gap"])
+        E = apply_purity_layout(E_gap, comp, frame["purity"])
+        ccolor = frame["ccolor"]
 
     edges = {}
     with _Progress(f"k-NN graph edges ({N} nodes)"):
@@ -673,15 +753,21 @@ def build_conet_structure(comp, comp_names, resp, iters, resp_names,
     best_obj = int(np.nanargmax(ocol)) if np.isfinite(ocol).any() else 0
     return dict(comp=comp, names=list(comp_names), N=N, E=E, E_raw=E_raw, E_gap=E_gap, dom=dom,
                 ccolor=ccolor, ei=ei, ej=ej, ew=ew, strengthN=sN, best_obj=best_obj,
-                purity_thr=purity_thr, resp=resp.copy(), resp_names=list(resp_names))
+                purity_thr=purity_thr, resp=resp.copy(), resp_names=list(resp_names),
+                frame={k: v for k, v in frame.items() if k != "E_raw"})
 
 
-def conet_dominance_fields(M):
-    """Continuous per-component composition field over the view (for the blended background + zones)."""
+def conet_dominance_fields(M, limits=None):
+    """Continuous per-component composition field over the view (for the blended background + zones).
+
+    *limits*: optional ``((x0, x1), (y0, y1))`` overriding the limits derived from this dataset's own
+    extent. The panel takes its axis limits from this dict (see ``_conet_panel``), so passing the SAME
+    limits to two CoNets is what makes them render on identical axes — otherwise each map is scaled to
+    its own extent and two views of one landscape cannot be compared position-for-position."""
     from scipy.spatial.distance import cdist
     from scipy.spatial import cKDTree, Delaunay
     E, comp = M["E"], M["comp"]
-    (x0, x1), (y0, y1) = _cn_view_limits(E)
+    (x0, x1), (y0, y1) = limits if limits is not None else _cn_view_limits(E)
     # core scale = 10th..90th-percentile extent, which EXCLUDES a far satellite (e.g. a resampled
     # CsPbI3 clique). The composition fill/zone REACH keys off this instead of the full view span, so a
     # distant cluster can't balloon the dominance regions across the whole (mostly empty) frame.
@@ -1545,17 +1631,22 @@ def load_run_conet_data(run_dir, snapshot=None):
 
 
 def build_conet(comp, names, resp, iters, umap_md=CN_UMAP_MD, gap_reach=CN_GAP_REACH,
-                purity_thr=CN_PURITY_THR, needles_comp=None, show_needles=False):
+                purity_thr=CN_PURITY_THR, needles_comp=None, show_needles=False, frame=None,
+                limits=None):
     """Build the CoNet structure (UMAP) + dominance fields for a single-objective run. Ranked needle
     optima (if any) are anchored to their nearest sample node and stored as ``M['needles']``; whether
-    their stars are drawn is gated by ``M['show_needles']`` (the UI toggle / --needles flag)."""
+    their stars are drawn is gated by ``M['show_needles']`` (the UI toggle / --needles flag).
+
+    *frame*: reuse an already-fitted map frame instead of fitting a new UMAP — see
+    ``build_conet_structure``."""
     M = build_conet_structure(comp, names, resp, iters, list(VALUE_COLUMNS),
-                              min_dist=umap_md, gap_reach=gap_reach, purity_thr=purity_thr)
+                              min_dist=umap_md, gap_reach=gap_reach, purity_thr=purity_thr,
+                              frame=frame)
     M["iters"] = np.asarray(iters, float)
     M["needles"] = _needle_rows(M["comp"], needles_comp)
     M["show_needles"] = bool(show_needles)
     with _Progress("dominance fields"):
-        F = conet_dominance_fields(M)
+        F = conet_dominance_fields(M, limits=limits)
     return M, F
 
 
@@ -1784,6 +1875,10 @@ class ConetViewer:
 # headless PNG render
 # ---------------------------------------------------------------------------
 def save_png(M, F, bounds, title, out_path, target_eg=TARGET_EG_DEFAULT, dpi=130):
+    """Render one CoNet panel to PNG.
+
+    Axis limits come from *F* (see ``conet_dominance_fields(limits=...)``), so two renders share a
+    frame by being built with the same limits, not by anything passed here."""
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     _apply_mpl_theme()

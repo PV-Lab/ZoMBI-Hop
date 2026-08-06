@@ -2573,7 +2573,13 @@ def _render_conet_artifacts(trial_dir: str, *, timeout_s: int = 1800) -> None:
     ``conet_uniform.png`` (a uniform-sampling baseline of the same landscape with
     its true optima starred) for a completed ensemble repeat.
 
-    Each render runs as an isolated subprocess: the CoNet builder fits UMAP on a
+    Both come from ONE ``paired_conet`` invocation, which fits a single UMAP on the
+    uniform baseline and places the run's real samples into that same frame. The
+    two plots therefore share a coordinate system, axis limits and colour scale, so
+    they can be read side by side — previously each fitted its own UMAP and the two
+    maps had nothing to do with each other.
+
+    The render runs as an isolated subprocess: the CoNet builder fits UMAP on a
     full N×N distance matrix (>10 GB for ~19k samples), so keeping it out of this
     process means an OOM, timeout, or crash there is logged and skipped rather than
     taking the MOBO run down before its metrics.json lands.
@@ -2581,26 +2587,21 @@ def _render_conet_artifacts(trial_dir: str, *, timeout_s: int = 1800) -> None:
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     viz = os.path.join(repo_root, "visualization")
     env = dict(os.environ, MPLBACKEND="Agg")
-    jobs = [
-        ("conet.png", [sys.executable, os.path.join(viz, "plot_10d.py"),
-                       "--run", trial_dir, "--needles",
-                       "--save", os.path.join(trial_dir, "conet.png")]),
-        ("conet_uniform.png", [sys.executable, os.path.join(viz, "uniform_baseline_conet.py"),
-                               "--run", trial_dir,
-                               "--save", os.path.join(trial_dir, "conet_uniform.png")]),
-    ]
-    for name, cmd in jobs:
-        t0 = time.time()
-        try:
-            r = subprocess.run(cmd, env=env, cwd=repo_root, timeout=timeout_s,
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            if r.returncode == 0:
-                print(f"    [trial] {name} rendered ({time.time() - t0:.0f}s)", flush=True)
-            else:
-                tail = "\n      ".join((r.stdout or "").splitlines()[-3:])
-                print(f"    [trial] {name} render failed rc={r.returncode}:\n      {tail}", flush=True)
-        except Exception as exc:
-            print(f"    [trial] {name} render error: {exc}", flush=True)
+    cmd = [sys.executable, os.path.join(viz, "paired_conet.py"),
+           "--run", trial_dir,
+           "--save", os.path.join(trial_dir, "conet.png"),
+           "--save-uniform", os.path.join(trial_dir, "conet_uniform.png")]
+    t0 = time.time()
+    try:
+        r = subprocess.run(cmd, env=env, cwd=repo_root, timeout=timeout_s,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if r.returncode == 0:
+            print(f"    [trial] conet pair rendered ({time.time() - t0:.0f}s)", flush=True)
+        else:
+            tail = "\n      ".join((r.stdout or "").splitlines()[-3:])
+            print(f"    [trial] conet pair render failed rc={r.returncode}:\n      {tail}", flush=True)
+    except Exception as exc:
+        print(f"    [trial] conet pair render error: {exc}", flush=True)
 
 
 # ─── Single trial: run ZoMBI on the objective + write all artifacts ────────────
@@ -2841,7 +2842,13 @@ def run_single_trial(
     try:
         plot_dist_from_centre(os.path.join(trial_dir, "dist_from_centre.png"), dh, maximize)
         plot_line_length_hist(os.path.join(trial_dir, "line_length_hist.png"), payloads)
-        plot_convergence(os.path.join(trial_dir, "convergence.png"), dh, maximize)
+        # Pass the per-point activation ids so the running-best envelope RESETS at
+        # every activation boundary (a sawtooth per activation) instead of one
+        # globally-monotone curve — each activation is a fresh ZoMBI search phase,
+        # so coasting on an earlier phase's peak hides how much it re-explores.
+        act_per_point, _ = _activation_zoom_per_point(n_points, snap_records)
+        plot_convergence(os.path.join(trial_dir, "convergence.png"), dh, maximize,
+                         activations=act_per_point)
     except Exception as exc:
         print(f"    [trial] static plot failed: {exc}")
 

@@ -52,6 +52,9 @@ Usage
   python optimize/pareto.py <run_dir> --no-collab          # own runs dir only
   python optimize/pareto.py --out <dir>     # write pareto.json / .png elsewhere
   python optimize/pareto.py --no-interactive # save static PNG instead of live window
+  python optimize/pareto.py --summary-dir <dir>  # where the top-trials Markdown goes
+                                            #   (default visualization/summaries)
+  python optimize/pareto.py --no-summary    # skip the top-trials Markdown table
   python optimize/pareto.py --with-old       # include mobo_old_jackson (excluded by default)
   python optimize/pareto.py --show-numberline # show hyperparameter number-line figure
   python optimize/pareto.py --only mobo_00_01,mobo_00_02          # only these runs
@@ -929,6 +932,160 @@ def plot_pareto_interactive(
     plt.show()
 
 
+# ─── Top-trial summary table ────────────────────────────────────────────────────
+
+# Per-repeat plots shown as columns in the summary table (file name -> column head).
+SUMMARY_PLOTS: list[tuple[str, str]] = [
+    ("convergence.png",   "convergence"),
+    ("conet.png",         "conet"),
+    ("conet_uniform.png", "conet uniform"),
+]
+
+
+def _sub_runs(trial_dir: str) -> list[str]:
+    """The ensemble repeat directories of a trial (``trial_N/run_1`` ...), sorted.
+
+    Sorted numerically so run_10 doesn't land between run_1 and run_2. A
+    non-ensemble trial has none, and the caller falls back to the trial dir itself.
+    """
+    dirs = [d for d in glob.glob(os.path.join(trial_dir, "run_*")) if os.path.isdir(d)]
+
+    def _key(d: str) -> tuple[int, str]:
+        tail = os.path.basename(d).replace("run_", "")
+        return (int(tail), "") if tail.isdigit() else (10**9, d)
+
+    return sorted(dirs, key=_key)
+
+
+def _run_metrics(run_dir: str) -> dict:
+    """Per-repeat ``metrics.json`` (has 'dist' / 'dup'), or {} if missing/unreadable."""
+    path = os.path.join(run_dir, "metrics.json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _short_trial_label(source_run: str, trial: int) -> str:
+    """Narrow two-line label for the trial column, e.g. ``job19202380<br>t23``.
+
+    Run names like ``mobo_ensemble_6d_job19202380`` are long enough to stretch the
+    column past the plots, so keep just the job segment when there is one.
+    """
+    short = next((tok for tok in reversed(source_run.split("_"))
+                  if tok.startswith("job")), source_run)
+    return f"{short}<br>t{trial}"
+
+
+def _md_img(src: str | None, alt: str, width: int = 460) -> str:
+    """Markdown-table cell for a plot: a thumbnail linking to the full image.
+
+    Table cells can't hold block elements, so this uses an inline ``<img>`` (which
+    every Markdown renderer passes through) rather than ``![]()`` sizing tricks.
+    """
+    if not src:
+        return "—"
+    return f'<a href="{src}"><img src="{src}" alt="{alt}" width="{width}"></a>'
+
+
+def _pinned_records(records: list[dict], include: list[str]) -> list[dict]:
+    """Records named by ``<run>/trial_<n>`` (or ``<run>/<n>``) tokens, in token order."""
+    out: list[dict] = []
+    for token in include:
+        run, _, trial_tok = token.strip().partition("/")
+        trial_tok = trial_tok.removeprefix("trial_")
+        if not run or not trial_tok.isdigit():
+            print(f"  [warn] --summary-include: cannot parse {token!r}, expected "
+                  "<run>/trial_<n>")
+            continue
+        trial = int(trial_tok)
+        hit = next((r for r in records
+                    if r["source_run"] == run and int(r["trial"]) == trial), None)
+        if hit is None:
+            print(f"  [warn] --summary-include: no trial matched {token!r}")
+            continue
+        out.append(hit)
+    return out
+
+
+def write_top_trials_summary(
+    records: list[dict],
+    out_dir: str,
+    *,
+    top_n: int = 3,
+    include: list[str] | None = None,
+    collection_label: str = "",
+) -> str | None:
+    """Write a Markdown summary of the *top_n* trials by ``dist_to_needles``.
+
+    *include* pins extra trials that the dist ranking would miss — each token is
+    ``<run>/trial_<n>`` or ``<run>/<n>`` (e.g. a trial kept for its low dup
+    fraction). Pinned trials are appended after the ranked ones, de-duplicated.
+
+    One row per ensemble repeat (so ``top_n`` trials x 5 repeats = 15 rows), with
+    that repeat's own dist / dup fraction and its convergence, conet and uniform-conet
+    plots. Image paths are written relative to *out_dir* so the Markdown renders in
+    place. Returns the written path, or None if no trial had usable repeats.
+    """
+    ranked = sorted(records, key=lambda r: r["metrics"][DIST_KEY])[:top_n]
+    pinned = _pinned_records(records, include or [])
+    keys = {(r["source_run"], r["trial"]) for r in ranked}
+    ranked += [r for r in pinned if (r["source_run"], r["trial"]) not in keys]
+    if not ranked:
+        return None
+    os.makedirs(out_dir, exist_ok=True)
+
+    lines: list[str] = []
+    title = "Top %d trials by distance to needles" % top_n
+    if len(ranked) > top_n:
+        title += " (+%d pinned)" % (len(ranked) - top_n)
+    if collection_label:
+        title += f" — {collection_label}"
+    lines.append(f"# {title}")
+    lines.append("")
+    lines.append(f"Generated {datetime.datetime.now().isoformat(timespec='seconds')}. "
+                 "Each trial contributes one row per ensemble repeat; `dist` and `dup` "
+                 "are that repeat's own values (the trial-level metric is the mean "
+                 "across repeats).")
+    lines.append("")
+    header = ["trial", "run", "dist to needles", "dup fraction"] + [h for _, h in SUMMARY_PLOTS]
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("|" + "|".join(["---"] * len(header)) + "|")
+
+    n_rows = 0
+    for rec in ranked:
+        trial_dir = os.path.join(rec.get("source_dir") or "", rec["source_run"],
+                                 f"trial_{rec['trial']}")
+        sub_runs = _sub_runs(trial_dir) or [trial_dir]
+        label = f"{rec['source_run']} trial {rec['trial']}"
+        short_label = _short_trial_label(rec["source_run"], rec["trial"])
+        for i, sub in enumerate(sub_runs):
+            m = _run_metrics(sub)
+            dist = m.get("dist", rec["metrics"][DIST_KEY])
+            dup = m.get("dup", rec["metrics"][DUP_KEY])
+            run_label = os.path.basename(sub) if sub != trial_dir else "—"
+            # Name the trial once per group; repeating it on every repeat row is
+            # what forces the column wide.
+            cells = [short_label if i == 0 else "",
+                     run_label, f"{float(dist):.4f}", f"{float(dup):.4f}"]
+            for fname, head in SUMMARY_PLOTS:
+                path = os.path.join(sub, fname)
+                rel = (os.path.relpath(path, out_dir)
+                       if os.path.isfile(path) else None)
+                cells.append(_md_img(rel, f"{label} {run_label} {head}"))
+            lines.append("| " + " | ".join(cells) + " |")
+            n_rows += 1
+
+    slug = "".join(c if (c.isalnum() or c in "-_") else "_"
+                   for c in (collection_label or "runs"))
+    md_path = os.path.join(out_dir, f"{slug}_top{len(ranked)}.md")
+    with open(md_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"  top-{len(ranked)} trial summary ({n_rows} rows) -> {md_path}")
+    return md_path
+
+
 # ─── Replot from a saved pareto.json ─────────────────────────────────────────────
 
 def _load_pareto_json(path: str) -> tuple[list[dict], np.ndarray, np.ndarray, list[str]]:
@@ -998,6 +1155,18 @@ def main() -> None:
     parser.add_argument("--no-shared-history", action="store_true",
                         help="When a single run dir is given, do NOT pool sibling runs "
                              "with a matching run_config; use only that one run's trials.")
+    parser.add_argument("--summary-dir", default=None,
+                        help="Directory for the top-trials Markdown summary "
+                             "(default: visualization/summaries).")
+    parser.add_argument("--summary-top", type=int, default=3,
+                        help="How many best-dist trials the summary table covers "
+                             "(default: 3; one row per ensemble repeat).")
+    parser.add_argument("--summary-include", default=None,
+                        help="Comma-separated extra trials to pin into the summary "
+                             "regardless of their dist rank, as <run>/trial_<n> "
+                             "(e.g. mobo_ensemble_6d_job19202376/trial_39).")
+    parser.add_argument("--no-summary", action="store_true",
+                        help="Skip writing the top-trials Markdown summary.")
     parser.add_argument("--no-collab", action="store_true",
                         help="Do NOT pool collaborators' runs directories; restrict the "
                              "shared-history pool to this checkout's own runs.")
@@ -1152,6 +1321,19 @@ def main() -> None:
     with open(json_path, "w") as f:
         json.dump(out, f, indent=2)
     print(f"  pareto.json -> {json_path}")
+
+    # Markdown summary of the best trials, one row per ensemble repeat. Written
+    # under visualization/summaries by default (next to the other write-ups) rather
+    # than into the runs tree, since it links out to per-repeat plots by relpath.
+    if not args.no_summary:
+        summary_dir = (os.path.abspath(args.summary_dir) if args.summary_dir
+                       else os.path.join(os.path.dirname(script_dir),
+                                         "visualization", "summaries"))
+        label = (os.path.basename(os.path.normpath(os.path.abspath(args.runs_dir)))
+                 if args.runs_dir else "runs")
+        include = [tok for tok in (args.summary_include or "").split(",") if tok.strip()]
+        write_top_trials_summary(records, summary_dir, top_n=args.summary_top,
+                                 include=include, collection_label=label)
 
     if args.no_interactive:
         plot_pareto(M, mask, obj_labels, os.path.join(out_dir, "pareto_front.png"),
