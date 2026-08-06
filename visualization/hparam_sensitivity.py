@@ -42,6 +42,18 @@ Reference pools (see the module constants):
        it from the folder name (``mobo_hebo_*`` -> hebo, else ensemble), so they do
        join the pool — exactly as they do in the Pareto plots. --own-runs-only
        restricts the pool to this account for a robustness check.
+  6d   the signature-matched pool around mobo_ensemble_6d_job19202380 — the same
+       rule, and the same pool ``python optimize/pareto.py <that run dir>``
+       collects (single run dir -> pool its config-matching siblings).
+  10d  the signature-matched pool around mobo_ensemble_10d_job18275950. All 16 of
+       this account's 10d runs share one signature (time_limit_hours=0.7), so the
+       choice of reference among them does not change the pool. eve_lal's
+       mobo_19_06_15_45_28_124009_10d has no run_config.json at all, so it has no
+       signature to match and stays out (4 trials).
+
+Cross-dimension comparisons are run for every PAIR of the analysed
+dimensionalities, so the 3-vs-4 conclusion stays on screen next to 3-vs-6 and
+4-vs-6 rather than being replaced by them.
 
 Bounds drift: the canonical space has changed since the older runs were sampled
 (3d has max_zooms=2 in 48% of trials vs a canonical low of 3, and raw>300 in 16%;
@@ -51,8 +63,9 @@ flags the affected dimensions, because clipping piles those trials onto exactly
 Any max_zooms/raw conclusion for 3d carries that caveat in the report.
 
 Usage:
-  python visualization/hparam_sensitivity.py                    # both dims
-  python visualization/hparam_sensitivity.py --dim 3
+  python visualization/hparam_sensitivity.py                    # 3d + 4d + 6d + 10d
+  python visualization/hparam_sensitivity.py --dim 6
+  python visualization/hparam_sensitivity.py --dim both         # 3d + 4d only
   python visualization/hparam_sensitivity.py --top-frac 0.2
   python visualization/hparam_sensitivity.py --bounds union     # drift sensitivity
   python visualization/hparam_sensitivity.py --own-runs-only
@@ -104,8 +117,18 @@ RUNS_DIR_DEFAULT = os.path.join(_REPO, "optimize", "runs")
 # config recording, so there is no signature to pool siblings on.
 REF_3D = os.path.join("archived_runs", "mobo_05_06_15_32")
 
-# The 4d reference run whose *signature* defines the pool (not used alone).
-REF_4D = os.path.join("archived_runs", "mobo_ensemble_4d_job17300587")
+# Reference runs whose *signature* defines the pool for their dimensionality (the
+# run is never used alone — see load_pool). 3d is absent by construction: it has no
+# usable run_config.json, so it is handled as an explicit single run.
+REF_RUNS = {
+    4: os.path.join("archived_runs", "mobo_ensemble_4d_job17300587"),
+    6: "mobo_ensemble_6d_job19202380",
+    # All 16 of this account's 10d runs carry one identical signature, so any of
+    # them defines the same pool; the largest is named for concreteness.
+    10: "mobo_ensemble_10d_job18275950",
+}
+
+DIMS = [3, 4, 6, 10]
 
 # Uniform std in one dimension, the reference for a per-hyperparameter spread.
 UNIFORM_STD_1D = 1.0 / math.sqrt(12.0)
@@ -202,7 +225,7 @@ def encode(records: list[dict], names: list[str], space: dict[str, tuple],
 # ─── Pool assembly ───────────────────────────────────────────────────────────────
 
 def _crawl_dirs(runs_dir: str, *, own_only: bool = False) -> list[str]:
-    """Every runs dir worth crawling for the 4d pool: ours (live + archived) + collabs.
+    """Every runs dir worth crawling for a signature pool: ours (live + archived) + collabs.
 
     collab_dirs.SHARE_COLLABORATOR_HISTORY is deliberately NOT consulted: that flag
     governs live GP pooling for run_mobo/pareto/sync_runs, and flipping it would
@@ -234,23 +257,28 @@ def load_pool(dim: int, runs_dir: str, *, own_only: bool = False) -> dict:
                      "from the CLI. Scores legacy runtime_s."),
         }
 
-    ref = os.path.join(runs_dir, REF_4D)
+    if dim not in REF_RUNS:
+        raise SystemExit(f"no reference run configured for dim {dim} "
+                         f"(known: {sorted(REF_RUNS) + [3]})")
+    ref = os.path.join(runs_dir, REF_RUNS[dim])
     sig = _load_run_signature(ref)
     if sig is None:
-        raise SystemExit(f"4d reference run has no usable run_config.json: {ref}")
+        raise SystemExit(f"{dim}d reference run has no usable run_config.json: {ref}")
+    if sig.get("dim") != dim:
+        raise SystemExit(f"{dim}d reference run records dim={sig.get('dim')}: {ref}")
     match_sig = dict(sig)
     note = (f"signature-matched pool around {os.path.basename(ref)} "
             f"({json.dumps(sig, sort_keys=True)})")
     if own_only:
         note += " | OWN RUNS ONLY: collaborator runs dirs excluded."
-    print(f"[pool 4d] {note}")
+    print(f"[pool {dim}d] {note}")
 
     dirs = _crawl_dirs(runs_dir, own_only=own_only)
     records: list[dict] = []
     for d in dirs:
         records += collect_trials(d, only_signature=match_sig)
     if not records:
-        raise SystemExit("4d pool is empty — no signature-matching runs found.")
+        raise SystemExit(f"{dim}d pool is empty — no signature-matching runs found.")
     return {"records": records, "signature": match_sig, "dirs": dirs, "note": note}
 
 
@@ -589,6 +617,7 @@ def hparam_ranges(group_records: dict[str, list[dict]], groups: dict[str, np.nda
 
 
 def cross_dim_agreement(A: np.ndarray, B: np.ndarray, names: list[str],
+                        label_a: str = "a", label_b: str = "b",
                         lo_pct: float = 10.0, hi_pct: float = 90.0,
                         wide: float = 0.5) -> list[dict]:
     """Per-hyperparameter overlap of two good sets' central ranges.
@@ -624,13 +653,13 @@ def cross_dim_agreement(A: np.ndarray, B: np.ndarray, names: list[str],
         elif frac < 0.5:
             verdict = "disagrees"
         elif a_wide != b_wide:
-            verdict = f"compatible ({'4d' if b_wide else '3d'} free)"
+            verdict = f"compatible ({label_b if b_wide else label_a} free)"
         else:
             verdict = "agrees"
         rows.append({
             "hparam": n,
-            "band_3d": [float(a_lo), float(a_hi)],
-            "band_4d": [float(b_lo), float(b_hi)],
+            "band_a": [float(a_lo), float(a_hi)],
+            "band_b": [float(b_lo), float(b_hi)],
             "overlap_frac": float(frac),
             "verdict": verdict,
         })
@@ -765,8 +794,8 @@ def plot_deploy_proximity(rows: list[dict], dim: int, out: str) -> None:
     print(f"  [plot] {out}")
 
 
-def plot_cross_dim(rows: list[dict], out: str) -> None:
-    """Per-hyperparameter 10-90 bands of the 3d and 4d good sets, side by side."""
+def plot_cross_dim(rows: list[dict], label_a: str, label_b: str, out: str) -> None:
+    """Per-hyperparameter 10-90 bands of two dimensionalities' good sets, side by side."""
     if not rows:
         return
     names = [r["hparam"] for r in rows]
@@ -779,8 +808,8 @@ def plot_cross_dim(rows: list[dict], out: str) -> None:
     for i, r in enumerate(rows):
         # A fully pinned band has zero width and would draw as nothing, so the
         # degenerate case gets a marker instead of an invisible line.
-        for band, off, col in ((r["band_3d"], 0.16, "#1f77b4"),
-                               (r["band_4d"], -0.16, "#ff7f0e")):
+        for band, off, col in ((r["band_a"], 0.16, "#1f77b4"),
+                               (r["band_b"], -0.16, "#ff7f0e")):
             if band[1] - band[0] < 0.01:
                 ax.plot([band[0]], [y[i] + off], marker="|", ms=9, mew=2.5,
                         color=col)
@@ -789,8 +818,8 @@ def plot_cross_dim(rows: list[dict], out: str) -> None:
                         solid_capstyle="butt")
         ax.text(1.02, y[i], r["verdict"], fontsize=6.5, va="center",
                 color=vcolor(r["verdict"]))
-    ax.plot([], [], lw=5, color="#1f77b4", label="3d good set (10-90%)")
-    ax.plot([], [], lw=5, color="#ff7f0e", label="4d good set (10-90%)")
+    ax.plot([], [], lw=5, color="#1f77b4", label=f"{label_a} good set (10-90%)")
+    ax.plot([], [], lw=5, color="#ff7f0e", label=f"{label_b} good set (10-90%)")
     ax.set_yticks(y)
     ax.set_yticklabels(names, fontsize=7)
     # Room to the right of the [0, 1] cube for the verdict labels.
@@ -798,8 +827,8 @@ def plot_cross_dim(rows: list[dict], out: str) -> None:
     ax.axvline(1.0, color="black", lw=0.8)
     ax.set_xticks([0.0, 0.25, 0.5, 0.75, 1.0])
     ax.set_xlabel("normalised value in canonical bounds")
-    ax.set_title("Does the good region sit in the same place in 3D and 4D?",
-                 fontsize=10)
+    ax.set_title(f"Does the good region sit in the same place in "
+                 f"{label_a.upper()} and {label_b.upper()}?", fontsize=10)
     ax.legend(fontsize=8, loc="lower left")
     ax.invert_yaxis()
     fig.tight_layout()
@@ -944,44 +973,52 @@ def write_report(summary: dict, names: list[str], out_dir: str) -> str:
         A("")
 
     if summary.get("cross_dim"):
-        cd = summary["cross_dim"]
-        A("## Is the good region in the same place in 3D and 4D?")
+        A("## Is the good region in the same place across dimensionalities?")
         A("")
-        A(f"Compared on the best-{summary['top_frac']:.0%}-of-Pareto sets "
-          f"(n_3d={cd['n_3d']}, n_4d={cd['n_4d']}). `dist_to_needles` is the one"
-          "objective defined comparably in both pools; Pareto membership is not, "
-          "since the 3d run scores `runtime_s` and the 4d pool "
-          "`avg_time_per_iter_s`. The 3d set is subsampled to the 4d size "
-          f"({cd['n_matched']}) over {cd['n_subsample']} draws wherever a raw "
-          "comparison would be confounded by group size.")
+        A(f"Each pair is compared on its best-{summary['top_frac']:.0%}-of-Pareto "
+          "sets. `dist_to_needles` is the one objective defined comparably across "
+          "pools; Pareto membership is not, since the 3d run scores `runtime_s` "
+          "and the 4d/6d pools `avg_time_per_iter_s`. The larger set is "
+          "subsampled to the smaller wherever a raw comparison would be "
+          "confounded by group size.")
         A("")
-        A(f"- energy distance {_f(cd['energy']['energy'])}, permutation "
-          f"p = **{_f(cd['energy']['p_value'])}** "
-          f"({cd['energy']['n_perm']} shuffles) — small p means the two good sets "
-          "occupy *different* regions")
-        A(f"- 3d→4d mean nearest-neighbour distance {_f(cd['nn_3d_to_4d']['d'])}, "
-          f"percentile of null **{_f(cd['nn_3d_to_4d']['percentile'])}**")
-        A(f"- 4d→3d mean nearest-neighbour distance {_f(cd['nn_4d_to_3d']['d'])}, "
-          f"percentile of null **{_f(cd['nn_4d_to_3d']['percentile'])}**")
-        A(f"- size-matched dispersion: 3d subsampled to n={cd['n_matched']} gives "
-          f"mean pairwise {_f(cd['matched']['mean_3d'])} "
-          f"(±{_f(cd['matched']['std_3d'])}) vs 4d {_f(cd['matched']['mean_4d'])}")
-        A("")
-        A("### Per-hyperparameter agreement")
-        A("")
-        A("| hyperparameter | 3d band (10-90%) | 4d band (10-90%) | overlap | verdict |")
-        A("|---|---|---|---|---|")
-        for r in cd["agreement"]:
-            A(f"| `{r['hparam']}` | "
-              f"[{r['band_3d'][0]:.2f}, {r['band_3d'][1]:.2f}] | "
-              f"[{r['band_4d'][0]:.2f}, {r['band_4d'][1]:.2f}] | "
-              f"{_f(r['overlap_frac'], 2)} | {r['verdict']} |")
-        A("")
-        counts = {}
-        for r in cd["agreement"]:
-            counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
-        A("Summary: " + ", ".join(f"**{v}** {k}" for k, v in sorted(counts.items())))
-        A("")
+        for cd in summary["cross_dim"]:
+            la, lb = cd["label_a"], cd["label_b"]
+            A(f"### {la.upper()} vs {lb.upper()}")
+            A("")
+            A(f"Sets: n_{la}={cd['n_a']}, n_{lb}={cd['n_b']}.")
+            A("")
+            A(f"- energy distance {_f(cd['energy']['energy'])}, permutation "
+              f"p = **{_f(cd['energy']['p_value'])}** "
+              f"({cd['energy']['n_perm']} shuffles) — small p means the two good "
+              "sets occupy *different* regions")
+            A(f"- {la}→{lb} mean nearest-neighbour distance "
+              f"{_f(cd['nn_a_to_b']['d'])}, percentile of null "
+              f"**{_f(cd['nn_a_to_b']['percentile'])}**")
+            A(f"- {lb}→{la} mean nearest-neighbour distance "
+              f"{_f(cd['nn_b_to_a']['d'])}, percentile of null "
+              f"**{_f(cd['nn_b_to_a']['percentile'])}**")
+            A(f"- size-matched dispersion: {cd['subsampled']} subsampled to "
+              f"n={cd['n_matched']} gives mean pairwise "
+              f"{_f(cd['matched']['mean_subsampled'])} "
+              f"(±{_f(cd['matched']['std_subsampled'])}) vs "
+              f"{_f(cd['matched']['mean_other'])} for the other")
+            A("")
+            A(f"| hyperparameter | {la} band (10-90%) | {lb} band (10-90%) | "
+              "overlap | verdict |")
+            A("|---|---|---|---|---|")
+            for r in cd["agreement"]:
+                A(f"| `{r['hparam']}` | "
+                  f"[{r['band_a'][0]:.2f}, {r['band_a'][1]:.2f}] | "
+                  f"[{r['band_b'][0]:.2f}, {r['band_b'][1]:.2f}] | "
+                  f"{_f(r['overlap_frac'], 2)} | {r['verdict']} |")
+            A("")
+            counts = {}
+            for r in cd["agreement"]:
+                counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+            A("Summary: "
+              + ", ".join(f"**{v}** {k}" for k, v in sorted(counts.items())))
+            A("")
 
     A("## Caveats")
     A("")
@@ -1189,12 +1226,14 @@ def analyse_dim(dim: int, args, space: dict, names: list[str],
     }
 
 
-def compare_dims(per_dim: dict, names: list[str], U: np.ndarray, args,
-                 rng: np.random.Generator) -> dict:
-    A = per_dim["3"]["_X"]["top"]
-    B = per_dim["4"]["_X"]["top"]
+def compare_dims(per_dim: dict, dim_a: int, dim_b: int, names: list[str],
+                 U: np.ndarray, args, rng: np.random.Generator) -> dict:
+    """One pairwise comparison of two dimensionalities' good sets."""
+    la, lb = f"{dim_a}d", f"{dim_b}d"
+    A = per_dim[str(dim_a)]["_X"]["top"]
+    B = per_dim[str(dim_b)]["_X"]["top"]
     print("=" * 70)
-    print(f"[cross-dim] 3d top n={len(A)} vs 4d top n={len(B)}")
+    print(f"[cross-dim] {la} top n={len(A)} vs {lb} top n={len(B)}")
 
     energy = energy_test(A, B, args.n_perm, rng)
     nn_ab = float(cross_dmin(A, B).mean())
@@ -1202,35 +1241,42 @@ def compare_dims(per_dim: dict, names: list[str], U: np.ndarray, args,
     null_ab = cross_dmin(U, B)
     null_ba = cross_dmin(U, A)
 
-    # Size-match the (larger) 3d set to the 4d set before comparing dispersion:
-    # mean pairwise distance shrinks with n, so the raw numbers are not comparable.
+    # Size-match the larger set to the smaller before comparing dispersion: mean
+    # pairwise distance shrinks with n, so the raw numbers are not comparable.
     k = min(len(A), len(B))
-    sub = [pdist_mean(A[rng.choice(len(A), size=k, replace=False)])
+    big, small_is_a = (A, False) if len(A) >= len(B) else (B, True)
+    sub = [pdist_mean(big[rng.choice(len(big), size=k, replace=False)])
            for _ in range(args.n_subsample)]
 
     out = {
-        "n_3d": len(A),
-        "n_4d": len(B),
+        "dim_a": dim_a,
+        "dim_b": dim_b,
+        "label_a": la,
+        "label_b": lb,
+        "n_a": len(A),
+        "n_b": len(B),
         "n_matched": k,
         "n_subsample": args.n_subsample,
+        "subsampled": lb if small_is_a else la,
         "energy": energy,
-        "nn_3d_to_4d": {"d": nn_ab, "percentile": _pct_le(null_ab, nn_ab),
-                        "null_mean": float(null_ab.mean())},
-        "nn_4d_to_3d": {"d": nn_ba, "percentile": _pct_le(null_ba, nn_ba),
-                        "null_mean": float(null_ba.mean())},
-        "matched": {"mean_3d": float(np.mean(sub)), "std_3d": float(np.std(sub)),
-                    "mean_4d": pdist_mean(B)},
-        "agreement": cross_dim_agreement(A, B, names),
+        "nn_a_to_b": {"d": nn_ab, "percentile": _pct_le(null_ab, nn_ab),
+                      "null_mean": float(null_ab.mean())},
+        "nn_b_to_a": {"d": nn_ba, "percentile": _pct_le(null_ba, nn_ba),
+                      "null_mean": float(null_ba.mean())},
+        "matched": {"mean_subsampled": float(np.mean(sub)),
+                    "std_subsampled": float(np.std(sub)),
+                    "mean_other": pdist_mean(A if small_is_a else B)},
+        "agreement": cross_dim_agreement(A, B, names, la, lb),
     }
     print(f"  [cross-dim] energy={energy['energy']:.4f} p={energy['p_value']:.3f}  "
-          f"3d→4d nn={nn_ab:.3f} (pct {out['nn_3d_to_4d']['percentile']:.3f})")
+          f"{la}→{lb} nn={nn_ab:.3f} (pct {out['nn_a_to_b']['percentile']:.3f})")
     counts = {}
     for r in out["agreement"]:
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
     print("  [cross-dim] per-hparam verdicts: "
           + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
-    plot_cross_dim(out["agreement"],
-                   os.path.join(args.out, "cross_dim_agreement.png"))
+    plot_cross_dim(out["agreement"], la, lb,
+                   os.path.join(args.out, f"cross_dim_agreement_{la}_{lb}.png"))
     return out
 
 
@@ -1238,8 +1284,10 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description="Cluster analysis of hyperparameter configurations in the "
                     "normalised search space.")
-    p.add_argument("--dim", default="both", choices=["3", "4", "both"],
-                   help="dimensionality to analyse (default: both)")
+    p.add_argument("--dim", default="all",
+                   choices=["3", "4", "6", "10", "both", "all"],
+                   help="dimensionality to analyse: one dim, `both` (3+4, the "
+                        "historical default) or `all` (3+4+6+10, the default)")
     p.add_argument("--top-frac", type=float, default=0.10,
                    help="fraction of the PARETO FRONT, best by dist_to_needles, "
                         "that forms the 'top' group (default: 0.10). At 10% this "
@@ -1255,7 +1303,8 @@ def main() -> None:
                    help="policy for values outside the canonical space "
                         "(default: clip, and flag the affected dimensions)")
     p.add_argument("--own-runs-only", action="store_true",
-                   help="restrict the 4d pool to this account's runs dirs "
+                   help="restrict the signature-matched pools to this account's "
+                        "runs dirs "
                         "(collaborator runs are pooled by default, matching "
                         "pareto.py's signature rule)")
     p.add_argument("--runs-dir", default=RUNS_DIR_DEFAULT,
@@ -1278,13 +1327,16 @@ def main() -> None:
           f"(uniform mean pairwise distance ~ {math.sqrt(len(names) / 6):.3f})")
     U = sobol_null(args.n_null, len(names), args.seed)
 
-    dims = [3, 4] if args.dim == "both" else [int(args.dim)]
+    dims = ([3, 4] if args.dim == "both" else
+            list(DIMS) if args.dim == "all" else [int(args.dim)])
     per_dim = {}
     for dim in dims:
         per_dim[str(dim)] = analyse_dim(dim, args, space, names, U, rng)
 
-    cross = (compare_dims(per_dim, names, U, args, rng)
-             if len(dims) == 2 else None)
+    # Every pair of the analysed dimensionalities, so 3-vs-4 conclusions stay
+    # comparable with the newer 3-vs-6 / 4-vs-6 ones.
+    cross = [compare_dims(per_dim, a, b, names, U, args, rng)
+             for i, a in enumerate(dims) for b in dims[i + 1:]]
 
     caveats = [
         "Euclidean distance in the normalised cube weights all "
@@ -1294,13 +1346,16 @@ def main() -> None:
         "The 3d reference is one archived run whose run_config.json records no "
         "dim/dataset/hparam_space, so its dimensionality is asserted, not "
         "verified, and it cannot be signature-pooled with siblings.",
-        "The 3d pool scores the legacy `runtime_s` while the 4d pool scores "
-        "`avg_time_per_iter_s`, so Pareto membership is not defined on the same "
-        "objective triple across dimensionalities — cross-dim claims use the "
+        "The 3d pool scores the legacy `runtime_s` while the 4d and 6d pools "
+        "score `avg_time_per_iter_s`, so Pareto membership is not defined on the "
+        "same objective triple across dimensionalities — cross-dim claims use the "
         "best-of-Pareto-by-dist_to_needles sets instead.",
-        "Each 4d run randomises its ensemble landscape (the signature "
-        "deliberately excludes ensemble_seed), so the 4d good set is averaged "
+        "Each 4d/6d run randomises its ensemble landscape (the signature "
+        "deliberately excludes ensemble_seed), so those good sets are averaged "
         "over landscapes while the 3d run is a single fixed one.",
+        "`dist_to_needles` is not comparable in magnitude across "
+        "dimensionalities — the needles differ and the space is larger — so the "
+        "`top` cut selects the sharp end *within* each pool, never across pools.",
         "A group's apparent spread partly reflects which bounds its sampler drew "
         "from, not only where good configurations live; newer runs record their "
         "own space at run_config.json:invocation.hparam_space, the 3d reference "
@@ -1310,13 +1365,14 @@ def main() -> None:
         "estimated and no asymptotic test is used.",
     ]
     caveats.append(
-        "The 4d pool spans both accounts. eve_lal's older-fork runs never stored "
+        "The signature-matched pools span both accounts. eve_lal's older-fork "
+        "runs never stored "
         "the `variant` key; pareto._load_run_signature backfills it from the "
         "folder name, which is what admits them — the same rule the Pareto plots "
         "use, but it is a name-based inference, not a recorded fact."
         if not args.own_runs_only else
-        "--own-runs-only was set: the 4d pool excludes collaborator runs, so it is "
-        "much smaller than the pool the Pareto plots use.")
+        "--own-runs-only was set: the signature-matched pools exclude collaborator "
+        "runs, so they are smaller than the pools the Pareto plots use.")
 
     summary = {
         "generated": datetime.datetime.now().isoformat(timespec="seconds"),
