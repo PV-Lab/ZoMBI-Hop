@@ -1,0 +1,20 @@
+{
+  "hparams": {
+    "nat_grad_step": 0.23242035,
+    "nat_grad_max_steps": 400,
+    "n_restarts": 300,
+    "raw": 300,
+    "ucb_beta": 3.0,
+    "max_zooms": 3,
+    "max_iterations": 2,
+    "top_m_points": 8,
+    "n_consecutive_converged": 5,
+    "input_noise_threshold_mult": 0.5,
+    "output_noise_threshold_mult": 2.0,
+    "max_penalty_radius": 0.5020402,
+    "needle_shrink_factor": 0.99,
+    "needle_stop_noise_multiplier": 1.0,
+    "paring_spatial_halfnoise": 5.0,
+    "paring_y_noise_multiplier": 10.0
+  }
+}

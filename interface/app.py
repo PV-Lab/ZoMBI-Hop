@@ -3811,8 +3811,8 @@ class NewRunDialog(tk.Toplevel):
                    command=lambda: self._browse_hparams_into(self._syn_hparams_var)).pack(side="left")
 
         row += 1
-        ttk.Label(tf, text="(trial.json-style file. If blank, arbitrary defaults "
-                           f"are used instead — from {DEFAULT_HPARAMS_PROVENANCE}.)",
+        ttk.Label(tf, text="(trial.json-style file. If blank, the tuned defaults "
+                           f"from {DEFAULT_HPARAMS_PROVENANCE} are used.)",
                   foreground="gray").grid(row=row, column=0, columnspan=3,
                                           sticky="w", padx=8)
 
@@ -3862,8 +3862,8 @@ class NewRunDialog(tk.Toplevel):
                    command=lambda: self._browse_hparams_into(self._hw_hparams_var)).pack(side="left")
 
         hrow += 1
-        ttk.Label(hw, text="(trial.json-style file. If blank, arbitrary defaults "
-                           f"are used instead — from {DEFAULT_HPARAMS_PROVENANCE}.)",
+        ttk.Label(hw, text="(trial.json-style file. If blank, the tuned defaults "
+                           f"from {DEFAULT_HPARAMS_PROVENANCE} are used.)",
                   foreground="gray").grid(
             row=hrow, column=0, columnspan=2, sticky="w", padx=8)
 
@@ -4195,6 +4195,12 @@ class HardwareResumeDialog(tk.Toplevel):
         hpf.grid(row=row, column=1, sticky="w", pady=4)
         ttk.Entry(hpf, textvariable=self._hparams_var, width=26).pack(side="left")
         ttk.Button(hpf, text="…", width=3, command=self._browse_hparams).pack(side="left")
+
+        row += 1
+        ttk.Label(f, text="(trial.json-style file. If blank, the tuned defaults "
+                          f"from {DEFAULT_HPARAMS_PROVENANCE} are used.)",
+                  foreground="gray").grid(row=row, column=0, columnspan=2,
+                                          sticky="w", padx=8)
 
         row += 1
         ttk.Separator(f, orient="horizontal").grid(
