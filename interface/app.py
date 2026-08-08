@@ -3722,8 +3722,10 @@ class DimSelector(ttk.Frame):
     def bounds_for_selected(self) -> tuple[list[float], list[float]]:
         """(lo, hi) lists aligned to ``selected_dims()``.
 
-        Raises ValueError (with a user-facing message) on an empty selection or a
-        min/max that is non-numeric or violates 0 ≤ min < max ≤ 1."""
+        Raises ValueError (with a user-facing message) on an empty selection, a
+        min/max that is non-numeric or violates 0 ≤ min < max ≤ 1, or a box that
+        cannot contain any composition (the simplex needs sum(min) ≤ 1 ≤ sum(max);
+        without this check the run would fail later inside random_simplex)."""
         dims = self.selected_dims()
         if not dims:
             raise ValueError("Select at least one dimension to optimise.")
@@ -3740,6 +3742,14 @@ class DimSelector(ttk.Frame):
                     f"dim {i}: need 0 ≤ min < max ≤ 1 (got [{a}, {b}]).")
             lo.append(a)
             hi.append(b)
+        if sum(hi) < 1.0 - 1e-9:
+            raise ValueError(
+                f"The maxima sum to {sum(hi):.4g} < 1, so no composition fits in "
+                "this box (components must sum to 1). Raise a max or add a dim.")
+        if sum(lo) > 1.0 + 1e-9:
+            raise ValueError(
+                f"The minima sum to {sum(lo):.4g} > 1, so no composition fits in "
+                "this box (components must sum to 1). Lower a min or drop a dim.")
         return lo, hi
 
 

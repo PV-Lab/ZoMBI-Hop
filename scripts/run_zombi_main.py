@@ -21,8 +21,8 @@ import torch
 
 from src import ZoMBIHop, LineBO
 from src.core.linebo import (
+    batch_line_bounds_segments,
     batch_line_simplex_segments,
-    line_simplex_segment,
     zero_sum_dirs,
 )
 
@@ -919,35 +919,39 @@ def initial_lines_on_boundary(
     max_retries: int = 10,
 ) -> np.ndarray:
     """
-    Generate num_lines with endpoints on the simplex boundary.
+    Generate num_lines with endpoints on the search-box boundary.
 
-    Sample num_lines interior points on the simplex and num_lines random
-    zero-sum directions; for each point + direction, extrapolate to the
-    simplex boundary (as in linebo.line_simplex_segment) to get (x_left, x_right).
+    Sample num_lines interior points inside the box-constrained simplex and
+    num_lines random zero-sum directions; for each point + direction, extend to
+    the boundary of ``[bounds[0], bounds[1]]`` (linebo.batch_line_bounds_segments)
+    to get (x_left, x_right). Clipping to the box — not to the bare simplex face —
+    matters whenever a dim is capped below 1 (e.g. [0, 0.3]): extending to the
+    simplex face would seed the run with points outside the requested box.
     Returns ordered_endpoints of shape (num_lines, 2, d) where [i, 0] is left
     and [i, 1] is right endpoint on the boundary.
     """
     d = bounds.shape[1]
     low, high = bounds[0], bounds[1]
-    # Interior points on simplex (sum=1, in [0,1])
+    # Interior points on simplex (sum=1, within the per-dim box)
     points = ZoMBIHop.random_simplex(num_lines, low, high, device=device)
+    bounds = bounds.to(device=points.device, dtype=points.dtype)
     endpoints_list = []
     for i in range(num_lines):
         x0 = points[i]
         for _ in range(max_retries):
             direction = zero_sum_dirs(1, d, device=device, dtype=dtype).squeeze(0)
-            seg = line_simplex_segment(x0, direction)
-            if seg is not None:
-                _t_min, _t_max, x_left, x_right = seg
-                endpoints_list.append([x_left.cpu().numpy(), x_right.cpu().numpy()])
+            x_left, x_right, _t_min, _t_max, mask = batch_line_bounds_segments(
+                x0, direction.unsqueeze(0).to(x0.dtype), bounds
+            )
+            if bool(mask.any()):
+                endpoints_list.append([x_left[0].cpu().numpy(),
+                                       x_right[0].cpu().numpy()])
                 break
         else:
-            # Fallback: segment between two vertices (boundary edges)
-            ei = torch.zeros(d, device=device, dtype=dtype)
-            ej = torch.zeros(d, device=device, dtype=dtype)
-            ei[i % d] = 1.0
-            ej[(i + 1) % d] = 1.0
-            endpoints_list.append([ei.cpu().numpy(), ej.cpu().numpy()])
+            # Fallback: chord between two independently sampled in-box points, so a
+            # degenerate direction never seeds a line outside the search box.
+            pair = ZoMBIHop.random_simplex(2, low, high, device=device)
+            endpoints_list.append([pair[0].cpu().numpy(), pair[1].cpu().numpy()])
     return np.array(endpoints_list)
 
 
