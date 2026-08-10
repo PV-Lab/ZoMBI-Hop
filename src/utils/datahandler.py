@@ -249,6 +249,19 @@ class DataHandler:
         self.needle_M_list: List[Optional[torch.Tensor]] = []  # each (d-1, d-1)
         self.needle_B: Optional[torch.Tensor] = None           # (d, d-1)
 
+        # --- Exclusion zones -------------------------------------------------
+        # Penalised regions that are NOT needles: an activation that burns its
+        # whole line budget without localising an optimum marks the region it was
+        # stuck in so the next activation is repelled from it. They participate in
+        # the penalty mask and the repulsive acquisition exactly like needles, but
+        # are deliberately kept out of self.needles / needles_results so the needle
+        # record (and every metric read off it, e.g. dist_to_needles) still means
+        # "an optimum we localised" rather than "a place we gave up on".
+        # They share needle_B — same simplex tangent space.
+        self.exclusions: Optional[torch.Tensor] = None          # (n, d)
+        self.exclusion_radii: Optional[torch.Tensor] = None     # (n, 1) sphere fallback
+        self.exclusion_M_list: List[Optional[torch.Tensor]] = []
+
         self._penalty_mask: Optional[torch.Tensor] = None
 
         # Pared dataset (noise-deduplicated view of X_all_actual / Y_all for GP)
@@ -317,6 +330,10 @@ class DataHandler:
         self.needle_penalty_radii = torch.empty((0, 1), device=self.device, dtype=self.dtype)
         self.needle_M_list = []
         self.needle_B = None
+
+        self.exclusions = torch.empty((0, self.d), device=self.device, dtype=self.dtype)
+        self.exclusion_radii = torch.empty((0, 1), device=self.device, dtype=self.dtype)
+        self.exclusion_M_list = []
 
         self._update_penalty_mask()
 
@@ -419,6 +436,8 @@ class DataHandler:
             needle_has_M = torch.zeros(0, dtype=torch.bool, device=self.device)
             needle_M_stack = torch.zeros(0, 1, 1, device=self.device, dtype=self.dtype)
 
+        excl_has_M, excl_M_stack = self._stack_optional_M(self.exclusion_M_list)
+
         # --- DP delta: only save rows added since the previous snapshot ---
         _d = self.d or 1
         n_curr = self.X_all_actual.shape[0] if self.X_all_actual is not None else 0
@@ -466,6 +485,12 @@ class DataHandler:
             'needle_M_stack': needle_M_stack,
             'needle_has_M': needle_has_M,
             'needle_B': self.needle_B,
+            'exclusions': (self.exclusions if self.exclusions is not None
+                           else torch.zeros(0, _d, device=self.device, dtype=self.dtype)),
+            'exclusion_radii': (self.exclusion_radii if self.exclusion_radii is not None
+                                else torch.zeros(0, 1, device=self.device, dtype=self.dtype)),
+            'exclusion_M_stack': excl_M_stack,
+            'exclusion_has_M': excl_has_M,
             'penalty_mask': self._penalty_mask,
             # Bounds-history delta
             'bounds_history_new': bounds_history_new,
@@ -779,6 +804,17 @@ class DataHandler:
         nb = d.get('needle_B')
         self.needle_B = nb.to(self.device, self.dtype) if isinstance(nb, torch.Tensor) else None
 
+        # Exclusion zones — absent from checkpoints predating them, hence the
+        # empty defaults rather than a KeyError.
+        _excl = _t('exclusions')
+        self.exclusions = _excl if _excl is not None else torch.empty(
+            0, _d, device=self.device, dtype=self.dtype)
+        _excl_r = _t('exclusion_radii')
+        self.exclusion_radii = _excl_r if _excl_r is not None else torch.empty(
+            0, 1, device=self.device, dtype=self.dtype)
+        self.exclusion_M_list = self._unstack_optional_M(
+            d, 'exclusion_M_stack', 'exclusion_has_M')
+
         pm = d.get('penalty_mask')
         self._penalty_mask = pm.to(self.device) if isinstance(pm, torch.Tensor) else None
 
@@ -868,6 +904,18 @@ class DataHandler:
 
         nb = tensors.get('needle_B', None)
         self.needle_B = nb.to(device=self.device, dtype=self.dtype) if nb is not None else None
+
+        # Exclusion zones (never present in the old checkpoint format → empty).
+        _excl = tensors.get('exclusions', None)
+        self.exclusions = (_excl.to(device=self.device, dtype=self.dtype)
+                           if isinstance(_excl, torch.Tensor)
+                           else torch.empty(0, self.d or 1, device=self.device, dtype=self.dtype))
+        _excl_r = tensors.get('exclusion_radii', None)
+        self.exclusion_radii = (_excl_r.to(device=self.device, dtype=self.dtype)
+                                if isinstance(_excl_r, torch.Tensor)
+                                else torch.empty(0, 1, device=self.device, dtype=self.dtype))
+        self.exclusion_M_list = self._unstack_optional_M(
+            tensors, 'exclusion_M_stack', 'exclusion_has_M')
 
         # Restore bounds_history (absent in old checkpoints → empty)
         bhs = tensors.get('bounds_history_stack', None)
@@ -1132,12 +1180,22 @@ class DataHandler:
         return self.needles_results
 
     def get_needles_and_penalty_radii(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return (needles, penalty_radii) tensors."""
-        return self.needles, self.needle_penalty_radii
+        """Return (centers, penalty_radii) of every penalised region.
+
+        Includes exclusion zones as well as needles: this feeds
+        RepulsiveAcquisition, and a region the hard penalty mask rejects must also
+        repel the acquisition, or every restart that lands there is wasted.
+        """
+        centers, radii, _ = self._penalty_regions()
+        return centers, radii
 
     def get_needle_ellipsoids(self) -> Tuple[List[Optional[torch.Tensor]], Optional[torch.Tensor]]:
-        """Return (needle_M_list, needle_B) for use in RepulsiveAcquisition."""
-        return self.needle_M_list, self.needle_B
+        """Return (M_list, B) for use in RepulsiveAcquisition, needles + exclusions.
+
+        Index-aligned with ``get_needles_and_penalty_radii``.
+        """
+        _, _, M_list = self._penalty_regions()
+        return M_list, self.needle_B
 
     def get_all_needle_results(self) -> List[Dict[str, Any]]:
         return self.needles_results
@@ -1157,6 +1215,99 @@ class DataHandler:
     # =========================================================================
     # Penalty mask
     # =========================================================================
+
+    def _stack_optional_M(
+        self, M_list: List[Optional[torch.Tensor]]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Serialise a list of Optional (d-1, d-1) matrices as (has_M, stacked).
+
+        None entries become zero blocks flagged False in ``has_M``, so the
+        optional-ness survives ``torch.save``.
+        """
+        if not M_list:
+            return (torch.zeros(0, dtype=torch.bool, device=self.device),
+                    torch.zeros(0, 1, 1, device=self.device, dtype=self.dtype))
+        dm1 = next((m.shape[0] for m in M_list if m is not None), None)
+        if dm1 is None:
+            dm1 = self.needle_B.shape[1] if self.needle_B is not None else max((self.d or 2) - 1, 1)
+        has_M = torch.tensor([m is not None for m in M_list],
+                             dtype=torch.bool, device=self.device)
+        stack = torch.stack([
+            m.to(device=self.device, dtype=self.dtype) if m is not None
+            else torch.zeros(dm1, dm1, device=self.device, dtype=self.dtype)
+            for m in M_list
+        ], dim=0)
+        return has_M, stack
+
+    def _unstack_optional_M(self, d: dict, stack_key: str,
+                            has_key: str) -> List[Optional[torch.Tensor]]:
+        """Inverse of ``_stack_optional_M``; [] when the keys are absent.
+
+        Absent keys are the normal case for a checkpoint written before exclusion
+        zones existed, so this must not raise — it must restore "no zones".
+        """
+        stack = d.get(stack_key)
+        has = d.get(has_key)
+        if not (isinstance(stack, torch.Tensor) and isinstance(has, torch.Tensor)
+                and has.shape[0] > 0):
+            return []
+        return [stack[i].to(self.device, self.dtype) if has[i].item() else None
+                for i in range(len(has))]
+
+    def _penalty_regions(self) -> Tuple[torch.Tensor, torch.Tensor, List[Optional[torch.Tensor]]]:
+        """Return (centers, radii, M_list) over EVERY penalised region.
+
+        Needles first, then exclusion zones. This is the single source of truth
+        for what the optimiser is repelled from, so a caller can never repel from
+        one kind and not the other. The M-list is padded to the centre count
+        because an old checkpoint can restore needles without their ellipsoids
+        (sphere fallback), and a short list would silently misalign the
+        needle/exclusion boundary.
+        """
+        n_needles = self.needles.shape[0] if self.needles is not None else 0
+        M_list: List[Optional[torch.Tensor]] = list(self.needle_M_list)
+        M_list += [None] * (n_needles - len(M_list))
+
+        if self.exclusions is None or self.exclusions.shape[0] == 0:
+            return self.needles, self.needle_penalty_radii, M_list
+
+        excl_M: List[Optional[torch.Tensor]] = list(self.exclusion_M_list)
+        excl_M += [None] * (self.exclusions.shape[0] - len(excl_M))
+        centers = torch.cat([self.needles, self.exclusions], dim=0)
+        radii = torch.cat([self.needle_penalty_radii, self.exclusion_radii], dim=0)
+        return centers, radii, M_list + excl_M
+
+    def add_exclusion(
+        self,
+        center: torch.Tensor,
+        M: Optional[torch.Tensor] = None,
+        B: Optional[torch.Tensor] = None,
+        radius: float = 0.0,
+    ) -> None:
+        """Record a non-needle exclusion zone and refresh the penalty mask.
+
+        ``M`` is the tangent-space ellipsoid (as for a needle); when it is None the
+        region falls back to a sphere of ``radius`` around ``center``.
+        """
+        center = center.to(device=self.device, dtype=self.dtype).reshape(1, -1)
+        if self.exclusions is None:
+            self.exclusions = torch.empty((0, self.d), device=self.device, dtype=self.dtype)
+            self.exclusion_radii = torch.empty((0, 1), device=self.device, dtype=self.dtype)
+
+        self.exclusions = torch.cat([self.exclusions, center], dim=0)
+        self.exclusion_radii = torch.cat([
+            self.exclusion_radii,
+            torch.tensor([[float(radius)]], device=self.device, dtype=self.dtype),
+        ], dim=0)
+        self.exclusion_M_list.append(
+            M.to(device=self.device, dtype=self.dtype) if M is not None else None)
+        if M is not None:
+            if B is not None:
+                self.needle_B = B.to(device=self.device, dtype=self.dtype)
+            elif self.needle_B is None:
+                self.needle_B = get_tangent_basis(self.d, self.device, self.dtype)
+
+        self._update_penalty_mask()
 
     def get_penalty_mask(self, X: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Return penalty mask (True = not penalized). If X is None, returns mask for all stored points."""
@@ -1183,19 +1334,20 @@ class DataHandler:
         num_pts = X_flat.shape[0]
         penalized = torch.zeros(num_pts, dtype=torch.bool, device=X.device)
 
-        # --- Regular needles ---
-        if self.needles is not None and self.needles.shape[0] > 0:
-            for idx in range(self.needles.shape[0]):
-                needle = self.needles[idx]  # (d,)
-                diff = X_flat - needle.unsqueeze(0)  # (num_pts, d)
+        # --- Needles and exclusion zones ---
+        centers, radii, M_list = self._penalty_regions()
+        if centers is not None and centers.shape[0] > 0:
+            for idx in range(centers.shape[0]):
+                center = centers[idx]  # (d,)
+                diff = X_flat - center.unsqueeze(0)  # (num_pts, d)
 
-                M = self.needle_M_list[idx] if idx < len(self.needle_M_list) else None
+                M = M_list[idx] if idx < len(M_list) else None
                 if M is not None and self.needle_B is not None:
                     u = diff @ self.needle_B
                     quad = (u @ M * u).sum(dim=-1)
                     inside = quad <= 1.0
                 else:
-                    r = self.needle_penalty_radii[idx].squeeze()
+                    r = radii[idx].squeeze()
                     inside = torch.norm(diff, dim=-1) <= r
                 penalized = penalized | inside
 
@@ -1583,14 +1735,24 @@ class DataHandler:
         self._update_penalty_mask()
 
     def shrink_all_needle_radii(self, factor: float) -> None:
-        """Shrink every needle's exclusion semi-axes by *factor* (0 < factor ≤ 1).
+        """Shrink every penalised region's semi-axes by *factor* (0 < factor ≤ 1).
 
         Semi-axis_new = factor × semi-axis_old  ⟺  M_new = M_old / factor².
+
+        Exclusion zones shrink alongside needles. They must: the never_terminate
+        recovery paths call this to hand territory back when the search runs out of
+        room, and a zone that could never be released would let a few capped
+        activations sterilise the simplex permanently.
         """
         f2 = factor ** 2
         for i, M in enumerate(self.needle_M_list):
             if M is not None:
                 self.needle_M_list[i] = M / f2
+        for i, M in enumerate(self.exclusion_M_list):
+            if M is not None:
+                self.exclusion_M_list[i] = M / f2
+        if self.exclusion_radii is not None and self.exclusion_radii.numel() > 0:
+            self.exclusion_radii = self.exclusion_radii * factor
         self._update_penalty_mask()
 
     def max_needle_radius(self) -> float:

@@ -133,7 +133,8 @@ class ZoMBIHop:
                  jaccard_window: int = 3,
                  jaccard_threshold: float = 0.9,
                  min_zoom_for_needle: int = 2,
-                 min_iters_per_zoom: int = 2):
+                 min_iters_per_zoom: int = 2,
+                 max_lines_per_activation: int = 30):
         """Initialize ZoMBIHop optimizer.
 
         Search-discipline constraints (hard, not tuned):
@@ -144,6 +145,15 @@ class ZoMBIHop:
           * ``min_iters_per_zoom`` — at least this many objective lines must be
             sampled at the current zoom level before the optimiser may declare a
             needle or zoom in/out from it (default 2).
+          * ``max_lines_per_activation`` — hard ceiling on objective lines
+            measured in one activation (default 30). Without it an activation's
+            cost is bounded only by ``max_zooms × max_iterations`` multiplied by
+            however many times the failure-retry path re-enters the same zoom,
+            which in practice produced single activations of 130+ lines (~3200
+            measurements) grinding on one unfruitful region. On reaching the cap
+            the activation ends and the region it was stuck in is penalised (see
+            ``_penalize_capped_zone``) so the next activation is repelled from it
+            rather than converging straight back in.
         """
         self.device = torch.device(device)
         self.dtype = dtype
@@ -178,6 +188,7 @@ class ZoMBIHop:
         self.min_axis_noise_mult = float(min_axis_noise_mult)
         self.min_zoom_for_needle = int(min_zoom_for_needle)
         self.min_iters_per_zoom = int(min_iters_per_zoom)
+        self.max_lines_per_activation = int(max_lines_per_activation)
 
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
@@ -501,6 +512,68 @@ class ZoMBIHop:
 
         return needle_X
 
+    def _penalize_capped_zone(self, dh, bounds: torch.Tensor) -> bool:
+        """Penalise the region an activation burned its whole line budget in.
+
+        Counterpart to ``_declare_needle_at_best``: same ellipsoid machinery, but
+        recorded as an *exclusion zone* rather than a needle. Hitting the cap means
+        the search kept re-converging somewhere without ever satisfying the needle
+        criteria — that is a statement about where NOT to look again, not a
+        discovered optimum, so it must not enter the needle record (``needles.csv``
+        and every metric derived from it, e.g. dist_to_needles).
+
+        The zone is centred on the best unpenalised point inside the active search
+        bounds — the attractor the activation kept falling into. Returns True if a
+        zone was recorded. Bounds are reset to the full search box either way, so
+        the next activation restarts globally instead of inside the dead region.
+        """
+        center, center_Y, _ = (dh.get_best_unpenalized() if self._is_global_bounds(bounds)
+                               else dh.get_best_in_bounds(bounds))
+        if center is None:
+            center, center_Y, _ = dh.get_best_unpenalized()
+
+        if center is None:
+            self._log("  [cap] no unpenalised point to centre an exclusion zone on — "
+                      "resetting bounds only.")
+        else:
+            M_excl = None
+            B_excl = None
+            try:
+                X, Y = dh.get_gp_data()
+                if X.shape[0] >= 2:
+                    self.gp_handler.fit(X, Y)
+                    self.gp_handler.create_acquisition(best_f=Y.max().item(), penalty_value=-1e6)
+                    M_excl, B_excl = self.gp_handler.determine_penalty_ellipsoid(
+                        needle=center,
+                        drop_fraction=self.ellipsoid_drop_fraction,
+                        eigenvalue_floor=self.ellipsoid_eigenvalue_floor,
+                        max_radius=self.max_penalty_radius,
+                    )
+            except Exception as e:
+                self._log(f"  [cap] ellipsoid fit failed ({e}) — falling back to a sphere.")
+                M_excl = None
+
+            if M_excl is not None:
+                dh.add_exclusion(center=center, M=M_excl, B=B_excl)
+            else:
+                # Sphere fallback: half the diagonal of the bounds the activation
+                # was working in — literally "the zone it was stuck in". NOT
+                # max_penalty_radius, which caps an ellipsoid SEMI-AXIS; read as a
+                # sphere radius its default of 1.0 exceeds the simplex diameter
+                # (√2) and would penalise the entire search space in one go.
+                r = 0.5 * torch.norm(bounds[1] - bounds[0]).item()
+                r = min(r, float(self.max_penalty_radius))
+                dh.add_exclusion(center=center, M=None, radius=r)
+            _y = center_Y.item() if torch.is_tensor(center_Y) else center_Y
+            self._log(f"  [cap] exclusion zone added at {center.cpu().numpy()} "
+                      f"(best local Y={_y:.4f}); this region is now repelled.")
+
+        full_bounds = self.full_bounds.clone()
+        self.bounds = full_bounds
+        dh.bounds = full_bounds.clone()
+        dh.current_zoom_bounds = full_bounds.clone()
+        return center is not None
+
     def _log(self, message: str):
         if self.verbose:
             print(message)
@@ -708,6 +781,7 @@ class ZoMBIHop:
             simplex that can produce no point at all)."""
             nonlocal global_iteration, stalled_retries, bounds, best_f_local
             nonlocal start_iteration, data_added_since_last_failure
+            nonlocal lines_this_activation
             full_bounds = self.full_bounds.clone()
             dh.bounds = full_bounds.clone()
             dh.current_zoom_bounds = full_bounds.clone()
@@ -718,6 +792,7 @@ class ZoMBIHop:
                           f"measurement — stopping to avoid a spin loop.")
                 return False
             global_iteration += 1
+            lines_this_activation += 1
             stalled_retries = 0
             data_added_since_last_failure = True
             dh.take_snapshot(f"act{activation}_z{zoom}_i{iteration}_spacefill",
@@ -768,6 +843,13 @@ class ZoMBIHop:
         MAX_STALLED_RETRIES = 40
         stalled_retries = 0
 
+        # Objective lines measured in the current activation; reset per activation
+        # and checked against self.max_lines_per_activation. Counts every measured
+        # line including space-filling fallbacks, and is deliberately NOT reset by
+        # the failure-retry path — re-entering the same zoom is precisely the route
+        # by which an activation used to run away to 130+ lines.
+        lines_this_activation = 0
+
         while activation < max_activations and not finished:
             self._log(f"\n{'='*50}")
             self._log(f"ACTIVATION {activation+1}/{max_activations}")
@@ -801,14 +883,24 @@ class ZoMBIHop:
                 dh.current_zoom_bounds = bounds.clone()
                 dh.bounds = bounds.clone()
             activation_failed = False
+            activation_capped = False
             consecutive_converged = 0
             best_f_local: float = float('-inf')
             zoom_bounds_history: List[torch.Tensor] = []
+            lines_this_activation = 0
 
             start_zoom = zoom if activation == start_activation else 0
             current_zoom = start_zoom
 
             while current_zoom < dh.max_zooms and not finished:
+                # Line-budget guard at the top of the zoom loop. Placed here rather
+                # than only in the iteration loop because the failure-retry path
+                # `continue`s straight back to this point, and determine_new_bounds
+                # advances the zoom from here too — every route that would buy this
+                # activation another max_iterations lines passes through here.
+                if lines_this_activation >= self.max_lines_per_activation:
+                    activation_capped = True
+                    break
                 zoom = current_zoom
                 self._log(f"\n{'─'*50}")
                 self._log(f"--- Zoom {zoom+1}/{dh.max_zooms} ---")
@@ -840,9 +932,14 @@ class ZoMBIHop:
                 # takes effect within this zoom rather than at the next one.
                 _next_iteration = start_iteration
                 while _next_iteration < dh.max_iterations:
+                    if lines_this_activation >= self.max_lines_per_activation:
+                        activation_capped = True
+                        break
                     iteration = _next_iteration
                     _next_iteration += 1
-                    self._log(f"\n  · iter {iteration+1}/{dh.max_iterations}")
+                    self._log(f"\n  · iter {iteration+1}/{dh.max_iterations}  "
+                              f"(activation lines {lines_this_activation}/"
+                              f"{self.max_lines_per_activation})")
 
                     # Operator hyperparameter changes, applied between measured lines.
                     for _chg in apply_pending_hparams(zombi=self, log=self._log):
@@ -895,6 +992,7 @@ class ZoMBIHop:
                     )
                     global_iteration += 1
                     iters_this_zoom += 1
+                    lines_this_activation += 1
                     data_added_since_last_failure = True
                     stalled_retries = 0  # real measurement made → not stalled
                     if self.verbose:
@@ -978,6 +1076,12 @@ class ZoMBIHop:
 
                 # --- After inner iteration loop ---
                 if finished:
+                    break
+
+                # Cap reached without a needle — leave the zoom loop; the region is
+                # penalised once, after it (the guard at the top of this loop exits
+                # the same way, so handling it here as well would double-penalise).
+                if activation_capped and needle is None:
                     break
 
                 if needle is not None:
@@ -1133,6 +1237,37 @@ class ZoMBIHop:
                     start_iteration = 0
                 else:
                     break  # exhausted all zoom levels without needle
+
+            # Cap reached without a needle: this activation spent its whole line
+            # budget circling a region it never localised. Penalise that region so
+            # the next activation is repelled from it instead of converging
+            # straight back in, and hand it the full simplex.
+            if activation_capped and needle is None and not finished:
+                self._log(
+                    f"\n  [cap] activation {activation+1} hit the "
+                    f"{self.max_lines_per_activation}-line budget "
+                    f"({lines_this_activation} measured) without declaring a "
+                    f"needle — ending it and penalising the region."
+                )
+                self._penalize_capped_zone(dh, bounds)
+                dh.take_snapshot(
+                    f"act{activation}_z{zoom}_capped",
+                    activation=activation, zoom=zoom, iteration=iteration,
+                    permanent=True,
+                )
+                # Exclusion zones accumulate one per capped activation, so they need
+                # the same over-penalisation release valve the needle path has —
+                # otherwise a run of capped activations can wall off the simplex with
+                # nothing to reopen it. Unlike the needle path this never ends the
+                # run: a zone records where the search gave up, not something found,
+                # so saturating on them is a reason to hand territory back, not stop.
+                test_samples = self.random_sampler(
+                    dh.raw, self.bounds[0], self.bounds[1],
+                    device=str(self.device), torch_dtype=self.dtype,
+                )
+                penalized_pct = (1 - dh.get_penalty_mask(test_samples).float().mean().item()) * 100
+                if penalized_pct > 90:
+                    _keep_searching(f"Too much area penalized after cap: {penalized_pct:.2f}%")
 
             # Re-label every pared point with the median of its local neighbourhood
             # so the GP trains on a noise-smoothed signal in subsequent activations.
