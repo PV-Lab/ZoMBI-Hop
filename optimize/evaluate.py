@@ -965,13 +965,28 @@ def save_convergence_metrics_plot(
     ]
     metrics = [m for m in metrics if m[0] in df.columns]
 
+    # Needles at the iteration they were actually declared on (needles.csv), not one
+    # marker per row — see plot_metrics.needle_discoveries.
+    import numpy as np
+    import plot_metrics
+    disc_it, disc_v = plot_metrics.needle_discoveries(os.path.dirname(os.path.abspath(csv_path)))
+
     fig, axes = plt.subplots(2, 3, figsize=(16, 8))
     fig.suptitle("Convergence metrics over iterations")
     used = 0
     for ax, (col, label, color, steps) in zip(axes.flat, metrics):
         used += 1
         if col == "recent_needle_value" or steps:
-            ax.plot(df["iteration"], df[col], color=color, drawstyle="steps-post", marker="o", ms=3)
+            if disc_it.size:
+                last_it = float(df["iteration"].max())
+                ax.plot(np.concatenate([disc_it, [last_it]]),
+                        np.concatenate([disc_v, [disc_v[-1]]]),
+                        color=color, drawstyle="steps-post")
+                ax.plot(disc_it, disc_v, "o", ms=4, color=color,
+                        label=f"needle found ({disc_it.size})")
+                ax.legend(fontsize=7, loc="lower right")
+            else:
+                ax.plot(df["iteration"], df[col], color=color, drawstyle="steps-post")
         else:
             ax.plot(df["iteration"], df[col], color=color)
         if log_x:
@@ -1041,6 +1056,7 @@ def run_single_eval(
     coverage: bool = False,
     no_video: bool = False,
     no_convergence_plot: bool = False,
+    no_plots: bool = False,
     log_x: bool = False,
     log_y: bool = False,
 ) -> dict:
@@ -1089,6 +1105,8 @@ def run_single_eval(
             line_0=plot_state.get("line_0"),
             line_1=plot_state.get("line_1"),
             n_points_before=(dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0),
+            # Activation this line was measured in (see run_mobo.write_metrics_over_time_csv).
+            activation=int(dh.current_activation),
             gp_grid_vals=(rm.gp_landscape_vals(gp_ref[0], grid_pts, maximize)
                           if dim == 3 else None),
         ))
@@ -1194,24 +1212,33 @@ def run_single_eval(
     except Exception as exc:
         print(f"      [run] CSV write failed: {exc}")
 
-    try:
-        rm.plot_dist_from_centre(os.path.join(out_dir, "dist_from_centre.png"), dh, maximize)
-        if dim == 3 and ds.get("grid_pts") is not None:
-            rm.plot_line_length_hist(os.path.join(out_dir, "line_length_hist.png"), payloads)
-        rm.plot_hparam_edge_proximity(
-            os.path.join(out_dir, "hparam_edge_proximity.png"),
-            rm.hparams_to_norm(hparams))
-        # Per-sample activation ids (from the snapshot records) so the convergence
-        # plot resets its running-best envelope at each activation boundary.
-        n_y = int(dh.Y_all.shape[0]) if dh.Y_all is not None else 0
-        conv_acts, _ = rm._activation_zoom_per_point(n_y, snap_records)
-        rm.plot_convergence(os.path.join(out_dir, "convergence.png"), dh, maximize,
-                            activations=conv_acts)
-    except Exception as exc:
-        print(f"      [run] static plot failed: {exc}")
+    # --no-plots keeps every CSV and metrics.json but skips all rendering. Meant for
+    # the repeats of a showdown cell: the numbers are what the statistics are computed
+    # from, while the plots only need to exist for one representative repeat. The CoNet
+    # pair further down is the reason this flag pays — a UMAP on an N×N co-occurrence
+    # matrix costs minutes to tens of minutes, rivalling the optimizer budget itself.
+    if no_plots:
+        print("      [run] --no-plots: skipping renders (CSVs/metrics still written)")
+
+    if not no_plots:
+        try:
+            rm.plot_dist_from_centre(os.path.join(out_dir, "dist_from_centre.png"), dh, maximize)
+            if dim == 3 and ds.get("grid_pts") is not None:
+                rm.plot_line_length_hist(os.path.join(out_dir, "line_length_hist.png"), payloads)
+            rm.plot_hparam_edge_proximity(
+                os.path.join(out_dir, "hparam_edge_proximity.png"),
+                rm.hparams_to_norm(hparams))
+            # Per-sample activation ids (from the snapshot records) so the convergence
+            # plot resets its running-best envelope at each activation boundary.
+            n_y = int(dh.Y_all.shape[0]) if dh.Y_all is not None else 0
+            conv_acts, _ = rm._activation_zoom_per_point(n_y, snap_records)
+            rm.plot_convergence(os.path.join(out_dir, "convergence.png"), dh, maximize,
+                                activations=conv_acts)
+        except Exception as exc:
+            print(f"      [run] static plot failed: {exc}")
 
     metrics_csv = os.path.join(out_dir, "metrics_over_time.csv")
-    if not no_convergence_plot and os.path.isfile(metrics_csv):
+    if not no_convergence_plot and not no_plots and os.path.isfile(metrics_csv):
         try:
             save_convergence_metrics_plot(
                 metrics_csv, os.path.join(out_dir, "convergence_metrics.png"),
@@ -1219,9 +1246,27 @@ def run_single_eval(
             )
         except Exception as exc:
             print(f"      [run] convergence metrics plot failed: {exc}")
+        try:
+            import plot_metrics
+            # true_best is the analytic optimum of THIS run's landscape; pass it so
+            # non-ensemble datasets (which have no ensemble_config.json to rebuild
+            # from) still get the reference line.
+            tb = None
+            opt = ds.get("true_optima")
+            if opt and callable(ds.get("fn")):
+                try:
+                    tb = float(max(float(ds["fn"](np.asarray(o, dtype=float).ravel()))
+                                   for o in opt))
+                except Exception:
+                    tb = None
+            plot_metrics.plot_needle_values(out_dir, true_best=tb)
+        except Exception as exc:
+            print(f"      [run] needle values plot failed: {exc}")
 
     try:
-        if dim == 3 and ds.get("grid_pts") is not None and ds.get("grid_vals") is not None:
+        if no_plots:
+            pass
+        elif dim == 3 and ds.get("grid_pts") is not None and ds.get("grid_vals") is not None:
             ref_title = (
                 "Reference: oracle landscape"
                 if ds.get("landscape") == "synthetic" else
@@ -1279,7 +1324,7 @@ def run_single_eval(
     # save_coverage_image. For 3D we reuse the dataset's prebuilt grid; for 4D (where
     # fullgp/ensemble carry no grid) we build a simplex grid and evaluate the objective
     # on it (batch predictor if available, else the single-point fn — ~sub-second).
-    if coverage and dim in (3, 4):
+    if coverage and not no_plots and dim in (3, 4):
         try:
             import coverage_plot
             cov_grid_pts = ds.get("grid_pts")
@@ -1326,7 +1371,7 @@ def run_single_eval(
     # 30-minute timeout on an N×N UMAP, so it is the most likely thing to blow the job's
     # wall-time. Writing the metrics first means a lost render costs a plot, not the
     # measurement the run existed to produce.
-    if os.path.isfile(os.path.join(out_dir, "ensemble_config.json")):
+    if not no_plots and os.path.isfile(os.path.join(out_dir, "ensemble_config.json")):
         rm._render_conet_artifacts(out_dir)
 
     if interrupted:
@@ -1575,6 +1620,7 @@ def evaluate_dataset(
                     coverage=args.coverage,
                     no_video=args.no_video,
                     no_convergence_plot=args.no_convergence_plot,
+                    no_plots=args.no_plots,
                     log_x=args.log_x,
                     log_y=args.log_y,
                 )
@@ -1693,6 +1739,11 @@ def main() -> None:
                              "points), like optimize/coverage_plot.py. 3D ternary / 4D "
                              "tetrahedron.")
     parser.add_argument("--no-video", action="store_true", help="Skip timelapse MP4 assembly.")
+    parser.add_argument("--no-plots", action="store_true",
+                        help="Skip ALL rendering (static plots, landscape frames, "
+                             "coverage, CoNet) while still writing every CSV and "
+                             "metrics.json. Used for the extra repeats of a showdown "
+                             "cell, where only one repeat needs pictures.")
     parser.add_argument("--no-convergence-plot", action="store_true",
                         help="Skip convergence_metrics.png panel plot.")
     parser.add_argument("--log-x", action="store_true", help="Log x-axis on convergence_metrics.png.")

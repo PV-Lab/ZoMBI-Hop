@@ -72,10 +72,12 @@ date/time + process id for uniqueness) containing:
         ├─ needles.csv                (needle_idx, FA, MA, Br, value,
         │                              median_value, zoom, iteration, reason,
         │                              dist_to_centre)
-        ├─ metrics_over_time.csv      (iteration, dist_to_needles, dup_fraction,
+        ├─ metrics_over_time.csv      (iteration, activation, n_needles,
+        │                              dist_to_needles, dup_fraction,
         │                              pct_matched, avg_pairwise_dist,
         │                              recent_needle_value)
         ├─ convergence.png
+        ├─ needle_values.png
         ├─ dist_from_centre.png
         ├─ line_length_hist.png
         ├─ hparam_edge_proximity.png
@@ -388,10 +390,18 @@ def unique_run_dir(parent: str, prefix: str) -> str:
 
 HPARAM_SPACE: dict[str, tuple] = {
     # Acquisition optimisation
-    "nat_grad_step":               (0.001,  0.5,   "log"),
+    # Upper bound is 0.1: _optimize_acquisition is fixed-step mirror ascent with
+    # no line search and no early stop — the update is x ← x·exp(clamp(step·(g−ḡ),
+    # ±10)) — so a large step is not "faster convergence", it is a multiplicative
+    # jump onto a simplex face repeated nat_grad_max_steps times.
+    "nat_grad_step":               (0.001,  0.1,   "log"),
     "nat_grad_max_steps":          (10,     400,   "int"),
     "n_restarts":                  (20,     300,   "int"),
-    "raw":                         (1,    300,  "int"),
+    # Lower bound is 20 (= n_restarts' lower bound): `raw` is the candidate pool
+    # the top-n_restarts unpenalised seeds are drawn from, so raw < n_restarts
+    # sends GPSimplex into its resample-retry loop every iteration and still
+    # yields fewer restarts than requested.
+    "raw":                         (20,    300,  "int"),
     # Acquisition function
     "ucb_beta":                    (0.001,   3.0,   "linear"),
     # Zoom / convergence
@@ -404,14 +414,33 @@ HPARAM_SPACE: dict[str, tuple] = {
     "top_m_points":                (2,      8,     "int"),
     "n_consecutive_converged":     (1,      5,    "int"),
     "input_noise_threshold_mult":  (0.5,    6.0,   "linear"),
-    "output_noise_threshold_mult": (0.01,    2.0,   "linear"),
+    # Lower bound is 0.1: the convergence test is EI < GP_output_noise × this,
+    # so below ~0.1 it is effectively unsatisfiable — EI convergence stops
+    # declaring needles at all and every needle has to come from the Jaccard
+    # force-declare fallback, at the cost of the wasted zoom iterations.
+    "output_noise_threshold_mult": (0.1,    2.0,   "linear"),
     # Penalisation & needle
     "max_penalty_radius":          (0.01,    5.0,   "linear"),
-    "needle_shrink_factor":        (0.1,   0.99,  "linear"),
+    # Bounds are set by the failure-retry budget (MAX_STALLED_RETRIES = 40 in
+    # ZoMBIHop.run). Case-3 recovery shrinks every semi-axis by this factor per
+    # no-new-data retry and stops once max radius < needle_stop_noise_multiplier
+    # × input_noise_ilr. Above ~0.95 the axes cannot reach the noise floor within
+    # 40 retries, so recovery never completes and the run terminates instead;
+    # below ~0.5 the first retry drops straight through the floor, turning the
+    # shrink mechanism into a one-shot stop button rather than a retry.
+    "needle_shrink_factor":        (0.5,   0.95,  "linear"),
     "needle_stop_noise_multiplier":(1.0,    8.0,   "linear"),
     # Point paring (deduplication)
-    "paring_spatial_halfnoise":    (0.1,    5.0,   "linear"),
-    "paring_y_noise_multiplier":   (0.1,    10.0,   "linear"),
+    # Upper bound is 2.0: this radius (× input_noise_ilr) is reused for three
+    # things — duplicate detection, the post-activation median relabelling of
+    # every pared Y, and the needle's recorded median value. At 5σ the median
+    # smooths over a ~10σ-wide ball, flattening the peaks the search exists to
+    # find and blurring the value recorded for each needle.
+    "paring_spatial_halfnoise":    (0.1,    2.0,   "linear"),
+    # Upper bound is 5.0: two points whose Y differ by more than a few output-
+    # noise σ are a real signal difference, not a duplicate; merging them via
+    # the keep/replace coin flip discards measured optima.
+    "paring_y_noise_multiplier":   (0.1,    5.0,   "linear"),
 }
 HPARAM_NAMES = list(HPARAM_SPACE.keys())
 N_HPARAMS    = len(HPARAM_NAMES)
@@ -2182,6 +2211,12 @@ def write_metrics_over_time_csv(path: str, payloads: list[dict], X_all: np.ndarr
         recent = float(nvals[-1]) if nvals is not None and len(nvals) > 0 else np.nan
         rows.append({
             "iteration": p["iter_num"],
+            # Activation of this line, and the needle count as of it. Together these
+            # make the discovery iteration of each needle recoverable from this file
+            # alone (n_needles increments exactly on the line a needle was declared),
+            # instead of guessing it from where recent_needle_value happens to change.
+            "activation": (int(p["activation"]) if p.get("activation") is not None else np.nan),
+            "n_needles": int(len(disc)),
             "dist_to_needles":  round(metric_dist_to_needles(disc, true_optima, dim=dim), 6),
             "dup_fraction":     round(metric_dup_fraction(X_upto, dim=dim), 6),
             "pct_matched_comp": round(metric_pct_matched_comp(disc, true_optima, dim=dim), 4),
@@ -2189,7 +2224,7 @@ def write_metrics_over_time_csv(path: str, payloads: list[dict], X_all: np.ndarr
             "avg_pairwise_dist":round(metric_avg_pairwise_dist(disc), 6),
             "recent_needle_value": (round(recent, 6) if not math.isnan(recent) else np.nan),
         })
-    cols = ["iteration", "dist_to_needles", "dup_fraction",
+    cols = ["iteration", "activation", "n_needles", "dist_to_needles", "dup_fraction",
             "pct_matched_comp", "pct_matched",
             "avg_pairwise_dist", "recent_needle_value"]
     pd.DataFrame(rows, columns=cols).to_csv(path, index=False)
@@ -2320,7 +2355,7 @@ def write_trial_json(path: str, trial_num: int, phase: str,
 
 # ─── End-of-trial auto plots (plot_metrics + coverage_plot; no videos) ─────────
 
-def _auto_generate_plots(trial_dir: str, dim: int) -> None:
+def _auto_generate_plots(trial_dir: str, dim: int, true_best: float | None = None) -> None:
     """Generate the metrics time-series plot (all dims) and, for 3D, the static
     coverage plot — automatically, at the end of a trial, with no videos and no
     interactive windows. (4D's landscape is the interactive point cloud written
@@ -2333,6 +2368,8 @@ def _auto_generate_plots(trial_dir: str, dim: int) -> None:
         if os.path.isfile(csv_path):
             plot_metrics.plot_metrics(
                 csv_path, save_path=os.path.join(trial_dir, "metrics_over_time.png"))
+        # Standalone needle-value plot (with true-best / best-found reference lines).
+        plot_metrics.plot_needle_values(trial_dir, true_best=true_best)
     except Exception as exc:
         print(f"    [trial] plot_metrics failed: {exc}")
     # Static coverage plot: ternary (3D) only. 4D uses the interactive point cloud.
@@ -2709,6 +2746,10 @@ def run_single_trial(
             line_0=plot_state.get("line_0"),
             line_1=plot_state.get("line_1"),
             n_points_before=(dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0),
+            # The activation this line was measured in. Recorded per iteration (not
+            # just per snapshot) so lines-per-activation is exact rather than
+            # inferred from point counts.
+            activation=int(dh.current_activation),
         )
         if keep_heavy:
             # Drop heavy fields from the prior payload — only the final one is rendered.
@@ -2888,7 +2929,14 @@ def run_single_trial(
         except Exception as exc:
             print(f"    [trial] 4D point cloud failed: {exc}")
 
-    _auto_generate_plots(trial_dir, dim)
+    # Noiseless objective at the true optima — the ceiling the needle values are
+    # chasing (observed Y can exceed it: make_sim_obj adds output noise).
+    try:
+        true_best = max(float(fn_callable(np.asarray(o, dtype=float).ravel()))
+                        for o in true_optima) if true_optima else None
+    except Exception:
+        true_best = None
+    _auto_generate_plots(trial_dir, dim, true_best=true_best)
 
     result = {"dist": dist, "dup": dup, "runtime": runtime,
               "avg_time_per_iter": avg_time_per_iter, "n_iters": n_iters,

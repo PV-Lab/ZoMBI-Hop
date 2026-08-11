@@ -45,14 +45,28 @@ RUN_DIR="optimize/runs/mobo_ensemble_10d_job${SLURM_JOB_ID}"
 # new landscape. Modulo keeps it in the int32 range NumPy's RandomState accepts.
 ENSEMBLE_SEED=$(( SLURM_JOB_ID % 2147483647 ))
 
-# Seed with the archived trial_112. The 3 best-dist_to_needles trials from the old
-# ensemble 10d pool (job16948660/job16857325) were cleaned off scratch, so they were
-# dropped; re-derive replacements with pareto.py once a fresh 10d pool exists and add
-# them back here. load_seed_hparams() skips any missing seed dir with a warning.
+# Seeds: the four 6d Pareto winners (2 best dist_to_needles, 2 best dup_fraction from
+# the job192023xx pool), PROJECTED into the tightened HPARAM_SPACE by
+# optimize/clamp_hparams.py. The projection is written to disk rather than left to
+# hparams_to_norm's silent [0,1] clamp so the configuration that gets re-evaluated
+# here is exactly the one optimize/runs/showdown_6d_clamped scored — every one of the
+# four sat outside the new bounds on at least two axes, so seeding the raw trial dirs
+# would have re-evaluated something neither file describes.
+#
+# These are re-evaluated as initial trials IN ADDITION to the full Sobol init
+# (load_seed_hparams ignores their stored 6d metrics), which is what makes a fresh
+# 10d pool start from known-good regions without inheriting incomparable scores.
+# The old 10d runs were moved to optimize/runs/archived_runs/ — they were tuned
+# under the OLD bounds, where the same normalised coordinate means a different
+# configuration, and --share-history only globs one level (runs/mobo_*), so
+# archiving them is what keeps this pool clean. Do not move them back.
 uv run python optimize/run_mobo.py --dataset ensemble --dim 10 --time-limit 0.7 --share-history \
     --ensemble-seed "$ENSEMBLE_SEED" \
     --start-from-best \
-        optimize/runs/archived_runs/mobo_3d_05_06_15_32/trial_112 \
+        optimize/hparams/clamped_6d/dist1c.json \
+        optimize/hparams/clamped_6d/dist2c.json \
+        optimize/hparams/clamped_6d/dup1c.json \
+        optimize/hparams/clamped_6d/dup2c.json \
     --run-dir "$RUN_DIR" &
 wait $!
 rc=$?

@@ -1,0 +1,128 @@
+{
+  "config_name": "dist2c",
+  "hparams": {
+    "nat_grad_step": 0.1,
+    "nat_grad_max_steps": 10,
+    "n_restarts": 300,
+    "raw": 255,
+    "ucb_beta": 0.001,
+    "max_zooms": 10,
+    "max_iterations": 22,
+    "top_m_points": 5,
+    "n_consecutive_converged": 5,
+    "input_noise_threshold_mult": 6.0,
+    "output_noise_threshold_mult": 0.1,
+    "max_penalty_radius": 3.86916399,
+    "needle_shrink_factor": 0.5,
+    "needle_stop_noise_multiplier": 8.0,
+    "paring_spatial_halfnoise": 0.1,
+    "paring_y_noise_multiplier": 0.1
+  },
+  "source_run": "mobo_ensemble_6d_job19202377",
+  "trial": 40,
+  "selected_for": "clamped",
+  "unclamped_metrics": {
+    "dist_to_needles": 2.250463,
+    "dup_fraction": 0.543363,
+    "avg_time_per_iter_s": 2.7673,
+    "n_points_penalty": 15772.0,
+    "runtime_s": 9057.464,
+    "n_iters": 3276
+  },
+  "clamped_from": {
+    "nat_grad_step": [
+      0.10548217,
+      0.1
+    ],
+    "output_noise_threshold_mult": [
+      0.01,
+      0.1
+    ],
+    "needle_shrink_factor": [
+      0.1,
+      0.5
+    ]
+  },
+  "hparam_space": {
+    "nat_grad_step": [
+      0.001,
+      0.1,
+      "log"
+    ],
+    "nat_grad_max_steps": [
+      10,
+      400,
+      "int"
+    ],
+    "n_restarts": [
+      20,
+      300,
+      "int"
+    ],
+    "raw": [
+      20,
+      300,
+      "int"
+    ],
+    "ucb_beta": [
+      0.001,
+      3.0,
+      "linear"
+    ],
+    "max_zooms": [
+      3,
+      10,
+      "int"
+    ],
+    "max_iterations": [
+      2,
+      30,
+      "int"
+    ],
+    "top_m_points": [
+      2,
+      8,
+      "int"
+    ],
+    "n_consecutive_converged": [
+      1,
+      5,
+      "int"
+    ],
+    "input_noise_threshold_mult": [
+      0.5,
+      6.0,
+      "linear"
+    ],
+    "output_noise_threshold_mult": [
+      0.1,
+      2.0,
+      "linear"
+    ],
+    "max_penalty_radius": [
+      0.01,
+      5.0,
+      "linear"
+    ],
+    "needle_shrink_factor": [
+      0.5,
+      0.95,
+      "linear"
+    ],
+    "needle_stop_noise_multiplier": [
+      1.0,
+      8.0,
+      "linear"
+    ],
+    "paring_spatial_halfnoise": [
+      0.1,
+      2.0,
+      "linear"
+    ],
+    "paring_y_noise_multiplier": [
+      0.1,
+      5.0,
+      "linear"
+    ]
+  }
+}
