@@ -46,27 +46,33 @@ RUN_DIR="optimize/runs/mobo_ensemble_10d_job${SLURM_JOB_ID}"
 ENSEMBLE_SEED=$(( SLURM_JOB_ID % 2147483647 ))
 
 # Seeds: the four 6d Pareto winners (2 best dist_to_needles, 2 best dup_fraction from
-# the job192023xx pool), PROJECTED into the tightened HPARAM_SPACE by
-# optimize/clamp_hparams.py. The projection is written to disk rather than left to
-# hparams_to_norm's silent [0,1] clamp so the configuration that gets re-evaluated
-# here is exactly the one optimize/runs/showdown_6d_clamped scored — every one of the
-# four sat outside the new bounds on at least two axes, so seeding the raw trial dirs
-# would have re-evaluated something neither file describes.
+# the job192023xx pool) PLUS merge1, the hand-crafted config that led the showdown's
+# gap-to-field on dist while declaring the most needles — all PROJECTED into the
+# HPARAM_SPACE re-tightened on 2026-08-12. The projection is written to disk rather
+# than left to hparams_to_norm's silent [0,1] clamp so the configuration that gets
+# re-evaluated here is exactly the one the JSON describes; seeding the older
+# optimize/hparams/clamped_6d/ files directly would now re-evaluate something neither
+# file describes (dup1c's nat_grad_max_steps=400 would land on 80, dist2c's
+# max_zooms=10 on 6, and so on). merge1 needed no projection at all — it already sat
+# inside every new bound, which is a large part of why the new bounds are where they
+# are. Regenerate with optimize/hparams/tight_6d/ if HPARAM_SPACE moves again.
 #
 # These are re-evaluated as initial trials IN ADDITION to the full Sobol init
 # (load_seed_hparams ignores their stored 6d metrics), which is what makes a fresh
 # 10d pool start from known-good regions without inheriting incomparable scores.
 # The old 10d runs were moved to optimize/runs/archived_runs/ — they were tuned
 # under the OLD bounds, where the same normalised coordinate means a different
-# configuration, and --share-history only globs one level (runs/mobo_*), so
-# archiving them is what keeps this pool clean. Do not move them back.
+# configuration (and the space has since lost an axis, so it is not even the same
+# dimension), and --share-history only globs one level (runs/mobo_*), so archiving
+# them is what keeps this pool clean. Do not move them back.
 uv run python optimize/run_mobo.py --dataset ensemble --dim 10 --time-limit 0.7 --share-history \
     --ensemble-seed "$ENSEMBLE_SEED" \
     --start-from-best \
-        optimize/hparams/clamped_6d/dist1c.json \
-        optimize/hparams/clamped_6d/dist2c.json \
-        optimize/hparams/clamped_6d/dup1c.json \
-        optimize/hparams/clamped_6d/dup2c.json \
+        optimize/hparams/tight_6d/dist1t.json \
+        optimize/hparams/tight_6d/dist2t.json \
+        optimize/hparams/tight_6d/dup1t.json \
+        optimize/hparams/tight_6d/dup2t.json \
+        optimize/hparams/tight_6d/merge1t.json \
     --run-dir "$RUN_DIR" &
 wait $!
 rc=$?

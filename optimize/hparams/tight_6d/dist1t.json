@@ -1,0 +1,135 @@
+{
+  "config_name": "dist1t",
+  "hparams": {
+    "nat_grad_step": 0.07212702,
+    "nat_grad_max_steps": 10,
+    "n_restarts": 300,
+    "raw": 300,
+    "ucb_beta": 0.001,
+    "max_zooms": 6,
+    "max_iterations": 12,
+    "top_m_points": 8,
+    "n_consecutive_converged": 5,
+    "output_noise_threshold_mult": 1.15311808,
+    "max_penalty_radius": 1.00995717,
+    "needle_shrink_factor": 0.5,
+    "needle_stop_noise_multiplier": 5.74588213,
+    "paring_spatial_halfnoise": 2.0,
+    "paring_y_noise_multiplier": 0.1
+  },
+  "source_run": "mobo_ensemble_6d_job19202380",
+  "trial": 23,
+  "selected_for": "clamped",
+  "unclamped_metrics": {
+    "dist_to_needles": 2.088759,
+    "dup_fraction": 0.502301,
+    "avg_time_per_iter_s": 3.0781,
+    "n_points_penalty": 14270.0,
+    "runtime_s": 9034.722,
+    "n_iters": 2963
+  },
+  "clamped_from": {
+    "needle_shrink_factor": [
+      0.1,
+      0.5
+    ],
+    "paring_spatial_halfnoise": [
+      5.0,
+      2.0
+    ]
+  },
+  "hparam_space": {
+    "nat_grad_step": [
+      0.01,
+      0.1,
+      "log"
+    ],
+    "nat_grad_max_steps": [
+      10,
+      80,
+      "int"
+    ],
+    "n_restarts": [
+      100,
+      300,
+      "int"
+    ],
+    "raw": [
+      150,
+      400,
+      "int"
+    ],
+    "ucb_beta": [
+      0.001,
+      3.0,
+      "linear"
+    ],
+    "max_zooms": [
+      3,
+      6,
+      "int"
+    ],
+    "max_iterations": [
+      2,
+      12,
+      "int"
+    ],
+    "top_m_points": [
+      4,
+      16,
+      "int"
+    ],
+    "n_consecutive_converged": [
+      2,
+      5,
+      "int"
+    ],
+    "output_noise_threshold_mult": [
+      0.1,
+      2.0,
+      "linear"
+    ],
+    "max_penalty_radius": [
+      0.15,
+      1.5,
+      "linear"
+    ],
+    "needle_shrink_factor": [
+      0.5,
+      0.95,
+      "linear"
+    ],
+    "needle_stop_noise_multiplier": [
+      1.0,
+      8.0,
+      "linear"
+    ],
+    "paring_spatial_halfnoise": [
+      0.1,
+      2.0,
+      "linear"
+    ],
+    "paring_y_noise_multiplier": [
+      0.1,
+      5.0,
+      "linear"
+    ]
+  },
+  "reclamped_from": {
+    "source_config": "dist1c",
+    "source_file": "optimize/hparams/clamped_6d/dist1c.json",
+    "moved": {
+      "max_zooms": [
+        9.0,
+        6
+      ],
+      "max_iterations": [
+        30.0,
+        12
+      ]
+    },
+    "dropped_axes": [
+      "input_noise_threshold_mult"
+    ]
+  }
+}

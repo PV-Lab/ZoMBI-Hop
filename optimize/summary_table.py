@@ -181,12 +181,22 @@ def _read_json(path: str) -> dict:
 # a summary must still be writable where the recomputation cannot run.
 
 # Composition-L2 radius past which a needle earns no credit, and the cost charged for
-# every unmatched member of the larger set. 0.5 sits just above the largest matched
-# distance actually observed, so a needle that lands anywhere a real needle plausibly
-# lands is scored on where it is rather than flattened to the penalty. Alternatives, if
-# the domain answer differs: ~0.157 (input-noise L2 = NOISE_LEVEL*sqrt(d), the floor
-# below which a needle cannot be localized at all) or 1.414 (simplex diameter — cap
-# nothing, credit every distance).
+# every unmatched member of the larger set.
+#
+# As of 2026-08-11 this is ``eval_metrics.UNMATCHED_PENALTY``: that module now does the
+# optimal assignment at this cutoff itself, so runs scored after that date already
+# carry this definition in their ``metrics.json`` and the recomputation below merely
+# reproduces it. It is kept because it is the only way to put OLDER runs — scored
+# greedily at 10.0 — on the same axis as new ones, which is exactly what a showdown
+# spanning the change needs.
+#
+# Duplicated as a literal rather than imported from eval_metrics ON PURPOSE: that
+# import pulls in numpy/torch/scipy, and this module is imported by the SLURM epilogue
+# path where the scientific stack may not be loaded (importing torch there would cost
+# seconds, or fail outright). It must be kept equal to eval_metrics.UNMATCHED_PENALTY
+# — ``recomputed_dist`` asserts that whenever the stack is importable, so a drift shows
+# up as a loud warning on the first run scored rather than as two summaries that
+# quietly disagree.
 DEFAULT_DIST_CUTOFF = 0.5
 
 # Keyed by the ensemble config's canonical JSON: identical config <=> identical
@@ -247,6 +257,33 @@ def _needles_of(run_dir: str):
         return None
 
 
+_CUTOFF_CHECKED = False
+
+
+def _check_cutoff_matches_eval_metrics() -> None:
+    """Warn once if ``DEFAULT_DIST_CUTOFF`` has drifted from ``eval_metrics``.
+
+    The two have to agree or new runs (scored by eval_metrics at write time) and old
+    ones (re-scored here) land on different axes, which is precisely the comparison
+    this recomputation exists to make possible. Checked lazily and once: by the time
+    it runs the scientific stack is already imported, so it costs nothing, and it
+    stays silent on the epilogue path where eval_metrics cannot be imported at all.
+    """
+    global _CUTOFF_CHECKED
+    if _CUTOFF_CHECKED:
+        return
+    _CUTOFF_CHECKED = True
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import eval_metrics
+    except Exception:
+        return
+    if abs(float(eval_metrics.UNMATCHED_PENALTY) - DEFAULT_DIST_CUTOFF) > 1e-12:
+        print(f"  ⚠ [dist] DEFAULT_DIST_CUTOFF={DEFAULT_DIST_CUTOFF} but "
+              f"eval_metrics.UNMATCHED_PENALTY={eval_metrics.UNMATCHED_PENALTY}; "
+              f"re-scored runs will not be comparable to newly-written metrics.json")
+
+
 def recomputed_dist(run_dir: str, cutoff: float = DEFAULT_DIST_CUTOFF):
     """``dist_to_needles`` for one run under the optimal assignment, or None.
 
@@ -262,6 +299,7 @@ def recomputed_dist(run_dir: str, cutoff: float = DEFAULT_DIST_CUTOFF):
     D = _needles_of(run_dir)
     if D is None:
         return None
+    _check_cutoff_matches_eval_metrics()
     if len(D) == 0:
         return float(cutoff)
     try:
@@ -755,27 +793,31 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
         A("`dist to needles` is the value stored in each run's `metrics.json`, matched "
           "GREEDILY (`--legacy-dist`).")
     else:
-        A(f"`dist to needles` is **recomputed here**, not read from `metrics.json`, and "
-          f"differs from it on two counts. Needle positions come from each run's "
-          f"`needles.csv` and the true optima are rebuilt from its "
-          f"`ensemble_config.json`; the two sets are then paired by MINIMUM-COST "
-          f"assignment (`scipy.optimize.linear_sum_assignment`) rather than the greedy "
-          f"nearest-unclaimed walk `eval_metrics.metric_dist_to_needles` uses, which is "
-          f"order-dependent and can only over-state the distance. **The unmatched "
-          f"penalty is `{dist_cutoff:g}`, not the stored 10.0** — measured matched "
-          f"distances here are 0.05–0.55 and composition L2 cannot exceed ~1.414, so a "
-          f"penalty of 10.0 is 20–200x anything it is averaged with and leaves the "
-          f"score ~99% a needle-COUNT comparison with the distances as noise on top. "
-          f"At `{dist_cutoff:g}` the two terms are commensurate, so this column now "
-          f"responds to where needles landed and not only to how many there were.")
+        A(f"`dist to needles` is **recomputed here**, not read from `metrics.json`. "
+          f"Needle positions come from each run's `needles.csv` and the true optima "
+          f"are rebuilt from its `ensemble_config.json`; the two sets are then paired "
+          f"by MINIMUM-COST assignment (`scipy.optimize.linear_sum_assignment`) with "
+          f"each matched distance capped at `{dist_cutoff:g}`, which is also the "
+          f"penalty charged for every unmatched needle or optimum.")
         A("")
-        A(f"The cost of that change is deterrence: the penalty is what makes declaring "
-          f"spurious needles expensive, and a run padded with 200 needles scattered "
-          f"through the densest optima cluster scores 51.8x an honest run at a cutoff "
-          f"of 10.0 but only 2.6x at 0.5. Over-declaration is still penalised — it is "
-          f"the `(n_declared - n_true)` term — just no longer to the exclusion of "
-          f"everything else. Use `--dist-cutoff 10` to recover the old weighting, or "
-          f"`--legacy-dist` for the stored greedy values verbatim.")
+        A(f"Since 2026-08-11 that is exactly what `eval_metrics.metric_dist_to_needles` "
+          f"does at write time, so for runs scored after that date this column simply "
+          f"REPRODUCES `metrics.json` and the recomputation is a no-op. Its purpose is "
+          f"runs scored BEFORE it: those were matched greedily — walking the optima in "
+          f"list order and letting each take its nearest unclaimed needle, which is "
+          f"order-dependent and can only over-state the distance — at an unmatched "
+          f"penalty of 10.0. Recomputing puts both eras on one axis, which a showdown "
+          f"spanning the change needs.")
+        A("")
+        A(f"The penalty moved from 10.0 to {dist_cutoff:g} because of scale: measured "
+          f"matched distances are 0.05–0.55 and composition L2 cannot exceed ~1.414, "
+          f"so 10.0 was 20–200x anything it was averaged with and left the score ~99% "
+          f"a needle-COUNT comparison with the distances as noise on top. The cost is "
+          f"deterrence — a run padded with 200 needles scattered through the densest "
+          f"optima cluster scores 51.8x an honest run at 10.0 but only 2.6x at 0.5. "
+          f"Over-declaration is still penalised, via the `(n_declared - n_true)` term, "
+          f"just no longer to the exclusion of everything else. Use `--dist-cutoff 10` "
+          f"for the old weighting, or `--legacy-dist` for the stored values verbatim.")
     A("")
     if n_dist_fallback:
         A(f"⚠ {n_dist_fallback} run(s) could not be re-scored (no `needles.csv` / "
@@ -851,6 +893,18 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
               "Each row averages all configurations on one landscape, which measures "
               "the landscape rather than the hyperparameters: a high mean distance "
               "means every configuration struggled there.")
+
+    # The spread section. Imported here rather than at module scope because it needs
+    # matplotlib, and this module is imported by the SLURM epilogue path where the
+    # scientific stack may not be loaded; it returns [] if it cannot draw anything,
+    # so a missing section never costs the summary.
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import variance_plots
+        L.extend(variance_plots.variance_section(
+            reps, [c["name"] for c in configs], landscapes, out_dir))
+    except Exception as exc:
+        print(f"  [chart] variance section skipped: {exc}")
 
     A("## Per-landscape winners")
     A("")

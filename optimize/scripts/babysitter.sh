@@ -5,7 +5,8 @@
 # ONE idempotent pass. Safe to run from cron (every ~10 min). Does NOT loop
 # itself — the scheduler provides the cadence, so a hung pass can never wedge.
 #
-# Target fleet:  2x ensemble_mobo_4d  +  2x ensemble_mobo_3d  running at all times.
+# Target fleet:  see the TARGET map below (currently 4x ensemble_mobo_10d; 3d/4d
+#                are listed but paused). Kept alive at all times.
 #
 # The .sbatch scripts already self-heal the common cases: `scontrol requeue`
 # across the 12h wall-time (same job id, stays in the queue) and an sbatch of a
@@ -47,7 +48,18 @@ mkdir -p "$REPORTS"
 # sbatch paths in the .sbatch files are RELATIVE to the submit dir (logs/, run_mobo.py).
 cd "$REPO" || { echo "cannot cd $REPO" >&2; exit 1; }
 
-TARGET=2                 # desired running+pending per type
+# Desired running+pending count, PER TYPE. Was a single global TARGET=2 back when
+# every managed type wanted the same count; 10d wants 4 GPUs and 3d/4d want 2 each,
+# so the target has to vary per type. The keys of this map are also the list of types
+# the main loop walks — adding a type here (with an ensemble_mobo_<type>.sbatch beside
+# this script) is all it takes to bring it under the babysitter.
+#
+# 3d and 4d are kept in the map at their old target but are currently PAUSED via
+# fleet.sh (see .babysitter/paused_3d, paused_4d): their pooled history predates the
+# 2026-08-11 dist_to_needles change and would mix metric scales in one GP. Leaving
+# them listed-but-paused means `fleet.sh resume 3d` is all that is needed once their
+# history is sorted, rather than another edit here.
+declare -A TARGET=( [10d]=4 [4d]=2 [3d]=2 )
 COOLDOWN=600             # min seconds between environmental resubmits of a type
 CIRCUIT_BREAK_FAILS=3    # N consecutive FAILED for a type -> halt, stop escalating
 
@@ -114,7 +126,7 @@ escalate() {                       # escalate <name> <script> <jobid> <need>
     prompt="You are babysitting SLURM MOBO runs. Your working directory is the git
 repo $REPO (branch is whatever is currently checked out). Job $jobid (name '$name',
 submitted via $script) exited FATALLY with a non-zero return code. The fleet is now
-SHORT by $need job(s) of this type; target is $TARGET per type.
+SHORT by $need job(s) of this type; target is $target for this type.
 
 Do ALL of this in order, then stop:
 1. Read the failure. stderr: ${errf:-<none>}  stdout: ${outf:-<none>}.
@@ -188,10 +200,11 @@ Delete the smoke run dir (optimize/runs/_babysit_smoke_${jobid}) when done."
 # ----------------------------------------------------------------------------
 # Main: one pass over each type.
 # ----------------------------------------------------------------------------
-for type in 4d 3d; do
+for type in "${!TARGET[@]}"; do
     name="ensemble_mobo_${type}"
     script="optimize/scripts/ensemble_mobo_${type}.sbatch"
     stamp="$STATE/last_submit_${type}"
+    target="${TARGET[$type]}"
 
     # Manual pause (set by fleet.sh kill): a global "paused" flag halts every type,
     # a per-type "paused_<type>" halts just this one. Honor it so the babysitter
@@ -203,11 +216,11 @@ for type in 4d 3d; do
 
     # squeue lists only active jobs (R/PD/CF/CG) -> that IS the live fleet count.
     active="$(squeue -u adewinmb -n "$name" -h -o '%i' 2>/dev/null | wc -l)"
-    if [ "$active" -ge "$TARGET" ]; then
+    if [ "$active" -ge "$target" ]; then
         continue                                   # healthy; stay quiet
     fi
-    need=$(( TARGET - active ))
-    log "$name: $active/$TARGET active — short by $need. Investigating."
+    need=$(( target - active ))
+    log "$name: $active/$target active — short by $need. Investigating."
 
     mapfile -t ids < <(recent_ended_ids "$name" "$CIRCUIT_BREAK_FAILS")
     if [ "${#ids[@]}" -eq 0 ]; then

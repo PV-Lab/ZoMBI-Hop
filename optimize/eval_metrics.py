@@ -10,8 +10,45 @@ from pathlib import Path
 import numpy as np
 import torch
 from scipy.spatial import cKDTree
+from scipy.optimize import linear_sum_assignment
 
-UNMATCHED_PENALTY = 10.0
+# Cost charged for every unmatched member of the larger set, AND the radius past
+# which a matched needle earns no credit (see metric_dist_to_needles).
+#
+# This was 10.0 until 2026-08-11. The problem with 10.0 is one of scale: measured
+# matched-needle distances are 0.05-0.55 and composition L2 on the simplex cannot
+# exceed its diameter ~1.414, so a 10.0 penalty is 20-200x anything it is averaged
+# with. The consequence is not subtle — on an 8-peak landscape the localization term
+# contributes 0.6% of the score, i.e. the metric is ~99% a comparison of how many
+# needles were declared against how many exist, with the distances it is named for
+# as noise on top. (That is also why ``metric_pct_matched`` read 0.0 everywhere.)
+# At 0.5 — just above the largest matched distance actually observed — the two terms
+# are commensurate, so the metric responds to WHERE needles landed and not only to
+# how many there were.
+#
+# TRADEOFF, recorded because it is why 10.0 was chosen originally: the penalty is the
+# whole anti-spam deterrent. Scoring a real run against the same run plus 200 needles
+# jittered into the densest optima cluster gives a spam/honest ratio of 51.8x at 10.0
+# but only 2.6x at 0.5. Over-declaration is still penalised — that is the
+# ``(n_declared - n_true)`` term — just no longer to the exclusion of everything else.
+#
+# Changing this constant deliberately moves every consumer at once, which is the
+# point: the same number is the failure sentinel in ``evaluate.run_once``,
+# ``run_mobo._run_trial`` and ``run_mobo._failure_penalty_Y``, all of which mean "the
+# worst attainable distance". At 10.0 those sentinels sat 20-50x outside the range of
+# real measurements and dominated the standardisation of the MOBO GP's first
+# objective; at 0.5 a failed trial scores exactly as badly as a run that declared
+# nothing, which is what they were always documented to mean.
+#
+# Alternatives, if the domain answer differs: ~0.157 (input-noise L2 =
+# NOISE_LEVEL*sqrt(d), the floor below which a needle cannot be localized at all), or
+# 1.414 (simplex diameter — cap nothing, credit every distance).
+UNMATCHED_PENALTY = 0.5
+
+# The pre-2026-08-11 value, kept so old runs can be re-scored on their original
+# scale (``summary_table --dist-cutoff 10``) without hunting for the number.
+LEGACY_UNMATCHED_PENALTY = 10.0
+
 MATCH_RADIUS = 0.05
 # Input-noise scale (per-component composition std) used for the duplicate-sample
 # radius; matched to the measured average input noise of data/2nd_real_run.db.
@@ -83,8 +120,37 @@ def metric_dist_to_needles(
     dim: int | None = None,
     penalty: float | None = None,
 ) -> float:
-    """Symmetric greedy matching distance (composition L2 + fixed penalty)."""
-    d = infer_metric_dim(dim, discovered, true_optima)
+    """Symmetric minimum-cost matching distance (composition L2 + fixed penalty).
+
+    Needles and true optima are paired one-to-one at MINIMUM total cost, and the
+    score is the mean over ``max(n_discovered, n_true)`` of the matched distances
+    plus ``penalty`` for every unmatched member of the larger set. Lower is better;
+    the range is ``[0, penalty]``.
+
+    Two things changed here on 2026-08-11, and both make the number mean more than
+    it used to:
+
+    **The pairing is optimal, not greedy.** The previous implementation walked
+    ``true_optima`` in list order and let each take its nearest unclaimed needle.
+    That is order-dependent and can cost strictly more than the best pairing — an
+    optimum early in the list takes the one needle a later optimum needed, sending
+    the later one to the full penalty even though a perfectly good alternative
+    existed. The intended quantity was always the minimum total matching cost, which
+    ``scipy.optimize.linear_sum_assignment`` computes exactly (Hungarian, O(n^3) —
+    trivial at the ~100 needles per run seen here). So this can only ever report a
+    distance less than or equal to the old one, never more.
+
+    **Every matched distance is capped at ``penalty``.** Without the cap a needle
+    that landed 1.2 away would cost MORE than not declaring it at all, which makes
+    the metric non-monotone in the thing it is supposed to reward. With it, the
+    penalty reads as what it is: the radius past which a needle earns no credit.
+
+    ``penalty`` defaults to ``UNMATCHED_PENALTY``; pass ``LEGACY_UNMATCHED_PENALTY``
+    to score on the pre-2026-08-11 scale. Note that even at the legacy value this
+    does NOT reproduce old stored numbers exactly, because the greedy pairing is
+    gone — use the values already in ``metrics.json`` for that.
+    """
+    del dim  # the metric is scale-free in d; kept for call-site symmetry
     pen = float(penalty if penalty is not None else UNMATCHED_PENALTY)
     n_opt = len(true_optima)
     if n_opt == 0:
@@ -92,25 +158,16 @@ def metric_dist_to_needles(
     n_disc = len(discovered)
     if n_disc == 0:
         return pen
-    disc = as_numpy(discovered, dtype=float)
-    used: set[int] = set()
-    total = 0.0
-    for t in true_optima:
-        t_np = as_numpy(t, dtype=float).ravel()
-        best_d, best_j = float("inf"), -1
-        for j in range(len(disc)):
-            if j in used:
-                continue
-            dist = float(np.linalg.norm(disc[j].ravel() - t_np))
-            if dist < best_d:
-                best_d, best_j = dist, j
-        if best_j >= 0:
-            used.add(best_j)
-            total += best_d
-        else:
-            total += pen
-    total += (n_disc - len(used)) * pen
-    return total / max(n_disc, n_opt)
+    disc = as_numpy(discovered, dtype=float).reshape(n_disc, -1)
+    opt = np.asarray([as_numpy(t, dtype=float).ravel() for t in true_optima],
+                     dtype=float)
+    # Capped cost matrix, then the exact minimum-cost assignment. Rectangular is
+    # fine: linear_sum_assignment pairs min(n_disc, n_opt) of them and the rest are
+    # unmatched by construction.
+    cost = np.minimum(np.linalg.norm(disc[:, None, :] - opt[None, :, :], axis=2), pen)
+    rows, cols = linear_sum_assignment(cost)
+    n = max(n_disc, n_opt)
+    return float((cost[rows, cols].sum() + pen * (n - len(rows))) / n)
 
 
 def zoom_size_fraction(zoom_bounds, full_bounds=None) -> float:
