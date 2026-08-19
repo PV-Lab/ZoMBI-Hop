@@ -100,7 +100,7 @@ class ZoMBIHop:
                  n_restarts: int = 30,
                  raw: int = 500,
                  convergence_pi_threshold: float = 0.01,  # deprecated/ignored: convergence now uses Expected Improvement vs the output-noise floor
-                 input_noise_threshold_mult: float = 2.0,
+                 input_noise_threshold_mult: float = 3.0,
                  output_noise_threshold_mult: float = 2.0,
                  n_consecutive_converged: int = 2,
                  max_gp_points: int = 3000,
@@ -124,7 +124,7 @@ class ZoMBIHop:
                  max_penalty_radius: float = 1.0,
                  paring_spatial_halfnoise: float = 0.5,
                  paring_y_noise_multiplier: float = 1.0,
-                 input_noise: float = 0.064,
+                 input_noise: float = 0.128,
                  input_noise_ilr: Optional[float] = None,
                  needle_shrink_factor: float = 0.85,
                  needle_stop_noise_multiplier: float = 3.0,
@@ -133,15 +133,15 @@ class ZoMBIHop:
                  min_axis_noise_mult: float = 2.0,
                  jaccard_window: int = 3,
                  jaccard_threshold: float = 0.9,
-                 min_zoom_for_needle: int = 2,
+                 min_zoom_for_needle: int = 1,
                  min_iters_per_zoom: int = 2,
                  max_lines_per_activation: int = 30):
         """Initialize ZoMBIHop optimizer.
 
         Search-discipline constraints (hard, not tuned):
           * ``min_zoom_for_needle`` — a needle may only be declared once the
-            search has zoomed to this 0-indexed level or deeper (default 2 ⇒
-            zoom level 3+). This also forces the optimiser to zoom in at least
+            search has zoomed to this 0-indexed level or deeper (default 1 ⇒
+            zoom level 2+). This also forces the optimiser to zoom in at least
             ``min_zoom_for_needle + 1`` times before it can localise an optimum.
           * ``min_iters_per_zoom`` — at least this many objective lines must be
             sampled at the current zoom level before the optimiser may declare a
@@ -293,6 +293,14 @@ class ZoMBIHop:
                       "initialized to the full search box.")
         if self.data_handler.current_zoom_bounds is None:
             self.data_handler.current_zoom_bounds = self.bounds.clone()
+
+        # The minimum-width floor on zoom boxes (DataHandler._apply_min_box_width)
+        # widens narrow axes and translates the result back inside the *global* box.
+        # save_init records that box, but a resumed handler restores only `bounds`
+        # (the current zoom region), and ZoMBI holds the authoritative copy in either
+        # case — including a caller-tightened box such as [0, 0.3] on one axis — so
+        # set it unconditionally rather than relying on the checkpoint.
+        self.data_handler._full_bounds_ref = self.full_bounds.clone()
 
         # GP handler
         self.gp_handler = GPSimplex(

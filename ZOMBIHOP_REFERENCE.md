@@ -241,7 +241,7 @@ Data flow between key objects:
 | Parameter | Default | Controls |
 |-----------|---------|----------|
 | `convergence_pi_threshold` | 0.01 | **Deprecated / ignored.** Convergence now uses Expected Improvement vs the output-noise floor (`EI < GP_output_noise × output_noise_threshold_mult`); there is no separate PI threshold. Kept only so older configs/JSONs still load. |
-| `input_noise_threshold_mult` | 2.0 | Unused directly in convergence check (kept for backward compat); related to input noise scale. |
+| `input_noise_threshold_mult` | 3.0 | Minimum trust-region width is this multiple of `input_noise` (`DataHandler.min_box_width`); each axis of a candidate zoom box narrower than that is widened about its centre before the Jaccard novelty test. 0 disables the floor. |
 | `output_noise_threshold_mult` | 2.0 | Y improvement (over the **local** prev_best within bounds) must be < this × GP output noise. Higher = easier to converge. |
 
 ### GP & Acquisition

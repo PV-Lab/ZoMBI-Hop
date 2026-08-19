@@ -29,7 +29,7 @@ DEFAULT_HPARAMS: dict = {
     "max_iterations": 2,
     "top_m_points": 8,
     "n_consecutive_converged": 5,
-    "input_noise_threshold_mult": 0.5,
+    "input_noise_threshold_mult": 3.0,
     "output_noise_threshold_mult": 2.0,
     "max_penalty_radius": 0.5020402,
     "needle_shrink_factor": 0.99,
@@ -38,8 +38,19 @@ DEFAULT_HPARAMS: dict = {
     "paring_y_noise_multiplier": 10.0,
 }
 
-# Known physical input noise (per-component composition std), measured as the
-# average input noise of data/2nd_real_run.db (see visualization/input_noise.py).
+# Known physical input noise (per-component composition std), measured by
+# visualization/input_noise.py from runs/run_39af/composition_log.jsonl — the
+# 6-dim hardware run of 2026-08-12, which records the composition the optimiser
+# *sent* alongside the one the printer realised, so nothing is reconstructed.
+#
+# The previous value (0.064) came from data/2nd_real_run.db, where the sent
+# composition was never logged and had to be inferred by fitting a line through
+# each print line's realised endpoints. That fit absorbs the systematic
+# requested-vs-realised offset, so it measures only the scatter about the line
+# and under-reports by ~3x (0.040 vs 0.128 on run_39af's own data). ~87% of the
+# residual on run_39af is *perpendicular* to the requested line, i.e. the printer
+# genuinely misses the composition rather than merely mis-spacing along the line.
+#
 # Not a tuned hyperparameter, so it lives outside DEFAULT_HPARAMS; the hardware
 # runner folds it into its defaults.
-DEFAULT_INPUT_NOISE = 0.064
+DEFAULT_INPUT_NOISE = 0.128

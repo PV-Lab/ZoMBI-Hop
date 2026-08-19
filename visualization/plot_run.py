@@ -5,32 +5,64 @@ Interactive Dash app (with an optional static-PNG export mode) that plots every
 datapoint collected during a *real* ZoMBI-Hop run on a simplex diagram, over a
 Random-Forest-interpolated background of those same points.
 
-Both d=3 and d=4 runs are supported. A d=3 (3-component) composition lives on a
-triangle, so it is drawn as the usual **ternary** diagram. A d=4 (4-component)
-composition lives on a 3-simplex, so it is drawn as a 3D **quaternary**
-tetrahedron: the four components are the four corners, every measured point sits
-inside the solid, and the optional interpolated background fills the volume.
+The dimensionality is **detected from the data**, and the diagram type follows
+from it — the composition is never projected down to fit a fixed diagram:
+
+  * **d=3** — a 3-component composition lives on a triangle, drawn as the usual
+    **ternary** diagram over an interpolated background.
+  * **d=4** — a 4-component composition lives on a 3-simplex, drawn as a 3D
+    **quaternary** tetrahedron: the four components are the four corners, every
+    measured point sits inside the solid, and the background fills the volume.
+  * **d>=5** — a simplex of 5+ components has no faithful 2D/3D embedding, so the
+    run is drawn as a **CoNet** (``plot_10d``'s co-occurrence-network UMAP map,
+    the same view ``conet.png`` shows). This is the plain single-dataset CoNet;
+    the uniform baseline of ``paired_conet.py`` is not involved.
 
 Two data sources are supported, selectable in the app:
 
   * **Run directory** (e.g. ``runs/run_7eb9``) — the full measured dataset
     ``(X, Y)`` is reconstructed from the run's delta snapshots
     (``reconstruct_snapshot_tensors``).
-  * **Data file** (e.g. ``data/2nd_real_run.db`` or ``data/campaign1a.csv``) —
-    the ``results`` table (``.db``) or the campaign table (``.csv``) is read
-    directly; the three composition columns (FAPbI3, MAPbI3, MAPbBr3) form ``X``
-    and a chosen value column (default ``Objective``) forms ``Y``. The format is
-    detected automatically from the file extension.
+  * **Data file** (e.g. ``data/6d.db`` or ``data/campaign1a.csv``) — the
+    ``results`` table (``.db``) or the campaign table (``.csv``) is read
+    directly. The composition columns are **discovered** rather than hard-coded
+    (see ``detect_comp_columns``), so ``3d.db``/``4d.db``/``6d.db`` each plot at
+    their own dimensionality, and a chosen value column (default ``Objective``)
+    forms ``Y``. The format is detected from the file extension.
 
-For whichever source, the app:
-  1. Trains a Random-Forest surrogate on ``(X, Y)`` and evaluates it over a
-     dense ternary grid — the smooth background heatmap (viridis).
-  2. Overlays every collected datapoint on top, each coloured by its measured
-     value (same viridis scale as the background) with a black outline so
-     individual measurements stay legible.
+For d=3 / d=4 the app trains a Random-Forest (or GP) surrogate on ``(X, Y)``,
+evaluates it over a dense simplex grid as a smooth background heatmap, and
+overlays every measured datapoint coloured by its value on the same viridis
+scale, with a black outline so individual measurements stay legible.
 
-The diagram type (ternary vs. tetrahedron) is chosen automatically from the
-number of composition columns; d=3 and d=4 are supported.
+Two optional panels, each behind a checkbox in the left panel:
+
+  * **Time slider** — replays the run in *line* increments. A line is one
+    deposition line of (nominally) 24 points; because some points are culled, the
+    lines are not all 24 long, so the boundaries are taken from the data's own
+    ``Iteration`` column rather than assumed (see ``line_index``). The slider runs
+    from 0 lines (an empty plot) on the left to every line on the right. On the
+    simplex diagrams each step rings the points its newest line added in red, so
+    what that step contributed is visible at a glance.
+  * **Convergence plot** — a panel below the main diagram in the style of
+    ``optimize/run_mobo.py``'s ``plot_convergence``: every observed Y against
+    sample index, the running-best step envelope (reset at each activation), and
+    a crimson dashed rule at each declared needle. With the time slider on, it
+    fills in alongside the main plot and keeps fixed axes, so points appear
+    rather than the whole plot rescaling.
+
+For the CoNet + time slider, the UMAP map is fitted **once on the full dataset**
+and every intermediate step replays that fitted frame (``build_conet(frame=...)``)
+on its prefix of the points, so a sample sits at exactly the same coordinates at
+every step instead of the map re-fitting and shifting under the animation.
+
+Slider steps are **precomputed**, not rendered on demand: selecting a source with
+the slider on starts a background pass that renders every step of the range,
+starting from the step on screen, and what it stores is the finished artefact —
+the PNG the browser displays, or the serialised figure Dash sends it. It all
+lives on disk, so a range survives closing the app, and CoNet steps are served
+as plain image URLs rather than inlined into the callback. Scrubbing then costs
+a file read. See "precomputed time-slider steps" below.
 
 Usage
 -----
@@ -40,7 +72,8 @@ Usage
 
   # Static PNG export (legacy behaviour), no server:
   python visualization/plot_run.py --export --run runs/run_7eb9
-  python visualization/plot_run.py --export --db data/2nd_real_run.db --out db.png
+  python visualization/plot_run.py --export --db data/3d.db --out db.png
+  python visualization/plot_run.py --export --db data/6d.db --out conet.png
   python visualization/plot_run.py --export --db data/campaign1a.csv --out csv.png
 
 Flags
@@ -61,13 +94,27 @@ Flags
   --labels A,B,C    Corner labels for [bottom-left,bottom-right,top]
                     (default: FAPbI3,MAPbI3,MAPbBr3).
   --show            (export only) Display the matplotlib figure as well as saving.
+  --cache-dir PATH  Where rendered slider steps are cached (kept between runs).
+  --no-precompute   Render time-slider steps on demand instead of ahead of time.
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import contextlib
+import hashlib
+import io
 import json
+import os
+import re
+import shutil
 import sqlite3
 import sys
+import tempfile
+import threading
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
 
 import numpy as np
@@ -75,9 +122,10 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
 
-# ── project root on sys.path so `src` imports resolve ──────────────────────────
+# ── project root (and this dir, for `plot_10d`) on sys.path ────────────────────
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
+sys.path.insert(0, str(_HERE))
 
 from src.utils.datahandler import reconstruct_snapshot_tensors  # noqa: E402
 
@@ -116,11 +164,33 @@ TETRA_EDGES = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
 DIM_LABELS: dict[int, str] = {0: "FAPbI3", 9: "MAPbBr3", 8: "MAPbI3", 2: "CsPbI3"}
 CORNER_DIM_ORDER: list[int] = [9, 8, 0]   # bottom-left, bottom-right, top
 
-# Composition columns in a ``results`` DB table, ordered [bottom-left,
-# bottom-right, top] to match comp_to_xy / the run default corner layout.
-DB_COMP_COLS: list[str] = ["FAPbI3", "MAPbI3", "MAPbBr3"]
 DB_VALUE_COLS: list[str] = ["Objective", "Bandgap", "Photoconductance", "Stability"]
 DEFAULT_DB_VALUE = "Objective"
+
+# The 3-component layout of the original real-run campaign, ordered [bottom-left,
+# bottom-right, top] to match comp_to_xy. Plotting no longer assumes it — the
+# composition columns are detected per file (``detect_comp_columns``) so a d=4 or
+# d=6 file is not squashed into three — but ``input_noise.py`` analyses that
+# specific campaign and imports this triple, so it stays as the d=3 default.
+DB_COMP_COLS: list[str] = ["FAPbI3", "MAPbI3", "MAPbBr3"]
+
+# A ``results`` table lays its ten hardware module slots out contiguously between
+# the ``Iteration`` and ``X`` columns. A slot loaded with a real precursor carries
+# that precursor's name (FAPbI3, CsPbI3, MACl, …); an empty slot keeps its
+# placeholder name ``ModuleN`` and is all zeros. Detecting the composition columns
+# this way — rather than hard-coding one fixed triple — is what lets 3d.db, 4d.db
+# and 6d.db each plot at their own true dimensionality.
+_COMP_SPAN = ("Iteration", "X")
+_MODULE_RE = re.compile(r"module\d+$", re.IGNORECASE)
+
+# d>=5 has no faithful simplex diagram, so it is drawn as a CoNet instead.
+CONET_MIN_D = 5
+
+# Nominal points per deposition line. Only a fallback: run directories carry no
+# ``Iteration`` column, so their lines are assumed to be exactly this long. Data
+# files use their real ``Iteration`` values, which is what handles culled
+# (shorter-than-nominal) lines correctly — see ``line_index``.
+NOMINAL_LINE_POINTS = 24
 
 
 # ── ternary utilities (mirror interactive_test_zombi.py) ───────────────────────
@@ -179,6 +249,115 @@ def simplex_grid(n: int, d: int) -> np.ndarray:
     raise ValueError(f"Only d=3 or d=4 simplex grids are supported (got d={d}).")
 
 
+# ── the loaded dataset ────────────────────────────────────────────────────────
+
+@dataclass
+class Dataset:
+    """One loaded source, ready to plot, whatever its dimensionality.
+
+    ``X`` is (N, d) row-normalised composition, ``Y`` is (N,) the measured value,
+    and ``labels`` names the d components. ``lines`` is the per-point deposition
+    line id (0-based, ascending, not necessarily contiguous in length — see
+    ``line_index``); the time slider steps through it one line at a time.
+
+    ``activations`` is the per-point ZoMBI activation id, or None when the source
+    does not record one. It is optimizer state, so only run directories have it
+    (recovered from their snapshots); a ``.db``/``.csv`` is a hardware result log
+    with no such column. The convergence plot resets its running-best envelope at
+    each activation boundary when it is present — see ``run_activations``.
+
+    ``needles`` is an ``(n, 2)`` array of ``[sample index, points collected when
+    declared]`` for every needle the run declared, or None when the source keeps no
+    needle record (again, ``.db``/``.csv``). The convergence plot rules a line at
+    each. The two columns differ because a needle is declared *at the best point so
+    far*, which is usually an earlier sample than the moment of declaration — see
+    ``run_needles``.
+    """
+
+    X: np.ndarray
+    Y: np.ndarray
+    labels: tuple[str, ...]
+    title: str
+    lines: np.ndarray
+    value_name: str = DEFAULT_DB_VALUE
+    activations: np.ndarray | None = None
+    needles: np.ndarray | None = None
+
+    def __iter__(self):
+        """Unpack as the legacy ``(X, Y, labels, title)`` tuple.
+
+        ``load_db_dataset`` / ``load_run_source`` used to return that 4-tuple, and
+        several sibling modules unpack it that way (``needle_overlay``,
+        ``random_baseline``, ``plot_warm_start``, ``optimize/evaluate``,
+        ``warm_start/test_greedy_optima_gp``). Keeping the unpacking contract means
+        the richer Dataset can carry ``lines``/``value_name`` for the time slider
+        without any of them having to change.
+        """
+        return iter((self.X, self.Y, self.labels, self.title))
+
+    @property
+    def d(self) -> int:
+        return int(self.X.shape[1])
+
+    @property
+    def n_lines(self) -> int:
+        return int(self.lines.max()) + 1 if len(self.lines) else 0
+
+    def prefix_rows(self, n_lines: int) -> np.ndarray:
+        """Row indices belonging to the first ``n_lines`` deposition lines.
+
+        Returned as explicit indices rather than a count: the rows of a line are
+        contiguous in every file seen so far, but nothing in the format guarantees
+        it, and a CoNet step selects its embedding rows by exactly this index array
+        (``E_raw[rows]``). Indices keep that correct either way, where a bare count
+        would silently mis-pair points with coordinates.
+        """
+        return np.flatnonzero(self.lines < int(n_lines))
+
+    def prefix(self, n_lines: int) -> "Dataset":
+        """This dataset restricted to its first ``n_lines`` deposition lines."""
+        rows = self.prefix_rows(n_lines)
+        return _dc_replace(
+            self, X=self.X[rows], Y=self.Y[rows], lines=self.lines[rows],
+            activations=None if self.activations is None else self.activations[rows],
+            needles=self.needles_within(rows),
+        )
+
+    def needles_within(self, rows: np.ndarray) -> np.ndarray | None:
+        """Needles already declared by ``rows``, re-indexed into that selection.
+
+        Both conditions matter: the needle's own sample must be in the selection,
+        *and* it must have been declared by then. A needle sits at the best point
+        found so far, so its sample can be drawn long before the optimizer decided
+        it was a needle; showing it early would put a needle on the plot at a step
+        where the run had not found one.
+        """
+        if self.needles is None:
+            return None
+        pos = np.full(len(self.Y), -1, dtype=int)
+        pos[rows] = np.arange(len(rows))
+        keep = [(pos[i], when) for i, when in self.needles
+                if 0 <= i < len(pos) and pos[i] >= 0 and when <= len(rows)]
+        return np.asarray(keep, dtype=int).reshape(-1, 2)
+
+
+def line_index(iteration: np.ndarray | None, n: int) -> np.ndarray:
+    """Per-point deposition-line id, 0-based and ascending.
+
+    A line is nominally ``NOMINAL_LINE_POINTS`` points, but the pipeline culls
+    points, so real lines run shorter (in ``data/6d.db`` they range from 14 to 24).
+    Slicing at a fixed stride would therefore drift out of phase with the actual
+    lines within a few steps. When the source carries an ``Iteration`` column that
+    column *is* the line marker, so it is used directly (densified to 0..L-1 so the
+    slider maps onto contiguous steps). Only when there is no such column — a run
+    directory reconstructed from snapshots — do we fall back to fixed-size blocks.
+    """
+    if iteration is None:
+        return np.arange(n, dtype=int) // NOMINAL_LINE_POINTS
+    _, dense = np.unique(np.asarray(iteration, dtype=float), return_inverse=True)
+    return dense.astype(int)
+
+
 # ── data loading: run directories ────────────────────────────────────────────
 
 def _resolve_run_dir(run_arg: str) -> Path:
@@ -225,6 +404,111 @@ def _run_dims(run_dir: Path) -> list[int] | None:
         except Exception:
             pass
     return None
+
+
+def run_activations(run_dir: Path, snapshot: str, n_points: int) -> np.ndarray | None:
+    """Per-point ZoMBI activation id for a run, or None if it cannot be recovered.
+
+    Each snapshot's ``summary.json`` records the activation that was running and the
+    cumulative ``n_points`` at that moment, which is exactly the ``(n_points,
+    activation)`` record stream ``run_mobo._activation_zoom_per_point`` buckets: the
+    points in ``[prev_n, n)`` were measured under that snapshot's activation. Walking
+    the snapshots up to and including ``snapshot`` therefore reconstructs the
+    activation of every stored point, which is what lets the convergence plot restart
+    its running-best envelope at each activation boundary.
+
+    Returns None when there are no readable snapshots, so callers fall back to a
+    single global running best rather than inventing boundaries.
+    """
+    snaps_dir = run_dir / "snapshots"
+    if not snaps_dir.is_dir():
+        return None
+    records: list[tuple[int, int]] = []
+    for snap in sorted(p for p in snaps_dir.iterdir() if p.is_dir()):
+        try:
+            s = json.loads((snap / "summary.json").read_text())
+            records.append((int(s["n_points"]), int(s["activation"])))
+        except Exception:
+            continue                      # a partial/unreadable snapshot is skipped
+        if snap.name == snapshot:
+            break                         # the view is reconstructed only this far
+    if not records:
+        return None
+
+    act = np.zeros(int(n_points), dtype=int)
+    prev = 0
+    for n, a in records:
+        n = min(n, n_points)
+        if n > prev:
+            act[prev:n] = a
+            prev = n
+    if prev < n_points:                   # tail: points past the last snapshot
+        act[prev:] = records[-1][1]
+    return act
+
+
+def _needle_sample(rec: dict, X: np.ndarray, Y: np.ndarray) -> int | None:
+    """Index of the sample a needle record names, or None if it cannot be pinned.
+
+    A needle is declared *at* one of the collected points, so its recorded
+    composition should appear verbatim in ``X`` — matching on it recovers the
+    sample index ``run_mobo.plot_convergence`` rules its line at. The recorded
+    objective value is the fallback for a run whose needle was stored at a
+    different dimensionality than the reconstructed X.
+    """
+    point = np.asarray(rec.get("point") or [], dtype=float)
+    if point.size == X.shape[1] and point.sum() > 0:
+        dist = np.abs(X - point / point.sum()).max(axis=1)
+    else:
+        value = rec.get("value")
+        if value is None:
+            return None
+        dist = np.abs(Y - float(value))
+    i = int(np.argmin(dist))
+    # Only an essentially exact hit counts: a near miss means the record does not
+    # correspond to a stored point, and a line drawn on the wrong sample would be
+    # worse than no line at all.
+    return i if dist[i] <= 1e-6 else None
+
+
+def run_needles(run_dir: Path, snapshot: str, X: np.ndarray,
+                Y: np.ndarray) -> np.ndarray | None:
+    """``(n, 2)`` array of ``[sample index, points collected when declared]``.
+
+    Each snapshot carries the cumulative ``needles.json`` list, so a needle is
+    "declared" at the first snapshot whose list grew to include it — that
+    snapshot's ``n_points`` is when the run knew about it. The needle's own sample
+    index is recovered separately (``_needle_sample``), because the two are not the
+    same: a needle is declared at the best point found so far, which is typically
+    an earlier sample.
+
+    Returns an empty ``(0, 2)`` array for a run that declared no needles, and None
+    when there is no snapshot record at all, so callers can tell "none found" apart
+    from "not recorded" (a ``.db``/``.csv`` result log has no needle record).
+    """
+    snaps_dir = run_dir / "snapshots"
+    if not snaps_dir.is_dir():
+        return None
+    records: list[dict] = []
+    declared: list[int] = []
+    for snap in sorted(p for p in snaps_dir.iterdir() if p.is_dir()):
+        try:
+            n_points = int(json.loads((snap / "summary.json").read_text())["n_points"])
+            found = json.loads((snap / "needles.json").read_text())
+        except Exception:
+            continue                      # a partial/unreadable snapshot is skipped
+        while len(records) < len(found):  # everything this snapshot newly declared
+            records.append(found[len(records)])
+            declared.append(n_points)
+        if snap.name == snapshot:
+            break                         # the view is reconstructed only this far
+
+    out = []
+    for rec, when in zip(records, declared):
+        i = _needle_sample(rec, X, Y)
+        if i is not None:
+            out.append((i, min(when, len(Y))))
+    return np.asarray(out, dtype=int).reshape(-1, 2)
 
 
 def _corner_config(
@@ -285,7 +569,10 @@ def _reorder_columns(
 
 
 def load_run_dataset(run_dir: Path, snapshot: str) -> tuple[np.ndarray, np.ndarray]:
-    """Reconstruct the full measured dataset ``(X (N,3), Y (N,))`` for a run."""
+    """Reconstruct the full measured dataset ``(X (N,d), Y (N,))`` for a run.
+
+    Any d is returned; the caller picks the diagram from it (d>=5 becomes a CoNet).
+    """
     tensors = reconstruct_snapshot_tensors(run_dir, snapshot, device="cpu")
     X = tensors.get("X_all_actual")
     Y = tensors.get("Y_all")
@@ -293,8 +580,6 @@ def load_run_dataset(run_dir: Path, snapshot: str) -> tuple[np.ndarray, np.ndarr
         raise RuntimeError(f"No datapoints reconstructed from {run_dir}/{snapshot}")
     X = X.detach().cpu().numpy().astype(float)
     Y = Y.detach().cpu().numpy().astype(float).ravel()
-    if X.shape[1] not in (3, 4):
-        raise ValueError(f"Only d=3 or d=4 runs are supported (got d={X.shape[1]}).")
     # Normalise rows to sum 1 (guards against tiny numerical drift).
     s = X.sum(axis=1, keepdims=True)
     X = X / np.where(s == 0, 1.0, s)
@@ -306,15 +591,27 @@ def load_run_source(
     snapshot: str | None,
     corner_dims_override: str | None = None,
     labels_override: str | None = None,
-) -> tuple[np.ndarray, np.ndarray, tuple[str, str, str], str]:
-    """Load a run directory → ``(X, Y, labels, title)`` ready for plotting."""
+) -> Dataset:
+    """Load a run directory into a ``Dataset`` ready for plotting."""
     snapshot = snapshot or _default_snapshot(run_dir)
     run_dims = _run_dims(run_dir)
     corner_dims, labels = _corner_config(run_dir, corner_dims_override, labels_override)
     X, Y = load_run_dataset(run_dir, snapshot)
+    # Matched before the columns are reordered for the diagram: needles.json
+    # records a composition in the run's own dimension order.
+    needles = run_needles(run_dir, snapshot, X, Y)
     X = _reorder_columns(X, run_dims, corner_dims)
-    title = f"{run_dir.name} — collected datapoints  ({snapshot})"
-    return X, Y, labels, title
+    if len(labels) != X.shape[1]:      # d>=5: _corner_config's triple-oriented default
+        dims = corner_dims or run_dims or list(range(X.shape[1]))
+        labels = tuple(DIM_LABELS.get(d, f"dim {d}") for d in dims[: X.shape[1]])
+    return Dataset(
+        X=X, Y=Y, labels=tuple(labels),
+        title=f"{run_dir.name} — collected datapoints  ({snapshot})",
+        # Snapshots carry no Iteration column, so lines fall back to fixed blocks.
+        lines=line_index(None, len(X)),
+        activations=run_activations(run_dir, snapshot, len(X)),
+        needles=needles,
+    )
 
 
 # ── data loading: database / csv ──────────────────────────────────────────────
@@ -333,6 +630,80 @@ def _resolve_db_path(db_arg: str) -> Path:
     if candidate.is_file():
         return candidate.resolve()
     raise FileNotFoundError(f"Data file not found: {db_arg}")
+
+
+def _table_columns(path: Path) -> list[str]:
+    """Column names of a data file's table, in declaration order."""
+    if _is_csv(path):
+        import pandas as pd
+
+        return list(pd.read_csv(path, nrows=0).columns)
+    con = sqlite3.connect(str(path))
+    try:
+        return [r[1] for r in con.execute("PRAGMA table_info(results)")]
+    finally:
+        con.close()
+
+
+def _nonzero_columns(path: Path, cols: list[str]) -> list[str]:
+    """Those of ``cols`` that hold at least one non-zero, non-null value."""
+    if _is_csv(path):
+        import pandas as pd
+
+        df = pd.read_csv(path, usecols=lambda c: c in set(cols))
+        return [c for c in cols
+                if c in df.columns
+                and pd.to_numeric(df[c], errors="coerce").fillna(0.0).abs().max() > 0]
+    con = sqlite3.connect(str(path))
+    try:
+        keep = []
+        for c in cols:
+            hi = con.execute(
+                f'SELECT MAX(ABS("{c}")) FROM results WHERE "{c}" IS NOT NULL'
+            ).fetchone()[0]
+            if hi is not None and float(hi) > 0:
+                keep.append(c)
+        return keep
+    finally:
+        con.close()
+
+
+def detect_comp_columns(path: Path) -> list[str]:
+    """The composition columns actually used by a data file, in table order.
+
+    This is what gives the app its dimensionality: the length of the returned list
+    IS ``d``, so a 6-component file is plotted as 6 components rather than being
+    squeezed into a fixed three.
+
+    The candidates are the hardware module slots, which sit contiguously between
+    the ``Iteration`` and ``X`` columns (see ``_COMP_SPAN``). Two filters narrow
+    them to the components a campaign really varied:
+
+      * slots still carrying their ``ModuleN`` placeholder name were never loaded
+        with a precursor, so they are not components at all;
+      * slots that are all-zero across every row contribute nothing to any
+        composition — keeping them would inflate d with a constant column and, on
+        the simplex, add a corner no sample ever approaches.
+
+    A campaign CSV has no module slots; its span between ``Iteration`` and ``X``
+    is already exactly the composition columns, and the same filters are no-ops.
+    """
+    cols = _table_columns(path)
+    lo, hi = _COMP_SPAN
+    if lo not in cols or hi not in cols:
+        raise RuntimeError(
+            f"{path.name}: expected the composition columns between "
+            f"'{lo}' and '{hi}', but the table has no such span."
+        )
+    span = cols[cols.index(lo) + 1: cols.index(hi)]
+    named = [c for c in span if not _MODULE_RE.match(c)]
+    active = _nonzero_columns(path, named)
+    if len(active) < 2:
+        raise RuntimeError(
+            f"{path.name}: found {len(active)} varying composition column(s) "
+            f"{active} among {named}; need at least 2 to plot."
+        )
+    return active
 
 
 def db_value_columns(db_path: Path) -> list[str]:
@@ -384,26 +755,31 @@ def _load_db_rows(db_path: Path, cols: list[str]) -> np.ndarray:
     return np.asarray(rows, dtype=float)
 
 
-def load_db_dataset(
-    db_path: Path, value_col: str = DEFAULT_DB_VALUE
-) -> tuple[np.ndarray, np.ndarray, tuple[str, str, str], str]:
-    """Read a .db ``results`` table or campaign .csv → ``(X (N,3), Y (N,), labels, title)``.
+def load_db_dataset(db_path: Path, value_col: str = DEFAULT_DB_VALUE) -> Dataset:
+    """Read a .db ``results`` table or campaign .csv into a ``Dataset``.
 
-    The format is chosen from the file extension. Rows missing the value column
-    or any composition column are dropped, and composition rows are renormalised
-    to sum 1.
+    The format is chosen from the file extension and the width from
+    ``detect_comp_columns``, so d is whatever the file actually contains. Rows
+    missing the value column or any composition column are dropped, and
+    composition rows are renormalised to sum 1. The ``Iteration`` column is read
+    alongside so the time slider can step by real deposition lines.
     """
-    cols = DB_COMP_COLS + [value_col]
+    comp_cols = detect_comp_columns(db_path)
+    d = len(comp_cols)
+    cols = comp_cols + [value_col, _COMP_SPAN[0]]
     arr = _load_csv_rows(db_path, cols) if _is_csv(db_path) else _load_db_rows(db_path, cols)
     if arr.shape[0] == 0:
-        raise RuntimeError(f"No rows with non-null {DB_COMP_COLS} + {value_col} in {db_path}")
-    X = arr[:, :3]
-    Y = arr[:, 3]
+        raise RuntimeError(f"No rows with non-null {comp_cols} + {value_col} in {db_path}")
+    X, Y, iteration = arr[:, :d], arr[:, d], arr[:, d + 1]
     s = X.sum(axis=1, keepdims=True)
     X = X / np.where(s == 0, 1.0, s)
-    labels = (DB_COMP_COLS[0], DB_COMP_COLS[1], DB_COMP_COLS[2])
-    title = f"{db_path.name} — {X.shape[0]} measured points  ({value_col})"
-    return X, Y, labels, title
+    lines = line_index(iteration, len(X))
+    return Dataset(
+        X=X, Y=Y, labels=tuple(comp_cols),
+        title=(f"{db_path.name} — {X.shape[0]} measured points, d={d}, "
+               f"{int(lines.max()) + 1 if len(lines) else 0} lines  ({value_col})"),
+        lines=lines, value_name=value_col,
+    )
 
 
 # ── background surrogates ────────────────────────────────────────────────────
@@ -521,6 +897,27 @@ def _bg_marker_size(grid_n: int) -> float:
     return float(np.clip(1100.0 / max(grid_n, 1), 3.0, 16.0))
 
 
+# The time slider's newest deposition line is ringed in this colour so the points
+# that step added stand out against the black-edged points already on the plot.
+NEW_POINT_COLOR = "red"
+NEW_POINT_EDGE_WIDTH = 3.0
+
+
+def _point_edges(n: int, highlight: np.ndarray | None) -> tuple:
+    """Per-point (edge colour, edge width) arrays for the measured-point overlay.
+
+    ``highlight`` is a boolean mask over the plotted points (the rows added by the
+    time slider's newest line). Unhighlighted points keep the usual thin black
+    edge; highlighted ones get a thick red ring. Returns plain scalars when
+    nothing is highlighted so the common case sends no per-point arrays.
+    """
+    if highlight is None or not np.any(highlight):
+        return "black", 1.0
+    mask = np.asarray(highlight, dtype=bool)
+    return (np.where(mask, NEW_POINT_COLOR, "black"),
+            np.where(mask, NEW_POINT_EDGE_WIDTH, 1.0))
+
+
 def build_ternary_figure(
     X: np.ndarray,
     Y: np.ndarray,
@@ -536,6 +933,7 @@ def build_ternary_figure(
     scale: float = 1.0,
     plot_size: float = 0.80,
     color_limits: tuple[float, float] | None = None,
+    highlight: np.ndarray | None = None,
 ):
     """Interactive Plotly ternary: optional interpolated background + points overlay.
 
@@ -551,6 +949,10 @@ def build_ternary_figure(
 
     ``color_limits`` forces the viridis (vmin, vmax); pass it when two figures
     must share one colour scale, else it is derived from this figure's data.
+
+    ``highlight`` is an optional boolean mask over the rows of ``X``; those points
+    are ringed in red instead of black (the time slider uses it to show which
+    points the current deposition line added).
 
     Corner mapping mirrors comp_to_xy / matplotlib:
       col0 → bottom-left (b),  col1 → bottom-right (c),  col2 → top (a).
@@ -591,8 +993,10 @@ def build_ternary_figure(
             showlegend=False,
         ))
 
-    # Foreground: every measured datapoint, coloured by value with a black edge.
+    # Foreground: every measured datapoint, coloured by value with a black edge
+    # (red for the points the time slider's newest line added).
     if show_points:
+        edge_color, edge_width = _point_edges(len(X), highlight)
         customdata = np.column_stack([X[:, 0], X[:, 1], X[:, 2], Y])
         fig.add_trace(go.Scatterternary(
             a=X[:, 2], b=X[:, 0], c=X[:, 1],
@@ -600,7 +1004,7 @@ def build_ternary_figure(
             marker=dict(
                 symbol="circle", size=9 * scale, color=Y,
                 colorscale="Viridis", cmin=vmin, cmax=vmax,
-                line=dict(width=1.0, color="black"),
+                line=dict(width=edge_width, color=edge_color),
                 colorbar=colorbar,
             ),
             customdata=customdata,
@@ -664,6 +1068,7 @@ def build_quaternary_figure(
     gp_length_scale: float = 0.3,
     scale: float = 1.0,
     color_limits: tuple[float, float] | None = None,
+    highlight: np.ndarray | None = None,
 ):
     """Interactive Plotly 3D tetrahedron for d=4 compositions.
 
@@ -672,6 +1077,10 @@ def build_quaternary_figure(
     optional interpolated background fills the interior as a translucent 3D grid
     (its markers are kept small and semi-transparent so the opaque, black-edged
     measured points stay legible through the volume).
+
+    ``highlight`` is an optional boolean mask over the rows of ``X``; those points
+    are ringed in red and drawn slightly larger, so the points the time slider's
+    newest line added stand out inside the volume.
     """
     import plotly.graph_objects as go
 
@@ -731,23 +1140,42 @@ def build_quaternary_figure(
         ))
 
     # Foreground: every measured datapoint, coloured by value with a black edge.
+    #
+    # scatter3d's marker.line.width is a single number (unlike the 2D ternary,
+    # which takes a per-point array), so the points the time slider's newest line
+    # added go in their own trace: red-ringed and enlarged, since a thin ring
+    # alone is easy to lose inside the volume. The two traces are disjoint, so
+    # nothing is drawn twice at the same depth.
     if show_points:
         pxyz = comp_to_xyz(X)
         customdata = np.column_stack([X, Y])
         hover = "<br>".join(
             f"{labels[k]}=%{{customdata[{k}]:.3f}}" for k in range(X.shape[1])
         ) + f"<br>{value_name}=%{{customdata[{X.shape[1]}]:.4f}}<extra></extra>"
-        fig.add_trace(go.Scatter3d(
-            x=pxyz[:, 0], y=pxyz[:, 1], z=pxyz[:, 2], mode="markers",
-            marker=dict(
-                size=5 * scale, color=Y,
-                colorscale="Viridis", cmin=vmin, cmax=vmax,
-                line=dict(width=1.0, color="black"),
-                colorbar=colorbar,
-            ),
-            customdata=customdata, hovertemplate=hover,
-            name="measured", showlegend=False,
-        ))
+
+        new_mask = (np.zeros(len(X), dtype=bool) if highlight is None
+                    else np.asarray(highlight, dtype=bool))
+        layers = [(~new_mask, "black", 1.0, 5 * scale, "measured")]
+        if new_mask.any():
+            layers.append((new_mask, NEW_POINT_COLOR, NEW_POINT_EDGE_WIDTH,
+                           8 * scale, "newest line"))
+        # The colorbar rides on the first non-empty layer.
+        bar_taken = False
+        for mask, edge_color, edge_width, msize, name in layers:
+            if not mask.any():
+                continue
+            fig.add_trace(go.Scatter3d(
+                x=pxyz[mask, 0], y=pxyz[mask, 1], z=pxyz[mask, 2], mode="markers",
+                marker=dict(
+                    size=msize, color=Y[mask],
+                    colorscale="Viridis", cmin=vmin, cmax=vmax,
+                    line=dict(width=edge_width, color=edge_color),
+                    colorbar=None if bar_taken else colorbar,
+                ),
+                customdata=customdata[mask], hovertemplate=hover,
+                name=name, showlegend=False,
+            ))
+            bar_taken = True
 
     # Explicit *cube* scene box centered on the top vertex's vertical axis.
     #
@@ -791,7 +1219,10 @@ def build_quaternary_figure(
 
 
 def build_figure(X: np.ndarray, Y: np.ndarray, labels: tuple[str, ...], **kwargs):
-    """Dispatch to the ternary (d=3) or quaternary tetrahedron (d=4) builder."""
+    """Dispatch to the ternary (d=3) or quaternary tetrahedron (d=4) builder.
+
+    d>=5 has no simplex diagram and is handled by ``conet_png_src`` instead.
+    """
     d = X.shape[1]
     # plot_size only applies to the flat ternary; the d=4 scene is sized by the
     # camera, so zooming already covers it.
@@ -802,7 +1233,658 @@ def build_figure(X: np.ndarray, Y: np.ndarray, labels: tuple[str, ...], **kwargs
         return build_ternary_figure(X, Y, labels, **kwargs)
     if d == 4:
         return build_quaternary_figure(X, Y, labels, **kwargs)
-    raise ValueError(f"Only d=3 or d=4 is supported for plotting (got d={d}).")
+    raise ValueError(
+        f"d={d} has no simplex diagram; use conet_png_src for d>={CONET_MIN_D}.")
+
+
+# ── CoNet (d >= 5) ────────────────────────────────────────────────────────────
+#
+# plot_10d's CoNet is a matplotlib render, so it is delivered to the browser as a
+# PNG data URI rather than as a Plotly figure. This is the plain single-dataset
+# CoNet (what `conet.png` shows) — paired_conet.py's uniform-baseline variant is
+# deliberately not used here: there is no synthetic landscape to draw a baseline
+# from, and the second panel would say nothing about a real campaign.
+
+class CoNetTooFewPoints(RuntimeError):
+    """Raised when a time-slider step holds too few samples to embed."""
+
+
+# plot_10d.build_conet_structure refuses to embed fewer than 5 points.
+CONET_MIN_POINTS = 5
+
+# A 1x1 transparent PNG. Used for the CoNet's first few time-slider steps, which
+# hold too few samples for UMAP to embed: the slider's left end is meant to show an
+# empty plot, so the panel is blanked rather than left displaying a stale render.
+BLANK_PNG_SRC = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+)
+BLANK_PNG_BYTES = base64.b64decode(BLANK_PNG_SRC.split(",", 1)[1])
+
+
+def _data_uri(png: bytes) -> str:
+    """Wrap raw PNG bytes as the ``src`` of an ``html.Img``."""
+    return "data:image/png;base64," + base64.b64encode(png).decode()
+
+# The fitted map, keyed by dataset identity. The UMAP fit dominates the cost (~30s
+# for 2k points vs <1s to replay it), and the time slider re-renders on every drag,
+# so caching the fit is what makes scrubbing usable at all.
+_CONET_CACHE: dict[tuple, dict] = {}
+_CONET_CACHE_MAX = 4
+
+
+def fit_conet_frame(ds: Dataset, *, key: tuple) -> dict:
+    """Fit the CoNet map ONCE on a dataset's full point set, and cache it.
+
+    Everything the time slider needs to draw an intermediate step is fixed here,
+    on all the data:
+
+      * ``frame`` + ``E_raw`` — the fitted UMAP embedding and its gap/purity warp
+        parameters. Replaying these on a prefix of the points (rather than
+        refitting UMAP on that prefix) is what holds each sample at the same
+        coordinates through the whole animation; refitting would rebuild the map
+        from scratch at every step and the points would jump around.
+      * ``iters`` — the per-point deposition line, which is what plot_10d rims in
+        red as the "current iteration" (see below).
+      * ``limits`` — the axis extent, so the frame never rescales mid-animation.
+      * ``bounds`` — the 10th-90th-percentile colour bounds, so a value keeps the
+        same colour at every step.
+    """
+    import plot_10d as p10
+
+    comp, active = p10._reduce_comp(ds.X)
+    names = [n for n, a in zip(ds.labels, active) if a]
+    resp = ds.Y.reshape(-1, 1)
+    # plot_10d rims the points of the LATEST iteration in red. Its standalone
+    # entry points have no iteration column and pass acquisition order (one point
+    # per "iteration"), which would rim a single sample; here the deposition line
+    # is the real unit, so the rim marks every point the newest line added — the
+    # same thing the simplex diagrams highlight.
+    iters = np.asarray(ds.lines, dtype=float)
+    M, _ = p10.build_conet(comp, names, resp, iters)
+    fit = {
+        "comp": comp, "names": names, "resp": resp, "iters": iters,
+        "frame": M["frame"], "E_raw": M["E_raw"],
+        "limits": p10._cn_view_limits(M["E"]),
+        "bounds": p10.conet_bounds(resp),
+    }
+    if len(_CONET_CACHE) >= _CONET_CACHE_MAX:
+        _CONET_CACHE.pop(next(iter(_CONET_CACHE)))
+    _CONET_CACHE[key] = fit
+    return fit
+
+
+def conet_png_bytes(ds: Dataset, *, key: tuple, rows: np.ndarray | None = None) -> bytes:
+    """Render the CoNet to PNG bytes, optionally restricted to ``rows``.
+
+    ``rows`` (the time slider's selection) keeps only those samples. They are drawn
+    in the map fitted on the FULL dataset — the fitted frame is replayed on those
+    same rows of ``E_raw``, which reproduces the full fit's coordinates exactly, so
+    points appear in place instead of the map shifting under them.
+
+    The dominance fields (the coloured composition regions) *are* recomputed per
+    step: they describe where the currently-drawn samples sit, so they should grow
+    with the data. The axis limits and colour bounds they are computed against come
+    from the full fit, so the frame itself stays put.
+
+    The points of the step's newest deposition line come out red-rimmed: the fit
+    carries the line index as plot_10d's iteration, and plot_10d rims the highest
+    iteration present — which, on a prefix, is the line that step added.
+    """
+    import plot_10d as p10
+
+    fit = _CONET_CACHE.get(key) or fit_conet_frame(ds, key=key)
+    total = len(fit["comp"])
+    sel = np.arange(total) if rows is None else np.asarray(rows, dtype=int)
+    if len(sel) < CONET_MIN_POINTS:
+        raise CoNetTooFewPoints(
+            f"the CoNet needs at least {CONET_MIN_POINTS} samples to embed; "
+            f"the time slider is showing {len(sel)}."
+        )
+
+    frame = dict(fit["frame"])
+    frame["E_raw"] = fit["E_raw"][sel]
+    M, F = p10.build_conet(
+        fit["comp"][sel], fit["names"], fit["resp"][sel], fit["iters"][sel],
+        frame=frame, limits=fit["limits"],
+    )
+    title = f"{ds.title} · CoNet (d={ds.d}"
+    title += ")" if rows is None else f", {len(sel)}/{total} samples)"
+
+    buf = io.BytesIO()
+    p10.save_png(M, F, fit["bounds"], title, buf)
+    return buf.getvalue()
+
+
+def conet_png_src(ds: Dataset, *, key: tuple, rows: np.ndarray | None = None) -> str:
+    """``conet_png_bytes`` as a data URI, for direct use as an image ``src``."""
+    return _data_uri(conet_png_bytes(ds, key=key, rows=rows))
+
+
+# ── precomputed time-slider steps ─────────────────────────────────────────────
+#
+# A slider step is not cheap to draw. A CoNet step replays the fitted map but
+# still rebuilds the co-occurrence graph and the dominance fields over the
+# visible points (seconds, growing with the prefix), and a simplex step refits
+# the background surrogate over the whole grid. Rendering on demand means every
+# drag pays that again, which is what made scrubbing unusable.
+#
+# So a step is rendered at most ONCE, and what is kept is the *finished* artefact
+# — the PNG the browser displays, or the serialised figure Dash sends it — not
+# the inputs it was made from. Redrawing a step costs a file read, not a render.
+#
+# Everything lands on disk, under a directory named for a *signature* covering
+# whatever decides what a step looks like: the source (with its mtime, so edited
+# data misses), and the render knobs. The step index is deliberately not part of
+# it, so one signature owns a whole slider range. Because it is all on disk, a
+# range survives closing the app: reopening a dataset you have already scrubbed
+# costs nothing.
+#
+# Turning the slider on (or switching source, or moving a knob) starts a
+# background pass that walks the range and fills whatever is missing, beginning
+# at the step on screen. A new signature cancels the pass in flight, so switching
+# datasets does not leave stale work competing for the CPU.
+#
+# CoNet PNGs are never inlined into the callback response. They are served as
+# ordinary image URLs off a Flask route (``/plot-run-step/...``), so the browser
+# streams the file straight from disk and — since the URL is content-addressed —
+# keeps it in its own cache afterwards. Inlining them as base64 data URIs meant
+# pushing ~2MB of JSON through the callback on every single step.
+
+CACHE_DIR = Path(os.environ.get("PLOT_RUN_CACHE_DIR")
+                 or Path(tempfile.gettempdir()) / "zombi_plot_run_cache")
+CACHE_MAX_BYTES = 4 * 1024 ** 3   # least-recently-used signatures pruned past this
+# Part of every on-disk name. A signature covers the data and the render knobs,
+# but not the renderers themselves, so a change to what a panel *draws* would
+# otherwise be masked by steps cached before it. Bump this whenever that happens
+# (adding the needle rules did): old steps are then simply never looked up, and
+# age out with the prune, instead of being served stale.
+STEP_FORMAT = 3
+PRECOMPUTE = True                 # --no-precompute renders steps on demand instead
+STEP_URL_PREFIX = "/plot-run-step"
+
+# Decoded steps are also kept in memory, so a step already on screen costs
+# nothing at all to redraw. Bounded, since a figure at a high grid resolution is
+# not small; the disk copy is what makes a miss cheap.
+_STEPS: "OrderedDict[tuple, OrderedDict[int, object]]" = OrderedDict()
+_STEPS_MAX_SIGS = 4
+
+# Renders are serialised: they are CPU-bound, and the CoNet path touches
+# matplotlib's global rcParams. `foreground()` lets a step the user is actually
+# waiting on jump the queue instead of sitting behind a speculative one.
+_RENDER_LOCK = threading.Lock()
+_STATE_LOCK = threading.Lock()
+_FOREGROUND = threading.Event()
+_FG_LOCK = threading.Lock()
+_FG_COUNT = 0
+
+FULL_STEP = -1     # the "timeline off" render (all data), cached alongside the steps
+_CACHED = object()  # sentinel: the step is cached, but the caller asked for no value
+
+
+@contextlib.contextmanager
+def foreground():
+    """Mark the enclosed render as one a user is waiting on.
+
+    The background pass yields the render lock while this is held. Counted, not a
+    bare flag: Dash serves callbacks on several threads, so two foreground
+    renders can overlap and the first to finish must not un-flag the other.
+    """
+    global _FG_COUNT
+    with _FG_LOCK:
+        _FG_COUNT += 1
+        _FOREGROUND.set()
+    try:
+        yield
+    finally:
+        with _FG_LOCK:
+            _FG_COUNT -= 1
+            if _FG_COUNT == 0:
+                _FOREGROUND.clear()
+
+
+def _figure_to_bytes(fig) -> bytes:
+    """Serialise a plotly figure exactly as Dash would send it."""
+    import plotly.io as pio
+    return pio.to_json(fig).encode("utf-8")
+
+
+def _figure_from_bytes(raw: bytes) -> dict:
+    """The stored figure, as the plain dict a callback can return.
+
+    Deliberately *not* rebuilt into a ``go.Figure``: Dash serialises a dict
+    straight through, so this skips both figure construction and the numpy
+    encoding that dominates the cost of handing a big figure back.
+    """
+    return json.loads(raw)
+
+
+@dataclass(frozen=True)
+class Codec:
+    """How one kind of step artefact is stored and handed back.
+
+    ``ram`` is how many decoded steps to hold in memory for this kind; 0 means
+    none, which is right for the CoNet PNGs — nothing ever reads their bytes in
+    Python, the browser fetches them from disk by URL.
+    """
+    ext: str
+    encode: object
+    decode: object
+    ram: int
+
+
+PNG_STEP = Codec("png", lambda b: b, lambda b: b, ram=0)
+FIGURE_STEP = Codec("json", _figure_to_bytes, _figure_from_bytes, ram=200)
+
+
+def _sig_hash(sig: tuple) -> str:
+    """Short stable name for a signature; also the URL path of its PNG steps."""
+    return hashlib.sha1(repr((STEP_FORMAT, sig)).encode()).hexdigest()[:16]
+
+
+# Signature -> its directory, for the signatures this session has touched. Also
+# the set the prune must not evict: their steps are being served by URL right now.
+_SIG_DIRS: dict[tuple, Path] = {}
+
+
+def _prune_cache(keep: Path) -> None:
+    """Drop least-recently-used signature directories past ``CACHE_MAX_BYTES``."""
+    live = {keep, *_SIG_DIRS.values()}
+    try:
+        dirs = []
+        for c in CACHE_DIR.iterdir():
+            if c.is_dir() and c not in live:
+                size = sum(f.stat().st_size for f in c.glob("*") if f.is_file())
+                dirs.append((c.stat().st_mtime, size, c))
+    except OSError:
+        return
+    total = sum(size for _, size, _ in dirs)
+    for _, size, c in sorted(dirs):          # oldest first
+        if total <= CACHE_MAX_BYTES:
+            break
+        shutil.rmtree(c, ignore_errors=True)
+        total -= size
+
+
+def _sig_dir(sig: tuple) -> Path:
+    """Directory holding one signature's steps, created and LRU-touched."""
+    ck = (str(CACHE_DIR), sig)
+    d = _SIG_DIRS.get(ck)
+    if d is not None:
+        return d
+    d = CACHE_DIR / _sig_hash(sig)
+    fresh = not d.is_dir()
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        if fresh:
+            _prune_cache(d)
+        else:
+            os.utime(d, None)   # touch, so the prune order is by last use
+    except OSError:
+        pass
+    _SIG_DIRS[ck] = d
+    return d
+
+
+def _step_path(sig: tuple, n: int, codec: Codec) -> Path:
+    return _sig_dir(sig) / f"{n:+06d}.{codec.ext}"
+
+
+def _steps_for(sig: tuple, limit: int) -> "OrderedDict[int, object]":
+    """The in-memory step store for ``sig``, evicting the least recent signature."""
+    with _STATE_LOCK:
+        store = _STEPS.get(sig)
+        if store is None:
+            while len(_STEPS) >= _STEPS_MAX_SIGS:
+                _STEPS.popitem(last=False)
+            store = _STEPS[sig] = OrderedDict()
+        _STEPS.move_to_end(sig)
+        while len(store) > limit:
+            store.popitem(last=False)
+        return store
+
+
+def cached_step(sig: tuple, n: int, render, *, codec: Codec, want_value: bool = True):
+    """Return the artefact for one slider step, rendering it at most once.
+
+    ``render(n)`` builds the step; ``n == FULL_STEP`` means the whole dataset.
+    The encoded form is written under ``CACHE_DIR``, so a step outlives both
+    eviction from memory and the app itself.
+
+    ``want_value=False`` says the caller only needs the step to *exist* (the
+    CoNet path, which hands the browser a URL) — an already-cached step then
+    costs a single ``stat`` and returns ``None``, rather than reading a megabyte
+    of PNG into Python for nothing.
+    """
+    store = _steps_for(sig, codec.ram) if codec.ram else None
+    path = _step_path(sig, n, codec)
+
+    def hit():
+        if store is not None:
+            v = store.get(n)
+            if v is not None:
+                store.move_to_end(n)
+                return v
+        if path.is_file():
+            if not want_value:
+                return _CACHED
+            try:
+                v = codec.decode(path.read_bytes())
+            except OSError:
+                return None
+            if store is not None:
+                store[n] = v
+                _steps_for(sig, codec.ram)
+            return v
+        return None
+
+    v = hit()
+    if v is None:
+        with _RENDER_LOCK:
+            v = hit()               # another thread may have rendered it meanwhile
+            if v is None:
+                raw = codec.encode(render(n))
+                _write_step(path, raw)
+                v = _CACHED if not want_value else codec.decode(raw)
+                if store is not None and v is not _CACHED:
+                    store[n] = v
+                    _steps_for(sig, codec.ram)
+    return None if v is _CACHED else v
+
+
+def _write_step(path: Path, raw: bytes) -> None:
+    """Write a step atomically — a torn file must never be read back or served."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".part")
+        tmp.write_bytes(raw)
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def step_image_url(sig: tuple, n: int) -> str:
+    """URL serving a PNG step, for the ``src`` of an ``html.Img``.
+
+    Content-addressed (the signature covers the source and its mtime), so the
+    route can tell the browser to keep it indefinitely.
+    """
+    return f"{STEP_URL_PREFIX}/{_sig_hash(sig)}/{n:+06d}.png"
+
+
+def prefetch_urls(sig: tuple, n: int, n_max: int, *, span: int = 5) -> list[str]:
+    """URLs of the already-rendered steps either side of ``n``.
+
+    Handed to the browser to pull into its image cache, so stepping to a
+    neighbour paints from memory with no request at all.
+    """
+    out = []
+    for d in range(1, span + 1):
+        for m in (n + d, n - d):
+            if 0 <= m <= n_max and _step_path(sig, m, PNG_STEP).is_file():
+                out.append(step_image_url(sig, m))
+    return out
+
+
+@dataclass
+class _Warmer:
+    """One background pass filling every step of a set of panels."""
+    key: tuple
+    order: tuple[int, ...]
+    cancel: threading.Event = field(default_factory=threading.Event)
+    done: int = 0
+    error: str | None = None
+
+    @property
+    def total(self) -> int:
+        return len(self.order)
+
+
+_WARMER: _Warmer | None = None
+
+
+def start_warm(order, tracks) -> None:
+    """Fill every step of ``tracks`` in the background, cancelling any earlier pass.
+
+    ``tracks`` is a list of ``(signature, render, codec)`` — one per visible panel,
+    filled in lockstep so the main diagram and its convergence plot are ready at
+    the same step rather than one lagging the other.
+
+    Re-called on every render; a pass already running (or finished) for the same
+    signatures is left alone, so this is cheap to call unconditionally.
+    """
+    global _WARMER
+    key = tuple(sig for sig, _, _ in tracks)
+    with _STATE_LOCK:
+        if _WARMER is not None:
+            if _WARMER.key == key:
+                return
+            _WARMER.cancel.set()
+        w = _WARMER = _Warmer(key=key, order=tuple(order))
+
+    def _run() -> None:
+        for n in w.order:
+            if w.cancel.is_set():
+                return
+            # Never make a step the user is waiting on queue behind a speculative
+            # one: hold off while a foreground render is pending.
+            while _FOREGROUND.is_set() and not w.cancel.is_set():
+                time.sleep(0.05)
+            for sig, render, codec in tracks:
+                if w.cancel.is_set():
+                    return
+                try:
+                    cached_step(sig, n, render, codec=codec, want_value=False)
+                except Exception as e:  # a broken step must not kill the pass
+                    w.error = f"{type(e).__name__}: {e}"
+                    return
+            w.done += 1
+
+    threading.Thread(target=_run, name="plot_run-warm", daemon=True).start()
+
+
+def warm_order(current: int, n_max: int) -> list[int]:
+    """Step order for the background pass: outward from the step being viewed.
+
+    Forward first (scrubbing is normally left-to-right from where you are), then
+    back to the start, then the all-data render that unchecking the slider shows.
+    """
+    current = max(0, min(int(current), int(n_max)))
+    return (list(range(current, n_max + 1)) + list(range(current - 1, -1, -1))
+            + [FULL_STEP])
+
+
+def warm_status_text() -> str:
+    """One line on the background pass, for the panel under the slider."""
+    w = _WARMER
+    if w is None:
+        return ""
+    if w.error:
+        return f"precompute stopped: {w.error}"
+    if w.done >= w.total:
+        return f"all {w.total} steps precomputed - scrubbing is instant"
+    return f"precomputing steps... {w.done}/{w.total}"
+
+
+def conet_step_renderer(ds: Dataset, key: tuple):
+    """``render(n)`` -> the CoNet PNG for the first ``n`` lines of ``ds``.
+
+    The first few steps hold too few samples for UMAP to embed; they render as
+    the blank image (which is what that end of the slider means) so the pass can
+    fill the whole range without special cases.
+    """
+    def render(n: int) -> bytes:
+        rows = None if n == FULL_STEP else ds.prefix_rows(n)
+        if rows is not None and len(rows) < CONET_MIN_POINTS:
+            return BLANK_PNG_BYTES
+        return conet_png_bytes(ds, key=key, rows=rows)
+    return render
+
+
+def simplex_step_renderer(ds: Dataset, **kw):
+    """``render(n)`` -> the simplex figure for the first ``n`` lines of ``ds``.
+
+    Each step also rings the points its newest line (line ``n-1``) added in red,
+    so scrubbing the slider shows at a glance what that step contributed rather
+    than only that the cloud grew. The full-dataset step has no "newest" line and
+    is drawn plain.
+    """
+    background = kw.pop("background")
+
+    def render(n: int):
+        sub = ds if n == FULL_STEP else ds.prefix(n)
+        highlight = None if n == FULL_STEP else sub.lines == int(n) - 1
+        # A background surrogate needs something to fit; the early steps can be
+        # empty or near-empty, so drop to no background there.
+        bg = background if len(sub.X) >= 2 else "none"
+        return build_figure(sub.X, sub.Y, sub.labels, background=bg,
+                            highlight=highlight, **kw)
+    return render
+
+
+def convergence_step_renderer(ds: Dataset, *, show_line_marks: bool):
+    """``render(n)`` -> the convergence figure for the first ``n`` lines of ``ds``."""
+    def render(n: int):
+        rows = None if n == FULL_STEP else ds.prefix_rows(n)
+        return build_convergence_figure(ds, rows=rows,
+                                        show_line_marks=show_line_marks)
+    return render
+
+
+# ── convergence panel ─────────────────────────────────────────────────────────
+
+def build_convergence_figure(
+    ds: Dataset,
+    *,
+    rows: np.ndarray | None = None,
+    show_line_marks: bool = False,
+    height: int = 300,
+):
+    """Plotly convergence panel in the style of ``run_mobo.plot_convergence``.
+
+    Every observed Y against sample index as steel-blue dots, with the
+    running-best envelope over them as a dark-orange ``steps-post`` line — the same
+    two marks, colours and axis labels the run's ``convergence.png`` uses.
+
+    When the source records activations (``ds.activations``), the envelope **resets
+    at every activation boundary**, matching ``plot_convergence(activations=...)``:
+    each activation gets its own best-so-far sawtooth, drawn as its own disconnected
+    segment with a dotted rule at the boundary. Each activation is a fresh ZoMBI
+    search phase, so letting one curve coast on an earlier phase's peak would hide
+    how much the new phase re-explores. Sources with no activation record (a
+    ``.db``/``.csv`` result log) fall back to a single global running best.
+
+    ``rows`` (the time slider's selection) restricts the drawn data, while the axis
+    ranges stay pinned to the FULL dataset. That is what makes the panel fill in
+    under the slider: points appear inside a fixed frame instead of the whole plot
+    rescaling at every step. Each point keeps its own sample index on the x axis, so
+    a point never moves once drawn.
+
+    When the source records needles (``ds.needles``), a crimson dashed rule marks
+    each one, the way ``plot_convergence`` does — at the *sample that was declared
+    the needle*, which is where its ``convergence.png`` draws it. Because that is
+    usually an earlier point than the moment of declaration, a needle only appears
+    once the run had actually declared it, so the time slider never shows a needle
+    before the optimizer found one.
+
+    ``show_line_marks`` adds a very faint rule at each deposition-line boundary —
+    it is what ties a slider position (measured in lines) to a place on this axis.
+    """
+    import plotly.graph_objects as go
+
+    Y_all = np.asarray(ds.Y, dtype=float).ravel()
+    n_total = len(Y_all)
+    sel = np.arange(n_total) if rows is None else np.asarray(rows, dtype=int)
+    acts = None if ds.activations is None else np.asarray(ds.activations).ravel()
+    if acts is not None and len(acts) != n_total:
+        acts = None
+
+    # Ranges from the FULL data, padded, so the frame is identical at every step.
+    if n_total:
+        lo, hi = float(Y_all.min()), float(Y_all.max())
+        pad = (hi - lo) * 0.06 or 1e-6
+        y_range = [lo - pad, hi + pad]
+        x_range = [-0.02 * n_total, n_total * 1.02]
+    else:
+        y_range, x_range = None, None
+
+    fig = go.Figure()
+
+    if show_line_marks and n_total:
+        # Boundaries of the real (variably-sized) lines. Kept fainter than the
+        # activation rules below: there are far more of them (109 lines vs ~14
+        # activations in these runs), so they must read as a background scale.
+        for b in np.flatnonzero(np.diff(ds.lines)) + 1:
+            fig.add_vline(x=float(b) - 0.5, line=dict(color="#cccccc", width=0.6, dash="dot"),
+                          opacity=0.25, layer="below")
+
+    # Activation boundaries, drawn over the FULL dataset so the frame is fixed.
+    if acts is not None:
+        for b in np.flatnonzero(np.diff(acts)) + 1:
+            fig.add_vline(x=float(b) - 0.5, line=dict(color="#888888", width=0.7, dash="dot"),
+                          opacity=0.35, layer="below")
+
+    # Needle rules, under the data. Drawn as traces rather than layout shapes so
+    # they carry one shared legend entry and say on hover which needle they are.
+    if ds.needles is not None and y_range is not None:
+        shown = [(i, when) for i, when in ds.needles if when <= len(sel)]
+        for k, (i, when) in enumerate(shown):
+            fig.add_trace(go.Scatter(
+                x=[float(i), float(i)], y=y_range, mode="lines",
+                name="needle found", legendgroup="needle", showlegend=(k == 0),
+                line=dict(color="crimson", width=1.2, dash="dash"), opacity=0.55,
+                hovertemplate=(f"needle {k + 1} at sample {int(i)}<br>"
+                               f"declared after {int(when)} points<extra></extra>"),
+            ))
+
+    fig.add_trace(go.Scatter(
+        x=sel, y=Y_all[sel], mode="markers", name="obs",
+        marker=dict(size=5, color="steelblue", opacity=0.65),
+        hovertemplate=f"sample %{{x}}<br>{ds.value_name}=%{{y:.4f}}<extra></extra>",
+    ))
+
+    # One envelope per activation (or a single global one when there is no
+    # activation record). Each segment is its own trace, so nothing bridges a
+    # boundary — the reset is a real break in the line, not a steep climb.
+    if len(sel):
+        if acts is None:
+            groups = [sel]
+            best_label = "running best"
+        else:
+            sel_acts = acts[sel]
+            cuts = np.flatnonzero(np.diff(sel_acts)) + 1
+            groups = np.split(sel, cuts)
+            best_label = "running best (reset/activation)"
+        for gi, g in enumerate(groups):
+            if not len(g):
+                continue
+            fig.add_trace(go.Scatter(
+                x=g, y=np.maximum.accumulate(Y_all[g]), mode="lines",
+                name=best_label, legendgroup="best", showlegend=(gi == 0),
+                line=dict(color="darkorange", width=2, shape="hv"),
+                hovertemplate="best through %{x}: %{y:.4f}<extra></extra>",
+            ))
+
+    n_needles = 0 if ds.needles is None else sum(1 for _, w in ds.needles
+                                                 if w <= len(sel))
+    needle_note = "" if ds.needles is None else f", {n_needles} needles"
+
+    fig.update_layout(
+        xaxis=dict(title="Sample index", range=x_range, showgrid=True, gridcolor="#eee",
+                   zeroline=False, linecolor="black", showline=True, mirror=False),
+        yaxis=dict(title=f"{ds.value_name} Y", range=y_range, showgrid=True,
+                   gridcolor="#eee", zeroline=False, linecolor="black", showline=True),
+        title=dict(text=f"Convergence  ({len(sel)}/{n_total} pts{needle_note})",
+                   x=0.5, y=0.97,
+                   yanchor="top", font=dict(size=13)),
+        showlegend=True,
+        legend=dict(x=0.99, y=0.02, xanchor="right", yanchor="bottom",
+                    font=dict(size=10), bgcolor="rgba(255,255,255,0.7)"),
+        margin=dict(l=60, r=40, t=40, b=45),
+        height=height,
+        plot_bgcolor="white", paper_bgcolor="white",
+    )
+    return fig
 
 
 # ── Dash app ──────────────────────────────────────────────────────────────────
@@ -824,15 +1906,52 @@ def _list_db_files() -> list[str]:
     return sorted(p.name for p in files)
 
 
+# Loaded datasets, keyed by source signature. The time slider re-renders on every
+# drag and each render needs the full dataset (to slice a prefix from), so without
+# this every step would re-read the .db from disk.
+_DATA_CACHE: dict[tuple, Dataset] = {}
+_DATA_CACHE_MAX = 8
+
+
+def _source_key(source_type: str, run_name: str | None, db_name: str | None,
+                db_value: str | None) -> tuple:
+    """Cache key identifying a source, including its mtime so edits are picked up."""
+    if source_type == "run":
+        p = _resolve_run_dir(run_name or "")
+        return ("run", str(p), p.stat().st_mtime)
+    p = _resolve_db_path(db_name or "")
+    return ("db", str(p), p.stat().st_mtime, db_value)
+
+
+def load_source(key: tuple) -> Dataset:
+    """Load (or reuse) the ``Dataset`` for a cache key produced by ``_source_key``."""
+    hit = _DATA_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ds = (load_run_source(Path(key[1]), None) if key[0] == "run"
+          else load_db_dataset(Path(key[1]), key[3]))
+    if len(_DATA_CACHE) >= _DATA_CACHE_MAX:
+        _DATA_CACHE.pop(next(iter(_DATA_CACHE)))
+    _DATA_CACHE[key] = ds
+    return ds
+
+
 def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS):
     """Construct the Dash application."""
-    from dash import Dash, dcc, html, Input, Output, State, no_update
+    from dash import Dash, ctx, dcc, html, Input, Output, State, no_update
 
     run_names = _list_run_dirs()
     db_names = _list_db_files()
 
-    default_db = "2nd_real_run.db" if "2nd_real_run.db" in db_names else (
-        db_names[0] if db_names else None)
+    step_btn_style = {
+        "flex": "0 0 auto", "width": "28px", "height": "28px", "padding": "0",
+        "lineHeight": "1", "fontSize": "11px", "color": "#555",
+        "background": "#fff", "border": "1px solid #d5d5d5",
+        "borderRadius": "4px", "cursor": "pointer",
+    }
+
+    default_db = next((n for n in ("3d.db", "4d.db", "6d.db") if n in db_names),
+                      db_names[0] if db_names else None)
     default_run = DEFAULT_RUN if DEFAULT_RUN in run_names else (
         run_names[0] if run_names else None)
 
@@ -901,6 +2020,56 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
                 value=["show"],
                 style={"marginTop": "12px"},
             ),
+
+            # ── Time slider ───────────────────────────────────────────────────
+            # Replays the run one deposition line at a time. Fully left = 0 lines
+            # (an empty plot), fully right = every line. The steps are real lines
+            # read from the data's Iteration column, not fixed 24-point blocks, so
+            # culled (short) lines stay in phase — see line_index().
+            html.Hr(style={"marginTop": "18px", "border": "none",
+                           "borderTop": "1px solid #e3e3e3"}),
+            dcc.Checklist(
+                id="timeline-on",
+                options=[{"label": " Enable time slider", "value": "on"}],
+                value=[],
+            ),
+            html.Div(id="timeline-controls", style={"display": "none"}, children=[
+                # A step button either side of the slider: one line back / one
+                # line on, without having to land the handle on an exact tick.
+                html.Div(style={"display": "flex", "alignItems": "center",
+                                "gap": "6px"}, children=[
+                    html.Button("\u25c0", id="timeline-prev", n_clicks=0,
+                                title="one line back", style=step_btn_style),
+                    html.Div(style={"flex": 1, "minWidth": 0}, children=[
+                        dcc.Slider(id="timeline", min=0, max=1, step=1, value=1,
+                                   marks=None,
+                                   tooltip={"placement": "bottom",
+                                            "always_visible": True}),
+                    ]),
+                    html.Button("\u25b6", id="timeline-next", n_clicks=0,
+                                title="one line on", style=step_btn_style),
+                ]),
+                html.Div(id="timeline-status",
+                         style={"fontSize": "12px", "color": "#666", "marginTop": "4px"}),
+                # Every step of the range is rendered in the background as soon as
+                # the slider is switched on; this says how far that has got, so a
+                # step that is briefly still slow is explained rather than puzzling.
+                html.Div(id="warm-status",
+                         style={"fontSize": "11px", "color": "#999", "marginTop": "2px"}),
+                dcc.Interval(id="warm-poll", interval=800, disabled=True),
+                dcc.Store(id="conet-prefetch"),
+                dcc.Store(id="conet-prefetch-sink"),
+            ]),
+
+            # ── Convergence panel ─────────────────────────────────────────────
+            dcc.Checklist(
+                id="convergence-on",
+                options=[{"label": " Show convergence plot", "value": "on"}],
+                value=[],
+                style={"marginTop": "12px"},
+            ),
+            html.Hr(style={"marginTop": "12px", "border": "none",
+                           "borderTop": "1px solid #e3e3e3"}),
 
             html.Label("Grid resolution", style=label_style),
             dcc.Slider(
@@ -983,8 +2152,24 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
             }),
         ]),
 
-        html.Div(style={"flex": 1, "padding": "10px"}, children=[
-            dcc.Loading(dcc.Graph(id="ternary-graph", style={"height": "90vh"})),
+        # Main plot area. d<=4 renders into the Plotly graph and d>=5 into the
+        # CoNet <img> (plot_10d draws with matplotlib, so it arrives as a PNG,
+        # streamed from the step cache by URL); exactly one of the two is ever
+        # visible. The convergence panel sits below whichever is showing.
+        html.Div(style={"flex": 1, "padding": "10px", "minWidth": 0}, children=[
+            dcc.Loading(children=[
+                html.Div(id="simplex-container", children=[
+                    dcc.Graph(id="ternary-graph", style={"height": "90vh"}),
+                ]),
+                html.Div(id="conet-container", style={"display": "none"}, children=[
+                    html.Img(id="conet-image",
+                             style={"width": "100%", "height": "auto",
+                                    "display": "block"}),
+                ]),
+                html.Div(id="convergence-container", style={"display": "none"}, children=[
+                    dcc.Graph(id="convergence-graph", style={"height": "300px"}),
+                ]),
+            ]),
         ]),
     ])
 
@@ -1072,10 +2257,116 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         value = DEFAULT_DB_VALUE if DEFAULT_DB_VALUE in cols else (cols[0] if cols else None)
         return [{"label": c, "value": c} for c in cols], value
 
+    # Serve rendered CoNet steps as ordinary images, straight off the disk cache.
+    # The URL is content-addressed (its signature covers the source file and its
+    # mtime), so the browser is told it never expires: coming back to a step it
+    # has already drawn costs no request at all, let alone a re-render.
+    _URL_DIR_RE = re.compile(r"^[0-9a-f]{16}$")
+    _URL_STEP_RE = re.compile(r"^[-+]\d{5}\.png$")
+
+    @app.server.route(f"{STEP_URL_PREFIX}/<sig>/<step>")
+    def _serve_step(sig, step):
+        from flask import abort, send_file
+        if not (_URL_DIR_RE.match(sig) and _URL_STEP_RE.match(step)):
+            abort(404)
+        path = CACHE_DIR / sig / step
+        if not path.is_file():
+            abort(404)
+        return send_file(path, mimetype="image/png", max_age=31536000)
+
+    # Pull the neighbouring steps into the browser's image cache, so stepping to
+    # one paints from memory instead of waiting on a request.
+    app.clientside_callback(
+        """
+        function (urls) {
+            (urls || []).forEach(function (u) { var img = new Image(); img.src = u; });
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("conet-prefetch-sink", "data"),
+        Input("conet-prefetch", "data"),
+    )
+
+    # Show/hide the time-slider controls with its checkbox.
+    @app.callback(
+        Output("timeline-controls", "style"),
+        Input("timeline-on", "value"),
+    )
+    def _toggle_timeline(timeline_on):
+        return {"display": "block", "marginTop": "8px"} if timeline_on else {"display": "none"}
+
+    # Re-range the time slider whenever the source changes: one step per deposition
+    # line, 0 (empty) on the left and every line on the right. Snapped to the new
+    # maximum so switching sources never leaves the slider past the end of the data.
+    @app.callback(
+        Output("timeline", "max"),
+        Output("timeline", "value"),
+        Output("timeline", "marks"),
+        Input("source-type", "value"),
+        Input("run-dropdown", "value"),
+        Input("db-dropdown", "value"),
+        Input("db-value-dropdown", "value"),
+    )
+    def _timeline_range(source_type, run_name, db_name, db_value):
+        try:
+            ds = load_source(_source_key(source_type, run_name, db_name, db_value))
+        except Exception:
+            return 1, 1, None
+        n = max(ds.n_lines, 1)
+        return n, n, {0: "0", n: str(n)}
+
+    # Step the slider one line at a time. `allow_duplicate` because the slider's
+    # value is also set by _timeline_range when the source changes.
+    @app.callback(
+        Output("timeline", "value", allow_duplicate=True),
+        Input("timeline-prev", "n_clicks"),
+        Input("timeline-next", "n_clicks"),
+        State("timeline", "value"),
+        State("timeline", "max"),
+        prevent_initial_call=True,
+    )
+    def _step_timeline(_prev, _next, value, n_max):
+        delta = -1 if ctx.triggered_id == "timeline-prev" else 1
+        stepped = int(value or 0) + delta
+        stepped = max(0, min(stepped, int(n_max or 0)))
+        return no_update if stepped == value else stepped
+
+    @app.callback(
+        Output("timeline-prev", "disabled"),
+        Output("timeline-next", "disabled"),
+        Input("timeline", "value"),
+        Input("timeline", "max"),
+    )
+    def _step_buttons(value, n_max):
+        value, n_max = int(value or 0), int(n_max or 0)
+        return value <= 0, value >= n_max
+
+    # Poll the precompute pass only while the time slider is in use.
+    @app.callback(
+        Output("warm-poll", "disabled"),
+        Input("timeline-on", "value"),
+    )
+    def _poll_enabled(timeline_on):
+        return not bool(timeline_on)
+
+    @app.callback(
+        Output("warm-status", "children"),
+        Input("warm-poll", "n_intervals"),
+    )
+    def _warm_status(_n):
+        return warm_status_text()
+
     # Main render callback.
     @app.callback(
         Output("ternary-graph", "figure"),
+        Output("simplex-container", "style"),
+        Output("conet-image", "src"),
+        Output("conet-container", "style"),
+        Output("convergence-graph", "figure"),
+        Output("convergence-container", "style"),
+        Output("timeline-status", "children"),
         Output("status", "children"),
+        Output("conet-prefetch", "data"),
         Input("source-type", "value"),
         Input("run-dropdown", "value"),
         Input("db-dropdown", "value"),
@@ -1090,52 +2381,164 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         Input("color-override", "value"),
         Input("color-min", "value"),
         Input("color-max", "value"),
+        Input("timeline-on", "value"),
+        Input("timeline", "value"),
+        Input("convergence-on", "value"),
     )
-    def _render(source_type, run_name, db_name, db_value, background, show_points,
-                gn, ntrees, gp_ls, scale, plot_size, color_override, color_min,
-                color_max):
-        try:
-            if source_type == "run":
-                if not run_name:
-                    return no_update, "No run selected."
-                X, Y, labels, title = load_run_source(_resolve_run_dir(run_name), None)
-                value_name = "Objective"
-            else:
-                if not db_name or not db_value:
-                    return no_update, "No database / value column selected."
-                X, Y, labels, title = load_db_dataset(_resolve_db_path(db_name), db_value)
-                value_name = db_value
+    def _render(*args):
+        return render_state(*args, no_update=no_update)
 
-            # Manual color-scale override: only applied when the box is checked
-            # and both bounds are valid (min < max); otherwise fall back to the
-            # data-derived percentile limits inside build_figure.
-            color_limits = None
-            if color_override and color_min is not None and color_max is not None:
-                lo, hi = float(color_min), float(color_max)
-                if hi > lo:
-                    color_limits = (lo, hi)
+    return app
 
-            fig = build_figure(
-                X, Y, labels,
+
+def render_state(source_type, run_name, db_name, db_value, background, show_points,
+                 gn, ntrees, gp_ls, scale, plot_size, color_override, color_min,
+                 color_max, timeline_on, timeline, convergence_on, *, no_update=None,
+                 precompute=None):
+    """Everything the main Dash callback renders, as a plain function.
+
+    Split out of the callback body so it can be exercised (and its eight outputs
+    checked) without standing up a server. Returns the callback's output tuple:
+    ``(simplex figure, simplex style, conet src, conet style, convergence figure,
+    convergence style, timeline status, status, conet prefetch urls)``.
+
+    ``precompute`` (default: the module-level ``PRECOMPUTE``) controls whether the
+    background pass that fills the rest of the slider range is started.
+    """
+    precompute = PRECOMPUTE if precompute is None else bool(precompute)
+    hide = {"display": "none"}
+    show_block = {"display": "block"}
+    try:
+        if source_type == "run" and not run_name:
+            return (no_update,) * 7 + ("No run selected.", no_update)
+        if source_type == "db" and not (db_name and db_value):
+            return ((no_update,) * 7
+                    + ("No database / value column selected.", no_update))
+
+        key = _source_key(source_type, run_name, db_name, db_value)
+        full = load_source(key)
+
+        # The time slider cuts the dataset to its first N deposition lines.
+        # Everything downstream draws `ds` but keeps its frame (axis limits, colour
+        # bounds, CoNet map) pinned to `full`, so the view fills in rather than
+        # rescaling at each step.
+        timeline_on = bool(timeline_on)
+        n_lines = int(timeline) if timeline is not None else full.n_lines
+        rows = full.prefix_rows(n_lines) if timeline_on else None
+        ds = full.prefix(n_lines) if timeline_on else full
+        tl_status = (f"{n_lines}/{full.n_lines} lines · {len(ds.X)}/{len(full.X)} points"
+                     if timeline_on else "")
+
+        # Manual color-scale override: only applied when the box is checked and both
+        # bounds are valid (min < max). Otherwise the limits come from the FULL
+        # data's percentiles — not the visible prefix's — so a point's colour does
+        # not change as the time slider advances.
+        color_limits = None
+        if color_override and color_min is not None and color_max is not None:
+            lo, hi = float(color_min), float(color_max)
+            if hi > lo:
+                color_limits = (lo, hi)
+        if color_limits is None and timeline_on:
+            color_limits = _color_limits(None, full.Y)
+
+        # Every step goes through the cache, under a signature holding everything
+        # that changes what a step looks like (the step index deliberately not
+        # among them, so one signature covers the whole slider range). The step
+        # on screen is rendered here if it is not cached yet; `start_warm` then
+        # fills the rest of the range in the background, so the next drag lands
+        # on an already-rendered step instead of paying for it.
+        step = n_lines if timeline_on else FULL_STEP
+        tracks = []          # (signature, render, codec) per visible panel
+
+        fig = no_update
+        conet_src = no_update
+        prefetch = no_update
+        conet = full.d >= CONET_MIN_D
+        if conet:
+            simplex_style, conet_style = hide, show_block
+            diagram = f"CoNet (d={full.d})"
+            # None of the surrogate knobs feed the CoNet, so its signature is the
+            # source alone — twiddling them never invalidates a rendered step.
+            sig = ("conet", key)
+            render = conet_step_renderer(full, key)
+            tracks.append((sig, render, PNG_STEP))
+            # The slider's leftmost steps hold too few samples to embed; they
+            # render blank (an empty plot is what that end means) and say so
+            # under the slider rather than erroring out.
+            if rows is not None and len(rows) < CONET_MIN_POINTS:
+                tl_status = (
+                    f"{tl_status} — the CoNet needs at least {CONET_MIN_POINTS} "
+                    f"samples to embed; the time slider is showing {len(rows)}.")
+        else:
+            simplex_style, conet_style = show_block, hide
+            diagram = "tetrahedron (d=4)" if full.d == 4 else "ternary (d=3)"
+            sig = ("simplex", key, int(gn), int(ntrees), background,
+                   bool(show_points), float(gp_ls), float(scale),
+                   float(plot_size), color_limits)
+            render = simplex_step_renderer(
+                full,
                 grid_n=int(gn), n_estimators=int(ntrees),
-                title=title, value_name=value_name,
+                title=full.title, value_name=full.value_name,
                 background=background, show_points=bool(show_points),
                 gp_length_scale=float(gp_ls), scale=float(scale),
                 plot_size=float(plot_size), color_limits=color_limits,
             )
-            diagram = "tetrahedron (d=4)" if X.shape[1] == 4 else "ternary (d=3)"
-            status = (
-                f"{X.shape[0]} points\n"
-                f"Y range: [{Y.min():.4f}, {Y.max():.4f}]\n"
-                f"diagram: {diagram}\n"
-                f"background: {background}\n"
-                f"corners: {labels}"
-            )
-            return fig, status
-        except Exception as e:  # surface load/plot errors in the UI
-            return no_update, f"Error: {e}"
+            tracks.append((sig, render, FIGURE_STEP))
 
-    return app
+        conv_fig = no_update
+        conv_style = hide
+        if convergence_on:
+            conv_style = show_block
+            # Its own signature: the convergence panel depends on the source and
+            # on whether the line marks are drawn, not on any surrogate knob.
+            conv_sig = ("convergence", key, bool(timeline_on))
+            conv_render = convergence_step_renderer(
+                full, show_line_marks=bool(timeline_on))
+            tracks.append((conv_sig, conv_render, FIGURE_STEP))
+
+        # Flagged as foreground so the background pass yields the render lock
+        # rather than making these wait behind a step nobody asked for.
+        with foreground():
+            if conet:
+                # The bytes are never read into Python: the step is written to
+                # disk and the browser is handed a URL to stream it from.
+                cached_step(sig, step, render, codec=PNG_STEP, want_value=False)
+                conet_src = step_image_url(sig, step)
+                prefetch = prefetch_urls(sig, step, full.n_lines)
+            else:
+                fig = cached_step(sig, step, render, codec=FIGURE_STEP)
+            if convergence_on:
+                conv_fig = cached_step(conv_sig, step, conv_render,
+                                       codec=FIGURE_STEP)
+
+        if timeline_on and precompute:
+            start_warm(warm_order(step, full.n_lines), tracks)
+
+        yr = (f"[{ds.Y.min():.4f}, {ds.Y.max():.4f}]" if len(ds.Y) else "(no points)")
+        # Say plainly whether the running best resets: a .db/.csv result log has no
+        # activation column, so there the envelope is necessarily one global curve.
+        if full.activations is None:
+            act_note = "activations: none recorded (single global running best)"
+        else:
+            act_note = f"activations: {int(full.activations.max()) + 1} (running best resets)"
+        # Same story for needles: they are optimizer state, recorded in a run's
+        # snapshots and nowhere in a result log.
+        if full.needles is None:
+            act_note += "\nneedles: none recorded"
+        else:
+            act_note += f"\nneedles: {len(full.needles)} (marked on the convergence plot)"
+        status = (
+            f"{len(ds.X)}/{len(full.X)} points · {full.n_lines} lines\n"
+            f"Y range: {yr}\n"
+            f"diagram: {diagram}\n"
+            f"background: {background if full.d < CONET_MIN_D else 'n/a'}\n"
+            f"components: {full.labels}\n"
+            f"{act_note}"
+        )
+        return (fig, simplex_style, conet_src, conet_style,
+                conv_fig, conv_style, tl_status, status, prefetch)
+    except Exception as e:  # surface load/plot errors in the UI
+        return (no_update,) * 7 + (f"Error: {e}", no_update)
 
 
 # ── static export (legacy matplotlib path) ────────────────────────────────────
@@ -1149,21 +2552,30 @@ def export_png(args: argparse.Namespace) -> None:
 
     if args.db:
         db_path = _resolve_db_path(args.db)
-        X, Y, labels, title = load_db_dataset(db_path, args.value)
+        ds = load_db_dataset(db_path, args.value)
         out_default = db_path.with_suffix(".png")
-        value_name = args.value
     else:
         run_dir = _resolve_run_dir(args.run)
-        X, Y, labels, title = load_run_source(
-            run_dir, args.snapshot, args.corner_dims, args.labels)
+        ds = load_run_source(run_dir, args.snapshot, args.corner_dims, args.labels)
         out_default = run_dir / "run_ternary.png"
-        value_name = "Objective"
 
-    d = X.shape[1]
+    X, Y, labels, title, value_name, d = (
+        ds.X, ds.Y, ds.labels, ds.title, ds.value_name, ds.d)
+    diagram = (f"CoNet (d={d})" if d >= CONET_MIN_D else
+               "tetrahedron (d=4)" if d == 4 else "ternary (d=3)")
     print(f"Title  : {title}")
     print(f"Labels : {labels}")
-    print(f"Diagram: {'tetrahedron (d=4)' if d == 4 else 'ternary (d=3)'}")
+    print(f"Diagram: {diagram}")
     print(f"Points : {X.shape[0]}   Y range: [{Y.min():.4f}, {Y.max():.4f}]")
+
+    # d>=5 has no simplex diagram; export the CoNet PNG that the app shows.
+    if d >= CONET_MIN_D:
+        out = Path(args.out) if args.out else out_default.with_name(
+            f"{out_default.stem}_conet.png")
+        src = conet_png_src(ds, key=("export", str(out_default)))
+        out.write_bytes(base64.b64decode(src.split(",", 1)[1]))
+        print(f"Saved figure -> {out}")
+        return
 
     # d=4 grids grow as O(n^3); clamp as the interactive builder does.
     grid_n = min(args.grid_n, TETRA_GRID_MAX_N) if d == 4 else args.grid_n
@@ -1264,6 +2676,8 @@ def _export_tetra_png(X, Y, labels, title, value_name, grid_pts, grid_vals,
 # ── main ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    global CACHE_DIR, PRECOMPUTE
+
     parser = argparse.ArgumentParser(
         description="Interactive Dash app (or static PNG) for a ZoMBI-Hop run's "
                     "datapoints on an RF-interpolated ternary."
@@ -1298,6 +2712,12 @@ def main() -> None:
     parser.add_argument("--labels", default=None,
                         help="Comma-separated corner labels, one per composition "
                              "column (3 for a ternary run, 4 for a tetrahedron run).")
+    parser.add_argument("--cache-dir", default=None,
+                        help="Directory holding precomputed slider steps, kept "
+                             f"between sessions (default: {CACHE_DIR}).")
+    parser.add_argument("--no-precompute", action="store_true",
+                        help="Render time-slider steps on demand instead of "
+                             "precomputing the whole range in the background.")
     parser.add_argument("--show", action="store_true",
                         help="(export only) Display the matplotlib figure as well.")
     args = parser.parse_args()
@@ -1306,8 +2726,14 @@ def main() -> None:
         export_png(args)
         return
 
+    if args.cache_dir:
+        CACHE_DIR = Path(args.cache_dir)
+    PRECOMPUTE = not args.no_precompute
+
     app = build_app(grid_n=args.grid_n, n_estimators=args.n_estimators)
     print(f"Dash app running at http://127.0.0.1:{args.port}")
+    print(f"Rendered steps are cached under {CACHE_DIR}"
+          + (" and precomputed in the background" if PRECOMPUTE else ""))
     app.run(debug=False, port=args.port)
 
 

@@ -136,7 +136,7 @@ HPARAM_DESC: Dict[str, str] = {
     "max_iterations": "max acquisition iterations per zoom level before moving on.",
     "top_m_points": "how many top points define the next zoom's bounding box (larger = wider zoom regions).",
     "n_consecutive_converged": "consecutive low-improvement iterations required to declare a needle (higher = more reluctant to call a needle).",
-    "input_noise_threshold_mult": "multiplier on input noise controlling how aggressively nearby points are treated as duplicates when zooming/stopping.",
+    "input_noise_threshold_mult": "minimum width of a zoom box, as a multiple of input_noise; narrower axes are widened about their centre so the box is not finer than the printer can actuate.",
     "output_noise_threshold_mult": "multiplier on output noise for the convergence gate: lower = converges sooner (declares needles faster).",
     "max_penalty_radius": "max radius of the ellipsoid that penalizes the region around a found needle (larger = more area excluded from future search).",
     "needle_shrink_factor": "factor by which needle trust regions shrink on retry (closer to 1 = shrink slowly).",

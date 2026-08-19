@@ -77,7 +77,7 @@ class DataHandler:
         n_restarts: int = 30,
         raw: int = 500,
         convergence_pi_threshold: float = 0.01,
-        input_noise_threshold_mult: float = 2.0,
+        input_noise_threshold_mult: float = 3.0,
         output_noise_threshold_mult: float = 2.0,
         n_consecutive_converged: int = 2,
         max_gp_points: int = 3000,
@@ -160,7 +160,7 @@ class DataHandler:
         elif input_noise_ilr is not None:
             self.input_noise = float(input_noise_ilr) / 3.0
         else:
-            self.input_noise = 0.064
+            self.input_noise = 0.128
 
         # Jaccard sliding-window
         self.jaccard_window = int(jaccard_window)
@@ -231,6 +231,9 @@ class DataHandler:
         # Per-axis extent of the full (global) domain, captured at initialize(); the
         # reference for the zoom-size factor that scales the point-paring radius.
         self._full_extent: Optional[torch.Tensor] = None    # (d,) tensor
+        # The full (global) box itself, captured at initialize(); the clip target
+        # when the input-noise floor widens a zoom box (see _apply_min_box_width).
+        self._full_bounds_ref: Optional[torch.Tensor] = None  # (2, d) tensor
 
         self.needles: Optional[torch.Tensor] = None
         self.needle_vals: Optional[torch.Tensor] = None
@@ -306,6 +309,7 @@ class DataHandler:
         # (ZoMBI passes the full [0,1]^d box here). Clamped away from zero so a
         # degenerate axis can't blow up the ratio.
         self._full_extent = (self.bounds[1] - self.bounds[0]).clamp(min=1e-12)
+        self._full_bounds_ref = self.bounds.clone()
 
         if self.top_m_points is None:
             self.top_m_points = max(self.d + 1, 4)
@@ -1684,13 +1688,65 @@ class DataHandler:
         vol_union = vol_a + vol_b - vol_inter
         return 0.0 if vol_union < 1e-30 else vol_inter / vol_union
 
+    def min_box_width(self) -> float:
+        """Smallest per-axis zoom-box width the input noise makes meaningful.
+
+        ``input_noise_threshold_mult × input_noise`` in composition L2 units. A box
+        narrower than this along some axis is asking the printer for a resolution it
+        does not have: the requested compositions land inside the box but the
+        *realised* ones — the only ones the GP ever sees — scatter outside it, so the
+        acquisition optimises over a region no measurement actually samples. Returns
+        0.0 when either factor is non-positive, which disables the floor.
+        """
+        floor = float(self.input_noise_threshold_mult) * float(self.input_noise)
+        return floor if floor > 0.0 else 0.0
+
+    def _apply_min_box_width(self, box: torch.Tensor) -> torch.Tensor:
+        """Widen any axis of *box* narrower than :meth:`min_box_width`, about its centre.
+
+        Expansion is symmetric, then translated (not truncated) back inside the global
+        domain so the widened axis keeps its full width wherever the domain allows it;
+        only an axis whose domain is itself narrower than the floor ends up clipped
+        short. Axes already at or above the floor are untouched, so this never shrinks
+        a box and never moves one that did not need widening.
+        """
+        floor = self.min_box_width()
+        if floor <= 0.0:
+            return box
+        lo, hi = box[0], box[1]
+        deficit = (floor - (hi - lo)).clamp(min=0.0) / 2.0
+        if not bool((deficit > 0).any()):
+            return box
+        lo = lo - deficit
+        hi = hi + deficit
+
+        # Clip target: the global domain. Recorded by save_init and re-asserted by
+        # ZoMBIHop on every construction (including resumes), so it is set for any
+        # optimiser-driven run; a bare DataHandler used standalone falls back to the
+        # unit box, matching _full_extent's convention.
+        ref = self._full_bounds_ref
+        if ref is not None:
+            g_lo, g_hi = ref[0], ref[1]
+        else:
+            g_lo = torch.zeros_like(lo)
+            g_hi = torch.ones_like(hi)
+
+        shift_up = (g_lo - lo).clamp(min=0.0)
+        lo = lo + shift_up
+        hi = hi + shift_up
+        shift_dn = (hi - g_hi).clamp(min=0.0)
+        lo = lo - shift_dn
+        hi = hi - shift_dn
+        return torch.stack([lo.clamp(min=g_lo), hi.clamp(max=g_hi)], dim=0)
+
     def determine_new_bounds(self, add_to_history: bool = True) -> torch.Tensor:
         """Compute new bounds via a Jaccard-aware sliding window over unpenalized points.
 
         Slides a window of top_m_points along the Y-sorted unpenalized set.  For
-        each candidate AABB, computes the max Jaccard overlap against the last
-        jaccard_window entries in bounds_history.  Returns the first window whose
-        max Jaccard ≤ jaccard_threshold; if none qualifies, returns the least-
+        each candidate AABB, widens any axis below the input-noise floor
+        (:meth:`_apply_min_box_width`) and computes the max Jaccard overlap against
+        the last jaccard_window entries in bounds_history.  Returns the first window
+        whose max Jaccard ≤ jaccard_threshold; if none qualifies, returns the least-
         similar window found.  Appends to bounds_history only when
         add_to_history=True.
         """
@@ -1716,6 +1772,9 @@ class DataHandler:
         for start in range(max_start + 1):
             window = X_sorted[start:start + k]
             cand = torch.stack([window.min(dim=0).values, window.max(dim=0).values], dim=0)
+            # Floor the box at the input-noise resolution BEFORE the novelty test, so
+            # the Jaccard comparison sees the box the optimiser will actually search.
+            cand = self._apply_min_box_width(cand)
             max_jac = 0.0
             for prev in recent:
                 jac = self._jaccard_box(cand, prev)

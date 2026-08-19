@@ -279,10 +279,10 @@ DATASET_CHOICES = sorted([*DATASET_DIMS, ENSEMBLE_DATASET,
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE  = torch.float64
 
-# Simulated input noise: per-component composition std, matched to the measured
-# average input noise of data/2nd_real_run.db (per-component std ≈ 0.064; see
-# visualization/input_noise.py). Also fed to ZoMBI as the known ``input_noise``.
-NOISE_LEVEL       = 0.064
+# Simulated input noise: per-component composition std, measured from runs/run_39af/composition_log.jsonl, the 6-dim hardware run of 2026-08-12 (109 lines / 2042 samples), which logs the sent composition directly: pooled per-component std 0.128, mean L2 0.271
+# (see visualization/input_noise.py and default_hparams.DEFAULT_INPUT_NOISE).
+# Also fed to ZoMBI as the known ``input_noise``.
+NOISE_LEVEL       = 0.128
 # Simulated output noise: the measured objective is within ~4.5% of the true value,
 # so y-noise is multiplicative (std = OUTPUT_NOISE_FRAC × |y|), not absolute.
 OUTPUT_NOISE_FRAC = 0.045
@@ -405,9 +405,9 @@ HPARAM_SPACE: dict[str, tuple] = {
     # Acquisition function
     "ucb_beta":                    (0.001,   3.0,   "linear"),
     # Zoom / convergence
-    # Lower bound is 3: a needle can only be declared at zoom level 3+
+    # Lower bound is 2: a needle can only be declared at zoom level 2+
     # (ZoMBIHop.min_zoom_for_needle), so max_zooms must allow reaching it.
-    "max_zooms":                   (3,      10,    "int"),
+    "max_zooms":                   (2,      10,    "int"),
     # Lower bound is 2 so at least min_iters_per_zoom (=2) lines can be sampled
     # per zoom level before the optimiser may advance or declare a needle.
     "max_iterations":              (2,      30,    "int"),
