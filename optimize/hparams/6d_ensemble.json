@@ -8,7 +8,7 @@
     "max_zooms": 3,
     "max_iterations": 2,
     "top_m_points": 8,
-    "n_consecutive_converged": 5,
+    "n_consecutive_converged": 2,
     "input_noise_threshold_mult": 0.5,
     "output_noise_threshold_mult": 2.0,
     "max_penalty_radius": 0.5020402,

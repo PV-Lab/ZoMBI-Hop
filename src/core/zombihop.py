@@ -23,6 +23,7 @@ from .hparam_live import (
     apply_pending as apply_pending_hparams,
     write_effective as write_effective_hparams,
 )
+from . import retro
 
 
 # --- CUDA optimization settings (when CUDA is available) ---
@@ -446,15 +447,36 @@ class ZoMBIHop:
         """
         Declare a needle at the current best unpenalized point.
 
-        Fits the GP, computes the Hessian ellipsoid, records the needle, and
-        resets bounds to the full simplex.  Returns the needle tensor, or None
-        when no unpenalized points exist.  ``reason`` is used only for logging.
+        Selects the point via ``get_best_unpenalized`` and delegates to
+        ``_declare_needle_from_point``.  Returns the needle tensor, or None
+        when no unpenalized points exist.
         """
         needle_X, needle_Y, global_idx = dh.get_best_unpenalized()
         if needle_X is None:
             self._log("  [declare_needle] no unpenalized points — cannot declare needle.")
             return None
+        return self._declare_needle_from_point(
+            dh, needle_X, needle_Y, global_idx, zoom, iteration, reason
+        )
 
+    def _declare_needle_from_point(
+        self,
+        dh,
+        needle_X: torch.Tensor,
+        needle_Y: torch.Tensor,
+        global_idx: int,
+        zoom: int,
+        iteration: int,
+        reason: str = "converged",
+    ) -> torch.Tensor:
+        """
+        Declare a needle at ``needle_X`` — the declaration core shared by the
+        live convergence path and ``retro_declare_needles``.
+
+        Fits the GP, computes the Hessian ellipsoid, records the needle, and
+        resets bounds to the full simplex.  Returns the needle tensor.
+        ``reason`` is used only for logging.
+        """
         # Median Y of all raw observations within the paring spatial distance
         thresh = dh.paring_spatial_halfnoise * dh.input_noise
         nearby = torch.norm(dh.X_all_actual - needle_X.unsqueeze(0), dim=1) <= thresh
@@ -511,6 +533,203 @@ class ZoMBIHop:
         self._log(f"  → bounds reset to full search box for next activation")
 
         return needle_X
+
+    def retro_declare_needles(self, dry_run: bool = False) -> dict:
+        """
+        Retroactively declare needles the CURRENT convergence criteria would
+        have produced on this run's already-measured history.
+
+        Intended for a resume after the operator loosened the criteria (e.g.
+        n_consecutive_converged 5→2 in config.json): replays the convergence
+        record stream (see src/core/retro.py for sources and the evidence
+        standard), finds at most one trigger per past activation that has not
+        already declared a needle, and declares each trigger's needle at that
+        activation's best measured point — skipping it when that point is
+        already inside a penalty region ("covered"), which also makes repeated
+        calls idempotent. After ≥1 declaration the resume position advances to
+        a fresh activation on the full search box and a permanent
+        "retro_needles" snapshot persists everything.
+
+        ``dry_run=True`` mutates nothing (no GP fit, no snapshot, no state
+        change, no file writes — including run.log) and reports what an apply
+        would attempt. Never raises: any internal failure returns
+        ``{applied: False, error: ...}`` so a hardware resume cannot be
+        poisoned.
+        """
+        try:
+            return self._retro_declare_needles(dry_run=dry_run)
+        except Exception as e:
+            msg = f"  [retro] retro_declare_needles failed: {e!r} — continuing without retro needles."
+            try:
+                if dry_run:
+                    if self.verbose:
+                        print(msg)
+                else:
+                    self._log(msg)
+            except Exception:
+                pass
+            return {"applied": False, "error": repr(e), "triggers": [], "candidates": []}
+
+    def _retro_declare_needles(self, dry_run: bool) -> dict:
+        dh = self.data_handler
+
+        def _rlog(message: str):
+            # dry_run must leave the run dir byte-identical — bypass run.log.
+            if dry_run:
+                if self.verbose:
+                    print(message)
+            else:
+                self._log(message)
+
+        result: dict = {"applied": False, "triggers": [], "candidates": []}
+
+        n_consec = int(dh.n_consecutive_converged)
+        if n_consec < 1:
+            result["error"] = f"invalid n_consecutive_converged={n_consec}"
+            _rlog(f"  [retro] {result['error']} — aborting.")
+            return result
+        if not dh.save_enabled or dh.run_dir is None:
+            result["error"] = "run has no directory (saving disabled) — nothing to replay"
+            _rlog(f"  [retro] {result['error']}")
+            return result
+
+        records, source = retro.load_convergence_history(dh.run_dir)
+        if not records:
+            result["error"] = f"no convergence history ({source})"
+            _rlog(f"  [retro] {result['error']}")
+            return result
+
+        skip_activations = set(retro.needle_discovery_activations(dh.run_dir))
+        _rlog(f"  [retro] replaying {len(records)} record(s) from {source}  "
+              f"(criteria: n_consecutive={n_consec}, "
+              f"min_zoom={self.min_zoom_for_needle}, "
+              f"min_iters={self.min_iters_per_zoom}; "
+              f"skipping needle activations {sorted(skip_activations)})")
+
+        triggers = retro.find_retro_triggers(
+            records, n_consec, self.min_zoom_for_needle, self.min_iters_per_zoom,
+            skip_activations,
+        )
+        result["triggers"] = triggers
+        if not triggers:
+            _rlog("  [retro] no past activation satisfies the needle criteria.")
+            return result
+
+        ranges = retro.activation_point_ranges(dh.run_dir)
+        n_rows = dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0
+        declared = 0
+        candidates_out: List[dict] = []
+        earlier_points: List[torch.Tensor] = []
+        for trig in triggers:
+            act = trig["activation"]
+            entry = dict(trig)
+            rows = [i for (a, b) in ranges.get(act, [])
+                    for i in range(a, min(b, n_rows))]
+            if not rows:
+                entry["skipped_reason"] = "empty"
+                _rlog(f"  [retro] activation {act}: trigger at z{trig['zoom']}/"
+                      f"i{trig['iteration']} but no attributable points — skipping.")
+                candidates_out.append(entry)
+                continue
+
+            # One needle per activation, ever. A needle sits at a measured
+            # point, so an activation whose row range already contains one has
+            # been accounted for — by the original run or by an earlier retro
+            # pass. Without this a resume would keep mining the same activation
+            # for its next-best leftover point every time the penalty
+            # ellipsoids are too small to cover it, stacking ever-worse needles
+            # on each resume.
+            if dh.needle_indices is not None and dh.needle_indices.numel():
+                existing = {int(i) for i in dh.needle_indices.reshape(-1).tolist()}
+                if existing & set(rows):
+                    entry["skipped_reason"] = "already declared"
+                    _rlog(f"  [retro] activation {act}: already has a needle "
+                          f"— skipping.")
+                    candidates_out.append(entry)
+                    continue
+
+            # The activation's best UNPENALIZED measured point — the same rule
+            # the live path applies (``_declare_needle_at_best`` selects via
+            # ``get_best_unpenalized``), restricted to this activation's rows.
+            # Points already inside a penalty region are skipped rather than
+            # re-declared, so an activation that converged onto ground a
+            # previous needle already owns contributes its best *uncovered*
+            # optimum instead of nothing. Each declaration below updates the
+            # mask, so later triggers falling inside a new ellipsoid drop out
+            # naturally rather than stacking duplicates.
+            idx_t = torch.tensor(rows, device=dh.X_all_actual.device, dtype=torch.long)
+            mask_rows = dh.get_penalty_mask()[idx_t]
+            if not bool(mask_rows.any().item()):
+                entry["skipped_reason"] = "covered"
+                _rlog(f"  [retro] activation {act}: every measured point lies "
+                      f"inside an existing penalty region — skipping.")
+                candidates_out.append(entry)
+                continue
+            open_idx = idx_t[mask_rows]
+            best_local = int(torch.argmax(dh.Y_all[open_idx].reshape(-1)).item())
+            row = int(open_idx[best_local].item())
+            needle_X = dh.X_all_actual[row]
+            needle_Y = dh.Y_all[row]
+            entry["x"] = needle_X.detach().cpu().numpy().ravel().tolist()
+            entry["y"] = float(needle_Y.item())
+            entry["dist_to_earlier_candidates"] = [
+                float(torch.norm(needle_X - p).item()) for p in earlier_points
+            ]
+            earlier_points.append(needle_X.detach().clone())
+
+            if dry_run:
+                _rlog(f"  [retro] activation {act}: would declare needle at "
+                      f"{needle_X.cpu().numpy()} (Y={entry['y']:.4f}; trigger "
+                      f"z{trig['zoom']}/i{trig['iteration']}, "
+                      f"counter {trig['counter']}/{n_consec}).")
+            else:
+                _rlog(f"  [retro] activation {act}: declaring needle "
+                      f"(trigger z{trig['zoom']}/i{trig['iteration']}, "
+                      f"counter {trig['counter']}/{n_consec}) ...")
+                # Same reason string a live convergence needle carries: a
+                # retroactive needle IS a convergence needle, just recognised
+                # late, and no display or export path may tell them apart.
+                # Provenance stays in the run log's [retro] lines.
+                needle = self._declare_needle_from_point(
+                    dh, needle_X, needle_Y, row,
+                    zoom=int(trig["zoom"]), iteration=int(trig["iteration"]),
+                    reason="EI convergence",
+                )
+                entry["declared"] = needle is not None
+                if needle is not None:
+                    declared += 1
+            candidates_out.append(entry)
+
+        result["candidates"] = candidates_out
+        if dry_run:
+            n_would = len([c for c in candidates_out if "skipped_reason" not in c])
+            _rlog(f"  [retro] dry run: {n_would} of {len(triggers)} trigger(s) would "
+                  f"declare a needle; nothing was changed. Note: at apply time each "
+                  f"new ellipsoid can cover later candidates, collapsing nearby "
+                  f"candidates into fewer needles.")
+            return result
+
+        result["n_declared"] = declared
+        if declared > 0:
+            # Fresh activation for the resumed search. The declaration core
+            # already reset self.bounds/dh.bounds to the full box, but run()
+            # re-enters the resumed activation through dh.current_zoom_bounds —
+            # reset it too, BEFORE the snapshot so delta.pt persists it.
+            acts = [int(r["activation"]) for r in records
+                    if isinstance(r.get("activation"), int)]
+            new_act = max([int(dh.current_activation)] + acts) + 1
+            dh.current_zoom_bounds = self.full_bounds.clone()
+            dh.take_snapshot("retro_needles", permanent=True,
+                             activation=new_act, zoom=0, iteration=0)
+            result["applied"] = True
+            result["new_activation"] = new_act
+            self._log(f"  [retro] declared {declared} retroactive needle(s); "
+                      f"resuming at fresh activation {new_act} (zoom 0, iter 0) "
+                      f"on the full search box.")
+        else:
+            self._log("  [retro] no retroactive needles declared "
+                      "(all candidates covered or empty).")
+        return result
 
     def _penalize_capped_zone(self, dh, bounds: torch.Tensor) -> bool:
         """Penalise the region an activation burned its whole line budget in.
@@ -588,6 +807,13 @@ class ZoMBIHop:
             candidate_str = f"{candidate.cpu().numpy()}" if candidate is not None else "None"
             extra = f" | EI={ei:.2e}" if ei is not None else ""
             print(f"[A{activation+1}/Z{zoom+1}/I{iteration+1}] Candidate: {candidate_str}{extra}")
+
+    def _record_convergence(self, **record):
+        """Sidecar write for retroactive replay — must never disturb the loop."""
+        try:
+            self.data_handler.append_convergence_record(**record)
+        except Exception:
+            pass
 
     def _check_convergence_to_needle(
         self,
@@ -904,6 +1130,8 @@ class ZoMBIHop:
                 zoom = current_zoom
                 self._log(f"\n{'─'*50}")
                 self._log(f"--- Zoom {zoom+1}/{dh.max_zooms} ---")
+                self._record_convergence(activation=activation, zoom=zoom,
+                                         event="zoom_entry")
                 self._log(f"Search bounds: [{bounds[0].cpu().numpy()}] – [{bounds[1].cpu().numpy()}]")
 
                 # Use local GP data when zoomed in so GP posterior is tight
@@ -973,6 +1201,9 @@ class ZoMBIHop:
                         self._log("No valid candidate found (all in penalized regions)")
                         activation_failed = True
                         self._log_status(activation, zoom, iteration, None)
+                        self._record_convergence(activation=activation, zoom=zoom,
+                                                 iteration=iteration, measured=False,
+                                                 event="candidate_none")
                         break
 
                     # Local reference point: best unpenalized within the active
@@ -1024,6 +1255,9 @@ class ZoMBIHop:
                         self._log("No unpenalized Y values, breaking — every point in this batch "
                                   "lies inside at least one needle penalty ball.")
                         activation_failed = True
+                        self._record_convergence(activation=activation, zoom=zoom,
+                                                 iteration=iteration, measured=True,
+                                                 event="all_penalized")
                         break
 
                     curr_best_X, curr_best_Y, _ = dh.get_best_unpenalized()
@@ -1040,6 +1274,11 @@ class ZoMBIHop:
                     self._log_status(activation, zoom, iteration, candidate, ei=ei)
                     if consecutive_converged > 0:
                         self._log(f"Convergence count: {consecutive_converged}/{dh.n_consecutive_converged}")
+                    self._record_convergence(activation=activation, zoom=zoom,
+                                             iteration=iteration, measured=True,
+                                             converged=bool(converged),
+                                             counter=int(consecutive_converged),
+                                             ei=float(ei))
 
                     _overall_masked = dh.Y_all[dh.get_penalty_mask()]
                     _overall_max_str = f"{_overall_masked.max().item():.4f}" if _overall_masked.numel() > 0 else "N/A"

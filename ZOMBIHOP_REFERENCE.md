@@ -1442,3 +1442,41 @@ The hardware runner script had stale constructor calls. Fixed:
 | `penalization_threshold`, `penalty_num_directions`, `penalty_radius_step` | Removed (old penalty API) |
 | `penalty_max_radius=...` | `max_penalty_radius=...` |
 | Resume: `X_init_actual=None, bounds=bounds_resumed` | Resume: dummy `torch.zeros(0, d)` tensors for X_init_actual, X_init_expected, Y_init; `run_uuid=resume_uuid` |
+
+---
+
+## 9. Retroactive Needle Declaration (Aug 2026)
+
+When convergence criteria are loosened on an existing run (e.g. `n_consecutive_converged` edited in
+the run''s `config.json` before a resume), past activations that circled an optimum without formally
+declaring it can be converted into needles retroactively.
+
+**Evidence standard.** The per-iteration convergence record is replayed under the *current* criteria:
+a past activation triggers if, at some measured iteration, the recorded consecutive-converged counter
+reached `n_consecutive_converged` with `zoom >= min_zoom_for_needle` and
+`iters_this_zoom >= min_iters_per_zoom`. The recorded counter already includes every real reset
+(non-converged iterations, candidate failures); counterfactual too-shallow resets are deliberately not
+simulated — the standard is "the last n measured lines all converged consecutively".
+
+**Record sources.** New runs append a structured record to `<run_dir>/convergence_history.jsonl`
+(one JSON line per iteration/zoom-entry/failure, written by `DataHandler.append_convergence_record`).
+Runs that predate the sidecar are parsed from `run.log` (`src/core/retro.py:parse_run_log`).
+
+**Declaration.** For each triggered activation (skipping those that already declared a needle), the
+candidate is that activation''s best measured point; if it is already inside a penalty volume the
+trigger is skipped as "covered" (the activation was re-converging on a known needle). Otherwise the
+standard declaration machinery runs (`_declare_needle_from_point`: local GP, clean-acquisition
+Hessian, penalty ellipsoid, local median). Because each retro needle is centred on its activation''s
+best point, repeat passes are idempotent. After >=1 declaration the run''s resume position advances to
+a fresh activation (zoom 0, full search box) via a permanent `retro_needles` snapshot.
+
+**Entry points.**
+- Automatic on resume: `run_zombi_main(..., retro_needles=True)` (default); disable with
+  `python scripts/main.py --no-retro-needles`.
+- Offline preview/apply: `python scripts/retro_needles.py --uuid <UUID> [--checkpoint-dir runs]
+  [--device cpu] [--apply]` — dry-run by default (prints the trigger/candidate table, run dir left
+  byte-identical); `--apply` performs the real pass.
+
+**Caveat.** Points inside existing penalty ellipsoids are unrecoverable by this pass (their
+activations report "covered") — an optimum swallowed by an oversized exclusion zone stays hidden
+unless the zone shrinks via the failure-retry path.

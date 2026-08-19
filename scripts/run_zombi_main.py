@@ -1089,7 +1089,8 @@ def _load_needles_for_plot(
 def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None = None,
                    checkpoint_dir: str | None = None, hparams_path: str | None = None,
                    new_run_uuid: str | None = None,
-                   bounds_lo: list | None = None, bounds_hi: list | None = None):
+                   bounds_lo: list | None = None, bounds_hi: list | None = None,
+                   retro_needles: bool = True):
     """Run DB-driven ZoMBI-Hop loop (new or resume).
 
     hparams_path : optional path to a trial.json-style JSON file whose 'hparams'
@@ -1102,6 +1103,10 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
         dim capped at 0.3 — constrains sampling, zoom-resets and space-filling to
         that box. On resume, if omitted, they are restored from the run's
         hw_config.json so the box survives across resumes.
+    retro_needles : on resume, retroactively declare needles that past
+        activations would have produced under the run's *current* convergence
+        criteria (e.g. after loosening n_consecutive_converged in config.json)
+        before optimization restarts. New runs never run this pass.
     """
     global OPTIMIZING_DIMS
     if optimizing_dims is not None:
@@ -1275,6 +1280,30 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
         run_dir_ref[0] = run_dir
         optimizer_ref[0] = optimizer
         set_composition_log_dir(run_dir_ref[0])  # append to existing log across resume
+        if retro_needles:
+            # Criteria loosened since the run last stopped (config.json edits
+            # applied by load_state) may make past activations needle-worthy.
+            # Declare them BEFORE the GUI flush and the needles.db sync below
+            # so both see the retro needles immediately.
+            try:
+                _res = optimizer.retro_declare_needles(dry_run=False)
+                if _res.get("applied"):
+                    print("=" * 80)
+                    print(f"RETROACTIVE NEEDLES: declared {_res.get('n_declared')} "
+                          f"needle(s) from past activations under the current "
+                          f"criteria; resuming at fresh activation "
+                          f"{_res.get('new_activation')}.")
+                    for _c in _res.get("candidates", []):
+                        if _c.get("declared"):
+                            print(f"  activation {_c['activation']}: Y={_c['y']:.4f} "
+                                  f"at {_c['x']}")
+                    print("=" * 80)
+                elif _res.get("error"):
+                    print(f"[ZoMBI] Retro needle pass skipped: {_res['error']}")
+                else:
+                    print("[ZoMBI] Retro needle pass: no new needles under current criteria.")
+            except Exception as e:
+                print(f"[ZoMBI] Retro needle pass failed: {e}")
         _flush_initial_state()  # write historical data to GUI immediately
         print(
             f"✅ Resumed from activation={optimizer.current_activation}, "
