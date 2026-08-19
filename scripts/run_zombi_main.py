@@ -51,6 +51,11 @@ OPTIMIZING_DIMS = [0, 8, 9]
 # to minimize (we negate for the GP; plots/logs show measured y).
 MINIMIZE_OBJECTIVE = False
 
+# A measured composition whose entries sum to <= this is treated as "no readback"
+# rather than as a real sample at the origin. Rows like this come from zero-filled
+# composition readback, not from the apparatus, and must never reach the GP.
+_ZERO_COMP_TOL = 1e-12
+
 
 # ── composition logging ─────────────────────────────────────────────────────────
 # Records, per objective call, the SENT (requested) and REAL (measured)
@@ -590,6 +595,9 @@ def get_y_measurements(
 
     consecutive_errors = 0
     max_consecutive_errors = 10
+    mismatch_polls = 0
+    max_mismatch_polls = 30  # ~30 s of 1 Hz re-reads before falling back
+    empty_polls = 0
 
     if ready_for_objectives:
         while True:
@@ -657,19 +665,89 @@ def get_y_measurements(
                     X_meas_full = np.array(comp_rows, dtype=float) if comp_rows else None
                 else:
                     X_meas_full = None
-                if X_meas_full is not None and X_meas_full.shape[0] >= len(flat):
-                    x_meas = X_meas_full[valid_indices][:, OPTIMIZING_DIMS]
-                elif X_meas_full is not None and X_meas_full.shape[0] > 0:
-                    x_meas = np.zeros((len(valid_indices), len(OPTIMIZING_DIMS)), dtype=float)
-                    n_to_copy = min(X_meas_full.shape[0], len(valid_indices))
-                    x_meas[:n_to_copy] = X_meas_full[:n_to_copy][:, OPTIMIZING_DIMS]
+                # The objective row and the compositions matrix are two separate
+                # writes. If their lengths disagree we are looking at a torn packet:
+                # a new y vector against the previous batch's compositions. Padding
+                # it to length produced all-zero compositions with real y values;
+                # truncating it silently mislabelled real points. Neither is safe --
+                # go back and re-read instead.
+                n_comp = 0 if X_meas_full is None else X_meas_full.shape[0]
+                if n_comp != len(flat):
+                    conn.close()
+                    mismatch_polls += 1
+                    if mismatch_polls == 1 or mismatch_polls % 10 == 0:
+                        print(
+                            f"[get_y_measurements] WARNING torn packet: {len(flat)} objective "
+                            f"values vs {n_comp} composition rows; re-reading "
+                            f"(attempt {mismatch_polls}/{max_mismatch_polls})"
+                        )
+                    if mismatch_polls < max_mismatch_polls:
+                        _time.sleep(1)
+                        continue
+                    # Gave up waiting for the writer to catch up. Fall back to the
+                    # old zero-fill so the run does not deadlock, but say so loudly:
+                    # the all-zero rows are dropped by the guard below.
+                    print(
+                        f"[get_y_measurements] ERROR compositions never reached "
+                        f"{len(flat)} rows after {max_mismatch_polls}s; zero-filling "
+                        f"the missing rows, which will then be DROPPED as invalid"
+                    )
+                    n_dims_full = X_meas_full.shape[1] if n_comp > 0 else len(OPTIMIZING_DIMS)
+                    x_full = np.zeros((len(valid_indices), n_dims_full), dtype=float)
+                    if n_comp > 0:
+                        keep = valid_indices[valid_indices < n_comp]
+                        x_full[: len(keep)] = X_meas_full[keep]
+                    x_meas = x_full[:, OPTIMIZING_DIMS] if n_comp > 0 else x_full
                 else:
-                    x_meas = np.zeros((len(valid_indices), len(OPTIMIZING_DIMS)), dtype=float)
+                    x_full = X_meas_full[valid_indices]
+                    x_meas = x_full[:, OPTIMIZING_DIMS]
+
+                # Guard: a composition of all zeros is not a physical sample -- it is
+                # the signature of a zero-filled row that never got real readback.
+                # Drop those rows rather than teaching the GP that the empty
+                # composition scores whatever y happened to arrive with it.
+                zero_rows = np.abs(x_full).sum(axis=1) <= _ZERO_COMP_TOL
+                if zero_rows.any():
+                    n_drop = int(zero_rows.sum())
+                    print(
+                        f"[get_y_measurements] WARNING dropping {n_drop}/{len(x_meas)} "
+                        f"point(s) with all-zero composition "
+                        f"(y={np.round(y[zero_rows], 4).tolist()})"
+                    )
+                    keep_rows = ~zero_rows
+                    x_meas = x_meas[keep_rows]
+                    y = y[keep_rows]
+                    valid_indices = valid_indices[keep_rows]
+                    if len(y) == 0:
+                        # Nothing usable in this packet. Waiting is the only correct
+                        # move -- there is no real composition to hand the GP -- but
+                        # say so periodically so an operator sees the stall instead
+                        # of watching a silent spin.
+                        empty_polls += 1
+                        if empty_polls == 1 or empty_polls % 30 == 0:
+                            print(
+                                f"[get_y_measurements] ERROR every point in this packet had an "
+                                f"all-zero composition; no usable data, waiting for the apparatus "
+                                f"(waited {empty_polls}s)"
+                            )
+                        conn.close()
+                        _time.sleep(1)
+                        continue
+
                 if verbose:
                     print(f"[get_y_measurements] ✅ NEW DATA RECEIVED: {len(y)} objective values")
                 conn.close()
                 break
-        except Exception:
+        except Exception as e:
+            # Do not swallow silently: without this, any error in the block above
+            # (including a UnicodeEncodeError from a log print on a cp1252 console)
+            # becomes an invisible infinite retry loop rather than a reported fault.
+            try:
+                print(f"[get_y_measurements] read attempt failed, retrying: {e!r}")
+            except UnicodeEncodeError:
+                # The failure may itself be an encoding error whose message carries
+                # the offending characters; never let the report re-raise.
+                print(f"[get_y_measurements] read attempt failed, retrying: {ascii(repr(e))}")
             consecutive_errors += 1
             if consecutive_errors >= max_consecutive_errors:
                 _time.sleep(5.0)
@@ -792,8 +870,20 @@ def objective(
         measured=x_meas_all, y_measured=y_all, valid_indices=valid_indices,
         num_experiments=num_experiments,
     )
-    x_meas_main = x_meas_all[:num_experiments].astype(np.float64)
-    y_main = np.asarray(y_all[:num_experiments]).ravel().astype(np.float64)
+    # Split main vs cache rail by SEND-ORDER index, not by position in the returned
+    # array. get_y_measurements drops rows (NaN y, and now all-zero compositions), so
+    # the returned arrays are shorter than the sent batch and a positional slice would
+    # pull cache-rail points into the main rail. valid_indices maps each surviving row
+    # back to its row in np.vstack([x_main, x_cache]).
+    valid_indices = np.asarray(valid_indices)
+    main_mask = valid_indices < num_experiments
+    x_meas_main = x_meas_all[main_mask].astype(np.float64)
+    y_main = np.asarray(y_all[main_mask]).ravel().astype(np.float64)
+    if len(y_main) < num_experiments:
+        print(
+            f"[objective] WARNING main rail returned {len(y_main)}/{num_experiments} "
+            f"usable points ({num_experiments - len(y_main)} dropped)"
+        )
     y_for_gp = y_measured_to_optimizer(y_main)
     return (
         torch.tensor(x_meas_main, device=device, dtype=dtype),
@@ -1089,7 +1179,8 @@ def _load_needles_for_plot(
 def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None = None,
                    checkpoint_dir: str | None = None, hparams_path: str | None = None,
                    new_run_uuid: str | None = None,
-                   bounds_lo: list | None = None, bounds_hi: list | None = None):
+                   bounds_lo: list | None = None, bounds_hi: list | None = None,
+                   retro_needles: bool = True):
     """Run DB-driven ZoMBI-Hop loop (new or resume).
 
     hparams_path : optional path to a trial.json-style JSON file whose 'hparams'
@@ -1102,6 +1193,10 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
         dim capped at 0.3 — constrains sampling, zoom-resets and space-filling to
         that box. On resume, if omitted, they are restored from the run's
         hw_config.json so the box survives across resumes.
+    retro_needles : on resume, retroactively declare needles that past
+        activations would have produced under the run's *current* convergence
+        criteria (e.g. after loosening n_consecutive_converged in config.json)
+        before optimization restarts. New runs never run this pass.
     """
     global OPTIMIZING_DIMS
     if optimizing_dims is not None:
@@ -1275,6 +1370,30 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
         run_dir_ref[0] = run_dir
         optimizer_ref[0] = optimizer
         set_composition_log_dir(run_dir_ref[0])  # append to existing log across resume
+        if retro_needles:
+            # Criteria loosened since the run last stopped (config.json edits
+            # applied by load_state) may make past activations needle-worthy.
+            # Declare them BEFORE the GUI flush and the needles.db sync below
+            # so both see the retro needles immediately.
+            try:
+                _res = optimizer.retro_declare_needles(dry_run=False)
+                if _res.get("applied"):
+                    print("=" * 80)
+                    print(f"RETROACTIVE NEEDLES: declared {_res.get('n_declared')} "
+                          f"needle(s) from past activations under the current "
+                          f"criteria; resuming at fresh activation "
+                          f"{_res.get('new_activation')}.")
+                    for _c in _res.get("candidates", []):
+                        if _c.get("declared"):
+                            print(f"  activation {_c['activation']}: Y={_c['y']:.4f} "
+                                  f"at {_c['x']}")
+                    print("=" * 80)
+                elif _res.get("error"):
+                    print(f"[ZoMBI] Retro needle pass skipped: {_res['error']}")
+                else:
+                    print("[ZoMBI] Retro needle pass: no new needles under current criteria.")
+            except Exception as e:
+                print(f"[ZoMBI] Retro needle pass failed: {e}")
         _flush_initial_state()  # write historical data to GUI immediately
         print(
             f"✅ Resumed from activation={optimizer.current_activation}, "

@@ -15,9 +15,9 @@ from botorch.utils.multi_objective.pareto import is_non_dominated
 
 # ─── Simulation / ZoMBI constants ─────────────────────────────────────────────
 
-# Known input noise (per-component composition std) matched to the measured
-# average input noise of data/2nd_real_run.db (≈ 0.064; see run_mobo.NOISE_LEVEL).
-NOISE_LEVEL = 0.064
+# Known input noise (per-component composition std), measured from runs/run_39af/composition_log.jsonl, the 6-dim hardware run of 2026-08-12 (109 lines / 2042 samples), which logs the sent composition directly: pooled per-component std 0.128, mean L2 0.271
+# (see run_mobo.NOISE_LEVEL and default_hparams.DEFAULT_INPUT_NOISE).
+NOISE_LEVEL = 0.128
 NUM_EXPERIMENTS = 24
 NUM_LINES = 10
 N_INIT_LINES = 2

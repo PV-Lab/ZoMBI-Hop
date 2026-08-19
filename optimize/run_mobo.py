@@ -281,10 +281,10 @@ DATASET_CHOICES = sorted([*DATASET_DIMS, ENSEMBLE_DATASET,
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE  = torch.float64
 
-# Simulated input noise: per-component composition std, matched to the measured
-# average input noise of data/2nd_real_run.db (per-component std ≈ 0.064; see
-# visualization/input_noise.py). Also fed to ZoMBI as the known ``input_noise``.
-NOISE_LEVEL       = 0.064
+# Simulated input noise: per-component composition std, measured from runs/run_39af/composition_log.jsonl, the 6-dim hardware run of 2026-08-12 (109 lines / 2042 samples), which logs the sent composition directly: pooled per-component std 0.128, mean L2 0.271
+# (see visualization/input_noise.py and default_hparams.DEFAULT_INPUT_NOISE).
+# Also fed to ZoMBI as the known ``input_noise``.
+NOISE_LEVEL       = 0.128
 # Simulated output noise: the measured objective is within ~4.5% of the true value,
 # so y-noise is multiplicative (std = OUTPUT_NOISE_FRAC × |y|), not absolute.
 OUTPUT_NOISE_FRAC = 0.045
@@ -409,10 +409,20 @@ HPARAM_SPACE: dict[str, tuple] = {
     # Acquisition function
     "ucb_beta":                    (0.001,   3.0,   "linear"),
     # Zoom / convergence
-    "max_zooms":                   (3,      6,     "int"),
+    # Lower bound is 2: a needle can only be declared at zoom level 2+
+    # (ZoMBIHop.min_zoom_for_needle, lowered to 1 post-6d-campaign), so max_zooms
+    # must allow reaching it. Kept in sync with evaluate._force_zoom_floors(),
+    # which derives the same floor from ZoMBIHop's own defaults.
+    "max_zooms":                   (2,      6,     "int"),
+    # Lower bound is 2 so at least min_iters_per_zoom (=2) lines can be sampled
+    # per zoom level before the optimiser may advance or declare a needle.
     "max_iterations":              (2,      12,    "int"),
     "top_m_points":                (4,      16,    "int"),
     "n_consecutive_converged":     (2,      5,     "int"),
+    # Lower bound is 0.1: the convergence test is EI < GP_output_noise × this,
+    # so below ~0.1 it is effectively unsatisfiable — EI convergence stops
+    # declaring needles at all and every needle has to come from the Jaccard
+    # force-declare fallback, at the cost of the wasted zoom iterations.
     "output_noise_threshold_mult": (0.1,    2.0,   "linear"),
     # Penalisation & needle
     "max_penalty_radius":          (0.15,   1.5,   "linear"),

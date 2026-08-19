@@ -25,6 +25,19 @@ Two logging regimes are handled, detected automatically:
     treated as the sent compositions. (By construction the first and last sample
     of every line then carry zero noise.)
 
+    This reconstruction is a *lower bound*, and a badly biased one: fitting the
+    line through the realised endpoints absorbs the whole systematic
+    requested-vs-realised offset into the fit, leaving only the scatter about it.
+    On run_39af it under-reports the noise by roughly 4x. Prefer a composition
+    log whenever one exists.
+
+The authoritative source is a run's ``composition_log.jsonl``, written per
+objective call with both the compositions the optimiser *asked* for (``sent``)
+and the ones the printer *realised* (``measured``). Nothing is reconstructed and
+no endpoint is forced to zero error, so this is the number that should calibrate
+``input_noise``. ``--run`` picks it up automatically when the file is present;
+``--comp-log`` points at one directly.
+
 A "line" is one printed row of up to 24 samples. In a data file the line index
 is the ``Iteration`` column; in a run directory each acquisition batch added to
 the data handler is one line.
@@ -35,6 +48,7 @@ Usage
   python visualization/input_noise.py --db data/2nd_real_run.db
   python visualization/input_noise.py --db data/2nd_real_run.db --per-line
   python visualization/input_noise.py --run runs/run_7eb9
+  python visualization/input_noise.py --comp-log runs/run_39af
   python visualization/input_noise.py --db data/2nd_real_run.db --plot noise.png
   python visualization/input_noise.py --ternary
   python visualization/input_noise.py --run runs/run_7eb9 --ternary
@@ -43,7 +57,10 @@ Usage
 Flags
 -----
   --db PATH        Data file (.db results table or .csv campaign) to analyse.
-  --run PATH       Run directory (or bare run name under runs/) to analyse.
+  --run PATH       Run directory (or bare run name under runs/) to analyse. Uses
+                   the run's composition_log.jsonl when present, else snapshots.
+  --comp-log PATH  A composition_log.jsonl (or the run directory holding one).
+  --rail NAME      Restrict a composition log to one rail (default: all rails).
   --snapshot N     Snapshot to reconstruct up to for --run (default: latest.txt).
   --force-legacy   Ignore any logged sent compositions and always reconstruct
                    them from the per-line endpoints (useful for sanity checks).
@@ -53,7 +70,7 @@ Flags
                    GP minimum lengthscale drawn as a reference circle. If no
                    data source is given, random demo points are generated.
   --input-noise V  Override the input noise / GP min lengthscale shown on the
-                   ternary (composition L2 units; default: 0.064 or read from
+                   ternary (composition L2 units; default: 0.128 or read from
                    run config.json).
 """
 from __future__ import annotations
@@ -78,7 +95,7 @@ from visualization.plot_run import (  # noqa: E402
     _resolve_run_dir,
 )
 
-_DEFAULT_INPUT_NOISE = 0.064  # composition L2; DataHandler default
+_DEFAULT_INPUT_NOISE = 0.128  # composition L2; DataHandler default
 
 # Column-name patterns tried, per component, when looking for an explicitly
 # logged "sent" composition in a data file (correct-logging case).
@@ -92,7 +109,7 @@ _DEGENERATE_LINE_EPS = 1e-9
 # ── line container ─────────────────────────────────────────────────────────────
 
 class Line:
-    """One printed line: real compositions and (sent) compositions, both (n, 3)."""
+    """One printed line: real compositions and (sent) compositions, both (n, d)."""
 
     def __init__(self, real: np.ndarray, sent: np.ndarray | None, key):
         self.key = key
@@ -205,16 +222,94 @@ def _ordered_unique(values: np.ndarray) -> list:
     return seen
 
 
+# ── data loading: composition log ──────────────────────────────────────────────
+
+COMP_LOG_NAME = "composition_log.jsonl"
+
+
+def resolve_comp_log(path_like: str | Path) -> Path:
+    """Resolve a --comp-log argument to an actual composition_log.jsonl file.
+
+    Accepts the file itself, a run directory containing one, or a bare run name
+    under runs/ (the same spellings --run accepts).
+    """
+    p = Path(path_like)
+    if p.is_file():
+        return p
+    for cand in (p / COMP_LOG_NAME,):
+        if cand.is_file():
+            return cand
+    run_dir = _resolve_run_dir(str(path_like))
+    cand = run_dir / COMP_LOG_NAME
+    if cand.is_file():
+        return cand
+    raise RuntimeError(f"No {COMP_LOG_NAME} found at or under {path_like}")
+
+
+def load_comp_log_lines(
+    log_path: Path, force_legacy: bool, rail: str | None = None
+) -> tuple[list[Line], bool]:
+    """Load per-line sent/measured compositions from a ``composition_log.jsonl``.
+
+    One :class:`Line` per (objective call, rail): ``sent`` is what the optimiser
+    asked for and ``measured`` is what came back, both full ``d``-dim simplex
+    points. This is the only source where the sent composition is recorded rather
+    than inferred, so it needs no reconstruction and no regime detection —
+    ``force_legacy`` is still honoured for A/B comparison against the line-fit
+    estimate, since that comparison is the whole reason to distrust the latter.
+
+    Rows whose sent and measured blocks disagree in length, or that carry fewer
+    than one sample, are skipped: a call can be logged with an empty result when
+    the objective returned nothing.
+    """
+    import json
+
+    lines: list[Line] = []
+    with log_path.open(encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, start=1):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"{log_path.name}:{lineno} is not valid JSON: {exc}") from exc
+            call = rec.get("call", lineno)
+            for r in rec.get("rails", []):
+                name = r.get("name", "?")
+                if rail is not None and name != rail:
+                    continue
+                sent = np.asarray(r.get("sent") or [], dtype=float)
+                meas = np.asarray(r.get("measured") or [], dtype=float)
+                if meas.ndim != 2 or meas.shape[0] == 0:
+                    continue
+                if sent.shape != meas.shape:
+                    continue
+                lines.append(Line(meas, None if force_legacy else sent, key=f"{call}/{name}"))
+    if not lines:
+        raise RuntimeError(f"No usable rows in {log_path}" + (f" for rail {rail!r}" if rail else ""))
+    return lines, not force_legacy
+
+
 # ── data loading: run directory ────────────────────────────────────────────────
 
-def load_run_lines(run_dir: Path, snapshot: str | None, force_legacy: bool) -> tuple[list[Line], bool]:
-    """Load real/sent compositions from a run directory's snapshots.
+def load_run_lines(
+    run_dir: Path, snapshot: str | None, force_legacy: bool, rail: str | None = None
+) -> tuple[list[Line], bool]:
+    """Load real/sent compositions from a run directory.
 
+    Prefers the run's ``composition_log.jsonl`` when present: it records the sent
+    composition per objective call, so it needs no reconstruction and is not
+    limited to d=3. Falls back to the snapshots otherwise, where
     ``X_all_expected`` is the sent composition and ``X_all_actual`` the real one.
-    When they are identical the run predates correct logging; the whole run is
+    When those are identical the run predates correct logging; the whole run is
     then treated as a single line for endpoint reconstruction (snapshots do not
     record per-line batch boundaries).
     """
+    comp_log = run_dir / COMP_LOG_NAME
+    if comp_log.is_file():
+        return load_comp_log_lines(comp_log, force_legacy, rail)
+
     snapshot = snapshot or _default_snapshot(run_dir)
     tensors = reconstruct_snapshot_tensors(run_dir, snapshot, device="cpu")
     actual = tensors.get("X_all_actual")
@@ -236,8 +331,17 @@ def load_run_lines(run_dir: Path, snapshot: str | None, force_legacy: bool) -> t
 # ── noise computation ──────────────────────────────────────────────────────────
 
 def compute_noise(lines: list[Line]) -> dict:
-    """Aggregate per-sample input noise (sent − real) across all lines."""
-    diffs = []          # (n, 3) signed per-component differences
+    """Aggregate per-sample input noise (sent − real) across all lines.
+
+    ``pooled_std`` is the statistic that calibrates the ``input_noise``
+    hyperparameter: the per-component standard deviation of the sent−real
+    residual, pooled over every component and sample. The optimiser's
+    ``input_noise`` is a single isotropic per-component sigma, so that is the
+    like-for-like quantity — not the mean L2 magnitude, which is larger by
+    roughly sqrt(d) and is reported here only for continuity with earlier
+    analyses.
+    """
+    diffs = []          # (n, d) signed per-component differences
     per_line = []       # (key, n, mean magnitude) per line
     for ln in lines:
         sent = ln.resolved_sent()
@@ -246,15 +350,20 @@ def compute_noise(lines: list[Line]) -> dict:
         mag = np.linalg.norm(d, axis=1)
         per_line.append((ln.key, ln.real.shape[0], float(mag.mean()) if mag.size else 0.0))
 
-    D = np.concatenate(diffs, axis=0) if diffs else np.zeros((0, 3))
+    dim = diffs[0].shape[1] if diffs else len(DB_COMP_COLS)
+    D = np.concatenate(diffs, axis=0) if diffs else np.zeros((0, dim))
     mag = np.linalg.norm(D, axis=1)
     return {
         "n_points": int(D.shape[0]),
         "n_lines": len(lines),
+        "dim": int(dim),
         "mean_magnitude": float(mag.mean()) if mag.size else 0.0,
         "median_magnitude": float(np.median(mag)) if mag.size else 0.0,
         "max_magnitude": float(mag.max()) if mag.size else 0.0,
-        "per_component_mae": D.__abs__().mean(axis=0).tolist() if D.size else [0.0, 0.0, 0.0],
+        "per_component_mae": np.abs(D).mean(axis=0).tolist() if D.size else [0.0] * dim,
+        "per_component_bias": D.mean(axis=0).tolist() if D.size else [0.0] * dim,
+        "per_component_std": D.std(axis=0).tolist() if D.size else [0.0] * dim,
+        "pooled_std": float(D.reshape(-1).std()) if D.size else 0.0,
         "magnitudes": mag,
         "per_line": per_line,
     }
@@ -264,18 +373,24 @@ def compute_noise(lines: list[Line]) -> dict:
 
 def _print_report(stats: dict, correct: bool, source: str, per_line: bool) -> None:
     regime = "correctly-logged (sent read directly)" if correct else (
-        "legacy (sent reconstructed from per-line endpoints)")
+        "legacy (sent reconstructed from per-line endpoints) - LOWER BOUND")
     print(f"Source        : {source}")
     print(f"Logging regime: {regime}")
     print(f"Lines         : {stats['n_lines']}")
     print(f"Samples       : {stats['n_points']}")
     print()
+    print(f"input_noise (pooled per-component std): {stats['pooled_std']:.5f}   <-- calibration value")
+    print()
     print(f"Average input noise (||sent - real||) : {stats['mean_magnitude']:.5f}")
     print(f"  median                              : {stats['median_magnitude']:.5f}")
     print(f"  max                                 : {stats['max_magnitude']:.5f}")
-    mae = stats["per_component_mae"]
-    print(f"  per-component MAE [{DB_COMP_COLS[0]}, {DB_COMP_COLS[1]}, {DB_COMP_COLS[2]}]:")
-    print(f"    {mae[0]:.5f}   {mae[1]:.5f}   {mae[2]:.5f}")
+    dim = stats.get("dim", len(DB_COMP_COLS))
+    names = DB_COMP_COLS if dim == len(DB_COMP_COLS) else [f"x{i}" for i in range(dim)]
+    print()
+    print(f"  {'component':>10}  {'MAE':>9}  {'bias':>9}  {'std':>9}")
+    for nm, a, b, c in zip(names, stats["per_component_mae"],
+                           stats["per_component_bias"], stats["per_component_std"]):
+        print(f"  {nm:>10}  {a:9.5f}  {b:9.5f}  {c:9.5f}")
     if not correct:
         print()
         print("  Note: line endpoints carry zero noise by construction, so this")
@@ -475,6 +590,13 @@ def main() -> None:
     src = parser.add_mutually_exclusive_group(required=False)
     src.add_argument("--db", help="Data file (.db results table or .csv campaign).")
     src.add_argument("--run", help="Run directory or bare run name under runs/.")
+    src.add_argument("--comp-log", dest="comp_log",
+                     help="A composition_log.jsonl, or a run directory / run name "
+                          "containing one. This is the authoritative source: it "
+                          "records the sent composition directly.")
+    parser.add_argument("--rail", default=None,
+                        help="Restrict a composition log to one rail (e.g. main); "
+                             "default: all rails.")
     parser.add_argument("--snapshot", default=None,
                         help="Snapshot to reconstruct up to for --run (default: latest.txt).")
     parser.add_argument("--force-legacy", action="store_true",
@@ -501,8 +623,9 @@ def main() -> None:
     args = parser.parse_args()
 
     # Require a data source unless --ternary is used in demo mode.
-    if not args.db and not args.run and not args.ternary:
-        parser.error("one of --db or --run is required (or use --ternary alone for a demo)")
+    if not args.db and not args.run and not args.comp_log and not args.ternary:
+        parser.error("one of --db, --run or --comp-log is required "
+                     "(or use --ternary alone for a demo)")
 
     lines: list[Line] = []
     correct: bool = False
@@ -515,8 +638,13 @@ def main() -> None:
         source = db_path.name
     elif args.run:
         run_dir = _resolve_run_dir(args.run)
-        lines, correct = load_run_lines(run_dir, args.snapshot, args.force_legacy)
+        lines, correct = load_run_lines(run_dir, args.snapshot, args.force_legacy, args.rail)
         source = run_dir.name
+    elif args.comp_log:
+        log_path = resolve_comp_log(args.comp_log)
+        run_dir = log_path.parent
+        lines, correct = load_comp_log_lines(log_path, args.force_legacy, args.rail)
+        source = f"{run_dir.name}/{log_path.name}"
 
     if lines:
         stats = compute_noise(lines)

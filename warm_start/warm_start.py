@@ -41,10 +41,10 @@ design is scored by :func:`coverage_stats`: the distance from a uniform simplex
 probe to the nearest measured composition, whose max is the coverage radius.
 
 Noise constants (optimize/run_mobo.py):
-    NOISE_LEVEL       = 0.064   # input / SPATIAL per-component composition std
-                                #  == zombihop.py input_noise default (0.064)
+    NOISE_LEVEL       = 0.128   # input / SPATIAL per-component composition std
+                                #  == zombihop.py input_noise default (0.128)
     OUTPUT_NOISE_FRAC = 0.045   # multiplicative OUTPUT (y) noise fraction
-The physically meaningful "noise radius" in composition space is 0.064; 0.045 is
+The physically meaningful "noise radius" in composition space is 0.128; 0.045 is
 the y-noise fraction.  Both are reported.
 """
 
@@ -64,7 +64,7 @@ BUDGETS = {           # dim : total iteration budget
     10:  20000,
 }
 
-INPUT_NOISE = 0.064    # spatial composition-std noise radius (run_mobo NOISE_LEVEL)
+INPUT_NOISE = 0.128    # spatial composition-std noise radius (run_mobo NOISE_LEVEL)
 OUTPUT_NOISE_FRAC = 0.045  # multiplicative y-noise fraction (run_mobo OUTPUT_NOISE_FRAC)
 
 # Size of the uniform candidate pool the maximin selector greedily thins.  A
@@ -468,7 +468,7 @@ def coverage_stats(x: np.ndarray, seed: int = 0,
 def analyze(seed: int = 0, n_repeats: int = 5) -> None:
     print(f"{'dim':>4} {'budget':>7} {'pts':>6} "
           f"{'mean NN':>9} {'min NN':>8} "
-          f"{'NN/0.064':>9} {'NN/0.045':>9}")
+          f"{'NN/in':>9} {'NN/out':>9}")
     print("-" * 60)
     for dim in sorted(BUDGETS):
         n = n_warm_start(dim)
@@ -495,7 +495,7 @@ def analyze(seed: int = 0, n_repeats: int = 5) -> None:
     print("\nPoints needed for mean NN spacing == a target radius "
           "(scaling s ~ N**(-1/(d-1))):")
     print(f"{'dim':>4} {'N now':>8} {'s now':>8} "
-          f"{'N->0.064':>12} {'N->0.045':>12}")
+          f"{'N->' + str(INPUT_NOISE):>12} {'N->' + str(OUTPUT_NOISE_FRAC):>12}")
     print("-" * 50)
     for dim in sorted(BUDGETS):
         n = n_warm_start(dim)

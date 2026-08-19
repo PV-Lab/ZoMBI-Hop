@@ -131,7 +131,7 @@ CORNER_LABELS = ("FAPbI3", "MAPbI3", "MAPbBr3")
 
 RF_N_ESTIMATORS = 500
 OUTPUT_NOISE_FRAC = 0.045  # output noise as a fraction of the true y (measured ≈ within 4.5%)
-NOISE_LEVEL_ILR = 0.192     # input noise std in ILR space (≈ 0.064 ambient per-component × 3; matches data/2nd_real_run.db)
+NOISE_LEVEL_ILR = 0.384     # input noise std in ILR space (≈ 0.128 ambient per-component × 3; see default_hparams.DEFAULT_INPUT_NOISE)
 NUM_EXPERIMENTS = 24     # points sampled per suggested line (mirrors run_zombi_main.py)
 NUM_LINES = 10           # LineBO candidate lines per iteration
 TERNARY_GRID_N = 120     # ternary grid resolution for reference heatmap
@@ -171,7 +171,7 @@ ZOMBI_PARAMS: dict = dict(
     top_m_points=4,
     n_restarts=100,
     raw=1323,
-    input_noise_threshold_mult=2.0,
+    input_noise_threshold_mult=3.0,
     output_noise_threshold_mult=0.5,
     n_consecutive_converged=5,
     max_gp_points=3000,

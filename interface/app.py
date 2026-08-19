@@ -75,11 +75,10 @@ from optimize.composition_prediction import physics_simulate_line
 # ── constants ─────────────────────────────────────────────────────────────────
 DEVICE          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE           = torch.float64
-# Simulated input noise: per-component composition std matched to the measured
-# average input noise of data/2nd_real_run.db (≈ 0.064; see
-# visualization/input_noise.py). OUTPUT_NOISE_FRAC makes y-noise multiplicative
-# (the measured objective is within ~4.5% of the true value).
-NOISE_LEVEL = 0.064
+# Simulated input noise: per-component composition std, measured from runs/run_39af/composition_log.jsonl, the 6-dim hardware run of 2026-08-12 (109 lines / 2042 samples), which logs the sent composition directly: pooled per-component std 0.128, mean L2 0.271
+# (see visualization/input_noise.py). OUTPUT_NOISE_FRAC makes y-noise
+# multiplicative (the measured objective is within ~4.5% of the true value).
+NOISE_LEVEL = 0.128
 OUTPUT_NOISE_FRAC = 0.045
 NUM_EXPERIMENTS = 24
 NUM_LINES       = 10
@@ -159,7 +158,7 @@ HPARAM_CATEGORIES: dict[str, list[tuple]] = {
         ("ucb_beta",         "float", 0.1,  "UCB β",
          "Exploration–exploitation trade-off for UCB: higher β = more exploration. "
          "Ignored when acquisition_type is 'ei' or 'pi'."),
-        ("input_noise",  "float", 0.064, "Input noise (composition)",
+        ("input_noise",  "float", 0.128, "Input noise (composition)",
          "Std dev of isotropic Gaussian noise added to each composition component "
          "before simplex reprojection at every evaluation. Default matches the "
          "measured average input noise of data/2nd_real_run.db."),
@@ -176,7 +175,7 @@ HPARAM_CATEGORIES: dict[str, list[tuple]] = {
         ("n_consecutive_converged",     "int",   2,    "Consec. converged",
          "Number of consecutive iterations that must meet the convergence criterion "
          "before the optimizer zooms in."),
-        ("input_noise_threshold_mult",  "float", 2.0,  "Input noise mult",
+        ("input_noise_threshold_mult",  "float", 3.0,  "Input noise mult",
          "Convergence gate: if the best observed improvement < mult × input_noise, "
          "the iteration is considered converged."),
         ("output_noise_threshold_mult", "float", 2.0,  "Output noise mult",

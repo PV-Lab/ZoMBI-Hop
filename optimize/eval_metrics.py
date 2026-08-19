@@ -51,8 +51,8 @@ LEGACY_UNMATCHED_PENALTY = 10.0
 
 MATCH_RADIUS = 0.05
 # Input-noise scale (per-component composition std) used for the duplicate-sample
-# radius; matched to the measured average input noise of data/2nd_real_run.db.
-NOISE_LEVEL = 0.064
+# radius; measured from runs/run_39af/composition_log.jsonl, the 6-dim hardware run of 2026-08-12 (109 lines / 2042 samples), which logs the sent composition directly: pooled per-component std 0.128, mean L2 0.271 (see run_mobo.NOISE_LEVEL).
+NOISE_LEVEL = 0.128
 
 # Floor for the zoom-scaled duplicate distance (composition L2). The duplicate
 # radius is NOISE_LEVEL/2 at full domain but shrinks with the zoom-zone size (see
