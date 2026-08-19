@@ -396,14 +396,22 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
     # A worker uses this to decide whether it still has room for one more task.
     task_h = args.time_limit + args.walltime_margin
     walltime_h = max(1, int(args.worker_hours))
-    # Two estimates, because the no-plot repeats are much cheaper than the reserve a
-    # worker has to hold back for the plotted one. The low end assumes tasks cost the
-    # optimizer budget plus a little; the high end assumes every task needs the full
-    # reserve. Reality sits near the low end.
+    # ``walltime_margin`` is a SAFETY RESERVE — what a worker holds back before
+    # claiming one more task — NOT a per-task cost. Estimating the drain from it
+    # overstates the campaign by ~2.5x and cries wolf about needing a resubmit:
+    # the 200-run showdown_6d_clamped_reps10 was measured at 0.507 h/task against
+    # a 0.5 h optimizer budget (5 workers x 40 tasks, drained in 20.3 h of a 24 h
+    # wall-time, one submission, zero out-of-time events). Per-task overhead —
+    # landscape construction, metrics, and the repeat-1 CoNet renders — is minutes,
+    # not the reserve. So the expected drain is the budget plus that overhead, and
+    # the reserve only sets the worst case.
+    PER_TASK_OVERHEAD_H = 0.05
     n_plotted = sum(1 for t in tasks if t[4] == 0)
-    lo_h = (n_plotted * task_h + (len(tasks) - n_plotted) * (args.time_limit + 0.15))
-    lo_h /= max(1, args.n_workers)
-    est_h = len(tasks) * task_h / max(1, args.n_workers)
+    exp_h = len(tasks) * (args.time_limit + PER_TASK_OVERHEAD_H) / max(1, args.n_workers)
+    worst_h = len(tasks) * task_h / max(1, args.n_workers)
+    # A worker stops claiming once less than one task-reserve of wall-time is left,
+    # so this — not the raw wall-time — is the budget the campaign has to drain in.
+    claim_h = walltime_h - task_h
     sbatch = SBATCH_TEMPLATE.format(
         job_name=args.job_name or f"showdown_{args.dim}d",
         out_dir=out_dir,
@@ -429,12 +437,17 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
     print(f"    landscapes: {landscapes}")
     print(f"    queue -> {queue_path}")
     print(f"    {args.n_workers} persistent worker(s) @ {walltime_h} h; "
-          f"~{lo_h:.1f}-{est_h:.1f} h to drain "
-          f"({n_plotted} plotted @ <={task_h:.2g} h, {len(tasks) - n_plotted} --no-plots)")
-    if lo_h > walltime_h:
-        print(f"    NOTE: that exceeds the {walltime_h} h worker wall-time — workers will "
-              "stop cleanly when out of time;")
-        print(f"          re-submit (after --reset-stale) to finish the remainder.")
+          f"~{exp_h:.1f} h to drain (worst case {worst_h:.1f} h) "
+          f"({n_plotted} plotted, {len(tasks) - n_plotted} --no-plots)")
+    print(f"    workers stop claiming with {task_h:.2g} h left, so the drain budget "
+          f"is {claim_h:.1f} h")
+    if exp_h > claim_h:
+        over = exp_h / max(1e-9, claim_h)
+        print(f"    NOTE: the expected drain exceeds that budget by {over:.1f}x — this "
+              "campaign will NOT finish in one submission.")
+        print(f"          Either raise --n-workers to >= "
+              f"{int(-(-len(tasks) * (args.time_limit + PER_TASK_OVERHEAD_H) // claim_h))}, "
+              "or re-submit (after --reset-stale) to finish the remainder.")
     print(f"    submit with:  sbatch {sbatch_path}")
     return sbatch_path
 
