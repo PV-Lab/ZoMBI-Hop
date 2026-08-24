@@ -45,9 +45,29 @@ def _obj_label(spec: dict) -> str:
     return " ".join(parts)
 
 
+def _pin_numeric_threads() -> None:
+    """One thread per numeric library, set before any worker is forked.
+
+    Ten torch processes each defaulting to one OpenMP thread per core is 240
+    threads on a 24-core box. That oversubscription is what killed the first
+    s1_real launch (BrokenProcessPool after the random cells finished and the first
+    BoTorch fits started). The work is already parallel at the cell level, so each
+    cell wants exactly one thread.
+    """
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ.setdefault(var, "1")
+
+
 def _run_cell(job: dict) -> tuple[str, dict]:
     """One (objective, optimizer, seed). Module-level so it survives pickling to a
     worker process on Windows spawn."""
+    _pin_numeric_threads()
+    try:
+        import torch
+        torch.set_num_threads(1)
+    except Exception:
+        pass
     try:
         res = run_one(job["objective"], job["optimizer"], job["seed"],
                       Protocol(**job["protocol"]), out_dir=job["run_dir"],
@@ -96,29 +116,48 @@ def run_suite(config: dict, out_root: str, resume: bool = True,
                              "optimizer": opt_spec, "seed": seed,
                              "protocol": protocol_kwargs, "value_tol": value_tol})
 
+    def _absorb(cell: str, res: dict) -> None:
+        curves[cell] = {"objective": res.get("objective"),
+                        "optimizer": res.get("optimizer"),
+                        **{k: res.get(k) for k in _CURVE_KEYS}}
+        rows.append({k: v for k, v in res.items() if k not in _CURVE_KEYS})
+
+    done_cells: set[str] = set()
     if workers > 1 and len(jobs) > 1:
-        # Each run is independent and CPU-bound, so processes (not threads) are the
-        # right unit: BoTorch fits hold the GIL. Worker startup is ~4 s of torch
-        # import, which is noise against a 1000-sample run.
-        from concurrent.futures import ProcessPoolExecutor, as_completed
+        _pin_numeric_threads()
+        from concurrent.futures import BrokenExecutor, ProcessPoolExecutor, as_completed
         print(f"running {len(jobs)} cells on {workers} workers", flush=True)
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_run_cell, j): j["cell"] for j in jobs}
-            for i, fut in enumerate(as_completed(futures), 1):
-                cell, res = fut.result()
-                print(f"[{i}/{len(jobs)}] {cell}", flush=True)
-                curves[cell] = {"objective": res.get("objective"),
-                                "optimizer": res.get("optimizer"),
-                                **{k: res.get(k) for k in _CURVE_KEYS}}
-                rows.append({k: v for k, v in res.items() if k not in _CURVE_KEYS})
-    else:
-        for j in jobs:
-            print(f"[run ] {j['cell']}", flush=True)
-            cell, res = _run_cell(j)
-            curves[cell] = {"objective": res.get("objective"),
-                                "optimizer": res.get("optimizer"),
-                                **{k: res.get(k) for k in _CURVE_KEYS}}
-            rows.append({k: v for k, v in res.items() if k not in _CURVE_KEYS})
+        try:
+            # max_tasks_per_child recycles a worker after every cell. Torch and
+            # BoTorch keep allocator arenas alive across fits, so a worker that runs
+            # twenty 2000-sample cells in a row grows without bound; the ~4 s
+            # respawn is noise against a cell that takes minutes.
+            with ProcessPoolExecutor(max_workers=workers,
+                                     max_tasks_per_child=1) as pool:
+                futures = {pool.submit(_run_cell, j): j["cell"] for j in jobs}
+                for i, fut in enumerate(as_completed(futures), 1):
+                    cell, res = fut.result()
+                    done_cells.add(cell)
+                    print(f"[{i}/{len(jobs)}] {cell}", flush=True)
+                    _absorb(cell, res)
+        except (BrokenExecutor, OSError) as exc:
+            # One worker dying takes the whole pool with it. Every finished cell has
+            # already been written to its own run dir, so nothing is lost -- finish
+            # the rest serially instead of discarding the run.
+            print(f"\n!! worker pool broke ({type(exc).__name__}: {exc}); "
+                  f"finishing the remaining cells serially", flush=True)
+
+    for j in jobs:
+        if j["cell"] in done_cells:
+            continue
+        done = os.path.join(j["run_dir"], "metrics.json")
+        if os.path.exists(done):
+            with open(done, encoding="utf-8") as fh:
+                _absorb(j["cell"], json.load(fh))
+            continue
+        print(f"[run ] {j['cell']}", flush=True)
+        cell, res = _run_cell(j)
+        _absorb(cell, res)
 
     _write_aggregate(suite_dir, rows)
     with open(os.path.join(suite_dir, "curves.json"), "w", encoding="utf-8") as fh:

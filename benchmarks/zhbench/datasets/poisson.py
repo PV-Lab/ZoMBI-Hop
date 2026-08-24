@@ -72,11 +72,13 @@ of 30 June 2022 -- i.e. 95.5% of MP has no elasticity data at all. 54 of the 662
    extremes are elemental Dy at ``nu = -130.93`` and Ti3Ga at ``nu = +77.05`` --
    Materials Project elastic-tensor fitting artefacts, not auxetics. Training on
    them (which upstream does) is why the faithful recipe scores **5-fold CV
-   R^2 = -22.4** and OOB R^2 = -0.65: worse than predicting the mean. It also puts
-   a single 79-high spike on a landscape whose median is -0.5, which is not a
-   multi-optimum benchmark, it is one artefact. ``target_range`` defaults to
-   ``(-1.0, 0.5)`` here for that reason; ``target_range=None`` reproduces upstream
-   byte-for-byte and both are measured in ``meta`` and ``--report``.
+   R^2 = -22.4** and OOB R^2 = -0.655: worse than predicting the mean. It also puts
+   a spike reaching ``-nu = 79.1`` at the worst training row (2.53 even on a 0.05
+   grid) onto a landscape whose median is -0.51, and leaves exactly ONE supported
+   reference optimum. That is not a multi-optimum benchmark, it is one bad DFT
+   fit. ``target_range`` defaults to ``(-1.0, 0.5)`` here for that reason;
+   ``target_range=None`` reproduces upstream and both are measured in ``meta``
+   and ``--report``.
 
 2. **Five crude scalars do not determine a Poisson ratio.** The median material has
    16 other materials within the benchmark match radius ``r = 0.05``, and a pair
@@ -84,8 +86,8 @@ of 30 June 2022 -- i.e. 95.5% of MP has no elasticity data at all. 54 of the 662
    deviation of the physical target (0.0796). Averaging that within-radius variance
    gives an **R^2 ceiling of 0.363** for *any* model on these features at this
    resolution. The retrained forest reaches 0.153, so it captures ~40% of the only
-   signal that is there. Grouping folds by chemical system (4070 systems, so
-   polymorphs cannot leak) barely moves it: 0.143. This is not a tuning problem.
+   signal that is there. Grouping folds by chemical system (4004 systems, so the 21
+   Al2O3 polymorphs cannot leak) barely moves it: 0.143. Not a tuning problem.
 
 3. **The cube is almost entirely empty.** Only **0.08%** of ``[0, 1]^5`` lies within
    ``r = 0.05`` of any measured material; the median uniform draw is 0.58 away.
@@ -108,7 +110,16 @@ Then the filter this dataset cannot do without, given (3): a peak survives only 
 some MEASURED material lies within ``r`` of it AND that material's own ``-nu``
 clears ``v - value_tol * (v - background)`` -- ``metrics.reached_flags``' near-AND-
 high test, turned around onto the reference set. A peak with no measurement near it
-is a fact about a random forest, not about materials.
+is a fact about a random forest, not about materials. On the physical variant this
+cuts 1403 detected peaks to **9**, and ``meta["peak_support"]`` names the material
+behind each: only 3 of the 9 are vouched for by a material that is itself auxetic.
+
+Because a forest is piecewise constant, exact ties are everywhere (387 per 20000
+uniform probes) and ``predict`` under ``n_jobs=-1`` is not bitwise reproducible --
+threads accumulate tree outputs in whatever order they finish. That was enough to
+make the same cached model yield 8 supported peaks on one build and 9 on the next.
+:func:`_predictors` sums in fixed list order instead, so the reference set is
+stable and ``fn(peak)`` equals the cached ``true_values`` exactly.
 
 Reproduce every number here with::
 
@@ -231,8 +242,39 @@ def _transcode(pickle_path: str, csv_path: str, *, force: bool = False) -> int:
         lambda c: "-".join(sorted(e.symbol for e in c.elements))
         if hasattr(c, "elements") else "")
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    out.to_csv(csv_path, index=True, index_label="mp_row")
+    # %.17g, not the default: pandas' default float formatting does NOT round-trip
+    # float64 here, and the difference is not cosmetic. Refitting on the truncated
+    # CSV moved one as-published CV fold from R^2 -91.2 to -96.2, because a forest
+    # split can land on the other side of a rounded value and the outlier rows make
+    # the squared error enormously sensitive. The CSV is the canonical artifact, so
+    # it has to reproduce the pickle exactly.
+    out.to_csv(csv_path, index=True, index_label="mp_row", float_format="%.17g")
+    if not _round_trips(pickle_path, csv_path):
+        raise ValueError(f"{csv_path} does not reproduce {pickle_path} bitwise")
     return int(out.shape[0])
+
+
+def _read_csv(path: str):
+    """``read_csv`` with the only float parser that is correctly rounded.
+
+    pandas 3.0's default C parser is off by 1 ULP on 1745 of 6628 ``density``
+    values (and similar elsewhere), even from ``%.17g`` text. Harmless in most
+    contexts; not here, because a forest split can fall on the other side of a
+    perturbed value and the whole reference set is built from exact tie-breaking.
+    """
+    import pandas as pd
+
+    return pd.read_csv(path, float_precision="round_trip")
+
+
+def _round_trips(pickle_path: str, csv_path: str) -> bool:
+    """Every numeric column of the CSV must equal the pickle bit for bit."""
+    import pandas as pd
+
+    src, dst = pd.read_pickle(pickle_path), _read_csv(csv_path)
+    return all(np.array_equal(src[c].to_numpy(dtype=float),
+                              dst[c].to_numpy(dtype=float))
+               for c in ALL_COLUMNS if c != "composition")
 
 
 def _fetch_from_materials_project(*, dest: str, api_key: str | None) -> dict:
@@ -285,9 +327,7 @@ def load_frame(dim: int = DIM, target_range: tuple | None = PHYSICAL_RANGE) -> d
     ``target_range`` drops any row, so the two variants share one coordinate system
     and their peaks are directly comparable.
     """
-    import pandas as pd
-
-    df = pd.read_csv(_frame_path())
+    df = _read_csv(_frame_path())
     cols = FEATURE_SETS[int(dim)]
     X_raw = df[list(cols)].to_numpy(dtype=float)
     y_nu = df[TARGET].to_numpy(dtype=float)
@@ -494,7 +534,9 @@ def cross_validate(dim: int = DIM, target_range: tuple | None = PHYSICAL_RANGE, 
         for tr, te in splits:
             m = RandomForestRegressor(n_estimators=RF_TREES, random_state=seed,
                                       n_jobs=-1).fit(X[tr], nu[tr])
-            p = m.predict(X[te])
+            # Fitting is deterministic given random_state; PREDICTING under
+            # n_jobs=-1 is not, so scores drift in the 4th decimal between runs.
+            p = _predictors(m)[1](X[te])
             ss = float(((nu[te] - nu[te].mean()) ** 2).sum())
             r2.append(1.0 - float(((nu[te] - p) ** 2).sum()) / ss if ss > 0 else np.nan)
             rmse.append(float(np.sqrt(((nu[te] - p) ** 2).mean())))
@@ -862,14 +904,16 @@ _VERDICT = (
     "deviation, capping R^2 near 0.36; the forest gets 0.15. (3) 99.92% of the cube "
     "has no material within r, so the reference optima are credible only after the "
     "support filter, and a uniform-probe contrast describes the forest's "
-    "extrapolation, not the landscape -- which is why only 1 of the 8 supported "
-    "peaks clears the uniform p99 while 3 clear the measured-slab p99. (4) The "
-    "support filter leaves 8 peaks but only ONE with a genuinely auxetic material "
-    "behind it (LiLa3, nu = -0.97, itself sitting against the edge of the physical "
-    "window). This is closer to a single-needle problem with 7 marginal bumps than "
-    "to the 20-optimum landscapes the ensemble suite provides. As published -- "
-    "trained on the unfiltered target -- it is not a benchmark at all: CV R^2 is "
-    "-23.6, and the reference set collapses to 1 peak."
+    "extrapolation, not the landscape -- which is why only 2 of the 9 supported "
+    "peaks clear the uniform p99 while 4 clear the measured-slab p99. (4) The "
+    "support filter leaves 9 peaks, but only 3 have a genuinely auxetic material "
+    "behind them (LiLa3 at nu = -0.97, KAgO at -0.17, TiCdF6 at -0.005), and LiLa3 "
+    "sits against the edge of the physical window, i.e. next door to the values "
+    "this module just called artefacts. Read that as one clear needle plus a "
+    "handful of marginal bumps, not as a 9-optimum landscape; the sharp "
+    "multi-optimum test remains the ensemble suite. As published -- trained on the "
+    "unfiltered target -- it is not a benchmark at all: CV R^2 is -22.4 and the "
+    "reference set collapses to a single peak."
 )
 
 
