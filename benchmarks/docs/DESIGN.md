@@ -108,13 +108,48 @@ raises `BudgetExhausted` for every method alike.
    zooming; baselines have no zoom. The benchmark uses one global radius for
    everyone so the number is comparable, which means a zooming method reads high by
    construction. It is reported as a diagnostic, not a score.
-3. **Shallow real landscapes.** Only 4/24 (3-D) and 11/24 (4-D) full-GP peaks clear
-   the 99th percentile of uniform random sampling. `real3d`/`real4d` may be too
-   smooth to separate methods; the RF surrogate over the same campaigns would be
-   spikier. Worth adding as `real{3,4}d_rf`.
-4. **Public materials datasets.** Brianna already evaluated and rejected the
-   awesome-matchem route ("HTEM ... mixes at most 4 elements at a time, and there
-   are only ~44 data points per set of elements") and Olympus OER ("too
-   sparse/smooth compared to our data. Also 5d and 6d interactions are all
-   theoretical"). Aleks asked for exactly those datasets. That disagreement needs
-   settling before anyone builds the adapters.
+3. **Shallow real landscapes.** Measured with `metrics.landscape_contrast`
+   (2000 uniform probes):
+
+   | objective | true optima | after merge | peaks above random p99 | mean prominence |
+   |---|---|---|---|---|
+   | `real3d` | 24 | **20** | **0.15** | 0.50 |
+   | `real4d` | 24 | 24 | **0.46** | 0.73 |
+   | `ensemble 3d, n=20` | 20 | 18 | 1.00 | 1.00 |
+   | `ensemble 4d, n=20` | 20 | 19 | 1.00 | 1.00 |
+
+   Only 15% of the 3-D campaign's detected peaks stand above what uniform random
+   sampling routinely hits, and four of its 24 reference peaks are closer together
+   than `2r` and get merged. `real3d` is close to being unable to separate methods
+   at all; `real4d` is usable but soft. The RF surrogate over the same campaigns is
+   spikier and should be added as `real{3,4}d_rf` — this is the strongest argument
+   for doing so.
+
+   An early signal that the metric change matters: on `real4d` at N=1000, uniform
+   random reaches `peak_ratio` 0.292 while `gp_qucb` reaches 0.208. Random beats a
+   standard BO baseline at recovering *many* optima, which is exactly Aleks's
+   prediction and exactly what cumulative best-y would have hidden.
+4. **Public materials datasets — an unresolved disagreement, not a task.**
+   Aleks asked us to expand to `awesome-matchem-datasets`. Brianna has already
+   evaluated and rejected that route in `Narrowing Generalization Options.docx`:
+   HTEM "mixes at most 4 elements at a time, and there are only ~44 data points per
+   set of elements"; the rest are "too sparse, have too few dimensions, just
+   theoretical (so probably overly smooth), or in a different domain"; and Olympus
+   OER is "too sparse/smooth compared to our data. Also 5d and 6d interactions are
+   all theoretical." Somebody has to settle this before adapters get built.
+
+   What a survey of the list actually supports:
+
+   | source | status |
+   |---|---|
+   | Olympus OER plates | **the only strong candidate.** 4 plates, 6-D simplex, 2119–2121 rows each, real measured overpotential. Needs no `olympus` install — the raw `data.csv` is enough (the package pins `tensorflow==1.15` and will not install). Caveat: compositions lie on a **discrete 0.1 lattice** (11 levels/component), so a continuous objective means fitting a surrogate over the grid, as the ZoMBI paper does. |
+   | HTEM-DB | `htem.nrel.gov` and `htem-api.nrel.gov` are **dead** (the awesome-matchem README still links the dead host). Confirms Brianna's view. |
+   | everything else in awesome-matchem | structure-, SMILES-, text- or categorical-reagent-based. No large dense continuous-composition set at dim 3–12. |
+   | `data/poisson_RF_trained.pkl` | **will not load** — pickled with scikit-learn 1.1.1; the tree node dtype changed in 1.3. Needs a `scikit-learn<1.3` env or a node-array rewrite. |
+   | `data/3D-6-final-GP-model` | needs GPy, which does not install on py3.12 / numpy 2.x. |
+   | ROBOT (`nataliemaus/robot`) | benchmarks rover / lunar lander / stocks / GuacaMol — **nothing material-science**. Not pip-installable, one commit from 2022. Usable as an algorithm to reimplement, not as a dependency. |
+
+   Recommendation: build `oer6d` from the Olympus CSVs (cheap, real, 6-D, and it
+   answers Aleks directly), and drop HTEM. Do not spend time on the two orphaned
+   ZoMBI-paper pickles unless someone wants the 6-D Poisson ladder rung badly
+   enough to stand up a legacy-sklearn environment.
