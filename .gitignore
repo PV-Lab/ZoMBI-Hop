@@ -80,3 +80,6 @@ test_rfs/
 
 # babysitter runtime state (logs, crash reports, cooldown stamps, lock)
 optimize/scripts/.babysitter/
+
+# benchmarking-v2 outputs
+benchmarks/runs/

@@ -1,0 +1,23 @@
+# S2: the needle-count hypothesis. Same landscape family, more needles.
+# Does baseline performance degrade with n_optima while ZoMBI-Hop's holds?
+name: s2_needles
+protocol:
+  n_samples: 1000
+  batch_size: 24
+  n_init_lines: 2
+  input_noise: empirical
+seeds: [0, 1, 2, 3, 4]
+value_tol: 0.25
+objectives:
+  - {kind: ensemble, dim: 3, n_optima: 5,  landscape: 0}
+  - {kind: ensemble, dim: 3, n_optima: 10, landscape: 0}
+  - {kind: ensemble, dim: 3, n_optima: 20, landscape: 0}
+  - {kind: ensemble, dim: 3, n_optima: 40, landscape: 0}
+  - {kind: ensemble, dim: 4, n_optima: 5,  landscape: 0}
+  - {kind: ensemble, dim: 4, n_optima: 10, landscape: 0}
+  - {kind: ensemble, dim: 4, n_optima: 20, landscape: 0}
+  - {kind: ensemble, dim: 4, n_optima: 40, landscape: 0}
+optimizers:
+  - {name: random}
+  - {name: gp_qucb}
+  - {name: zombihop}

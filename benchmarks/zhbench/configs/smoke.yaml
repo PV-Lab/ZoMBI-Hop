@@ -1,0 +1,18 @@
+# Smoke suite: proves the harness works end to end on CPU in a few minutes.
+# The zombihop hyperparameters here are DELIBERATELY REDUCED so this finishes fast.
+# Never quote a number from this suite as a result.
+name: smoke
+note: "SMOKE ONLY - zombihop runs with deliberately reduced hyperparameters (n_restarts=20 vs 285) and a 240-sample budget it cannot zoom within. These numbers are a harness check, NOT a result."
+protocol:
+  n_samples: 240
+  batch_size: 24
+  n_init_lines: 2
+  input_noise: empirical
+seeds: [0]
+value_tol: 0.25
+objectives:
+  - {kind: ensemble, dim: 3, n_optima: 5, landscape: 0, seed: 0}
+optimizers:
+  - {name: random}
+  - {name: gp_qucb, pool_size: 512}
+  - {name: zombihop, hparams: smoke}

@@ -1,0 +1,16 @@
+{
+  "_provenance": "REDUCED-COST set for the smoke suite ONLY. Same structure as the tuned sets but with n_restarts/raw cut so a CPU smoke run finishes in minutes. NEVER use for a reported result.",
+  "max_zooms": 3,
+  "max_iterations": 2,
+  "top_m_points": 4,
+  "n_restarts": 20,
+  "raw": 32,
+  "input_noise_threshold_mult": 3.0,
+  "output_noise_threshold_mult": 2.0,
+  "n_consecutive_converged": 2,
+  "max_gp_points": 512,
+  "acquisition_type": "ucb",
+  "ucb_beta": 3.0,
+  "nat_grad_step": 0.02,
+  "nat_grad_max_steps": 50
+}

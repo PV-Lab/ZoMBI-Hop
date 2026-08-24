@@ -1,0 +1,20 @@
+# S1: the two real hardware campaigns, as full-campaign GP surrogates.
+# Reference optima are SURROGATE peaks, not hardware-validated. Both landscapes
+# are shallow (only 4/24 of the 3d peaks and 11/24 of the 4d peaks clear the 99th
+# percentile of uniform random sampling) -- read the scores with that in mind.
+name: s1_real
+protocol:
+  n_samples: 1000
+  batch_size: 24
+  n_init_lines: 2
+  input_noise: empirical
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+value_tol: 0.25
+objectives:
+  - {kind: real_gp, dim: 3}
+  - {kind: real_gp, dim: 4}
+optimizers:
+  - {name: random}
+  - {name: gp_qucb}
+  - {name: gp_qlogei}
+  - {name: zombihop}
