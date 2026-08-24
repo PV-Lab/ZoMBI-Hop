@@ -91,3 +91,24 @@ recovering artifacts. The benchmark uses `prominence_frac = 0.3` plus a
 **measured-support** rule — a peak needs at least one real campaign sample within
 `r` whose measured objective is close to the peak's predicted value — and reports
 `n_true` under both settings so the effect is visible.
+
+## 5. The environment ships two OpenMP runtimes
+
+`sklearn/.libs/vcomp140.dll` (Microsoft) and `torch/lib/libiomp5md.dll` (Intel) are
+both loaded by any process that imports scikit-learn and torch, which is every
+process that imports `optimize/run_mobo.py` (it uses `RandomForestRegressor` and
+torch together). numpy and scipy additionally bundle a separate OpenBLAS each.
+
+Loading two OpenMP runtimes into one process is documented as unsupported and is a
+known source of hard crashes. The benchmark hits it as a Windows access violation
+(exit `0xC0000005`) in cells that combine a scikit-learn surrogate objective with
+BoTorch. `KMP_DUPLICATE_LIB_OK=TRUE` did **not** suppress it.
+
+This is not benchmark-specific: any `run_mobo` consumer is exposed, and it will
+behave differently on the cluster than on a laptop because the runtimes differ.
+
+Worth doing when the environment is next rebuilt: pin one OpenMP provider, e.g.
+install numpy/scipy/scikit-learn from a single channel that shares a runtime with
+the torch build, and record the resolved set in `environment.yml`. `requirements.txt`
+is currently a UTF-16 conda freeze from a different machine (torch 2.5.1+cu121,
+numpy 1.26.4, botorch 0.15.1) and does not describe this environment at all.

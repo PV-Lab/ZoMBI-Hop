@@ -263,3 +263,31 @@ point that defines it — while 92 endpoints have a component at zero. LineBO pr
 against the zero faces constantly and never against an upper face. Built on the full
 simplex; `landscapes.unsupported_mask` reports what fraction of a run's samples fell
 in regions the campaign never measured, so a result driven by extrapolation is visible.
+
+
+## 18. Corrected landscape contrast (rank metric)
+
+The numbers in section 3 above were computed with the broken threshold metric (see
+`metrics.landscape_contrast`). Re-measured with rank-based rarity, 4000 probes:
+
+| objective | n_true | peak rarity | in top 1% | frac at max | mean prominence |
+|---|---|---|---|---|---|
+| `real3d` | 14 | **0.0349** | 0.21 | 0.0003 | 0.60 |
+| `real4d` | 27 | **0.0110** | 0.48 | 0.0003 | 0.77 |
+| `real6d` | 68 | **0.0021** | 0.81 | 0.0003 | 0.69 |
+
+Rarity is the number to read: on `real3d` 3.5% of uniform draws score as well as a
+typical reference optimum, so random search hits optimum-quality values constantly
+and a good `peak_ratio` there means little. On `real6d` it is 0.2%, seventeen times
+rarer. None of the three saturates (`frac_at_max` 0.0003), which is why the broken
+metric still produced the right ordering -- but these are the values to quote.
+
+## 19. A Windows access violation in gp_qucb cells (open)
+
+Cells combining the scikit-learn surrogate objective with BoTorch die with exit
+`0xC0000005` at n_samples=2000; `random` cells on the same objective never do, and
+the same cell at n_samples=336 completes. The environment loads two OpenMP runtimes
+(`sklearn/.libs/vcomp140.dll` and `torch/lib/libiomp5md.dll`) and
+`KMP_DUPLICATE_LIB_OK=TRUE` does not suppress it. Under diagnosis; see
+`UPSTREAM_REQUESTS.md` section 5. Cells run in isolated subprocesses with retries,
+so a residual crash costs one cell rather than the grid.
