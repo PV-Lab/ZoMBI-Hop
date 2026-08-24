@@ -50,6 +50,13 @@ class Objective:
     maximize: bool = True
     domain: str = "simplex"
     meta: dict = field(default_factory=dict)
+    #: Optional (n, d) -> (n,) evaluator. The surrogate objectives are sklearn GPs,
+    #: where per-call overhead dominates: ~1 ms of Python and validation per point
+    #: against microseconds of actual kernel algebra. A 2000-sample run makes 2000
+    #: single-point calls, so batching is a large win -- and it keeps sklearn's
+    #: threaded code out of the inner loop, which matters on Windows where sklearn
+    #: (vcomp140) and torch (libiomp5md) each load a different OpenMP runtime.
+    fn_batch: Callable[[np.ndarray], np.ndarray] | None = None
 
     @property
     def n_true(self) -> int:
@@ -144,10 +151,15 @@ def make_real_gp(dim: int, prominence: float | None = None) -> Objective:
     def fn(x, _p=predict):
         return float(_p(np.asarray(x, dtype=float).reshape(1, -1))[0])
 
+    def fn_batch(X, _p=predict):
+        from .landscapes import predict_chunked
+        return predict_chunked(_p, np.atleast_2d(np.asarray(X, dtype=float)))
+
     return Objective(
         name=f"real{dim}d",
         dim=int(dim),
         fn=fn,
+        fn_batch=fn_batch,
         true_optima=L.peaks,
         true_values=L.peak_values,
         maximize=True,

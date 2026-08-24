@@ -102,11 +102,17 @@ class GPBatch(BaseOptimizer):
         chosen: list[int] = []
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
+            # Build the acquisition once and update X_pending in place. Rebuilding
+            # it per greedy step re-creates the QMC sampler 24 times per decision
+            # for no benefit, and a fresh sampler each step would also make the
+            # greedy sequence noisier than it needs to be.
+            acq = self._acq(torch, model, None)
+            cand = Zpool.unsqueeze(1)
             for _ in range(q):
-                pending = (Zpool[chosen] if chosen else None)
-                acq = self._acq(torch, model, pending)
+                if chosen:
+                    acq.set_X_pending(Zpool[chosen])
                 with torch.no_grad():
-                    vals = acq(Zpool.unsqueeze(1)).cpu().numpy()
+                    vals = acq(cand).cpu().numpy()
                 vals[chosen] = -np.inf
                 chosen.append(int(np.argmax(vals)))
         self._n_suggest += 1

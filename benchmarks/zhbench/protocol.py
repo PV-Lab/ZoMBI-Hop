@@ -408,6 +408,7 @@ class ObjectiveRun:
     protocol: Protocol
     seed: int = 0
     maximize: bool = True
+    fn_batch: Callable[[np.ndarray], np.ndarray] | None = None
 
     n_samples: int = field(default=0, init=False)
     batch_idx: int = field(default=0, init=False)
@@ -425,6 +426,8 @@ class ObjectiveRun:
     # -- ground truth: never noisy, never counted -----------------------------
     def f_true(self, X: np.ndarray) -> np.ndarray:
         X = np.atleast_2d(np.asarray(X, dtype=float))
+        if self.fn_batch is not None:
+            return np.asarray(self.fn_batch(X), dtype=float).ravel()
         return np.asarray([float(self.fn(x)) for x in X], dtype=float)
 
     def _add_output_noise(self, y: np.ndarray) -> np.ndarray:

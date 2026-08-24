@@ -58,7 +58,8 @@ def run_one(objective_spec: dict, optimizer_spec: dict, seed: int,
     optimizer = OPT.build(optimizer_spec)
 
     run = ObjectiveRun(fn=objective.fn, dim=objective.dim, protocol=protocol,
-                       seed=seed, maximize=objective.maximize)
+                       seed=seed, maximize=objective.maximize,
+                       fn_batch=objective.fn_batch)
 
     t0 = time.time()
     error = ""
