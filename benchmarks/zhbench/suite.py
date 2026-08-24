@@ -29,6 +29,7 @@ from datetime import datetime
 import numpy as np
 import yaml
 
+from ._repo import REPO_ROOT as _REPO_ROOT
 from .protocol import Protocol
 from .runner import run_one
 
@@ -45,29 +46,32 @@ def _obj_label(spec: dict) -> str:
     return " ".join(parts)
 
 
-def _pin_numeric_threads() -> None:
-    """One thread per numeric library, set before any worker is forked.
+def _configure_worker_env() -> None:
+    """Environment a worker process needs, set before anything heavy is imported.
 
-    Ten torch processes each defaulting to one OpenMP thread per core is 240
-    threads on a 24-core box. That oversubscription is what killed the first
-    s1_real launch (BrokenProcessPool after the random cells finished and the first
-    BoTorch fits started). The work is already parallel at the cell level, so each
-    cell wants exactly one thread.
+    **Matplotlib backend.** This is the one that actually mattered.
+    ``optimize/run_mobo.py`` imports ``pyplot`` at module scope and never calls
+    ``matplotlib.use``, and matplotlib's default here resolves to ``tkagg``.
+    Initialising Tk inside a spawned worker crashes the process outright, which
+    surfaces as ``BrokenProcessPool`` with no traceback -- exactly what killed the
+    first two s1_real launches. Nothing in a benchmark run draws anything, so force
+    ``Agg``.
+
+    **Thread pinning.** Six torch processes each defaulting to one OpenMP thread
+    per core is 144 threads on a 24-core box. The work is already parallel at the
+    cell level, so each cell wants exactly one thread.
+
+    ``setdefault`` throughout, so an explicit setting from the caller wins.
     """
+    os.environ.setdefault("MPLBACKEND", "Agg")
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                 "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
         os.environ.setdefault(var, "1")
 
 
-def _run_cell(job: dict) -> tuple[str, dict]:
-    """One (objective, optimizer, seed). Module-level so it survives pickling to a
-    worker process on Windows spawn."""
-    _pin_numeric_threads()
-    try:
-        import torch
-        torch.set_num_threads(1)
-    except Exception:
-        pass
+def _run_cell_inprocess(job: dict) -> tuple[str, dict]:
+    """Run a cell in this process. Used for ``--workers 1`` and as the fallback."""
+    _configure_worker_env()
     try:
         res = run_one(job["objective"], job["optimizer"], job["seed"],
                       Protocol(**job["protocol"]), out_dir=job["run_dir"],
@@ -78,6 +82,59 @@ def _run_cell(job: dict) -> tuple[str, dict]:
                "optimizer": job["optimizer"]["name"], "seed": job["seed"],
                "error": f"{type(exc).__name__}: {exc}"}
     return job["cell"], res
+
+
+def _run_cell(job: dict) -> tuple[str, dict]:
+    """Run one cell in its own OS process, via the runner CLI.
+
+    A ``ProcessPoolExecutor`` was the obvious choice and the wrong one: a worker
+    that dies takes the entire pool with it, so one bad cell out of 180 discards
+    every cell still in flight. Two s1_real launches died that way with a bare
+    ``BrokenProcessPool`` and no traceback to work from.
+
+    A plain subprocess per cell is fully isolated. A crash, a segfault or a hang
+    becomes a non-zero exit or a timeout for *that* cell, recorded as its error and
+    nothing else. The cell writes its own ``metrics.json``, so the parent just
+    reads it back. Threads (not processes) drive these, since they only wait on
+    subprocesses.
+    """
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env.setdefault("MPLBACKEND", "Agg")
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        env.setdefault(var, "1")
+
+    cmd = [sys.executable, "-m", "benchmarks.zhbench.runner",
+           "--objective", json.dumps(job["objective"]),
+           "--optimizer", json.dumps(job["optimizer"]),
+           "--seed", str(job["seed"]),
+           "--protocol", json.dumps(job["protocol"]),
+           "--value-tol", str(job["value_tol"]),
+           "--out", job["run_dir"], "--quiet"]
+    err = ""
+    try:
+        # encoding is explicit: text=True decodes with the locale codec, which is
+        # GBK on this machine and dies on the child's UTF-8 output.
+        proc = subprocess.run(cmd, cwd=_REPO_ROOT, env=env, capture_output=True,
+                              encoding="utf-8", errors="replace",
+                              timeout=job.get("timeout_s", 7200))
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+            err = f"exit {proc.returncode}: " + " | ".join(tail)
+    except subprocess.TimeoutExpired:
+        err = f"timeout after {job.get('timeout_s', 7200)}s"
+
+    done = os.path.join(job["run_dir"], "metrics.json")
+    if os.path.exists(done):
+        with open(done, encoding="utf-8") as fh:
+            return job["cell"], json.load(fh)
+    return job["cell"], {"objective": _obj_label(job["objective"]),
+                         "optimizer": job["optimizer"]["name"],
+                         "seed": job["seed"],
+                         "error": err or "no metrics.json written"}
 
 
 def run_suite(config: dict, out_root: str, resume: bool = True,
@@ -124,40 +181,23 @@ def run_suite(config: dict, out_root: str, resume: bool = True,
 
     done_cells: set[str] = set()
     if workers > 1 and len(jobs) > 1:
-        _pin_numeric_threads()
-        from concurrent.futures import BrokenExecutor, ProcessPoolExecutor, as_completed
+        # Threads, because each one only waits on an isolated subprocess.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         print(f"running {len(jobs)} cells on {workers} workers", flush=True)
-        try:
-            # max_tasks_per_child recycles a worker after every cell. Torch and
-            # BoTorch keep allocator arenas alive across fits, so a worker that runs
-            # twenty 2000-sample cells in a row grows without bound; the ~4 s
-            # respawn is noise against a cell that takes minutes.
-            with ProcessPoolExecutor(max_workers=workers,
-                                     max_tasks_per_child=1) as pool:
-                futures = {pool.submit(_run_cell, j): j["cell"] for j in jobs}
-                for i, fut in enumerate(as_completed(futures), 1):
-                    cell, res = fut.result()
-                    done_cells.add(cell)
-                    print(f"[{i}/{len(jobs)}] {cell}", flush=True)
-                    _absorb(cell, res)
-        except (BrokenExecutor, OSError) as exc:
-            # One worker dying takes the whole pool with it. Every finished cell has
-            # already been written to its own run dir, so nothing is lost -- finish
-            # the rest serially instead of discarding the run.
-            print(f"\n!! worker pool broke ({type(exc).__name__}: {exc}); "
-                  f"finishing the remaining cells serially", flush=True)
-
-    for j in jobs:
-        if j["cell"] in done_cells:
-            continue
-        done = os.path.join(j["run_dir"], "metrics.json")
-        if os.path.exists(done):
-            with open(done, encoding="utf-8") as fh:
-                _absorb(j["cell"], json.load(fh))
-            continue
-        print(f"[run ] {j['cell']}", flush=True)
-        cell, res = _run_cell(j)
-        _absorb(cell, res)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_run_cell, j): j["cell"] for j in jobs}
+            for i, fut in enumerate(as_completed(futures), 1):
+                cell, res = fut.result()
+                done_cells.add(cell)
+                flag = "  !! " + res["error"][:80] if res.get("error") else ""
+                print(f"[{i}/{len(jobs)}] {cell}{flag}", flush=True)
+                _absorb(cell, res)
+    else:
+        for j in jobs:
+            print(f"[run ] {j['cell']}", flush=True)
+            cell, res = _run_cell_inprocess(j)
+            done_cells.add(cell)
+            _absorb(cell, res)
 
     _write_aggregate(suite_dir, rows)
     with open(os.path.join(suite_dir, "curves.json"), "w", encoding="utf-8") as fh:

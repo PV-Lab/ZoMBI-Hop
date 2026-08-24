@@ -45,9 +45,14 @@ each column by ``|x| / max|x|``, and fit ``RandomForestRegressor(n_estimators=50
 
 confirmed three ways -- the slice, the shipped model's ``n_features_in_ = 5``, and
 the upstream notebook cell (``dimensions = 5 # 5D X-dataset used to train the RF
-model``). ``dim=6`` is available and prepends ``nelements``, but that column is
-what ``iloc[:, 2:-1]`` deliberately skips, so it is NOT the published task and
-says so in ``meta``. If the registry wants a name, this is ``poisson5d``.
+model``). If the registry wants a name, this is ``poisson5d``.
+
+``dim=6`` is available and prepends ``nelements``, the column ``iloc[:, 2:-1]``
+deliberately skips. It is not the published task, and it is not a usable substitute
+either: the extra axis drops the fraction of the cube within ``r`` of a measurement
+from 0.08% to 0.01%, the lattice has to coarsen from 1/20 to 1/12 to stay
+affordable, and **zero** of its 2824 detected peaks survive the support filter.
+:func:`poisson5d` raises rather than hand the metrics an empty reference set.
 
 Because every column is divided by its own ``max|x|``, the search space is the
 **unit cube** ``[0, 1]^5`` -- hence ``domain="cube"``, and the upstream notebook
@@ -172,6 +177,11 @@ MATCH_RADIUS = 0.05         # optimize.eval_metrics.MATCH_RADIUS
 PEAK_PROMINENCE_FRAC = 0.12  # warm_gp_landscape._PEAK_PROMINENCE_FRAC
 PEAK_VALUE_TOL = 0.25       # metrics.reached_flags default value_tol
 MAX_PEAK_CANDIDATES = 20000
+#: The lattice sweep is ~30 us/point, so 5M is about two minutes. At d=5 the
+#: default 1/20 lattice is 4084101 points and fits; at d=6 it would be 85766121,
+#: i.e. 43 minutes, so :func:`_resolve_grid_n` coarsens and says so rather than
+#: silently choosing between a slow build and an unrecorded change of resolution.
+GRID_POINT_CAP = 5_000_000
 SEED = 0
 
 #: An isotropic solid cannot have ``nu`` outside this interval; rows that do are
@@ -561,6 +571,14 @@ def cross_validate(dim: int = DIM, target_range: tuple | None = PHYSICAL_RANGE, 
 
 # --- reference optima --------------------------------------------------------
 
+def _resolve_grid_n(dim: int, grid_n: int, cap: int = GRID_POINT_CAP) -> int:
+    """Largest lattice at or below ``grid_n`` that fits the evaluation budget."""
+    n = int(grid_n)
+    while n > 2 and (n + 1) ** int(dim) > cap:
+        n -= 1
+    return n
+
+
 def _grid_coords(flat_idx: np.ndarray, n: int, d: int) -> np.ndarray:
     return (np.stack(np.unravel_index(flat_idx, (n + 1,) * d), axis=1).astype(float)
             / float(n))
@@ -599,6 +617,7 @@ def detect_peaks(rf, dim: int, *, grid_n: int = GRID_N,
     which is the desired behaviour but means the raw local-max count is not a peak
     count and is reported separately as ``n_local_max_cells``.
     """
+    requested, grid_n = int(grid_n), _resolve_grid_n(dim, grid_n)
     n_total = (grid_n + 1) ** dim
     many = _predictors(rf)[1]
     z = np.empty(n_total, dtype=float)
@@ -621,7 +640,9 @@ def detect_peaks(rf, dim: int, *, grid_n: int = GRID_N,
             kept.append(int(idx))
             pts.append(p)
     sel = np.asarray(kept, dtype=int)
-    stats = {"grid_n": int(grid_n), "n_grid": int(n_total),
+    stats = {"grid_n": int(grid_n), "grid_n_requested": requested,
+             "n_grid": int(n_total), "spacing": 1.0 / grid_n,
+             "spacing_exceeds_match_radius": bool(1.0 / grid_n > MATCH_RADIUS),
              "n_local_max_cells": int(is_max.sum()),
              "n_above_prominence_floor": int(cand.size),
              "candidates_truncated": bool(cand.size > max_candidates),
@@ -783,8 +804,20 @@ def poisson5d(dim: int = DIM, target_range: tuple | None = PHYSICAL_RANGE, *,
                  else ("peaks_naive", "peak_values_naive"))
     P = np.asarray(ref[key], dtype=float).reshape(-1, dim)
     V = np.asarray(ref[vkey], dtype=float)
-
     a, cv, tag = ref["audit"], ref["cv"], ref["tag"]
+    if P.shape[0] == 0:
+        # An empty reference set is not a usable objective: solution_set_scores
+        # returns peak_ratio = nan and the failure lands silently in aggregate.csv.
+        # This is exactly what dim=6 does -- adding nelements pushes the fraction of
+        # the cube within r of a measurement from 0.08% to 0.01%, and the lattice has
+        # to coarsen to 1/12 to stay affordable, so nothing survives the support test.
+        raise ValueError(
+            f"poisson{dim}d [{tag}] has no supported reference optima "
+            f"({ref['n_peaks_naive']} peaks detected, 0 with a measurement within "
+            f"r={MATCH_RADIUS}). Use dim=5 -- the published task -- rather than "
+            "supported_only=False, which would hand the metrics a reference set "
+            "invented entirely by the forest.")
+
     name = f"poisson{dim}d"
     if tag != "physical":
         name += "_asPublished"
@@ -864,9 +897,9 @@ def poisson5d(dim: int = DIM, target_range: tuple | None = PHYSICAL_RANGE, *,
              f"{a['nu_std_used']:.4f}. That within-radius spread caps ANY model on "
              f"these features at R^2 ~ {cv['r2_ceiling_from_within_radius_spread']:.3f}; "
              f"this forest reaches {cv['random_kfold']['r2']:.3f}."),
-            (f"Of the {ref['n_peaks_supported']} supported peaks, "
-             f"{ref['n_peaks_auxetic_support']} is/are vouched for by a material that "
-             "is actually auxetic; the rest pass only because the support threshold "
+            (f"Only {ref['n_peaks_auxetic_support']} of the "
+             f"{ref['n_peaks_supported']} supported peaks are vouched for by a "
+             "material that is actually auxetic; the rest pass because the threshold "
              "v - value_tol*(v - background) is easy to clear for a peak that barely "
              "exceeds the background. meta['peak_support'] names the material behind "
              "each one so this is checkable rather than implied."),
@@ -947,6 +980,10 @@ def _report(dim: int, target_range: tuple | None, rebuild: bool) -> None:
         print(f"  CV {proto:22s} R2 {m['r2']:+.4f}  RMSE {m['rmse']:.4f}  "
               f"MAE {m['mae']:.4f}  Spearman {m['spearman']:+.4f}")
     print(f"  CV oob_r2 {cv['oob_r2_full_fit']:+.4f}  ({cv['n_groups']} chemical systems)")
+    if g["spacing_exceeds_match_radius"]:
+        print(f"  WARNING grid coarsened from 1/{g['grid_n_requested']} to "
+              f"1/{g['grid_n']} (spacing {g['spacing']:.4f} > r={MATCH_RADIUS}); "
+              "peaks closer than the spacing cannot be resolved")
     print(f"  grid {g['n_grid']} pts @ 1/{g['grid_n']}: surface [{g['surface_min']:.4f}, "
           f"{g['surface_max']:.4f}], background {g['background']:.4f}, "
           f"floor {g['prominence_floor']:.4f}, {g['n_local_max_cells']} local-max cells, "

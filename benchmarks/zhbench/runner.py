@@ -154,16 +154,20 @@ def main(argv=None) -> int:
                     help='JSON, e.g. \'{"kind":"ensemble","dim":3,"n_optima":5}\'')
     ap.add_argument("--optimizer", required=True, help='JSON, e.g. \'{"name":"random"}\'')
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--n-samples", type=int, default=1000)
-    ap.add_argument("--batch", type=int, default=24)
+    ap.add_argument("--protocol", default="{}",
+                    help="JSON kwargs for Protocol, e.g. '{\"n_samples\":2000}'")
+    ap.add_argument("--value-tol", type=float, default=0.25)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
     res = run_one(json.loads(args.objective), json.loads(args.optimizer), args.seed,
-                  Protocol(n_samples=args.n_samples, batch_size=args.batch),
-                  out_dir=args.out)
-    print(json.dumps({k: v for k, v in res.items()
-                      if not k.startswith("reached_curve")}, indent=2, default=float))
+                  Protocol(**json.loads(args.protocol)), out_dir=args.out,
+                  value_tol=args.value_tol)
+    if not args.quiet:
+        print(json.dumps({k: v for k, v in res.items()
+                          if not k.endswith(("_t", "_ratio", "_k", "_n"))},
+                         indent=2, default=float))
     return 0
 
 
