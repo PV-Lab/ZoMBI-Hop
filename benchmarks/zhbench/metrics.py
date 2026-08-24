@@ -295,12 +295,26 @@ def best_y_curve(y) -> np.ndarray:
 def landscape_contrast(fn, true_optima, true_values=None, dim: int | None = None,
                        n_probe: int = 4000, seed: int = 0,
                        domain: str = "simplex") -> dict:
-    """How far the reference optima stand above a uniform random sample.
+    """How rare a reference optimum's VALUE is under uniform random sampling.
 
-    Returns the fraction of reference optima that exceed the 99th percentile of
-    uniformly sampled objective values. Near 1.0 the optima are genuinely sharp and
-    a peak_ratio is meaningful; near 0 they are shallow bumps on a smooth surface
-    and any method -- including random -- will look good.
+    The headline is ``peak_rarity_median``: for each reference optimum, the
+    fraction of uniform probes scoring at least as well. Small means the value
+    signal is informative -- a random sampler rarely stumbles onto something that
+    good. Large means it does, and a strong ``peak_ratio`` on that objective says
+    less than it appears to.
+
+    This used to be "fraction of peaks above the 99th percentile", which is
+    unusable on any objective with a ceiling. ``synthetic_data.ensemble`` saturates
+    at 1.0, and once more than 1% of the domain sits at the ceiling the 99th
+    percentile IS 1.0, so a strict ``peak > p99`` test reports 0.0 for peaks that
+    are themselves at 1.0 -- and flips back to 1.0 if you change the probe count.
+    Measured on `ensemble(3, n_optima=10)`: 0.00 at 800 probes, 1.00 at 3000. A
+    rarity is a rank, so ties at the ceiling are counted rather than mis-signed.
+
+    ``frac_domain_at_max`` reports the saturation directly, because on a saturating
+    landscape "the optimum's value is not rare" and "the optimum is easy to locate"
+    are different statements -- ``peak_ratio`` is distance-based and still measures
+    the second.
     """
     T = _as2d(true_optima)
     d = dim or (T.shape[1] if T.size else None)
@@ -312,17 +326,24 @@ def landscape_contrast(fn, true_optima, true_values=None, dim: int | None = None
     vr = np.asarray([float(fn(x)) for x in Xr], dtype=float)
     tv = (np.asarray(true_values, dtype=float).ravel() if true_values is not None
           else np.asarray([float(fn(p)) for p in T], dtype=float))
-    p99 = float(np.percentile(vr, 99))
-    rng_span = float(vr.max() - np.median(vr)) or 1.0
+    med = float(np.median(vr))
+    vmax = float(vr.max())
+    rng_span = (vmax - med) or 1.0
+    # Rarity of each peak's value: P(a uniform draw scores at least as well).
+    rarity = (np.asarray([(vr >= t).mean() for t in tv], dtype=float)
+              if tv.size else np.empty(0))
     return {
-        "random_median": float(np.median(vr)),
-        "random_p99": p99,
-        "random_max": float(vr.max()),
+        "random_median": med,
+        "random_p99": float(np.percentile(vr, 99)),
+        "random_max": vmax,
         "peak_value_min": float(tv.min()) if tv.size else float("nan"),
         "peak_value_max": float(tv.max()) if tv.size else float("nan"),
-        "frac_peaks_above_random_p99": float((tv > p99).mean()) if tv.size else float("nan"),
-        "mean_peak_prominence": float(((tv - np.median(vr)) / rng_span).mean())
+        "peak_rarity_median": float(np.median(rarity)) if rarity.size else float("nan"),
+        "frac_peaks_in_top_1pct": float((rarity <= 0.01).mean()) if rarity.size else float("nan"),
+        "frac_domain_at_max": float((vr >= vmax - 1e-9).mean()),
+        "mean_peak_prominence": float(((tv - med) / rng_span).mean())
         if tv.size else float("nan"),
+        "n_probe": int(vr.size),
     }
 
 

@@ -1,11 +1,25 @@
-# S2: the needle-count hypothesis. Same landscape family, more needles.
-# Does baseline performance degrade with n_optima while ZoMBI-Hop's holds?
+# S2: the needle-count hypothesis, and the clean version of it.
+#
+# Same landscape family, more needles. Ensemble landscapes saturate at 1.0 and the
+# only points at the ceiling are the optima themselves, so the fraction of the
+# domain at maximum grows linearly with needle count: median peak rarity 0.0017
+# (n=5) -> 0.0267 (n=80). That is the honest statement of "more needles makes the
+# value signal less discriminating", and it applies to every method equally.
+#
+# ACHIEVED counts differ from requested ones, because the simplex cannot pack
+# arbitrarily many optima at 2r separation. Requested -> achieved (after merging):
+#   d=3:  5->5  10->10  20->18  40->26  80->33   (2-simplex packing limit ~33)
+#   d=4:  5->5  10->9   20->19  40->32  80->57
+#   d=6:  5->5  10->10  20->20  40->39  80->77
+# report.py plots the achieved count; plotting the request would compress three
+# different landscapes onto one x value and imply a plateau that is a packing limit.
 name: s2_needles
 protocol:
-  n_samples: 1000
+  n_samples: 2000
   batch_size: 24
   n_init_lines: 2
   noise: hardware
+  eval_at: [250, 500, 1000, 2000]
 seeds: [0, 1, 2, 3, 4]
 value_tol: 0.25
 objectives:
@@ -17,7 +31,12 @@ objectives:
   - {kind: ensemble, dim: 4, n_optima: 10, landscape: 0}
   - {kind: ensemble, dim: 4, n_optima: 20, landscape: 0}
   - {kind: ensemble, dim: 4, n_optima: 40, landscape: 0}
+  - {kind: ensemble, dim: 4, n_optima: 80, landscape: 0}
+  - {kind: ensemble, dim: 6, n_optima: 20, landscape: 0}
+  - {kind: ensemble, dim: 6, n_optima: 40, landscape: 0}
+  - {kind: ensemble, dim: 6, n_optima: 80, landscape: 0}
 optimizers:
   - {name: random}
   - {name: gp_qucb}
+  - {name: gp_ts}
   - {name: zombihop}

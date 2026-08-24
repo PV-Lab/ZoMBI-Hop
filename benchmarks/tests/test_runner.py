@@ -77,5 +77,17 @@ def test_objective_reports_its_own_contrast():
     obj = O.make_ensemble(dim=3, n_optima=5, landscape=0, seed=0)
     c = M.landscape_contrast(obj.fn, obj.true_optima, obj.true_values,
                              dim=obj.dim, n_probe=500)
-    assert 0.0 <= c["frac_peaks_above_random_p99"] <= 1.0
+    assert 0.0 <= c["peak_rarity_median"] <= 1.0
+    assert 0.0 <= c["frac_peaks_in_top_1pct"] <= 1.0
     assert c["random_p99"] >= c["random_median"]
+
+
+def test_landscape_contrast_is_stable_under_probe_count():
+    """The saturation bug: ensemble tops out at 1.0, so once >1% of the domain sits
+    at the ceiling the 99th percentile IS the ceiling, and a strict peak > p99 test
+    flips with the probe count. A rarity is a rank, so it does not."""
+    obj = O.make_ensemble(dim=3, n_optima=20, landscape=0, seed=0)
+    vals = [M.landscape_contrast(obj.fn, obj.true_optima, obj.true_values,
+                                 dim=3, n_probe=n)["peak_rarity_median"]
+            for n in (800, 3000)]
+    assert abs(vals[0] - vals[1]) < 0.05, vals

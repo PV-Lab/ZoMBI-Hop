@@ -227,16 +227,17 @@ def fig_needles(rows, curves, suite_dir, objectives) -> str | None:
 def fig_needle_count(rows, suite_dir) -> str | None:
     """peak_ratio vs n_optima -- the needle-count hypothesis. s2 only."""
     plt = _mpl()
+    # x-axis is the ACHIEVED number of distinct optima, not the requested one. The
+    # 2-simplex cannot hold 80 optima at 2r separation: asking for 80 at d=3 yields
+    # 33 after merging (40 -> 26, 20 -> 18). Plotting the request would compress
+    # three different landscapes onto one x value and imply a plateau that is really
+    # a packing limit.
     byn = defaultdict(list)
     for r in rows:
-        obj = r["objective"]
-        if "n_optima" not in obj:
+        n = r.get("n_true_optima")
+        if not isinstance(n, float) or not np.isfinite(n):
             return None
-        try:
-            n = int(obj.split("n_optima=")[1].split()[0])
-        except (IndexError, ValueError):
-            return None
-        byn[(r["optimizer"], n)].append(r.get("peak_ratio", np.nan))
+        byn[(r["optimizer"], int(n))].append(r.get("peak_ratio", np.nan))
     opts = _opts(rows)
     col = _colors(opts)
     fig, ax = plt.subplots(figsize=(6.4, 4.4))
@@ -249,7 +250,7 @@ def fig_needle_count(rows, suite_dir) -> str | None:
         ax.errorbar(ns, m, yerr=s, marker="o", capsize=3, color=col[o], label=o,
                     lw=2.2 if o.startswith("zombihop") else 1.6,
                     ls="--" if o == "random" else "-")
-    ax.set_xlabel("number of true optima")
+    ax.set_xlabel("number of distinct true optima (achieved, after merging at 2r)")
     ax.set_ylabel("peak ratio (recall)")
     ax.set_title("Does performance degrade as needles multiply?", fontsize=11)
     ax.grid(alpha=0.25)
