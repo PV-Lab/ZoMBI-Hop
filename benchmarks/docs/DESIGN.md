@@ -129,6 +129,26 @@ raises `BudgetExhausted` for every method alike.
    random reaches `peak_ratio` 0.292 while `gp_qucb` reaches 0.208. Random beats a
    standard BO baseline at recovering *many* optima, which is exactly Aleks's
    prediction and exactly what cumulative best-y would have hidden.
+
+5. **Compare at matched |S|, and report both.** First numbers, N=1000, **one seed
+   each** — not a result, a calibration of what the harness says:
+
+   | | real3d (20 true) | real4d (24 true) |
+   |---|---|---|
+   | ZoMBI-Hop needles declared | 9 | 7 |
+   | ZoMBI-Hop recall / precision | 0.250 / 0.556 | 0.083 / 0.286 |
+   | random post-hoc at the same \|S\| | 0.100 / 0.222 | 0.167 / 0.571 |
+   | random post-hoc at \|S\| = n_true | 0.400 / 0.400 | 0.292 / 0.292 |
+   | ZoMBI-Hop's own samples, post-hoc at the same \|S\| | 0.300 | 0.125 |
+   | input_cost | 49.6 vs 483.9 | 29.3 vs 481.8 |
+
+   At 3-D ZoMBI-Hop beats random 2.5x on both recall and precision **at matched
+   declarations**, and pays a tenth of the input cost. At 4-D it does not beat
+   random even at matched \|S\|. Two things to chase before drawing any conclusion:
+   ten seeds instead of one, and why ZoMBI-Hop declares only 7 needles in 1000
+   samples on a landscape with 24 optima. Note also that in both cases its own
+   samples support slightly more optima than it declares (0.300 vs 0.250; 0.125 vs
+   0.083), so declaration, not search, is part of what is limiting it.
 4. **Public materials datasets — an unresolved disagreement, not a task.**
    Aleks asked us to expand to `awesome-matchem-datasets`. Brianna has already
    evaluated and rejected that route in `Narrowing Generalization Options.docx`:
