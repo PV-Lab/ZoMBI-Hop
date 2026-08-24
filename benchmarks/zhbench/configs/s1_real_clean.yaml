@@ -1,0 +1,21 @@
+# S1 control: identical to s1_real but with noise off entirely (clean inputs AND
+# clean outputs). Says how much of the ranking is the noise model rather than the
+# search. Fewer seeds because it is a control, not a headline.
+name: s1_real_clean
+protocol:
+  n_samples: 2000
+  batch_size: 24
+  n_init_lines: 2
+  noise: none
+  eval_at: [250, 500, 1000, 2000]
+seeds: [0, 1, 2, 3, 4]
+value_tol: 0.25
+objectives:
+  - {kind: real_gp, dim: 3}
+  - {kind: real_gp, dim: 4}
+  - {kind: real_gp, dim: 6}
+optimizers:
+  - {name: random}
+  - {name: gp_qucb}
+  - {name: gp_ts}
+  - {name: zombihop}

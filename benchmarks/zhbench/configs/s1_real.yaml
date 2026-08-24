@@ -1,20 +1,30 @@
-# S1: the two real hardware campaigns, as full-campaign GP surrogates.
-# Reference optima are SURROGATE peaks, not hardware-validated. Both landscapes
-# are shallow (only 4/24 of the 3d peaks and 11/24 of the 4d peaks clear the 99th
-# percentile of uniform random sampling) -- read the scores with that in mind.
+# S1: the three real hardware campaigns as full-campaign GP surrogates.
+#
+# Reference optima are SUPPORTED surrogate peaks (prominence 0.3 + at least one
+# measured sample within r near the peak value), NOT hardware-validated optima.
+# Landscape contrast, measured: real3d 0.21, real4d 0.52, real6d 0.75 of reference
+# peaks above the 99th percentile of uniform random sampling. real3d is a weak
+# discriminator; real6d is the strong one.
+#
+# N=2000 with prefix evaluation at 250/500/1000/2000: 3D is saturated by uniform
+# sampling well before N=1000, so the small-N columns are where it discriminates.
 name: s1_real
 protocol:
-  n_samples: 1000
+  n_samples: 2000
   batch_size: 24
   n_init_lines: 2
   noise: hardware
+  eval_at: [250, 500, 1000, 2000]
 seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 value_tol: 0.25
 objectives:
   - {kind: real_gp, dim: 3}
   - {kind: real_gp, dim: 4}
+  - {kind: real_gp, dim: 6}
 optimizers:
   - {name: random}
   - {name: gp_qucb}
   - {name: gp_qlogei}
+  - {name: gp_ts}
   - {name: zombihop}
+  - {name: zombihop_nc5}

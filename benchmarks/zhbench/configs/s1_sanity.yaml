@@ -1,0 +1,15 @@
+name: s1_sanity
+note: "SANITY ONLY - 1 seed, N=480. Checks every method x objective cell runs. Not a result."
+protocol: {n_samples: 480, batch_size: 24, n_init_lines: 2, noise: hardware, eval_at: [240, 480]}
+seeds: [0]
+objectives:
+  - {kind: real_gp, dim: 3}
+  - {kind: real_gp, dim: 4}
+  - {kind: real_gp, dim: 6}
+optimizers:
+  - {name: random}
+  - {name: gp_qucb, pool_size: 512}
+  - {name: gp_qlogei, pool_size: 512}
+  - {name: gp_ts, pool_size: 512}
+  - {name: zombihop}
+  - {name: zombihop_nc5}

@@ -12,19 +12,24 @@ Every objective exposes the same surface:
 Nothing here re-implements a landscape. The synthetic ones come from
 ``synthetic_data.ensemble`` (Brianna's generator: Ackley basins on a Perlin
 background, plus distractors, ridges, plateaus and anisotropy) and the real ones
-from ``warm_start.warm_gp_landscape``, which fits a GP to an entire hardware
-campaign and detects its peaks.
+from ``.landscapes``, which fits the upstream fixed-length-scale GP to an entire
+hardware campaign and detects the peaks that have measured support.
 
 Two honesty notes that belong next to the data, not buried in a report:
 
-  * ``real3d`` / ``real4d`` reference optima are peaks of a SURROGATE fit to the
-    campaign, not hardware-validated optima. They are the same reference the team
-    already tunes hyperparameters against, so they are the right target -- but a
-    peak_ratio against them is a statement about the surrogate.
-  * Those two landscapes are shallow. Measured with
-    ``metrics.landscape_contrast``: only 4 of 24 (3-D) and 11 of 24 (4-D) detected
-    peaks clear the 99th percentile of uniform random sampling. Read their scores
-    with that in mind; the sharp multi-optimum test is the ensemble suite.
+  * Reference optima on the real campaigns are peaks of a SURROGATE fit to the
+    campaign, not hardware-validated optima. They are the same kind of reference
+    the team already tunes hyperparameters against, so they are the right target
+    -- but a peak_ratio against them is a statement about the surrogate.
+  * The three campaigns differ a lot in how discriminative they are. Fraction of
+    reference peaks clearing the 99th percentile of uniform random sampling
+    (``metrics.landscape_contrast``), at prominence 0.3 with measured support::
+
+        real3d   n_true 14   contrast 0.21     weak -- barely separates methods
+        real4d   n_true 27   contrast 0.52     usable but soft
+        real6d   n_true 68   contrast 0.75     the strong real test
+
+    Read real3d's scores with that firmly in mind.
 """
 
 from __future__ import annotations

@@ -28,6 +28,8 @@ than assumed.
 
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 from dataclasses import dataclass
 from functools import lru_cache
@@ -87,6 +89,22 @@ def load_campaign(dim: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return X, Y, line_id
 
 
+def predict_chunked(predict, X: np.ndarray, chunk: int = 4096) -> np.ndarray:
+    """Evaluate a GP predictor without materialising one huge kernel matrix.
+
+    sklearn builds the full ``(n_query, n_train)`` kernel in one allocation. The
+    6-D campaign has 2042 training points and the peak search uses a 60k probe
+    cloud, which is ~1 GB in float64 before anything else -- enough to fail on a
+    laptop and enough to matter inside a parallel suite where every worker would do
+    it at once.
+    """
+    X = np.atleast_2d(np.asarray(X, dtype=float))
+    if X.shape[0] <= chunk:
+        return np.asarray(predict(X), dtype=float).ravel()
+    return np.concatenate([np.asarray(predict(X[i:i + chunk]), dtype=float).ravel()
+                           for i in range(0, X.shape[0], chunk)])
+
+
 def detect_supported_peaks(predict, X_data: np.ndarray, Y_data: np.ndarray,
                            dim: int, *, prominence_frac: float = DEFAULT_PROMINENCE,
                            min_sep: float = DEFAULT_MIN_SEP, r: float = 0.05,
@@ -107,7 +125,7 @@ def detect_supported_peaks(predict, X_data: np.ndarray, Y_data: np.ndarray,
     """
     rng = np.random.default_rng(seed)
     probes = np.vstack([rng.dirichlet(np.ones(dim), size=n_probe), X_data])
-    z = np.asarray(predict(probes), dtype=float).ravel()
+    z = predict_chunked(predict, probes)
 
     tree = cKDTree(probes)
     is_max = np.fromiter(
@@ -155,6 +173,32 @@ def detect_supported_peaks(predict, X_data: np.ndarray, Y_data: np.ndarray,
     return probes[sup], z[sup], diag
 
 
+_CACHE_DIR = f"{REPO_ROOT}/data/reference_optima"
+
+
+def _cache_path(dim: int, prominence_frac: float, seed: int) -> str:
+    return f"{_CACHE_DIR}/real{dim}d_p{prominence_frac:g}_s{seed}.json"
+
+
+def _load_peak_cache(dim, prominence_frac, seed):
+    path = _cache_path(dim, prominence_frac, seed)
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as fh:
+        blob = json.load(fh)
+    return (np.asarray(blob["peaks"], dtype=float).reshape(-1, dim),
+            np.asarray(blob["values"], dtype=float),
+            blob["diagnostics"])
+
+
+def _save_peak_cache(dim, prominence_frac, seed, peaks, values, diag) -> None:
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    with open(_cache_path(dim, prominence_frac, seed), "w", encoding="utf-8") as fh:
+        json.dump({"peaks": np.asarray(peaks).tolist(),
+                   "values": np.asarray(values).tolist(),
+                   "diagnostics": diag}, fh, indent=2)
+
+
 @lru_cache(maxsize=8)
 def campaign_landscape(dim: int, prominence_frac: float = DEFAULT_PROMINENCE,
                        seed: int = 0) -> Landscape:
@@ -165,16 +209,25 @@ def campaign_landscape(dim: int, prominence_frac: float = DEFAULT_PROMINENCE,
 
     X, Y, line_id = load_campaign(dim)
     predict = build_gp_landscape(X, Y, GP_LENGTH_SCALE)
-    peaks, vals, diag = detect_supported_peaks(
-        predict, X, Y, dim, prominence_frac=prominence_frac, seed=seed)
 
-    # Report the upstream setting alongside, so the effect of the change is
-    # visible in every run's artifacts rather than argued about in a doc.
-    if abs(prominence_frac - UPSTREAM_PROMINENCE) > 1e-12:
-        _, _, d0 = detect_supported_peaks(
-            predict, X, Y, dim, prominence_frac=UPSTREAM_PROMINENCE, seed=seed)
-        diag["n_peaks_naive_at_0.12"] = d0["n_peaks_naive"]
-        diag["n_peaks_supported_at_0.12"] = d0["n_peaks_supported"]
+    # Peak detection is the expensive half (a 60k probe cloud against a 2042-point
+    # GP is ~20 s at d=6) and it is a pure function of the campaign, the prominence
+    # and the seed. A suite runs it once per (objective, optimizer, seed) cell --
+    # 180 times for s1 -- so cache it to disk.
+    cached = _load_peak_cache(dim, prominence_frac, seed)
+    if cached is not None:
+        peaks, vals, diag = cached
+    else:
+        peaks, vals, diag = detect_supported_peaks(
+            predict, X, Y, dim, prominence_frac=prominence_frac, seed=seed)
+        # Report the upstream setting alongside, so the effect of the change is
+        # visible in every run's artifacts rather than argued about in a doc.
+        if abs(prominence_frac - UPSTREAM_PROMINENCE) > 1e-12:
+            _, _, d0 = detect_supported_peaks(
+                predict, X, Y, dim, prominence_frac=UPSTREAM_PROMINENCE, seed=seed)
+            diag["n_peaks_naive_at_0.12"] = d0["n_peaks_naive"]
+            diag["n_peaks_supported_at_0.12"] = d0["n_peaks_supported"]
+        _save_peak_cache(dim, prominence_frac, seed, peaks, vals, diag)
 
     diag.update({"n_campaign_points": int(X.shape[0]),
                  "n_campaign_lines": int(np.unique(line_id).size),
