@@ -23,6 +23,7 @@ import argparse
 import csv
 import json
 import os
+import time
 import traceback
 from datetime import datetime
 
@@ -125,34 +126,67 @@ def _run_cell(job: dict) -> tuple[str, dict]:
            "--protocol", json.dumps(job["protocol"]),
            "--value-tol", str(job["value_tol"]),
            "--out", job["run_dir"], "--quiet"]
+    done = os.path.join(job["run_dir"], "metrics.json")
+
+    # Stagger the first launch. Every observed 0xC0000005 landed on the first GP
+    # cell of the run, i.e. the moment six processes import torch and sklearn
+    # simultaneously and race to load two different OpenMP runtimes. Spreading the
+    # starts costs seconds and removes the simultaneous-import window.
+    if job.get("stagger_s"):
+        time.sleep(job["stagger_s"])
+
+    # Retry a hard crash. The fault is a race between OpenMP runtimes, not a bug in
+    # the cell, so a repeat usually succeeds; a cell that fails every attempt is a
+    # real failure and is recorded as one. Retries are counted in the artifacts so
+    # nobody has to take this on trust.
+    attempts = int(job.get("retries", 2)) + 1
     err = ""
-    try:
-        # encoding is explicit: text=True decodes with the locale codec, which is
-        # GBK on this machine and dies on the child's UTF-8 output.
-        proc = subprocess.run(cmd, cwd=_REPO_ROOT, env=env, capture_output=True,
-                              encoding="utf-8", errors="replace",
-                              timeout=job.get("timeout_s", 7200))
-        if proc.returncode != 0:
+    for attempt in range(attempts):
+        try:
+            # encoding is explicit: text=True decodes with the locale codec, which
+            # is GBK on this machine and dies on the child's UTF-8 output.
+            proc = subprocess.run(cmd, cwd=_REPO_ROOT, env=env, capture_output=True,
+                                  encoding="utf-8", errors="replace",
+                                  timeout=job.get("timeout_s", 7200))
+            if proc.returncode == 0:
+                err = ""
+                break
             tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
             err = f"exit {proc.returncode}: " + " | ".join(tail)
-    except subprocess.TimeoutExpired:
-        err = f"timeout after {job.get('timeout_s', 7200)}s"
+        except subprocess.TimeoutExpired:
+            err = f"timeout after {job.get('timeout_s', 7200)}s"
+            break       # a timeout is not a race; retrying just burns the budget
+        if os.path.exists(done):
+            err = ""
+            break
+        time.sleep(2.0 * (attempt + 1))
 
-    done = os.path.join(job["run_dir"], "metrics.json")
     if os.path.exists(done):
         with open(done, encoding="utf-8") as fh:
-            return job["cell"], json.load(fh)
+            res = json.load(fh)
+        if attempt:
+            res["n_retries"] = int(attempt)
+        return job["cell"], res
     return job["cell"], {"objective": _obj_label(job["objective"]),
                          "optimizer": job["optimizer"]["name"],
-                         "seed": job["seed"],
+                         "seed": job["seed"], "n_retries": attempts - 1,
                          "error": err or "no metrics.json written"}
 
 
 def run_suite(config: dict, out_root: str, resume: bool = True,
-              workers: int = 1) -> str:
+              workers: int = 1, suite_dir: str | None = None,
+              retries: int = 2) -> str:
+    """Run the grid. Pass ``suite_dir`` to resume into an existing directory.
+
+    Resume is per-directory, so re-running a suite normally starts a fresh one and
+    skips nothing. ``--suite-dir`` points at an earlier run instead: cells that
+    already wrote ``metrics.json`` are skipped and only the missing ones -- the
+    ones that crashed -- are re-run.
+    """
     name = config.get("name", "suite")
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    suite_dir = os.path.join(out_root, f"{name}_{stamp}")
+    if suite_dir is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        suite_dir = os.path.join(out_root, f"{name}_{stamp}")
     os.makedirs(suite_dir, exist_ok=True)
     with open(os.path.join(suite_dir, "config.yaml"), "w", encoding="utf-8") as fh:
         yaml.safe_dump(config, fh, sort_keys=False)
@@ -182,7 +216,9 @@ def run_suite(config: dict, out_root: str, resume: bool = True,
                     continue
                 jobs.append({"cell": cell, "run_dir": run_dir, "objective": obj_spec,
                              "optimizer": opt_spec, "seed": seed,
-                             "protocol": protocol_kwargs, "value_tol": value_tol})
+                             "protocol": protocol_kwargs, "value_tol": value_tol,
+                             "retries": retries,
+                             "stagger_s": 3.0 * (len(jobs) % max(1, workers))})
 
     def _absorb(cell: str, res: dict) -> None:
         curves[cell] = {"objective": res.get("objective"),
@@ -284,6 +320,11 @@ def main(argv=None) -> int:
     ap.add_argument("--no-resume", action="store_true")
     ap.add_argument("--workers", type=int, default=1,
                     help="parallel processes; each cell is independent")
+    ap.add_argument("--suite-dir", default=None,
+                    help="resume into an existing suite dir, re-running only the "
+                         "cells that have no metrics.json")
+    ap.add_argument("--retries", type=int, default=2,
+                    help="retries per cell on a hard crash")
     args = ap.parse_args(argv)
 
     path = args.config
@@ -291,7 +332,8 @@ def main(argv=None) -> int:
         path = os.path.join(here, "configs", f"{args.config}.yaml")
     with open(path, encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh)
-    run_suite(cfg, args.out, resume=not args.no_resume, workers=args.workers)
+    run_suite(cfg, args.out, resume=not args.no_resume, workers=args.workers,
+              suite_dir=args.suite_dir, retries=args.retries)
     return 0
 
 
