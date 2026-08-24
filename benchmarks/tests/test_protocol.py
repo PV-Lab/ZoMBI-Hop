@@ -17,7 +17,7 @@ def _obj(dim=3):
 
 def test_budget_is_never_exceeded_and_truncates_a_straddling_batch():
     obj = _obj()
-    p = Protocol(n_samples=100, batch_size=24, input_noise="none")
+    p = Protocol(n_samples=100, batch_size=24, noise="none")
     run = ObjectiveRun(fn=obj.fn, dim=obj.dim, protocol=p, seed=0)
     rng = np.random.default_rng(0)
     for _ in range(10):
@@ -33,7 +33,7 @@ def test_budget_is_never_exceeded_and_truncates_a_straddling_batch():
 
 def test_init_design_is_identical_for_the_same_seed():
     obj = _obj()
-    p = Protocol(n_samples=240, batch_size=24, input_noise="empirical")
+    p = Protocol(n_samples=240, batch_size=24, noise="hardware")
     out = []
     for _ in range(2):
         run = ObjectiveRun(fn=obj.fn, dim=obj.dim, protocol=p, seed=7)
@@ -44,15 +44,15 @@ def test_init_design_is_identical_for_the_same_seed():
 
 def test_init_design_differs_across_seeds():
     obj = _obj()
-    p = Protocol(n_samples=240, batch_size=24, input_noise="empirical")
+    p = Protocol(n_samples=240, batch_size=24, noise="hardware")
     a = gen_init_design(ObjectiveRun(fn=obj.fn, dim=3, protocol=p, seed=1), p, 1)
     b = gen_init_design(ObjectiveRun(fn=obj.fn, dim=3, protocol=p, seed=2), p, 2)
     assert not np.allclose(a[0], b[0])
 
 
-@pytest.mark.parametrize("mode", ["none", "empirical", "gaussian"])
+@pytest.mark.parametrize("mode", ["none", "hardware", "physics"])
 def test_realize_stays_on_the_simplex(mode):
-    p = Protocol(input_noise=mode, input_noise_std=0.1)
+    p = Protocol(noise=mode)
     rng = np.random.default_rng(0)
     X = rng.dirichlet(np.ones(5), size=64)
     A = realize(X, p, rng)
@@ -60,26 +60,42 @@ def test_realize_stays_on_the_simplex(mode):
     assert (A >= -1e-12).all()
 
 
-def test_empirical_noise_is_calibrated_not_the_hardware_gaussian():
-    """The whole reason the calibration exists: N(0, NOISE_LEVEL) would be about
-    3x harsher than the print model ZoMBI-Hop actually faces."""
+def test_hardware_mode_actually_realizes_the_hardware_noise_level():
+    """The point of solving for the scale rather than assuming it.
+
+    NOISE_LEVEL is the std of (realized - requested) measured on the printer. If we
+    inject N(0, 0.128) and project back to the simplex, clipping pulls the realized
+    value below 0.128, and the benchmark would quietly be gentler than the lab it
+    claims to model. Assert the realized number, not the injected one.
+    """
+    from zhbench._repo import run_mobo
+    target = float(run_mobo().NOISE_LEVEL)
+    rng = np.random.default_rng(0)
+    p = Protocol(noise="hardware")
+    for dim in (3, 4, 6):
+        X = rng.dirichlet(np.ones(dim), size=3000)
+        got = float(np.std(realize(X, p, rng) - X))
+        assert abs(got - target) < 0.1 * target, (dim, got, target)
+
+
+def test_physics_mode_is_quieter_than_hardware_mode():
+    """Kept as a sensitivity, and the reason it is not the primary."""
     rng = np.random.default_rng(0)
     X = rng.dirichlet(np.ones(4), size=2000)
-    emp = realize(X, Protocol(input_noise="empirical"), rng)
-    gau = realize(X, Protocol(input_noise="gaussian"), rng)
-    d_emp = np.linalg.norm(emp - X, axis=1).mean()
-    d_gau = np.linalg.norm(gau - X, axis=1).mean()
-    assert 0.03 < d_emp < 0.15, d_emp
-    assert d_gau > 2 * d_emp, (d_emp, d_gau)
+    d_phys = float(np.std(realize(X, Protocol(noise="physics"), rng) - X))
+    d_hw = float(np.std(realize(X, Protocol(noise="hardware"), rng) - X))
+    assert d_phys < d_hw
+    assert d_hw / d_phys > 2.0, (d_phys, d_hw)
 
 
 def test_line_realization_falls_back_above_ten_components():
     """The printer has ten syringe modules. Above that there is no hardware to
     model, and the run must say so rather than crash or pretend."""
-    p = Protocol(input_noise="empirical")
-    assert line_realization_mode(6, p) == "physics"
-    assert line_realization_mode(MAX_PRINTABLE_COMPONENTS, p) == "physics"
+    p = Protocol(noise="hardware")
+    assert line_realization_mode(6, p) == "physics+residual"
+    assert line_realization_mode(MAX_PRINTABLE_COMPONENTS, p) == "physics+residual"
     assert line_realization_mode(12, p) == "no_printer_model"
+    assert line_realization_mode(6, Protocol(noise="physics")) == "physics"
 
     rng = np.random.default_rng(0)
     left, right = rng.dirichlet(np.ones(12), size=2)
@@ -89,8 +105,11 @@ def test_line_realization_falls_back_above_ten_components():
 
 
 def test_y_true_is_noiseless_and_y_observed_is_not():
+    """Metrics must never ride on a lucky measurement, so y_true is recomputed
+    noiselessly at the realized composition while the optimizer only ever sees
+    y_observed."""
     obj = _obj()
-    p = Protocol(n_samples=48, batch_size=24, input_noise="none")
+    p = Protocol(n_samples=48, batch_size=24, noise="hardware")
     run = ObjectiveRun(fn=obj.fn, dim=3, protocol=p, seed=0)
     rng = np.random.default_rng(0)
     X = rng.dirichlet(np.ones(3), size=24)
@@ -98,6 +117,18 @@ def test_y_true_is_noiseless_and_y_observed_is_not():
     h = run.stacked()
     assert np.allclose(h["y_true"], [obj.fn(x) for x in X_act])
     assert not np.allclose(h["y_observed"], h["y_true"])
+
+
+def test_none_mode_disables_output_noise_too():
+    """The control has to be a genuine control: clean inputs AND clean outputs."""
+    obj = _obj()
+    p = Protocol(n_samples=48, batch_size=24, noise="none")
+    run = ObjectiveRun(fn=obj.fn, dim=3, protocol=p, seed=0)
+    X = np.random.default_rng(0).dirichlet(np.ones(3), size=24)
+    X_act, _ = run.evaluate_batch(X)
+    h = run.stacked()
+    assert np.array_equal(h["X_actual"], h["X_requested"])
+    assert np.allclose(h["y_observed"], h["y_true"])
 
 
 def test_importing_the_core_does_not_leak_torch_global_state():

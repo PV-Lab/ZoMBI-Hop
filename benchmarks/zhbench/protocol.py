@@ -1,26 +1,35 @@
 """Protocol: budget, batching, initial design, and the noise model.
 
-Every method in this benchmark gets the same sample budget, the same batch size,
-the same initial design, and the same *magnitude* of realization error. The one
-thing that necessarily differs is the SHAPE of that error, and it differs for a
-physical reason:
+Every method gets the same sample budget, the same batch size, the same initial
+design, and the same *magnitude* of realization error.
 
-  * ZoMBI-Hop + LineBO asks for a printed LINE. The core turns the requested
-    endpoints into the compositions the printer would actually deposit via
-    ``optimize.composition_prediction.physics_simulate_line`` -- a deterministic
-    model of syringe ramp lag/overshoot plus junction-volume diffusion mixing.
-  * A batch baseline asks for q unrelated points. There is no line, so the
-    physics model does not apply. Those points get an i.i.d. perturbation whose
-    magnitude distribution is CALIBRATED to the physics model at the same
-    dimension (``calibrate_input_noise``), then are projected back to the simplex.
+Noise modes (``Protocol.noise``):
 
-Why calibrate rather than reuse ``run_mobo.NOISE_LEVEL`` directly: NOISE_LEVEL
-(0.128 per component) was measured on real 6-D hardware, where the mean L2
-requested-vs-realized error is 0.271. The physics simulator that ZoMBI-Hop
-actually faces in these benchmarks is gentler -- measured mean L2 0.066-0.090 for
-d in {3,4,6}. Handing baselines i.i.d. N(0, 0.128) would give them roughly 3x the
-handicap ZoMBI-Hop carries, which would silently manufacture the result we are
-trying to test.
+``hardware`` (primary)
+    Everyone is perturbed at the level the real printer was measured at:
+    ``run_mobo.NOISE_LEVEL`` = 0.128 per component. Lines get the deterministic
+    print model plus a random residual; batch points get the random part alone.
+    This is the honest primary because ZoMBI-Hop is *told* ``input_noise=0.128``,
+    so testing it in a world 3x quieter than that makes it over-conservative for
+    no reason, and because ~87% of the measured hardware residual is
+    perpendicular to the requested line -- which a ramp-lag/diffusion model cannot
+    produce at all.
+
+``physics`` (sensitivity)
+    Lines get the deterministic print model only; batch points get a perturbation
+    bootstrapped from that model's own residual distribution. Self-consistent, but
+    2.5-4x quieter than the printer.
+
+``none`` (control)
+    Perfect realization and no output noise. Says how much of the ranking is
+    driven by the noise model at all.
+
+In ``hardware`` mode the perturbation scale is *solved* rather than assumed.
+Adding ``N(0, 0.128)`` and projecting back to the simplex lands well below 0.128,
+because projection clips. ``calibrate_hardware_noise`` bisects on the pre-projection
+scale until the realized per-component std of ``X_actual - X_requested`` equals
+NOISE_LEVEL, separately for lines (where the print model already contributes) and
+for batches. ``tests/test_protocol.py`` asserts the realized value.
 
 Output noise is identical for everyone: multiplicative, std
 ``run_mobo.OUTPUT_NOISE_FRAC`` (0.045) times |y|.
@@ -37,14 +46,22 @@ import numpy as np
 
 from .spaces import project_simplex
 
-_CALIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "data", "input_noise_calibration.json")
+_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_CALIB_PATH = os.path.join(_DATA_DIR, "input_noise_calibration.json")
+_HW_PATH = os.path.join(_DATA_DIR, "hardware_noise_calibration.json")
 
-# Sample budget defaults. N=1000 is ~12 h of SDL runtime (Aleks's stated minimum);
-# q=24 is one printed line.
+# N=1000 is ~12 h of SDL runtime (Aleks's stated minimum); q=24 is one printed line.
 DEFAULT_N_SAMPLES = 1000
 DEFAULT_BATCH = 24
 DEFAULT_INIT_LINES = 2          # == run_mobo.N_INIT_LINES; 48 points
+
+#: The print model has ten syringe modules and raises above that. A HARDWARE limit:
+#: the SDL cannot print an 11-component gradient, so any run above 10 components is
+#: a purely computational study. Such runs record
+#: ``line_realization: "no_printer_model"`` so it never gets lost in a plot.
+MAX_PRINTABLE_COMPONENTS = 10
+
+NOISE_MODES = ("hardware", "physics", "none")
 
 
 class BudgetExhausted(Exception):
@@ -67,14 +84,20 @@ class Protocol:
     n_samples: int = DEFAULT_N_SAMPLES
     batch_size: int = DEFAULT_BATCH
     n_init_lines: int = DEFAULT_INIT_LINES
-    # "empirical" = bootstrap magnitudes calibrated against physics_simulate_line
-    #               (the default, and the only mode fair to both sides)
-    # "gaussian"  = i.i.d. N(0, input_noise_std) per component      [ablation]
-    # "none"      = perfect realization                             [ablation]
-    input_noise: str = "empirical"
-    input_noise_std: float | None = None    # only for input_noise == "gaussian"
+    noise: str = "hardware"
+    #: Override the target per-component realization std. None -> run_mobo.NOISE_LEVEL.
+    noise_level: float | None = None
     output_noise_frac: float | None = None  # None -> run_mobo.OUTPUT_NOISE_FRAC
     domain: str = "simplex"                 # "simplex" | "cube"
+    #: Sample counts at which metrics are also evaluated, by prefix. The endpoint is
+    #: always included. 3-D is saturated by uniform sampling well before N=1000, so
+    #: the small-N columns are where it discriminates.
+    eval_at: tuple[int, ...] = (250, 500, 1000, 2000)
+
+    def __post_init__(self):
+        if self.noise not in NOISE_MODES:
+            raise ValueError(f"noise must be one of {NOISE_MODES}, got {self.noise!r}")
+        self.eval_at = tuple(int(n) for n in self.eval_at if int(n) <= self.n_samples)
 
     @property
     def n_init_points(self) -> int:
@@ -85,7 +108,15 @@ class Protocol:
         """Batches after the initial design. Same for every method."""
         return max(0, (self.n_samples - self.n_init_points) // self.batch_size)
 
+    def resolved_noise_level(self) -> float:
+        if self.noise_level is not None:
+            return float(self.noise_level)
+        from ._repo import run_mobo
+        return float(run_mobo().NOISE_LEVEL)
+
     def resolved_output_noise_frac(self) -> float:
+        if self.noise == "none":
+            return 0.0
         if self.output_noise_frac is not None:
             return float(self.output_noise_frac)
         from ._repo import run_mobo
@@ -95,23 +126,18 @@ class Protocol:
         d = asdict(self)
         d["n_decisions"] = self.n_decisions
         d["n_init_points"] = self.n_init_points
+        d["eval_at"] = list(self.eval_at)
         return d
 
 
-# --- input-noise calibration -------------------------------------------------
+# --- calibration: the physics model's own residual distribution ---------------
 
-def calibrate_input_noise(dims=(3, 4, 5, 6, 8, 10, 12), n_lines: int = 200,
+def calibrate_input_noise(dims=(3, 4, 5, 6, 8, 10), n_lines: int = 200,
                           seed: int = 0, path: str = _CALIB_PATH) -> dict:
     """Measure the realization error ``physics_simulate_line`` actually produces.
 
-    For each dimension we draw ``n_lines`` random simplex chords, ask the physics
-    model what the printer would deposit, and record the per-point L2 distance
-    from the clean straight segment. Those magnitudes are the empirical
-    distribution baselines bootstrap from, so both sides of the comparison face
-    the same amount of composition error.
-
-    Writes a JSON table and returns it. Run once; re-run only if the print model
-    changes.
+    Used by ``noise="physics"``. Dimensions above ten are skipped because the
+    print model raises there.
     """
     from ._repo import _ensure_path
     _ensure_path()
@@ -121,6 +147,8 @@ def calibrate_input_noise(dims=(3, 4, 5, 6, 8, 10, 12), n_lines: int = 200,
     rng = np.random.default_rng(seed)
     table: dict[str, dict] = {}
     for d in dims:
+        if d > MAX_PRINTABLE_COMPONENTS:
+            continue
         mags: list[float] = []
         for _ in range(n_lines):
             a = rng.dirichlet(np.ones(d))
@@ -144,11 +172,10 @@ def calibrate_input_noise(dims=(3, 4, 5, 6, 8, 10, 12), n_lines: int = 200,
             "mean_l2": float(arr.mean()),
             "median_l2": float(np.median(arr)),
             "p95_l2": float(np.percentile(arr, 95)),
-            # A coarse quantile sketch is enough to bootstrap from and keeps the
-            # committed table small and readable.
+            "per_component_std": float(arr.mean() / np.sqrt(d)),
             "quantiles": [float(q) for q in np.percentile(arr, np.arange(0, 101, 2))],
         }
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(_DATA_DIR, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump({"source": "optimize.composition_prediction.physics_simulate_line",
                    "n_lines_per_dim": n_lines, "seed": seed, "dims": table},
@@ -156,31 +183,122 @@ def calibrate_input_noise(dims=(3, 4, 5, 6, 8, 10, 12), n_lines: int = 200,
     return table
 
 
-def _load_calibration() -> dict:
-    if not os.path.exists(_CALIB_PATH):
+def _load_json(path: str, what: str) -> dict:
+    if not os.path.exists(path):
         raise FileNotFoundError(
-            f"input-noise calibration table missing at {_CALIB_PATH}. "
-            "Generate it with: python -m benchmarks.zhbench.protocol --calibrate")
-    with open(_CALIB_PATH, encoding="utf-8") as fh:
-        return json.load(fh)["dims"]
+            f"{what} missing at {path}. Generate it with: "
+            "python -m benchmarks.zhbench.protocol --calibrate")
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
 
 
-def _quantiles_for_dim(dim: int) -> np.ndarray:
-    """Empirical magnitude quantiles for ``dim``, interpolating across the table."""
-    table = _load_calibration()
+def _interp_dim(table: dict, dim: int, key: str) -> np.ndarray | float:
     if str(dim) in table:
-        return np.asarray(table[str(dim)]["quantiles"], dtype=float)
+        v = table[str(dim)][key]
+        return np.asarray(v, dtype=float) if isinstance(v, list) else float(v)
     keys = sorted(int(k) for k in table)
     below = [k for k in keys if k <= dim]
     above = [k for k in keys if k >= dim]
     lo = max(below) if below else keys[0]
     hi = min(above) if above else keys[-1]
-    q_lo = np.asarray(table[str(lo)]["quantiles"], dtype=float)
-    q_hi = np.asarray(table[str(hi)]["quantiles"], dtype=float)
+    a, b = table[str(lo)][key], table[str(hi)][key]
     if lo == hi:
-        return q_lo
+        return np.asarray(a, dtype=float) if isinstance(a, list) else float(a)
     w = (dim - lo) / (hi - lo)
-    return (1.0 - w) * q_lo + w * q_hi
+    if isinstance(a, list):
+        return (1 - w) * np.asarray(a, float) + w * np.asarray(b, float)
+    return float((1 - w) * a + w * b)
+
+
+# --- calibration: the pre-projection scale that lands on NOISE_LEVEL ----------
+
+def _base_pairs(dim: int, kind: str, rng: np.random.Generator, n: int
+                ) -> tuple[np.ndarray, np.ndarray]:
+    """Requested points and their pre-perturbation realization.
+
+    Computed ONCE per (dim, kind) and reused across every bisection step: the
+    deterministic print model does not depend on the perturbation scale, and
+    re-running it inside the loop costs ~0.4 s per line for nothing.
+    """
+    if kind == "batch":
+        X_req = rng.dirichlet(np.ones(dim), size=n)
+        return X_req, X_req.copy()
+    from ._repo import _ensure_path
+    _ensure_path()
+    import torch
+    from optimize.composition_prediction import physics_simulate_line
+    reqs, acts = [], []
+    per_line = DEFAULT_BATCH
+    for _ in range(max(1, n // per_line)):
+        a, b = rng.dirichlet(np.ones(dim), size=2)
+        t = np.linspace(0.0, 1.0, per_line)[:, None]
+        reqs.append(a[None, :] + t * (b - a)[None, :])
+        act = physics_simulate_line(torch.as_tensor(a), torch.as_tensor(b),
+                                    num_points=per_line)
+        acts.append(np.asarray(
+            act.detach().cpu().numpy() if hasattr(act, "detach") else act, dtype=float))
+    return np.vstack(reqs), np.vstack(acts)
+
+
+def _realized_std(scale: float, X_req: np.ndarray, X_base: np.ndarray,
+                  rng: np.random.Generator) -> float:
+    """Pooled per-component std of (realized - requested) at a given scale."""
+    n, dim = X_base.shape
+    X_act = project_simplex(X_base + _perturb(n, dim, scale, rng))
+    return float(np.std(X_act - X_req))
+
+
+def calibrate_hardware_noise(dims=(3, 4, 5, 6, 8, 10, 12), target: float | None = None,
+                             seed: int = 0, n: int = 960, path: str = _HW_PATH) -> dict:
+    """Solve for the perturbation scale that realizes ``target`` per-component std.
+
+    Bisection, because there is no closed form: projection back to the simplex
+    clips, so the realized std is strictly below the injected one by an amount that
+    depends on the dimension and on how close the requested point sits to a face.
+    Solving it is the difference between "we injected 0.128" and "the samples really
+    are 0.128 off", and only the second is what NOISE_LEVEL means.
+    """
+    if target is None:
+        from ._repo import run_mobo
+        target = float(run_mobo().NOISE_LEVEL)
+    out: dict[str, dict] = {}
+    for d in dims:
+        kinds = ["batch"] + (["line"] if d <= MAX_PRINTABLE_COMPONENTS else [])
+        entry = {}
+        for kind in kinds:
+            X_req, X_base = _base_pairs(d, kind, np.random.default_rng(seed), n)
+            floor = _realized_std(0.0, X_req, X_base, np.random.default_rng(seed))
+            lo, hi = 0.0, 1.0
+            for _ in range(30):
+                mid = 0.5 * (lo + hi)
+                if _realized_std(mid, X_req, X_base,
+                                 np.random.default_rng(seed)) < target:
+                    lo = mid
+                else:
+                    hi = mid
+            scale = 0.5 * (lo + hi)
+            got = _realized_std(scale, X_req, X_base, np.random.default_rng(seed + 1))
+            entry[kind] = {"scale": float(scale), "realized_std": float(got),
+                           "unperturbed_std": float(floor)}
+        out[str(d)] = entry
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"target_per_component_std": float(target), "seed": seed,
+                   "note": "scale is pre-projection; realized_std is what the "
+                           "samples actually come out at; unperturbed_std is the "
+                           "print model's own contribution (0 for batches)",
+                   "dims": out}, fh, indent=2)
+    return out
+
+
+def _hardware_scale(dim: int, kind: str) -> float:
+    tbl = _load_json(_HW_PATH, "hardware noise calibration")["dims"]
+    if str(dim) in tbl and kind in tbl[str(dim)]:
+        return float(tbl[str(dim)][kind]["scale"])
+    sub = {k: v[kind] for k, v in tbl.items() if kind in v}
+    if not sub:
+        sub = {k: v["batch"] for k, v in tbl.items() if "batch" in v}
+    return float(_interp_dim(sub, dim, "scale"))
 
 
 def _zero_sum_unit(n: int, dim: int, rng: np.random.Generator) -> np.ndarray:
@@ -192,34 +310,84 @@ def _zero_sum_unit(n: int, dim: int, rng: np.random.Generator) -> np.ndarray:
     return u / nrm
 
 
+def _perturb(n: int, dim: int, scale: float, rng: np.random.Generator) -> np.ndarray:
+    """Isotropic tangent-space perturbation with the given per-component scale."""
+    return _zero_sum_unit(n, dim, rng) * (scale * np.sqrt(dim) *
+                                          np.abs(rng.standard_normal((n, 1))))
+
+
 def realize(X_requested: np.ndarray, protocol: Protocol,
             rng: np.random.Generator) -> np.ndarray:
-    """Turn requested compositions into the ones a printer would actually make.
+    """Turn requested compositions into what the lab would actually make.
 
-    Point-wise, for scattered batches. Lines go through the core's physics model
-    instead (see ``zombihop_runner``).
+    Point-wise, for scattered batches. Lines go through :func:`realize_line`.
     """
     X = np.atleast_2d(np.asarray(X_requested, dtype=float))
     n, dim = X.shape
-    mode = protocol.input_noise
-    if mode == "none":
+    if protocol.noise == "none":
         return X.copy()
-    if mode == "gaussian":
-        std = protocol.input_noise_std
-        if std is None:
-            from ._repo import run_mobo
-            std = float(run_mobo().NOISE_LEVEL)
-        pert = rng.standard_normal((n, dim)) * float(std)
-    elif mode == "empirical":
-        q = _quantiles_for_dim(dim)
+    if protocol.noise == "hardware":
+        pert = _perturb(n, dim, _hardware_scale(dim, "batch"), rng)
+    elif protocol.noise == "physics":
+        q = np.asarray(_interp_dim(
+            _load_json(_CALIB_PATH, "input-noise calibration")["dims"],
+            dim, "quantiles"), dtype=float)
         mags = np.interp(rng.random(n), np.linspace(0.0, 1.0, q.size), q)
         pert = _zero_sum_unit(n, dim, rng) * mags[:, None]
     else:
-        raise ValueError(f"unknown input_noise mode: {mode!r}")
+        raise ValueError(f"unknown noise mode: {protocol.noise!r}")
     X_act = X + pert
     if protocol.domain == "cube":
         return np.clip(X_act, 0.0, 1.0)
     return project_simplex(X_act)
+
+
+def line_realization_mode(dim: int, protocol: Protocol) -> str:
+    if protocol.noise == "none":
+        return "clean_segment"
+    if protocol.domain == "cube":
+        return "no_printer_model"
+    if dim > MAX_PRINTABLE_COMPONENTS:
+        return "no_printer_model"
+    return "physics" if protocol.noise == "physics" else "physics+residual"
+
+
+def realize_line(left: np.ndarray, right: np.ndarray, n_points: int,
+                 protocol: Protocol, rng: np.random.Generator | None = None
+                 ) -> np.ndarray:
+    """Compositions the printer would actually deposit for a requested chord.
+
+    For d <= 10 this starts from the deterministic hardware model (ramp
+    lag/overshoot + junction-volume diffusion mixing) the ZoMBI-Hop core uses. In
+    ``hardware`` mode a random residual is added on top, because the deterministic
+    model reproduces only the along-line part of the error while ~87% of the
+    measured hardware residual is perpendicular to the requested line.
+
+    Above ten components no printer exists, so the chord gets the point-wise
+    perturbation instead.
+    """
+    rng = rng or np.random.default_rng(0)
+    t = np.linspace(0.0, 1.0, n_points)[:, None]
+    clean = left[None, :] + t * (right - left)[None, :]
+    dim = left.shape[0]
+    mode = line_realization_mode(dim, protocol)
+    if mode == "clean_segment":
+        return clean
+    if mode == "no_printer_model":
+        return realize(clean, protocol, rng)
+
+    from ._repo import _ensure_path
+    _ensure_path()
+    import torch
+    from optimize.composition_prediction import physics_simulate_line
+    act = physics_simulate_line(torch.as_tensor(left), torch.as_tensor(right),
+                                num_points=n_points)
+    act = np.asarray(act.detach().cpu().numpy() if hasattr(act, "detach") else act,
+                     dtype=float)
+    if mode == "physics":
+        return act
+    act = act + _perturb(n_points, dim, _hardware_scale(dim, "line"), rng)
+    return project_simplex(act)
 
 
 # --- the wrapper every method goes through -----------------------------------
@@ -260,6 +428,8 @@ class ObjectiveRun:
         return np.asarray([float(self.fn(x)) for x in X], dtype=float)
 
     def _add_output_noise(self, y: np.ndarray) -> np.ndarray:
+        if self._out_frac <= 0:
+            return y
         return y + self._rng.standard_normal(y.shape) * (self._out_frac * np.abs(y))
 
     def _check_budget(self) -> None:
@@ -269,12 +439,12 @@ class ObjectiveRun:
     def evaluate_batch(self, X_requested: np.ndarray,
                        X_actual: np.ndarray | None = None
                        ) -> tuple[np.ndarray, np.ndarray]:
-        """Realize, measure, record, and count a batch. The baseline entry point.
+        """Realize, measure, record, and count a batch.
 
         ``X_actual`` may be supplied when the caller has already realized the
-        request through a different physical path -- the shared initial design does
-        this, because those batches really are printed LINES and go through
-        ``physics_simulate_line`` for every method alike.
+        request through a different physical path -- the shared initial design and
+        the ZoMBI-Hop line path both do this, because those batches really are
+        printed lines.
         """
         self._check_budget()
         X_req = np.atleast_2d(np.asarray(X_requested, dtype=float))
@@ -320,6 +490,13 @@ class ObjectiveRun:
             "batch": np.concatenate(self.batch_of),
         }
 
+    def realized_noise_std(self) -> float:
+        """Pooled per-component std of (realized - requested), as actually run."""
+        h = self.stacked()
+        if h["X_actual"].shape[0] == 0:
+            return float("nan")
+        return float(np.std(h["X_actual"] - h["X_requested"]))
+
 
 def random_chord(dim: int, rng: np.random.Generator,
                  domain: str = "simplex") -> tuple[np.ndarray, np.ndarray]:
@@ -349,61 +526,14 @@ def random_chord(dim: int, rng: np.random.Generator,
     return x0 + lo * d, x0 + hi * d
 
 
-#: The print model has ten syringe modules and raises above that
-#: (``composition_prediction.physics_simulate_line``: "physics model supports up
-#: to 10 modules"). This is a HARDWARE limit, not a software one -- the SDL
-#: cannot print an 11-component gradient -- so any run above 10 components is a
-#: purely computational study with no printer to model. Runs at d > 10 record
-#: ``line_realization: "no_printer_model"`` so this never gets lost in a plot.
-MAX_PRINTABLE_COMPONENTS = 10
-
-
-def line_realization_mode(dim: int, protocol: Protocol) -> str:
-    if protocol.domain == "cube":
-        return "clean_segment"
-    if protocol.input_noise == "none":
-        return "clean_segment"
-    if dim > MAX_PRINTABLE_COMPONENTS:
-        return "no_printer_model"
-    return "physics"
-
-
-def realize_line(left: np.ndarray, right: np.ndarray, n_points: int,
-                 protocol: Protocol, rng: np.random.Generator | None = None
-                 ) -> np.ndarray:
-    """Compositions the printer would actually deposit for a requested chord.
-
-    For d <= 10 this is the deterministic hardware model (ramp lag/overshoot +
-    junction-volume diffusion mixing) the ZoMBI-Hop core uses for every line.
-    Above 10 components no printer exists, so the chord gets the same calibrated
-    point-wise perturbation the batch baselines get, extrapolated from d=10.
-    """
-    t = np.linspace(0.0, 1.0, n_points)[:, None]
-    clean = left[None, :] + t * (right - left)[None, :]
-    mode = line_realization_mode(left.shape[0], protocol)
-    if mode == "clean_segment":
-        return clean
-    if mode == "no_printer_model":
-        return realize(clean, protocol, rng or np.random.default_rng(0))
-    from ._repo import _ensure_path
-    _ensure_path()
-    import torch
-    from optimize.composition_prediction import physics_simulate_line
-    act = physics_simulate_line(torch.as_tensor(left), torch.as_tensor(right),
-                                num_points=n_points)
-    return np.asarray(act.detach().cpu().numpy() if hasattr(act, "detach") else act,
-                      dtype=float)
-
-
 def gen_init_design(objective_run: ObjectiveRun, protocol: Protocol,
                     seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The shared initial design: ``n_init_lines`` random chords through the centroid.
 
     Mirrors the construction in ``optimize.evaluate.gen_init_data``, including
-    realizing each chord through ``physics_simulate_line`` -- these batches really
-    are printed lines, for every method alike. Routed through
-    :class:`ObjectiveRun` so it counts against the budget, and driven by the run
-    seed alone so it is byte-identical across methods at a given seed.
+    realizing each chord as a printed line. Routed through :class:`ObjectiveRun`
+    so it counts against the budget, and driven by the run seed alone so it is
+    byte-identical across methods at a given seed.
     """
     rng = np.random.default_rng(seed)
     dim = objective_run.dim
@@ -423,15 +553,19 @@ def gen_init_design(objective_run: ObjectiveRun, protocol: Protocol,
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="input-noise calibration")
+    ap = argparse.ArgumentParser(description="noise calibration")
     ap.add_argument("--calibrate", action="store_true",
-                    help="regenerate the input-noise calibration table")
+                    help="regenerate both calibration tables")
     ap.add_argument("--n-lines", type=int, default=200)
     ap.add_argument("--dims", type=int, nargs="+", default=[3, 4, 5, 6, 8, 10, 12])
     args = ap.parse_args()
     if args.calibrate:
-        tbl = calibrate_input_noise(dims=tuple(args.dims), n_lines=args.n_lines)
-        for d, v in tbl.items():
-            print(f"d={d:>3}  n={v['n']:>6}  mean_l2={v['mean_l2']:.4f}  "
-                  f"median={v['median_l2']:.4f}  p95={v['p95_l2']:.4f}")
-        print(f"\nwritten to {_CALIB_PATH}")
+        phys = [d for d in args.dims if d <= MAX_PRINTABLE_COMPONENTS]
+        print("physics residual distribution:")
+        for d, v in calibrate_input_noise(dims=tuple(phys), n_lines=args.n_lines).items():
+            print(f"  d={d:>3} mean_l2={v['mean_l2']:.4f} per_comp_std={v['per_component_std']:.4f}")
+        print("\nhardware-matched scales (solved so realized std == NOISE_LEVEL):")
+        for d, v in calibrate_hardware_noise(dims=tuple(args.dims)).items():
+            parts = " ".join(f"{k}: scale={x['scale']:.4f} realized={x['realized_std']:.4f}"
+                             for k, x in v.items())
+            print(f"  d={d:>3} {parts}")

@@ -1,0 +1,86 @@
+{
+  "target_per_component_std": 0.128,
+  "seed": 0,
+  "note": "scale is pre-projection; realized_std is what the samples actually come out at; unperturbed_std is the print model's own contribution (0 for batches)",
+  "dims": {
+    "3": {
+      "batch": {
+        "scale": 0.14596336195245385,
+        "realized_std": 0.12483405727265638,
+        "unperturbed_std": 3.424182279262797e-17
+      },
+      "line": {
+        "scale": 0.13470301823690534,
+        "realized_std": 0.12935463571986158,
+        "unperturbed_std": 0.05349184436161454
+      }
+    },
+    "4": {
+      "batch": {
+        "scale": 0.1592633998952806,
+        "realized_std": 0.12436675523929794,
+        "unperturbed_std": 3.200030506385691e-17
+      },
+      "line": {
+        "scale": 0.14830683777108788,
+        "realized_std": 0.12916027457458235,
+        "unperturbed_std": 0.055190690251861046
+      }
+    },
+    "5": {
+      "batch": {
+        "scale": 0.1728487084619701,
+        "realized_std": 0.13134484220135215,
+        "unperturbed_std": 2.8893802548470177e-17
+      },
+      "line": {
+        "scale": 0.16245155548676848,
+        "realized_std": 0.12733834987190218,
+        "unperturbed_std": 0.04958934788565642
+      }
+    },
+    "6": {
+      "batch": {
+        "scale": 0.18890181044116616,
+        "realized_std": 0.12492440388627302,
+        "unperturbed_std": 2.531393380974484e-17
+      },
+      "line": {
+        "scale": 0.17979707522317767,
+        "realized_std": 0.1257583905374982,
+        "unperturbed_std": 0.046344828294140585
+      }
+    },
+    "8": {
+      "batch": {
+        "scale": 0.2117068418301642,
+        "realized_std": 0.12414168812072825,
+        "unperturbed_std": 2.04674434565297e-17
+      },
+      "line": {
+        "scale": 0.21518021868541837,
+        "realized_std": 0.12555011831634108,
+        "unperturbed_std": 0.04551537794468938
+      }
+    },
+    "10": {
+      "batch": {
+        "scale": 0.26190803991630673,
+        "realized_std": 0.1268472178213818,
+        "unperturbed_std": 2.0692915066511244e-17
+      },
+      "line": {
+        "scale": 0.26296687172725797,
+        "realized_std": 0.12890933148928022,
+        "unperturbed_std": 0.04668361324126182
+      }
+    },
+    "12": {
+      "batch": {
+        "scale": 0.3274827846325934,
+        "realized_std": 0.12956857526242577,
+        "unperturbed_std": 1.7074793393696066e-17
+      }
+    }
+  }
+}

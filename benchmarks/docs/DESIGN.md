@@ -173,3 +173,93 @@ raises `BudgetExhausted` for every method alike.
    answers Aleks directly), and drop HTEM. Do not spend time on the two orphaned
    ZoMBI-paper pickles unless someone wants the 6-D Poisson ladder rung badly
    enough to stand up a legacy-sklearn environment.
+
+---
+
+# Round 2 — protocol revisions
+
+Five changes agreed after the first results. Numbering continues from above.
+
+## 11. Hardware-matched noise is now the primary, not physics-matched
+
+Round 1 calibrated the baselines' input noise to the *physics simulator*
+(mean L2 0.066-0.113). That equalised the two sides, but at the wrong level: the
+printer was measured at 0.27 L2 / 0.128 per component, ~2.5-4x noisier, and ~87%
+of the real residual is **perpendicular to the requested line** — a component a
+ramp-lag/diffusion model cannot produce at all. Meanwhile ZoMBI-Hop is *told*
+`input_noise=0.128`, so testing it in a world three times quieter than that makes
+it over-conservative for no reason.
+
+`Protocol.noise` is now a three-way switch:
+
+| mode | lines | batch points | role |
+|---|---|---|---|
+| `hardware` | print model + random residual | random | **primary** |
+| `physics` | print model only | bootstrapped from the print model's residuals | sensitivity |
+| `none` | clean segment | clean, and output noise off | control |
+
+In `hardware` mode the perturbation scale is **solved**, not assumed:
+`calibrate_hardware_noise` bisects until the *realized* per-component std of
+`X_actual - X_requested` equals `NOISE_LEVEL`. Injecting `N(0, 0.128)` and
+projecting back to the simplex lands well below 0.128 because projection clips, so
+"we injected 0.128" and "the samples really are 0.128 off" are different claims and
+only the second is what NOISE_LEVEL means. A test asserts the realized value, and
+every run records `realized_noise_std`.
+
+## 12. ZoMBI-Hop's needle count has a structural ceiling; report it as a curve
+
+"Why only 7 needles" is mostly arithmetic. With `max_zooms=3, max_iterations=2,
+min_zoom_for_needle=1, min_iters_per_zoom=2` an activation must spend 4-6 lines
+before it may declare anything, so ~42 lines (N=1000) buys at most 7-10 needles
+regardless of the landscape. Covering 24 optima needs ~100-150 lines. Reading a low
+`peak_ratio` as a search failure when it is a declaration budget is the easiest
+mistake this benchmark invites, so every ZoMBI-Hop run now emits a
+`needles_declared(t)` curve, and the budget sweep (below) is what separates the two
+explanations.
+
+## 13. Hyperparameter default switched to the JSON, with the stale value as a sensitivity
+
+`optimize/hparams/6d_ensemble.json` has `n_consecutive_converged=2`;
+`src/default_hparams.py`, which says it is a verbatim copy, still has 5. The JSON is
+the value the 6-D campaign actually ran, so it is the benchmark default
+(`zombihop`); 5 runs as `zombihop_nc5`. Reported upstream in `UPSTREAM_REQUESTS.md`.
+
+## 14. Reference optima must have measured support
+
+`detect_peaks` keeps anything rising 12% from the GP median to the max, which is
+why only 15% (3-D) / 46% (4-D) of "true optima" cleared random's p99 — most were GP
+wiggles between measurements. `benchmarks/zhbench/landscapes.py` raises prominence
+to 0.3 **and** requires at least one real campaign sample within `r` whose measured
+objective is close to the peak's predicted value. A GP bump with no measurement
+behind it is not a discovered material. `n_true` is reported at both prominence
+levels so the change is visible rather than asserted.
+
+This also gave the 6-D campaign a peak finder that works at all: the upstream
+lattice search is O(n^(d-1)) and is already coarse at d=4.
+
+## 15. Budget is a curve, not an endpoint
+
+Metrics are evaluated at N in {250, 500, 1000, 2000} by prefix, from a single
+2000-sample run — nothing about a prefix depends on what came after it. At N=1000
+uniform random puts ~9 samples within r=0.05 of any point on the 2-simplex, so 3-D
+is a saturated test at that budget and the small-N columns are where it
+discriminates. Declared sets are snapshotted at each checkpoint, so ZoMBI-Hop is
+scored on the needles it had actually committed to by then.
+
+## 16. A diversity-friendly BO baseline
+
+`gp_ts` — batch Thompson sampling via `MaxPosteriorSampling` on the same GP and
+candidate pool. qUCB and qLogEI are greedy by construction, so without TS the
+finding "standard BO recovers fewer optima" could be read as "qUCB is greedy".
+TuRBO and ROBOT cover the same objection more thoroughly later.
+
+## 17. real6d, on the full simplex
+
+`data/4th_real_run.db` (2423 rows / 111 iterations, 2042 scored across 109 lines;
+components FAPbI3, CsPbI3, FAPbBr3, MACl, MAPbI3, MAPbBr3). The apparent per-component
+ceilings (MACl 0.412, FAPbI3 0.515) are **not** a search box: of 218 line endpoints
+only 7 sit within 0.02 of a component max — exactly one per component, i.e. only the
+point that defines it — while 92 endpoints have a component at zero. LineBO presses
+against the zero faces constantly and never against an upper face. Built on the full
+simplex; `landscapes.unsupported_mask` reports what fraction of a run's samples fell
+in regions the campaign never measured, so a result driven by extrapolation is visible.

@@ -13,7 +13,11 @@ _SPECS: dict[str, dict] = {
     "random": {},
     "gp_qucb": {"kind": "ucb"},
     "gp_qlogei": {"kind": "logei"},
+    "gp_ts": {},
     "zombihop": {},
+    # n_consecutive_converged=5 sensitivity: the value src/default_hparams.py
+    # still carries, versus the 2 the 6-D campaign actually ran with.
+    "zombihop_nc5": {"n_consecutive_converged": 5},
 }
 
 
@@ -28,7 +32,10 @@ def _resolve(name: str):
     if name in ("gp_qucb", "gp_qlogei"):
         from .gp import GPBatch
         return GPBatch
-    if name == "zombihop":
+    if name == "gp_ts":
+        from .gp import GPThompson
+        return GPThompson
+    if name in ("zombihop", "zombihop_nc5"):
         from ..zombihop_runner import ZoMBIHopRunner
         return ZoMBIHopRunner
     raise ValueError(f"unknown optimizer {name!r}; available: {available()}")

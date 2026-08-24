@@ -335,13 +335,43 @@ def lift_over_random(value: float, random_value: float) -> float:
 
 # --- top-level assembly ------------------------------------------------------
 
-def compute_all(run, objective, declared=None, wall_s: float | None = None,
-                value_tol: float = 0.25) -> dict:
-    """Every metric for one finished run.
+def needles_declared_curve(declared_at, n_samples: int, step: int = 24
+                           ) -> tuple[list, list]:
+    """Cumulative count of declared optima against samples spent.
+
+    Worth plotting for ZoMBI-Hop because its needle count has a structural ceiling
+    that has nothing to do with the landscape: with ``max_zooms=3, max_iterations=2,
+    min_zoom_for_needle=1, min_iters_per_zoom=2`` an activation must spend 4-6 lines
+    before it is allowed to declare anything, so ~42 lines (N=1000) buys at most
+    7-10 needles no matter how many optima exist. Reading a low ``peak_ratio`` as a
+    search failure, when it is really a declaration budget, is the single easiest
+    mistake to make with this benchmark.
+    """
+    at = np.asarray(sorted(declared_at), dtype=float) if len(declared_at) else np.empty(0)
+    grid = list(range(0, int(n_samples) + 1, int(step)))
+    return grid, [int((at <= t).sum()) for t in grid]
+
+
+def _score_prefix(X, y_obs, y_true, T, tv, S, r, value_tol) -> dict:
+    """The metric block for one prefix of a run."""
+    out = solution_set_scores(S, T, tv, r=r)
+    first = reached_flags(X, y_true, T, tv, r=r, value_tol=value_tol)
+    out["reached_ratio"] = float(np.isfinite(first).sum() / T.shape[0]) if T.shape[0] else float("nan")
+    out["n_reached"] = int(np.isfinite(first).sum())
+    out["best_y"] = float(y_true.max()) if y_true.size else float("nan")
+    out["input_cost"] = input_cost(X)
+    return out
+
+
+def compute_all(run, objective, declared=None, declared_at=None,
+                wall_s: float | None = None, value_tol: float = 0.25) -> dict:
+    """Every metric for one finished run, at the endpoint and at each prefix.
 
     ``run`` is a :class:`~.protocol.ObjectiveRun`; ``objective`` is a
     :class:`~.objectives.Objective`; ``declared`` is the method's own solution set
-    or None, in which case one is extracted post hoc.
+    or None, in which case one is extracted post hoc; ``declared_at`` is the sample
+    index at which each declared optimum was declared, so prefixes can be scored
+    with only the optima the method had actually committed to by then.
     """
     h = run.stacked()
     X, y_obs, y_true = h["X_actual"], h["y_observed"], h["y_true"]
@@ -353,6 +383,33 @@ def compute_all(run, objective, declared=None, wall_s: float | None = None,
     S = _as2d(declared) if declared_is_own else S_posthoc
 
     out: dict = {"declared_source": "method" if declared_is_own else "posthoc"}
+
+    # -- the same metrics at each budget checkpoint ---------------------------
+    # One 2000-sample run answers "what would N=250 have looked like", because
+    # every method is fed the same stream and nothing about a prefix depends on
+    # what came after it. 3-D is saturated by uniform sampling long before
+    # N=1000 -- ~9 random samples land within r of any given point -- so the small
+    # -N columns are the ones that discriminate there.
+    by_n: dict[str, dict] = {}
+    at_arr = (np.asarray(declared_at, dtype=float)
+              if declared_at is not None and len(declared_at) else None)
+    for n in run.protocol.eval_at:
+        if n > run.n_samples:
+            continue
+        m = int(n)
+        Xp, yop, ytp = X[:m], y_obs[:m], y_true[:m]
+        if declared_is_own:
+            keep = (int((at_arr <= m).sum()) if at_arr is not None
+                    else S.shape[0])
+            Sp = S[:keep]
+        else:
+            Sp = posthoc_solution_set(Xp, yop, k=max(T.shape[0], 1), min_sep=2.0 * r)
+        by_n[str(m)] = _score_prefix(Xp, yop, ytp, T, tv, Sp, r, value_tol)
+    out["by_n"] = by_n
+    for m, blk in by_n.items():
+        for k in ("peak_ratio", "precision", "f1", "reached_ratio", "best_y",
+                  "n_declared"):
+            out[f"{k}@{m}"] = blk[k]
     out.update(solution_set_scores(S, T, tv, r=r))
     # Always report the post-hoc set too, so ZoMBI-Hop's declarations can be
     # compared against what its own samples would have supported.
@@ -388,6 +445,9 @@ def compute_all(run, objective, declared=None, wall_s: float | None = None,
         "reached_curve_ratio": ratio.tolist(),
     })
 
+    nd_t, nd_n = needles_declared_curve(
+        declared_at if declared_at is not None else [], run.protocol.n_samples,
+        step=run.protocol.batch_size)
     out.update({
         "best_y": float(y_true.max()) if y_true.size else float("nan"),
         "input_cost": input_cost(X),
@@ -395,6 +455,9 @@ def compute_all(run, objective, declared=None, wall_s: float | None = None,
         "n_samples": int(run.n_samples),
         "n_truncated": int(run.n_truncated),
         "n_batches": int(run.batch_idx),
+        "realized_noise_std": run.realized_noise_std(),
+        "needles_curve_t": nd_t,
+        "needles_curve_n": nd_n,
     })
     if wall_s is not None:
         out["wall_s"] = float(wall_s)

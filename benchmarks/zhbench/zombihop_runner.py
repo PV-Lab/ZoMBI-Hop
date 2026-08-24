@@ -29,20 +29,37 @@ _HPARAM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "
 def load_hparams(name: str | None, dim: int) -> tuple[dict, str]:
     """Resolve a hyperparameter set and say where it came from.
 
-    ``None`` picks the best available for ``dim``: the tuned per-dimension sets
-    transcribed from ``warm_start/BEST_HPARAMS.md`` for d=3 and d=4, otherwise
-    ``src.default_hparams.DEFAULT_HPARAMS`` (the 6-D MOBO ensemble winner, which is
-    the production default).
+    ``None`` picks the tuned per-dimension set for ``dim`` if one exists
+    (transcribed from ``warm_start/BEST_HPARAMS.md`` for d=3 and d=4), otherwise
+    ``optimize/hparams/6d_ensemble.json`` -- the 6-D MOBO ensemble winner.
+
+    Note that is the JSON, **not** ``src.default_hparams.DEFAULT_HPARAMS``, even
+    though the latter's docstring says it is "copied verbatim" from that file.
+    They have drifted: the JSON has ``n_consecutive_converged=2`` (Brianna loosened
+    it after the 6-D campaign, commit c4a9358) while ``default_hparams.py`` still
+    says 5. The JSON is the live value the campaign actually ran, so it is the
+    benchmark default; 5 is available as the ``zombihop_nc5`` sensitivity. Reported
+    upstream in ``benchmarks/UPSTREAM_REQUESTS.md``.
     """
     if name is None:
         cand = os.path.join(_HPARAM_DIR, f"{dim}d.json")
-        name = f"{dim}d" if os.path.exists(cand) else "default"
-    if name == "default":
+        name = f"{dim}d" if os.path.exists(cand) else "6d_ensemble"
+    if name == "stale_default":
         from src.default_hparams import DEFAULT_HPARAMS, DEFAULT_HPARAMS_PROVENANCE
-        return dict(DEFAULT_HPARAMS), f"src.default_hparams ({DEFAULT_HPARAMS_PROVENANCE})"
-    path = name if os.path.isabs(name) else os.path.join(_HPARAM_DIR, f"{name}.json")
+        return (dict(DEFAULT_HPARAMS),
+                f"src.default_hparams (claims {DEFAULT_HPARAMS_PROVENANCE}; STALE COPY)")
+    if name == "6d_ensemble":
+        from ._repo import REPO_ROOT
+        path = os.path.join(REPO_ROOT, "optimize", "hparams", "6d_ensemble.json")
+    elif os.path.isabs(name):
+        path = name
+    else:
+        path = os.path.join(_HPARAM_DIR, f"{name}.json")
     with open(path, encoding="utf-8") as fh:
         hp = json.load(fh)
+    # optimize/hparams/*.json nest the values under a "hparams" key.
+    if "hparams" in hp and isinstance(hp["hparams"], dict):
+        hp = hp["hparams"]
     return hp, path
 
 

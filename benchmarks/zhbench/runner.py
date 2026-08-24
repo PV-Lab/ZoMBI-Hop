@@ -82,7 +82,9 @@ def run_one(objective_spec: dict, optimizer_spec: dict, seed: int,
         wall = time.time() - t0
 
     declared = optimizer.declared_optima()
-    result = M.compute_all(run, objective, declared=declared, wall_s=wall,
+    declared_at = [row["sample_idx"] for row in getattr(optimizer, "needle_log", [])]
+    result = M.compute_all(run, objective, declared=declared,
+                           declared_at=declared_at or None, wall_s=wall,
                            value_tol=value_tol)
     result.update({
         "objective": objective.name,

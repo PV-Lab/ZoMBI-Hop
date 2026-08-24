@@ -30,7 +30,6 @@ Two honesty notes that belong next to the data, not buried in a report:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Callable
 
 import numpy as np
@@ -112,35 +111,45 @@ def make_ensemble(dim: int = 3, n_optima: int | None = None, landscape: int = 0,
 
 # --- real campaigns: full-campaign GP surrogates ------------------------------
 
-@lru_cache(maxsize=4)
-def _fullgp(dim: int) -> dict:
-    from warm_start.warm_gp_landscape import fullgp_objective
-    return fullgp_objective(int(dim))
+def make_real_gp(dim: int, prominence: float | None = None) -> Objective:
+    """GP fit to the whole real campaign; reference optima are its supported peaks.
 
+    d=3 ``data/2nd_real_run.db`` (41 lines / 953 rows, 644 scored)
+    d=4 ``data/3rd_real_run.db`` (61 lines / 1358 rows, 1224 scored)
+    d=6 ``data/4th_real_run.db`` (111 lines / 2423 rows, 2042 scored across 109 lines)
 
-def make_real_gp(dim: int) -> Objective:
-    """GP fit to the whole real campaign; reference optima are its detected peaks.
+    All three are gitignored. ``data/2nd_real_run.db`` is recoverable with
+    ``git show origin/evelyn-compositional:data/2nd_real_run.db > data/2nd_real_run.db``;
+    the other two came from Colin.
 
-    d=3 reads ``data/2nd_real_run.db`` (41 lines / 953 rows, 644 scored).
-    d=4 reads ``data/3rd_real_run.db`` (61 lines / 1358 rows, 1224 scored).
-    Both are gitignored; ``data/2nd_real_run.db`` is recoverable with
-    ``git show origin/evelyn-compositional:data/2nd_real_run.db > data/2nd_real_run.db``.
+    d=6 is built on the **full simplex**. The campaign's per-component maxima
+    (MACl 0.412, FAPbI3 0.515) look like a search box but are not one: of 218 line
+    endpoints only 7 sit within 0.02 of a component maximum -- exactly one per
+    component, i.e. only the point that defines it -- while 92 endpoints have a
+    component at zero. LineBO presses against the zero faces constantly and never
+    against an upper face, which is what a real box would have produced. If Brianna
+    confirms a box was used after all, restrict here.
     """
-    L = _fullgp(int(dim))
-    fn = L["fn"]
-    P = np.asarray(L["peaks"], dtype=float)
-    V = np.asarray([float(fn(p)) for p in P], dtype=float)
+    from . import landscapes as LS
+
+    prom = LS.DEFAULT_PROMINENCE if prominence is None else float(prominence)
+    L = LS.campaign_landscape(int(dim), prominence_frac=prom)
+    predict = L.predict
+
+    def fn(x, _p=predict):
+        return float(_p(np.asarray(x, dtype=float).reshape(1, -1))[0])
+
     return Objective(
         name=f"real{dim}d",
         dim=int(dim),
         fn=fn,
-        true_optima=P,
-        true_values=V,
+        true_optima=L.peaks,
+        true_values=L.peak_values,
         maximize=True,
         domain="simplex",
-        meta={"kind": "real_gp", "n_campaign_points": int(L["n_points"]),
-              "n_campaign_lines": int(L["n_lines"]),
-              "reference": "surrogate peaks, not hardware-validated"},
+        meta={"kind": "real_gp",
+              "reference": "supported surrogate peaks; NOT hardware-validated",
+              **L.diagnostics},
     )
 
 

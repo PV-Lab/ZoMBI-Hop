@@ -14,7 +14,7 @@ _ENS3 = {"kind": "ensemble", "dim": 3, "n_optima": 5, "landscape": 0, "seed": 0}
 
 
 def _p(n=96):
-    return Protocol(n_samples=n, batch_size=24, input_noise="empirical")
+    return Protocol(n_samples=n, batch_size=24, noise="hardware")
 
 
 def test_every_optimizer_spends_exactly_the_budget(tmp_path):
@@ -41,7 +41,7 @@ def test_all_methods_share_the_initial_design(tmp_path):
 
 def test_zombihop_declares_and_stops_in_budget(tmp_path):
     res = run_one(_ENS3, {"name": "zombihop", "hparams": "smoke"}, seed=0,
-                  protocol=Protocol(n_samples=240, batch_size=24, input_noise="none"),
+                  protocol=Protocol(n_samples=240, batch_size=24, noise="none"),
                   out_dir=str(tmp_path / "zh"))
     assert res["n_samples"] == 240
     assert res["declared_source"] == "method"
@@ -52,7 +52,7 @@ def test_zombihop_pays_a_far_lower_input_cost_than_a_scattered_batch(tmp_path):
     """ZoMBI-Hop prints contiguous lines; a batch baseline scatters. This is the
     physical advantage the benchmark deliberately does NOT charge the baselines
     for, so it has to be measured instead."""
-    p = Protocol(n_samples=240, batch_size=24, input_noise="none")
+    p = Protocol(n_samples=240, batch_size=24, noise="none")
     zh = run_one(_ENS3, {"name": "zombihop", "hparams": "smoke"}, seed=0, protocol=p,
                  out_dir=str(tmp_path / "zh"))
     rd = run_one(_ENS3, {"name": "random"}, seed=0, protocol=p,
@@ -67,7 +67,7 @@ def test_random_does_not_saturate_the_metric():
     spec = {"kind": "ensemble", "dim": 3, "n_optima": 20, "landscape": 0, "seed": 0}
     res = run_one(spec, {"name": "random"}, seed=0,
                   protocol=Protocol(n_samples=1000, batch_size=24,
-                                    input_noise="empirical"))
+                                    noise="hardware"))
     assert res["peak_ratio"] < 1.0
 
 

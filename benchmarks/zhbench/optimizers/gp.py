@@ -111,3 +111,42 @@ class GPBatch(BaseOptimizer):
                 chosen.append(int(np.argmax(vals)))
         self._n_suggest += 1
         return pool[np.asarray(chosen, dtype=int)]
+
+
+class GPThompson(GPBatch):
+    """Batch Thompson sampling over the same GP and candidate pool.
+
+    qUCB and qLogEI are greedy by construction: they concentrate a batch where the
+    posterior mean is already high, so "standard BO recovers fewer optima than
+    ZoMBI-Hop" risks being read as "qUCB is greedy" rather than as a statement
+    about BO. Thompson sampling draws each batch member from a different posterior
+    realisation, so it spreads across modes the posterior thinks are plausible --
+    the cheapest genuinely diversity-friendly BO baseline available. TuRBO and
+    ROBOT cover the same objection more thoroughly later.
+
+    ``replacement=False`` so a batch cannot be 24 copies of one point.
+    """
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("kind", "ucb")     # unused; TS has no acquisition
+        super().__init__(**kwargs)
+        self.name = "gp_ts"
+
+    def suggest(self, q: int) -> np.ndarray:
+        import torch
+        from botorch.generation import MaxPosteriorSampling
+
+        q = int(q)
+        rng = np.random.default_rng(self.seed + 5_000_011 + self._n_suggest)
+        pool = self._sample_domain(self.pool_size, rng=rng)
+        model = self._fit(torch)
+        Zpool = torch.as_tensor(self._to_model_space(pool), dtype=torch.double)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            torch.manual_seed(self.seed + self._n_suggest)
+            sampler = MaxPosteriorSampling(model=model, replacement=False)
+            chosen = sampler(Zpool, num_samples=q)
+        self._n_suggest += 1
+        # Map the chosen model-space rows back to their pool compositions.
+        idx = torch.cdist(chosen, Zpool).argmin(dim=1).cpu().numpy()
+        return pool[idx]

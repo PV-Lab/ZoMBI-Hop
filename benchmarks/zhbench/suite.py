@@ -3,7 +3,7 @@
 A suite config is YAML:
 
     name: smoke
-    protocol: {n_samples: 240, batch_size: 24, input_noise: empirical}
+    protocol: {n_samples: 240, batch_size: 24, noise: hardware}
     seeds: [0]
     objectives:
       - {kind: ensemble, dim: 3, n_optima: 5, landscape: 0}
@@ -32,7 +32,9 @@ import yaml
 from .protocol import Protocol
 from .runner import run_one
 
-_CURVE_KEYS = ("reached_curve_t", "reached_curve_ratio")
+_CURVE_KEYS = ("reached_curve_t", "reached_curve_ratio",
+               "pr_curve_k", "pr_curve_peak_ratio", "pr_curve_precision",
+               "needles_curve_t", "needles_curve_n", "by_n")
 
 
 def _obj_label(spec: dict) -> str:
@@ -43,7 +45,23 @@ def _obj_label(spec: dict) -> str:
     return " ".join(parts)
 
 
-def run_suite(config: dict, out_root: str, resume: bool = True) -> str:
+def _run_cell(job: dict) -> tuple[str, dict]:
+    """One (objective, optimizer, seed). Module-level so it survives pickling to a
+    worker process on Windows spawn."""
+    try:
+        res = run_one(job["objective"], job["optimizer"], job["seed"],
+                      Protocol(**job["protocol"]), out_dir=job["run_dir"],
+                      value_tol=job["value_tol"])
+    except Exception as exc:
+        traceback.print_exc()
+        res = {"objective": _obj_label(job["objective"]),
+               "optimizer": job["optimizer"]["name"], "seed": job["seed"],
+               "error": f"{type(exc).__name__}: {exc}"}
+    return job["cell"], res
+
+
+def run_suite(config: dict, out_root: str, resume: bool = True,
+              workers: int = 1) -> str:
     name = config.get("name", "suite")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     suite_dir = os.path.join(out_root, f"{name}_{stamp}")
@@ -57,6 +75,7 @@ def run_suite(config: dict, out_root: str, resume: bool = True) -> str:
 
     rows: list[dict] = []
     curves: dict[str, list] = {}
+    jobs: list[dict] = []
     for obj_spec in config["objectives"]:
         for opt_spec in config["optimizers"]:
             for seed in seeds:
@@ -68,19 +87,32 @@ def run_suite(config: dict, out_root: str, resume: bool = True) -> str:
                     with open(done, encoding="utf-8") as fh:
                         res = json.load(fh)
                     print(f"[skip] {cell}")
-                else:
-                    print(f"[run ] {cell}", flush=True)
-                    try:
-                        res = run_one(obj_spec, opt_spec, seed,
-                                      Protocol(**protocol_kwargs), out_dir=run_dir,
-                                      value_tol=value_tol)
-                    except Exception as exc:
-                        traceback.print_exc()
-                        res = {"objective": _obj_label(obj_spec),
-                               "optimizer": opt_spec["name"], "seed": seed,
-                               "error": f"{type(exc).__name__}: {exc}"}
+                    curves[cell] = {k: res.get(k) for k in _CURVE_KEYS}
+                    rows.append({k: v for k, v in res.items() if k not in _CURVE_KEYS})
+                    continue
+                jobs.append({"cell": cell, "run_dir": run_dir, "objective": obj_spec,
+                             "optimizer": opt_spec, "seed": seed,
+                             "protocol": protocol_kwargs, "value_tol": value_tol})
+
+    if workers > 1 and len(jobs) > 1:
+        # Each run is independent and CPU-bound, so processes (not threads) are the
+        # right unit: BoTorch fits hold the GIL. Worker startup is ~4 s of torch
+        # import, which is noise against a 1000-sample run.
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        print(f"running {len(jobs)} cells on {workers} workers", flush=True)
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_run_cell, j): j["cell"] for j in jobs}
+            for i, fut in enumerate(as_completed(futures), 1):
+                cell, res = fut.result()
+                print(f"[{i}/{len(jobs)}] {cell}", flush=True)
                 curves[cell] = {k: res.get(k) for k in _CURVE_KEYS}
                 rows.append({k: v for k, v in res.items() if k not in _CURVE_KEYS})
+    else:
+        for j in jobs:
+            print(f"[run ] {j['cell']}", flush=True)
+            cell, res = _run_cell(j)
+            curves[cell] = {k: res.get(k) for k in _CURVE_KEYS}
+            rows.append({k: v for k, v in res.items() if k not in _CURVE_KEYS})
 
     _write_aggregate(suite_dir, rows)
     with open(os.path.join(suite_dir, "curves.json"), "w", encoding="utf-8") as fh:
@@ -154,6 +186,8 @@ def main(argv=None) -> int:
     ap.add_argument("config", help="path to a suite YAML (or a name under configs/)")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(here), "runs"))
     ap.add_argument("--no-resume", action="store_true")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallel processes; each cell is independent")
     args = ap.parse_args(argv)
 
     path = args.config
@@ -161,7 +195,7 @@ def main(argv=None) -> int:
         path = os.path.join(here, "configs", f"{args.config}.yaml")
     with open(path, encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh)
-    run_suite(cfg, args.out, resume=not args.no_resume)
+    run_suite(cfg, args.out, resume=not args.no_resume, workers=args.workers)
     return 0
 
 
