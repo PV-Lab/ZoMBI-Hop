@@ -80,9 +80,9 @@ def fig_reached(rows, curves, suite_dir, objectives) -> str:
                              squeeze=False)
     for ax, obj in zip(axes[0], objectives):
         for o in opts:
-            cs = [c for k, c in curves.items()
-                  if k.startswith(obj.replace(" ", "_").replace("=", ""))
-                  and f"__{o}__" in k and c.get("reached_curve_ratio")]
+            cs = [c for c in curves.values()
+                  if c.get("objective") == obj and c.get("optimizer") == o
+                  and c.get("reached_curve_ratio")]
             if not cs:
                 continue
             t = np.asarray(cs[0]["reached_curve_t"], dtype=float)
@@ -152,10 +152,10 @@ def fig_matched_declarations(rows, curves, suite_dir, objectives) -> str:
     fig, axes = plt.subplots(1, len(objectives), figsize=(5.2 * len(objectives), 4.2),
                              squeeze=False)
     for ax, obj in zip(axes[0], objectives):
-        prefix = obj.replace(" ", "_").replace("=", "")
         for o in opts:
-            cs = [c for k, c in curves.items()
-                  if k.startswith(prefix) and f"__{o}__" in k and c.get("pr_curve_k")]
+            cs = [c for c in curves.values()
+                  if c.get("objective") == obj and c.get("optimizer") == o
+                  and c.get("pr_curve_k")]
             if not cs:
                 continue
             n = min(len(c["pr_curve_k"]) for c in cs)
@@ -196,10 +196,10 @@ def fig_needles(rows, curves, suite_dir, objectives) -> str | None:
     fig, ax = plt.subplots(figsize=(6.4, 4.2))
     any_line = False
     for obj in objectives:
-        prefix = obj.replace(" ", "_").replace("=", "")
         for o in zh:
-            cs = [c for k, c in curves.items()
-                  if k.startswith(prefix) and f"__{o}__" in k and c.get("needles_curve_n")]
+            cs = [c for c in curves.values()
+                  if c.get("objective") == obj and c.get("optimizer") == o
+                  and c.get("needles_curve_n")]
             if not cs:
                 continue
             n = min(len(c["needles_curve_t"]) for c in cs)

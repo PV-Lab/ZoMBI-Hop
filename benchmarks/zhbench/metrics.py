@@ -26,10 +26,10 @@ Three groups:
   C. Cost and hygiene -- SnAKe input-change cost, duplicate fraction, wall clock.
 
 Plus ``landscape_contrast``, which reports how discriminative an objective
-actually is. This matters: the real 3-D campaign GP has 24 detected peaks but only
-4 of them clear the 99th percentile of uniform random sampling, so a high
-``peak_ratio`` there means much less than the same number on a sharp synthetic
-landscape. Reporting it stops the suite from over-claiming.
+actually is. This matters: only 0.21 of the real 3-D campaign's reference peaks
+clear the 99th percentile of uniform random sampling, against 0.52 at 4-D and 0.75
+at 6-D, so the same ``peak_ratio`` means very different things on the three
+campaigns. Reporting it stops the suite from over-claiming.
 
 A note on comparing across dimensions, which the team has flagged twice (Brianna:
 "any distance based metrics can't be compared directly ... the metrics are more
@@ -267,6 +267,12 @@ def input_cost(X) -> float:
     is the physical price a batch baseline would pay in the lab but does not pay in
     this benchmark, so measuring it is how we stay honest about the advantage the
     baselines are being given.
+
+    Pass **requested** compositions, not realized ones. The machine executes what it
+    was commanded to; the realization error is a deposition artifact that costs no
+    extra syringe travel. Scoring the realized path instead makes hardware-level
+    noise look like movement cost and erases most of the line-vs-batch difference
+    -- which is exactly what it did before this was fixed.
     """
     X = _as2d(X)
     if X.shape[0] < 2:
@@ -352,14 +358,14 @@ def needles_declared_curve(declared_at, n_samples: int, step: int = 24
     return grid, [int((at <= t).sum()) for t in grid]
 
 
-def _score_prefix(X, y_obs, y_true, T, tv, S, r, value_tol) -> dict:
+def _score_prefix(X, X_req, y_obs, y_true, T, tv, S, r, value_tol) -> dict:
     """The metric block for one prefix of a run."""
     out = solution_set_scores(S, T, tv, r=r)
     first = reached_flags(X, y_true, T, tv, r=r, value_tol=value_tol)
     out["reached_ratio"] = float(np.isfinite(first).sum() / T.shape[0]) if T.shape[0] else float("nan")
     out["n_reached"] = int(np.isfinite(first).sum())
     out["best_y"] = float(y_true.max()) if y_true.size else float("nan")
-    out["input_cost"] = input_cost(X)
+    out["input_cost"] = input_cost(X_req)
     return out
 
 
@@ -375,6 +381,7 @@ def compute_all(run, objective, declared=None, declared_at=None,
     """
     h = run.stacked()
     X, y_obs, y_true = h["X_actual"], h["y_observed"], h["y_true"]
+    X_req = h["X_requested"]
     T, tv = merge_true_optima(objective.true_optima, objective.true_values)
     r = match_radius()
 
@@ -397,14 +404,14 @@ def compute_all(run, objective, declared=None, declared_at=None,
         if n > run.n_samples:
             continue
         m = int(n)
-        Xp, yop, ytp = X[:m], y_obs[:m], y_true[:m]
+        Xp, Xrp, yop, ytp = X[:m], X_req[:m], y_obs[:m], y_true[:m]
         if declared_is_own:
             keep = (int((at_arr <= m).sum()) if at_arr is not None
                     else S.shape[0])
             Sp = S[:keep]
         else:
             Sp = posthoc_solution_set(Xp, yop, k=max(T.shape[0], 1), min_sep=2.0 * r)
-        by_n[str(m)] = _score_prefix(Xp, yop, ytp, T, tv, Sp, r, value_tol)
+        by_n[str(m)] = _score_prefix(Xp, Xrp, yop, ytp, T, tv, Sp, r, value_tol)
     out["by_n"] = by_n
     for m, blk in by_n.items():
         for k in ("peak_ratio", "precision", "f1", "reached_ratio", "best_y",
@@ -450,7 +457,7 @@ def compute_all(run, objective, declared=None, declared_at=None,
         step=run.protocol.batch_size)
     out.update({
         "best_y": float(y_true.max()) if y_true.size else float("nan"),
-        "input_cost": input_cost(X),
+        "input_cost": input_cost(h["X_requested"]),
         "dup_fraction": dup_fraction(X, dim=objective.dim),
         "n_samples": int(run.n_samples),
         "n_truncated": int(run.n_truncated),

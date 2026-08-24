@@ -39,9 +39,10 @@ quietly become a wrong benchmark.
 
 What the plate measures -- and the hole in the middle
 -----------------------------------------------------
-Each plate is *exactly* the set of 0.1-lattice compositions with at most four
-nonzero components -- verified, not assumed: the 2121 rows are identical as a set
-to the 2121 points of ``simplex_lattice(10, 6)`` that have <= 4 nonzero entries::
+Each plate is the set of 0.1-lattice compositions with at most four nonzero
+components -- verified row by row against ``simplex_lattice(10, 6)``, not assumed.
+Plates 3496 and 4098 are complete; 3851 and 3860 are missing one and two rows
+respectively (2119 / 2120), presumably failed measurements. For 3496::
 
     6     unary        (one component at 1.0)
     135   binary       C(6,2) x 9
@@ -123,6 +124,29 @@ actually has.
 Because they survive, every reference optimum of ``oer6d`` is a real measured
 composition with a real measured overpotential. That is more than ``real3d`` /
 ``real4d`` can say, and it is the strongest argument for including this objective.
+
+Two consequences worth stating before anyone reads a score. Every reference
+optimum has two or three zero components, since the plate never measured anything
+else -- so they all sit on the simplex boundary, and a method that stays in the
+interior scores zero by construction (uniform Dirichlet search at a 1000-sample
+budget gets ``peak_ratio`` 0.00). And the basins are wide: on plate 3496 the
+measured rows within 0.15 of a reference optimum still average 0.73 of its
+prominence. :func:`basin_profile` measures that on the raw rows precisely so it
+cannot be blamed on the surrogate's smoothing.
+
+How the four plates compare (``--report --plate all``)::
+
+    plate  rf kfold R^2  rf face R^2  peaks  contrast  basin@0.15
+    3496       0.800        0.700       10     0.400      0.73
+    3851       0.711        0.525       38     0.237      0.24
+    3860       0.917        0.885       17     0.529      0.63
+    4098       0.706        0.678       14     0.143      0.24
+
+3496 is the default because it is the largest complete plate with a mid-range
+contrast; 3851 and 4098 are sharper landscapes but compressed in range, and 3860
+is by far the most predictable. ``contrast`` here is the fraction of reference
+optima above the 99th percentile of uniform simplex sampling -- the same statistic
+``objectives.py`` quotes for the campaign GPs (0.17 at 3-D, 0.46 at 4-D).
 
 Cost
 ----
@@ -275,18 +299,21 @@ def composition_audit(X: np.ndarray, over: np.ndarray) -> dict:
 
     ``frac_quinary_senary`` answers "the 5- and 6-component interactions are all
     theoretical" directly: it is 0.0 on every plate, i.e. worse than theoretical --
-    unmeasured. ``is_exactly_low_order_lattice`` checks the stronger structural
-    claim, that the plate IS the <= 4-nonzero part of the 0.1 lattice with nothing
-    missing and nothing extra; if that ever fails the counts below still hold but
-    the "measure-zero subset" framing would need revisiting.
+    unmeasured. ``frac_plate_lattice_unmeasured`` is the coverage number that
+    follows, counted against the plate's OWN lattice rather than assumed from the
+    nonzero-count histogram, so the one or two rows plates 3851/3860 are missing
+    show up as gaps instead of being rounded away.
+    ``covers_all_low_order`` records whether the plate is the complete <= 4-nonzero
+    part of that lattice; it is False for exactly those two plates.
     """
     nnz = (X > 1e-9).sum(axis=1)
-    counts = {int(k): int((nnz == k).sum()) for k in range(1, DIM + 1)}
+    counts = [int((nnz == k).sum()) for k in range(1, DIM + 1)]
     coarse = simplex_lattice(GRID_N, DIM)
     c_nnz = (coarse > 1e-9).sum(axis=1)
     fine = simplex_lattice(FINE_GRID_N, DIM)
     f_nnz = (fine > 1e-9).sum(axis=1)
-    lo = {tuple(v) for v in np.round(coarse[c_nnz <= 4], 6)}
+    measured = {tuple(v) for v in np.round(X, 6)}
+    on_lattice = np.asarray([tuple(v) in measured for v in np.round(coarse, 6)])
     return {
         "n_rows": int(X.shape[0]),
         "n_unique_compositions": int(np.unique(np.round(X, 9), axis=0).shape[0]),
@@ -294,15 +321,15 @@ def composition_audit(X: np.ndarray, over: np.ndarray) -> dict:
         "row_sum_max": float(X.sum(1).max()),
         "levels_per_component": [int(np.unique(np.round(X[:, j], 6)).size)
                                  for j in range(DIM)],
-        "n_by_nonzero_components": counts,
-        "n_quinary_senary": counts.get(5, 0) + counts.get(6, 0),
+        "n_by_nonzero_components": counts,      # index k-1 == k nonzero components
+        "n_quinary_senary": counts[4] + counts[5],
         "frac_quinary_senary": float((nnz >= 5).mean()),
         "max_nonzero_components": int(nnz.max()),
-        "is_exactly_low_order_lattice": bool(
-            lo == {tuple(v) for v in np.round(X, 6)}),
+        "all_rows_on_plate_lattice": bool(int(on_lattice.sum()) == X.shape[0]),
+        "covers_all_low_order": bool(on_lattice[c_nnz <= 4].all()),
         "n_plate_lattice_points": int(coarse.shape[0]),
-        "n_plate_lattice_unmeasured": int((c_nnz >= 5).sum()),
-        "frac_plate_lattice_unmeasured": float((c_nnz >= 5).mean()),
+        "n_plate_lattice_unmeasured": int((~on_lattice).sum()),
+        "frac_plate_lattice_unmeasured": float((~on_lattice).mean()),
         "frac_fine_lattice_with_5plus_components": float((f_nnz >= 5).mean()),
         "overpotential_v": {"min": float(over.min()), "median": float(np.median(over)),
                             "max": float(over.max()), "std": float(over.std())},
@@ -540,6 +567,46 @@ def support_mask(peaks: np.ndarray, values: np.ndarray, X: np.ndarray,
     return keep
 
 
+def basin_profile(peaks: np.ndarray, X: np.ndarray, y: np.ndarray,
+                  radii: tuple[float, ...] = (0.05, 0.10, 0.15, 0.20, 0.30, 0.40)
+                  ) -> dict:
+    """How fast the MEASURED value falls away from each reference optimum.
+
+    For each radius, the mean measured ``y`` of the plate rows within that distance
+    of a reference optimum, expressed as a fraction of the optimum's own prominence
+    above the plate median. 1.0 means the neighbourhood is as good as the peak;
+    0.0 means it is ordinary.
+
+    Deliberately computed on raw rows rather than on the surrogate, because the
+    question it answers -- "are these needles or hills?" -- is exactly the standing
+    objection to this dataset ("too sparse/smooth compared to our data"), and a
+    number computed from a model could be dismissed as the model's own smoothing.
+    A random forest is piecewise constant and a fixed-length-scale GP is smooth by
+    construction; the plate is neither.
+
+    Radii below 0.15 are uninformative here and report 1.00 by definition: adjacent
+    rows of a 0.1 lattice are 0.1414 apart, so the only row within 0.10 of a
+    reference optimum is the optimum itself.
+    """
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(X)
+    bg = float(np.median(y))
+    out: dict[str, dict] = {}
+    for r in radii:
+        fracs, counts = [], []
+        for p in peaks:
+            idx = tree.query_ball_point(p, r=r)
+            v_pk = float(y[tree.query(p)[1]])
+            if not idx or v_pk <= bg:
+                continue
+            fracs.append(float((y[np.asarray(idx, dtype=int)].mean() - bg) / (v_pk - bg)))
+            counts.append(len(idx))
+        out[f"{r:.2f}"] = {"mean_prominence_fraction": float(np.mean(fracs)) if fracs else float("nan"),
+                           "mean_n_rows": float(np.mean(counts)) if counts else 0.0}
+    return out
+
+
 def _contrast(vals_peaks: np.ndarray, vals_probe: np.ndarray) -> dict:
     """``metrics.landscape_contrast``'s statistic against an arbitrary probe set."""
     p99 = float(np.percentile(vals_probe, 99))
@@ -640,6 +707,8 @@ def reference_set(plate: str = DEFAULT_PLATE, kind: str = "rf", *,
         "grid_sensitivity_fine": {
             k: fine[k] for k in ("grid_n", "n_moves", "n_grid", "n_peaks_naive",
                                  "n_peaks_naive_unmeasured_order", "n_peaks_supported")},
+        "basin_profile_measured": basin_profile(main["peaks"], X, y),
+        "peak_nonzero_components": [int(v) for v in (main["peaks"] > 1e-9).sum(axis=1)],
         "audit": D["audit"],
         "cv": cross_validate(plate, seed=seed),
     }
@@ -652,18 +721,29 @@ def reference_set(plate: str = DEFAULT_PLATE, kind: str = "rf", *,
 # --- the objective -----------------------------------------------------------
 
 _VERDICT = (
-    "Usable, with its label attached. Every reference optimum is a real measured "
-    "composition with a real measured overpotential, which neither real3d nor "
-    "real4d can claim, and the contrast against uniform sampling is in the same "
-    "band as those two -- so oer6d discriminates about as well as the campaign "
-    "surrogates already in the suite, no better. Its disqualifying property is "
-    "coverage, not smoothness: the plate measures NO composition with more than "
-    "four nonzero components, so 29% of its own lattice and 66% of a 0.05 "
-    "refinement -- including everywhere a uniform sampler looks -- is model "
-    "output, not data. The 'too sparse/smooth' objection is directionally right "
-    "and misdiagnosed: the surface is not smooth, it is unconstrained. Ship it as "
-    "an external-data cross-check on a small reference set, never as the headline "
-    "multi-optimum evidence; that remains the ensemble suite."
+    "Include as a secondary, clearly labelled external-data objective; do not make "
+    "it headline evidence. FOR: all 10 reference optima are real measured "
+    "compositions with real measured overpotentials -- neither real3d nor real4d "
+    "can say that, both being peaks of a surrogate -- the plate is public and "
+    "regenerable in seconds, and the contrast (0.40 of peaks above the uniform "
+    "p99) sits between real3d (0.17) and real4d (0.46), so it discriminates about "
+    "as well as the campaign objectives already in the suite. AGAINST, and both "
+    "objections are confirmed by measurement, not by argument: (1) coverage -- the "
+    "plate contains NO composition with more than four nonzero components, so 29% "
+    "of its own lattice and 66% of a 0.05 refinement is model output rather than "
+    "data, every reference optimum sits on the simplex boundary, and a uniform "
+    "sampler scores exactly 0; (2) smoothness -- measured rows 0.15 away from an "
+    "optimum still average 0.73 of its prominence, so these are hills, not "
+    "needles. Brianna's 'too sparse/smooth compared to our data' is right on both "
+    "counts. What it misses is that the sparsity is structured rather than random: "
+    "the plate is dense on the low-order faces and empty everywhere else, which is "
+    "a different failure from thin coverage and makes uniform-probe statistics "
+    "such as landscape_contrast read optimistically. Use oer6d to show the method "
+    "transfers to somebody else's hardware data; keep the sharp multi-optimum "
+    "claim on the ensemble suite. If a sharper OER landscape is wanted, plates "
+    "3851 and 4098 fall to 0.24 of prominence at 0.15 (versus 0.73 on 3496) and "
+    "carry 38 and 14 reference optima, but they pay for it with lower contrast "
+    "(0.24 and 0.14) because their overpotential range is compressed."
 )
 
 
@@ -730,6 +810,8 @@ def oer6d(plate: str = DEFAULT_PLATE, kind: str = "rf", *, seed: int = SEED,
         "contrast_uniform_simplex": ref["contrast_uniform_simplex"],
         "contrast_uniform_simplex_naive_peaks": ref["contrast_uniform_simplex_naive_peaks"],
         "contrast_measured_support": ref["contrast_measured_support"],
+        "basin_profile_measured": ref["basin_profile_measured"],
+        "peak_nonzero_components": ref["peak_nonzero_components"],
 
         "n_quinary_senary_rows": audit["n_quinary_senary"],
         "frac_quinary_senary_rows": audit["frac_quinary_senary"],
@@ -768,6 +850,18 @@ def oer6d(plate: str = DEFAULT_PLATE, kind: str = "rf", *, seed: int = SEED,
             f"Reference set is small (n={ref['n_peaks_supported']}). A single "
             "matched or missed optimum moves peak_ratio by "
             f"{1.0 / max(ref['n_peaks_supported'], 1):.2f}; report a CI.",
+            "Every reference optimum lies on the BOUNDARY -- each has 2 or 3 zero "
+            f"components (nonzero counts {ref['peak_nonzero_components']}), because "
+            "the plate never measured anything else. A method that stays in the "
+            "interior scores 0 by construction; uniform Dirichlet search on this "
+            "objective gets peak_ratio 0.00 at a 1000-sample budget.",
+            "Basins are wide, and that is in the DATA, not the surrogate: measured "
+            "rows within 0.15 of a reference optimum still average "
+            f"{ref['basin_profile_measured']['0.15']['mean_prominence_fraction']:.2f} "
+            "of its prominence, and within 0.30 still "
+            f"{ref['basin_profile_measured']['0.30']['mean_prominence_fraction']:.2f}. "
+            "These are hills, not needles. The 'too smooth' objection is correct at "
+            "the scale of the match radius.",
         ],
         "verdict": _VERDICT,
     }
@@ -800,10 +894,12 @@ def _report(plate: str, kind: str, rebuild: bool) -> None:
     print(f"  {a['n_rows']} rows, {a['n_unique_compositions']} unique, sums "
           f"[{a['row_sum_min']:.6f}, {a['row_sum_max']:.6f}], levels/component "
           f"{a['levels_per_component']}")
-    print(f"  rows by nonzero components: {a['n_by_nonzero_components']}")
+    print("  rows by nonzero components: "
+          + " ".join(f"{k + 1}:{n}" for k, n in enumerate(a["n_by_nonzero_components"])))
     print(f"  quinary+senary rows: {a['n_quinary_senary']} "
-          f"({a['frac_quinary_senary']:.4%} of the plate); plate == complete "
-          f"<=4-nonzero 0.1 lattice: {a['is_exactly_low_order_lattice']}")
+          f"({a['frac_quinary_senary']:.4%} of the plate); every row on the 0.1 "
+          f"lattice: {a['all_rows_on_plate_lattice']}; complete over <=4 nonzero: "
+          f"{a['covers_all_low_order']}")
     print(f"  unmeasured: {a['n_plate_lattice_unmeasured']}/"
           f"{a['n_plate_lattice_points']} of the plate's own lattice "
           f"({a['frac_plate_lattice_unmeasured']:.1%}); "
@@ -836,6 +932,13 @@ def _report(plate: str, kind: str, rebuild: bool) -> None:
               f"mean prominence {c['mean_peak_prominence']:.2f})")
     print(f"  contrast vs uniform, NAIVE peaks: "
           f"{ref['contrast_uniform_simplex_naive_peaks']['frac_peaks_above_probe_p99']:.3f}")
+    print(f"  reference optima nonzero components: {ref['peak_nonzero_components']} "
+          "(all on the simplex boundary)")
+    print("  basin profile, MEASURED rows near an optimum (fraction of its "
+          "prominence):")
+    print("    " + "  ".join(
+        f"r={r}: {b['mean_prominence_fraction']:.2f} (n={b['mean_n_rows']:.0f})"
+        for r, b in ref["basin_profile_measured"].items()))
 
 
 if __name__ == "__main__":

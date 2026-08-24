@@ -87,7 +87,9 @@ def run_suite(config: dict, out_root: str, resume: bool = True,
                     with open(done, encoding="utf-8") as fh:
                         res = json.load(fh)
                     print(f"[skip] {cell}")
-                    curves[cell] = {k: res.get(k) for k in _CURVE_KEYS}
+                    curves[cell] = {"objective": res.get("objective"),
+                                "optimizer": res.get("optimizer"),
+                                **{k: res.get(k) for k in _CURVE_KEYS}}
                     rows.append({k: v for k, v in res.items() if k not in _CURVE_KEYS})
                     continue
                 jobs.append({"cell": cell, "run_dir": run_dir, "objective": obj_spec,
@@ -105,13 +107,17 @@ def run_suite(config: dict, out_root: str, resume: bool = True,
             for i, fut in enumerate(as_completed(futures), 1):
                 cell, res = fut.result()
                 print(f"[{i}/{len(jobs)}] {cell}", flush=True)
-                curves[cell] = {k: res.get(k) for k in _CURVE_KEYS}
+                curves[cell] = {"objective": res.get("objective"),
+                                "optimizer": res.get("optimizer"),
+                                **{k: res.get(k) for k in _CURVE_KEYS}}
                 rows.append({k: v for k, v in res.items() if k not in _CURVE_KEYS})
     else:
         for j in jobs:
             print(f"[run ] {j['cell']}", flush=True)
             cell, res = _run_cell(j)
-            curves[cell] = {k: res.get(k) for k in _CURVE_KEYS}
+            curves[cell] = {"objective": res.get("objective"),
+                                "optimizer": res.get("optimizer"),
+                                **{k: res.get(k) for k in _CURVE_KEYS}}
             rows.append({k: v for k, v in res.items() if k not in _CURVE_KEYS})
 
     _write_aggregate(suite_dir, rows)

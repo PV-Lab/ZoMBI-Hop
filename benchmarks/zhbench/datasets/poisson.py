@@ -412,33 +412,56 @@ def train_rf(dim: int = DIM, target_range: tuple | None = PHYSICAL_RANGE, *,
     return rf, info
 
 
-def _point_predictor(rf):
-    """Single-point ``predict`` that skips sklearn's per-call overhead.
+def _predictors(rf) -> tuple:
+    """Deterministic single-point and batched ``predict``, bypassing sklearn's.
 
-    ``RandomForestRegressor.predict`` costs 15.6 ms on one row (70 ms with
-    ``n_jobs=-1``, which is worse -- the thread pool dominates), almost all of it
-    validation and ``Parallel`` setup rather than tree descent. The benchmark calls
-    ``fn`` one point at a time and would spend 16 s per 1000-sample run inside
-    sklearn plumbing. Walking ``estimator.tree_`` directly costs 1.30 ms and returns
-    bit-identical values (verified max abs diff 0.0 over 1000 points).
+    Two problems with ``RandomForestRegressor.predict``, both load-bearing here.
+
+    Speed: it costs 15.6 ms on one row -- 70 ms with ``n_jobs=-1``, which is worse,
+    because thread-pool setup dominates a 500-tree single-row descent. The benchmark
+    calls ``fn`` one point at a time, so a 1000-sample run would spend 16 s inside
+    input validation and ``Parallel``. Walking ``estimator.tree_`` in a fixed order
+    costs 1.3 ms.
+
+    Reproducibility, which matters more: with ``n_jobs=-1`` sklearn accumulates tree
+    outputs into a shared buffer from several threads, so repeated calls differ by
+    ~3e-16 and are not bitwise reproducible. A forest is piecewise constant -- 387
+    of 20000 uniform probes hit an exact tie -- so ``z >= dilate(z)`` flips on
+    plateaus and the SAME cached model yielded 8 supported peaks on one build and 9
+    on the next. Summing in list order fixes the reference set. Both closures use
+    the identical accumulate-then-scale sequence, so ``fn(peak)`` equals the cached
+    ``true_values`` exactly rather than approximately.
     """
     trees = [e.tree_ for e in rf.estimators_]
     inv = 1.0 / len(trees)
     buf = np.empty((1, rf.n_features_in_), dtype=np.float32)
 
     def predict_one(x) -> float:
-        buf[0, :] = np.asarray(x, dtype=np.float64).ravel()
+        buf[0, :] = np.asarray(x, dtype=float).ravel()
         total = 0.0
         for t in trees:
             total += t.predict(buf)[0, 0]
         return float(total * inv)
-    return predict_one
+
+    def predict_many(X) -> np.ndarray:
+        Q = np.ascontiguousarray(X, dtype=np.float32)
+        out = np.zeros(Q.shape[0], dtype=float)
+        for t in trees:
+            out += t.predict(Q)[:, 0]
+        out *= inv
+        return out
+    return predict_one, predict_many
 
 
-def _batch_predict(rf, X: np.ndarray, chunk: int = 262144) -> np.ndarray:
+def _point_predictor(rf):
+    return _predictors(rf)[0]
+
+
+def _batch_predict(rf, X: np.ndarray, chunk: int = 131072) -> np.ndarray:
+    many = _predictors(rf)[1]
     out = np.empty(X.shape[0], dtype=float)
     for i in range(0, X.shape[0], chunk):
-        out[i:i + chunk] = rf.predict(X[i:i + chunk])
+        out[i:i + chunk] = many(X[i:i + chunk])
     return out
 
 
@@ -535,10 +558,11 @@ def detect_peaks(rf, dim: int, *, grid_n: int = GRID_N,
     count and is reported separately as ``n_local_max_cells``.
     """
     n_total = (grid_n + 1) ** dim
+    many = _predictors(rf)[1]
     z = np.empty(n_total, dtype=float)
-    for start in range(0, n_total, 262144):
-        idx = np.arange(start, min(start + 262144, n_total))
-        z[idx] = -rf.predict(_grid_coords(idx, grid_n, dim))
+    for start in range(0, n_total, 131072):
+        idx = np.arange(start, min(start + 131072, n_total))
+        z[idx] = -many(_grid_coords(idx, grid_n, dim))
 
     Z = z.reshape((grid_n + 1,) * dim)
     is_max = (Z >= _dilate(_dilate(Z))).ravel()
