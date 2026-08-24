@@ -75,9 +75,9 @@ class ZoMBIHopRunner:
 
     # -- the run ---------------------------------------------------------------
     def run(self, objective, run: ObjectiveRun, protocol: Protocol, seed: int) -> None:
-        from ._repo import run_mobo
+        from ._repo import evaluate, run_mobo
         rm = run_mobo()
-        from optimize.evaluate import _force_zoom_floors
+        _force_zoom_floors = evaluate()._force_zoom_floors
         import torch
 
         dim = int(objective.dim)

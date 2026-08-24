@@ -98,3 +98,19 @@ def test_y_true_is_noiseless_and_y_observed_is_not():
     h = run.stacked()
     assert np.allclose(h["y_true"], [obj.fn(x) for x in X_act])
     assert not np.allclose(h["y_observed"], h["y_true"])
+
+
+def test_importing_the_core_does_not_leak_torch_global_state():
+    """The core sets default device=cuda / dtype=float32 at import time when CUDA
+    exists. In a benchmark process that would silently run the BoTorch baselines at
+    a different precision from the method they are compared against."""
+    import torch
+
+    from zhbench import _repo
+
+    before_dtype = torch.get_default_dtype()
+    before_device = getattr(torch, "get_default_device", lambda: None)()
+    _repo.run_mobo()
+    assert torch.get_default_dtype() == before_dtype
+    if before_device is not None:
+        assert torch.get_default_device() == before_device

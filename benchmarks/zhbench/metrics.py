@@ -360,6 +360,22 @@ def compute_all(run, objective, declared=None, wall_s: float | None = None,
     out.update({f"posthoc_{k}": v for k, v in ph.items()
                 if k in ("peak_ratio", "precision", "f1", "dist_to_needles", "n_declared")})
 
+    # The precision-recall curve over |S|, so the suite can compare methods at
+    # MATCHED numbers of declared optima. Without this the comparison is unfair in a
+    # way that is easy to miss: ZoMBI-Hop volunteers however many needles it is
+    # confident in (7 on real4d), while a post-hoc set is free to declare n_true
+    # (24) guesses. Recall at |S| = n_true therefore caps ZoMBI-Hop at 7/24 for a
+    # purely structural reason. Read `peak_ratio` next to `pr_curve`.
+    curve = peak_ratio_curve(X, y_obs, T, tv, k_max=max(2 * T.shape[0], 10), r=r)
+    out["pr_curve_k"] = curve["k"]
+    out["pr_curve_peak_ratio"] = curve["peak_ratio"]
+    out["pr_curve_precision"] = curve["precision"]
+    if declared_is_own and S.shape[0] > 0:
+        k = int(S.shape[0])
+        idx = [i for i, kk in enumerate(curve["k"]) if kk == k]
+        out["posthoc_peak_ratio_at_n_declared"] = (curve["peak_ratio"][idx[0]]
+                                                   if idx else float("nan"))
+
     first = reached_flags(X, y_true, T, tv, r=r, value_tol=value_tol)
     grid, ratio = reached_ratio_curve(first, run.protocol.n_samples, step=run.protocol.batch_size)
     tk = time_to_k(first)
