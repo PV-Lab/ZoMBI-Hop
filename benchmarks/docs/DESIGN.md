@@ -282,12 +282,56 @@ and a good `peak_ratio` there means little. On `real6d` it is 0.2%, seventeen ti
 rarer. None of the three saturates (`frac_at_max` 0.0003), which is why the broken
 metric still produced the right ordering -- but these are the values to quote.
 
-## 19. A Windows access violation in gp_qucb cells (open)
+## 19. The 0xC0000005 crashes: unbounded acquisition memory (closed)
 
-Cells combining the scikit-learn surrogate objective with BoTorch die with exit
-`0xC0000005` at n_samples=2000; `random` cells on the same objective never do, and
-the same cell at n_samples=336 completes. The environment loads two OpenMP runtimes
-(`sklearn/.libs/vcomp140.dll` and `torch/lib/libiomp5md.dll`) and
-`KMP_DUPLICATE_LIB_OK=TRUE` does not suppress it. Under diagnosis; see
-`UPSTREAM_REQUESTS.md` section 5. Cells run in isolated subprocesses with retries,
-so a residual crash costs one cell rather than the grid.
+`gp_qucb` cells died with a Windows access violation at N=2000. Three of my
+diagnoses were wrong before the right one, and the wrong ones are recorded here
+because the pattern is instructive.
+
+| diagnosis | basis | verdict |
+|---|---|---|
+| thread oversubscription | 10 workers x 24 OMP threads | wrong -- pinning threads changed nothing |
+| dual OpenMP runtimes | sklearn vcomp140 + torch libiomp5md both present | wrong -- a pure-BoTorch reproducer that never loads vcomp140 crashes identically, and KMP_DUPLICATE_LIB_OK did not help |
+| startup race, first GP cell only | crashed at cell 11 twice | wrong -- an artifact of an uncontrolled box; cell 12 then crashed too |
+| budget threshold at N=2000 | crashed at 2000, passed at 336 | wrong -- no threshold; N=2000 simply runs 81 decisions instead of 12, so it is exposure |
+
+Every one of those was inferred from a correlation rather than measured. The
+actual cause, found by capping process commit with a job object and making the
+crash deterministic (cap 3000 MB: 3/3 crash; cap 5200 MB: 3/3 clean):
+
+`optimizers/gp.py` evaluated the acquisition over the whole 2048-candidate pool in
+one t-batch, so gpytorch materialised a `(pool, q_pending, n_train)` float64
+cross-covariance -- 2048 x 24 x 1024 x 8 = 384 MiB per temporary, with more beside
+it in `sq_dist`. Peak commit per cell 10.1 GB; several workers exceed the machine
+commit limit, and a torch allocation that cannot be satisfied faults with
+0xC0000005 rather than raising MemoryError, because the allocation that lands short
+is on an unchecked path inside gpytorch. That is also why try/except could not
+catch it, and why it looked nondeterministic.
+
+Fixed by chunking the pool (peak 10.1 -> 3.9 GB). **Changes no number**: chunked and
+unchunked runs produce a byte-identical `points.csv` and differ only in wall-clock.
+The chunk is rounded down to a power of two so MKL blocks the batched matmul the
+same way it does at full width; a non-power-of-two chunk shifts values by ~1 ulp.
+
+The environment really does load two OpenMP runtimes and that is still worth fixing
+(`UPSTREAM_REQUESTS.md` section 5) -- it just was not this.
+
+## 20. The budget was not being spent exactly
+
+Every cell reported `n_samples = 1992` against a nominal 2000. The baseline loop ran
+a fixed `n_decisions = (N - n_init) // q = 81`, and `48 + 81*24 = 1992`.
+
+Cosmetically this dropped the headline `peak_ratio@2000` column, since prefix
+scoring skips checkpoints above the samples actually spent. Substantively it was
+worse: ZoMBI-Hop never uses `n_decisions` -- it runs until `BudgetExhausted` -- so it
+would have spent 2000 while every baseline spent 1992. Comparing methods at
+different budgets is the exact failure this benchmark exists to prevent, and 0.4%
+would have been invisible in every figure.
+
+Both paths now run until the budget is spent, final partial batch truncated
+identically for everyone. Test pins it at a ragged N=200.
+
+The general lesson, and the reason the acceptance tests are written the way they
+are: assert on the artifacts on disk, not on what the protocol intends. "Same
+initial design" held when tested that way. "Exact budget" did not, and nothing
+short of reading `n_samples` out of a written `metrics.json` would have caught it.
