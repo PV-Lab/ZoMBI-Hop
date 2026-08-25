@@ -91,3 +91,15 @@ def test_landscape_contrast_is_stable_under_probe_count():
                                  dim=3, n_probe=n)["peak_rarity_median"]
             for n in (800, 3000)]
     assert abs(vals[0] - vals[1]) < 0.05, vals
+
+
+def test_budget_is_spent_exactly_even_when_not_divisible_by_q():
+    """N - n_init is not generally divisible by q. A fixed decision count would stop
+    the baselines short (2000 -> 1992) while ZoMBI-Hop, which runs until
+    BudgetExhausted, spent the full budget -- so the two would be compared at
+    different sample counts."""
+    p = Protocol(n_samples=200, batch_size=24, n_init_lines=2, noise="none")
+    assert (p.n_samples - p.n_init_points) % p.batch_size != 0, "pick a ragged N"
+    for spec in ({"name": "random"}, {"name": "zombihop", "hparams": "smoke"}):
+        res = run_one(_ENS3, spec, seed=0, protocol=p)
+        assert res["n_samples"] == 200, (spec["name"], res["n_samples"])

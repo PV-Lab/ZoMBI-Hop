@@ -69,7 +69,14 @@ def run_one(objective_spec: dict, optimizer_spec: dict, seed: int,
         else:
             X_req0, X_act0, y0 = gen_init_design(run, protocol, seed)
             optimizer.initialize(X_act0, y0, objective, seed)
-            for _ in range(protocol.n_decisions):
+            # Loop until the budget is actually spent, not for a fixed decision
+            # count. N - n_init is not generally divisible by q (2000 - 48 = 1952
+            # leaves 81 batches and 8 samples over), and ZoMBI-Hop runs until
+            # BudgetExhausted regardless -- so a fixed count would quietly give the
+            # baselines a smaller budget than the method they are compared against.
+            # The final partial batch is truncated by ObjectiveRun and counted in
+            # n_truncated, identically for every method.
+            while run.n_samples < protocol.n_samples:
                 X_req = np.atleast_2d(np.asarray(optimizer.suggest(protocol.batch_size),
                                                  dtype=float))
                 X_act, y = run.evaluate_batch(X_req)
