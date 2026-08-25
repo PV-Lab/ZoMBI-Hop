@@ -668,10 +668,24 @@ def build_ensemble_ds(config: dict, dataset: str, *, time_limit_hours: float | N
 _ZOMBI_OVERRIDE_KEYS = frozenset({"input_noise", "max_gp_points", "acquisition_type", "verbose"})
 
 
-def _split_hparams(hp: dict) -> tuple[dict, dict]:
-    """Return (mobo_hparams, zombi_fixed_overrides)."""
+def _split_hparams(hp: dict, *, source: str = "hparams") -> tuple[dict, dict]:
+    """Return (mobo_hparams, zombi_fixed_overrides).
+
+    Keys in neither set are DROPPED — they never reach ZoMBIHop, which falls back to
+    its constructor default for them. That is the intended behaviour for a trial
+    recorded by an older code revision whose search space has since lost a knob, but
+    it is silent, and a silently ignored hyperparameter is indistinguishable from an
+    honoured one when reading a config file. So say so: the showdown_6d_clamped_reps10_v2
+    configs advertise input_noise_threshold_mult 0.5-6.0, retired from HPARAM_SPACE in
+    56dd11d, and every one of those 200 runs actually used ZoMBIHop's default of 3.0.
+    """
     mobo = {k: hp[k] for k in rm.HPARAM_NAMES if k in hp}
     overrides = {k: hp[k] for k in _ZOMBI_OVERRIDE_KEYS if k in hp}
+    ignored = sorted(set(hp) - set(mobo) - set(overrides))
+    if ignored:
+        print(f"      [run] {source}: ignoring {len(ignored)} key(s) that are not in "
+              f"the current search space — ZoMBIHop's defaults apply instead: "
+              + ", ".join(f"{k}={hp[k]}" for k in ignored))
     return mobo, overrides
 
 
@@ -679,7 +693,7 @@ def _normalize_hparams(hp: dict, *, source: str) -> dict:
     missing = [k for k in rm.HPARAM_NAMES if k not in hp]
     if missing:
         sys.exit(f"{source}: missing hparams {missing} (stale hyperparameter set?).")
-    mobo, overrides = _split_hparams(hp)
+    mobo, overrides = _split_hparams(hp, source=source)
     return {**mobo, **overrides}
 
 
@@ -759,7 +773,7 @@ def load_hparams_from_json(json_path: str) -> dict[int, dict]:
     if missing:
         sys.exit(f"--hparams-json: missing hparams {missing} "
                  f"(stale hyperparameter set?).")
-    mobo, overrides = _split_hparams(hp)
+    mobo, overrides = _split_hparams(hp, source=os.path.basename(json_path))
     hp = {**mobo, **overrides}
     print(f"  [hparams-json] loaded {len(hp)} hyperparameters from {json_path}")
     return {0: hp}
