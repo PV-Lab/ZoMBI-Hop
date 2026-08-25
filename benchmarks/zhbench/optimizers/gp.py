@@ -27,7 +27,7 @@ class GPBatch(BaseOptimizer):
 
     def __init__(self, kind: str = "ucb", pool_size: int = 2048, ucb_beta: float = 2.0,
                  max_train_points: int = 1024, device: str = "cpu",
-                 mc_samples: int = 128, **kwargs):
+                 mc_samples: int = 128, acq_chunk: int = 256, **kwargs):
         super().__init__(**kwargs)
         if kind not in ("logei", "ucb"):
             raise ValueError("kind must be 'logei' or 'ucb'")
@@ -38,6 +38,7 @@ class GPBatch(BaseOptimizer):
         self.max_train_points = int(max_train_points)
         self.device = device
         self.mc_samples = int(mc_samples)
+        self.acq_chunk = int(acq_chunk)
 
     # -- coordinates ----------------------------------------------------------
     def _to_model_space(self, X: np.ndarray) -> np.ndarray:
@@ -89,6 +90,39 @@ class GPBatch(BaseOptimizer):
         return qLogExpectedImprovement(model, best_f=best_f, sampler=sampler,
                                        X_pending=X_pending)
 
+    def _eval_acq(self, torch, acq, cand):
+        """Score the candidate pool in bounded-memory chunks.
+
+        Evaluating all 2048 candidates in one t-batch makes gpytorch materialise a
+        ``(pool, q_pending, n_train)`` float64 cross-covariance -- 2048 x 24 x 1024
+        x 8 = 384 MiB per temporary, with more built alongside it in ``sq_dist``.
+        Peak commit for one such cell measured at 10.1 GB; six workers then exceed
+        the machine's commit limit, and a torch allocation that cannot be satisfied
+        faults with 0xC0000005 rather than raising MemoryError -- because the
+        allocation that lands short is on an *unchecked* path inside gpytorch, so
+        try/except cannot catch it either. Chunking drops the peak to 3.9 GB.
+
+        This is the same treatment ``landscapes.predict_chunked`` already gives the
+        sklearn side; the BoTorch side simply never got it.
+
+        The chunk is rounded DOWN to a power of two on purpose. Pool rows are an
+        independent t-batch dimension and the QMC sampler collapses its base samples
+        over exactly that dimension, so chunking is mathematically a no-op -- but MKL
+        re-blocks a batched matmul by batch count, and a non-power-of-two chunk
+        shifts values by ~1 ulp. A power-of-two chunk reproduces full-batch blocking
+        bitwise, which is what makes this a pure implementation change: verified
+        max abs difference 0.0, identical picks at every greedy step.
+        """
+        n = cand.shape[0]
+        chunk = 1 << max(0, int(self.acq_chunk).bit_length() - 1)
+        out = np.empty(n, dtype=float)
+        with torch.no_grad():
+            if n <= chunk:
+                return acq(cand).cpu().numpy().astype(float)
+            for i in range(0, n, chunk):
+                out[i:i + chunk] = acq(cand[i:i + chunk]).cpu().numpy()
+        return out
+
     # -- the loop -------------------------------------------------------------
     def suggest(self, q: int) -> np.ndarray:
         import torch
@@ -111,8 +145,7 @@ class GPBatch(BaseOptimizer):
             for _ in range(q):
                 if chosen:
                     acq.set_X_pending(Zpool[chosen])
-                with torch.no_grad():
-                    vals = acq(cand).cpu().numpy()
+                vals = self._eval_acq(torch, acq, cand)
                 vals[chosen] = -np.inf
                 chosen.append(int(np.argmax(vals)))
         self._n_suggest += 1

@@ -65,15 +65,12 @@ def _configure_worker_env() -> None:
     ``setdefault`` throughout, so an explicit setting from the caller wins.
     """
     os.environ.setdefault("MPLBACKEND", "Agg")
-    # Two OpenMP runtimes end up in one process here: sklearn ships
-    # .libs/vcomp140.dll (Microsoft) and torch ships lib/libiomp5md.dll (Intel),
-    # and numpy and scipy each bundle a separate OpenBLAS on top. A GP cell touches
-    # sklearn (the surrogate objective) and torch (BoTorch) in the same process,
-    # which is the documented recipe for an access violation -- observed as exit
-    # 0xC0000005 on real_gp_dim3/gp_qucb. This tells Intel's runtime to tolerate the
-    # duplicate. It is a mitigation, not a cure: the real fix is one OpenMP runtime
-    # in the environment, and cells stay isolated in subprocesses so a residual
-    # crash costs one cell.
+    # KMP_DUPLICATE_LIB_OK: the venv does load two OpenMP runtimes (sklearn ships
+    # .libs/vcomp140.dll, torch ships lib/libiomp5md.dll), which is unsupported and
+    # worth fixing when the environment is rebuilt. It was NOT the cause of the
+    # 0xC0000005 crashes -- those were an unbounded allocation in the acquisition
+    # loop (see optimizers/gp.py::_eval_acq), and a pure-BoTorch reproducer that
+    # never loads vcomp140.dll crashed identically. Kept because it is harmless.
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                 "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
