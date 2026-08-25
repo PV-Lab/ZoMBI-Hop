@@ -232,6 +232,14 @@ def fig_needle_count(rows, suite_dir) -> str | None:
     # 33 after merging (40 -> 26, 20 -> 18). Plotting the request would compress
     # three different landscapes onto one x value and imply a plateau that is really
     # a packing limit.
+    # Only meaningful for a needle-count sweep: objectives that differ ONLY in how
+    # many optima they contain. Emitting it for a suite whose objectives also differ
+    # in dimension (s1: real3d/real4d/real6d) would plot recall against optima count
+    # while dimension varies underneath, and read as "performance collapses with
+    # more optima" when most of the effect is dimension.
+    dims = {r.get("dim") for r in rows}
+    if len(dims) > 1:
+        return None
     byn = defaultdict(list)
     for r in rows:
         n = r.get("n_true_optima")
