@@ -314,6 +314,100 @@ def recomputed_dist(run_dir: str, cutoff: float = DEFAULT_DIST_CUTOFF):
         return None
 
 
+# ─── median nearest-neighbour spacing ────────────────────────────────────────────
+#
+# This column REPLACES ``dup fraction`` in the Markdown tables. Dup fraction counts the
+# samples whose nearest neighbour falls inside a radius of ``NOISE_LEVEL/2``, and commit
+# a2deba7 moved ``NOISE_LEVEL`` from 0.064 to 0.128 — the input-noise measurement was
+# redone against ``run_39af``, which logs the composition the optimiser *sent* rather
+# than inferring it. Campaigns from either side of that commit were scored against
+# ceilings that differ by 2x, so their dup fractions are answers to two different
+# questions rather than one question whose answer changed.
+#
+# Re-scoring both eras at one common radius does not fix it, and was tried first: at a
+# fixed 0.032 every configuration in both 6d campaigns lands between 0.83 and 0.93. The
+# metric saturates — nearly every sample has *some* neighbour at that radius — so it
+# separates nothing and mostly reports how many samples a run took. Any radius wide
+# enough to catch the older campaign's duplicates saturates the newer one's.
+#
+# The median nearest-neighbour distance has no radius, no noise level and no zoom
+# scaling in it, so every era sits on one axis, and it measures directly what dup
+# fraction was a proxy for: how far apart the points a run actually sampled are.
+# DIRECTION IS FLIPPED — higher is better.
+#
+# Reported in units of 1e-3 because the raw values are ~0.015 in composition L2 and four
+# leading zeros in every cell is not a table.
+NN_SPACING_SCALE = 1e3
+
+# Runs scored before ``median_nn_spacing`` existed in metrics.json are recomputed from
+# points.csv, the same way ``recomputed_dist`` back-fills older runs, so a campaign that
+# spans the change is still summarised on one axis.
+NN_SPACING_KEY = "median_nn_spacing"
+
+
+def _sample_points(run_dir: str):
+    """A run's sampled compositions from ``points.csv`` as an ``(n, d)`` array, or None.
+
+    The dimension is inferred from however many ``x<i>`` columns the file carries, so
+    this needs no manifest and works at any run dimension — same rule as ``_needles_of``.
+    """
+    path = os.path.join(run_dir, "points.csv")
+    if not os.path.isfile(path):
+        return None
+    try:
+        import numpy as np
+        with open(path, newline="") as f:
+            r = csv.DictReader(f)
+            if not r.fieldnames:
+                return None
+            cols = [c for c in r.fieldnames
+                    if len(c) > 1 and c[0] == "x" and c[1:].isdigit()]
+            if not cols:
+                return None
+            cols.sort(key=lambda c: int(c[1:]))
+            rows = [[float(row[c]) for c in cols] for row in r]
+        if len(rows) < 2:
+            return None
+        return np.asarray(rows, dtype=float).reshape(len(rows), len(cols))
+    except Exception:
+        return None
+
+
+def median_nn_spacing(run_dir: str, stored=None):
+    """Median nearest-neighbour spacing of one run, in composition L2, or None.
+
+    Prefers the value ``metrics.json`` carries (written by
+    ``eval_metrics.metric_median_nn_spacing`` since 2026-08-25); falls back to
+    recomputing it from ``points.csv`` for runs that predate the key. None means
+    neither source was available.
+    """
+    try:
+        v = float(stored)
+        if v == v:
+            return v
+    except (TypeError, ValueError):
+        pass
+    X = _sample_points(run_dir)
+    if X is None:
+        return None
+    try:
+        import numpy as np
+        from scipy.spatial import cKDTree
+        nn, _ = cKDTree(X).query(X, k=2)   # k=2: self (0) + nearest other
+        return float(np.median(nn[:, 1]))
+    except Exception as exc:
+        print(f"  [spacing] recompute failed for {run_dir}: {exc}")
+        return None
+
+
+def _fmt_nn(v, nd: int = 2) -> str:
+    """One spacing value, rescaled to units of 1e-3."""
+    try:
+        return f"{float(v) * NN_SPACING_SCALE:.{nd}f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
 def _md_img(src: str | None, alt: str, width: int = 460) -> str:
     """Markdown-table cell for a plot: a thumbnail linking to the full image.
 
@@ -350,8 +444,13 @@ def _mean(vals) -> float | None:
 
 
 # Metrics carried through the repeat statistics, in CSV column order.
-STAT_METRICS: list[str] = ["dist_to_needles", "dup_fraction",
-                          "lines_per_activation", "activations", "runtime_s"]
+STAT_METRICS: list[str] = ["dist_to_needles", "median_nn_spacing", "dup_fraction",
+                           "lines_per_activation", "activations", "runtime_s"]
+
+# Metrics where a LARGER value is better. Everything else in STAT_METRICS is
+# lower-is-better (or, like runtime, not ranked at all). The winners table and the
+# gap-to-the-field section both read direction from here rather than hard-coding it.
+HIGHER_IS_BETTER: set[str] = {"median_nn_spacing"}
 
 
 def _percentile(xs: list[float], q: float) -> float:
@@ -504,9 +603,13 @@ CONFIG_BAR_PLOT = "config_means.png"
 # Panels of that chart: (metric key, panel title, bar colour). Both metrics are
 # "lower is better", which the caption states rather than the axes.
 BAR_METRICS: list[tuple[str, str, str]] = [
-    ("dist_to_needles", "dist to needles", "#2a78d6"),
-    ("dup_fraction",    "dup fraction",    "#eb6834"),
+    ("dist_to_needles",   "dist to needles (lower is better)",            "#2a78d6"),
+    ("median_nn_spacing", "median NN spacing x10^-3 (higher is better)",  "#eb6834"),
 ]
+
+# Display scale per metric, applied to the bars and their labels only — the CSVs and
+# every stored value stay in the metric's own units.
+BAR_SCALE: dict[str, float] = {"median_nn_spacing": NN_SPACING_SCALE}
 
 # Half-width multiplier for a 95% interval under the normal approximation. The
 # within-landscape form pools ~n_repeats x n_landscapes runs, so the t correction is
@@ -557,7 +660,7 @@ def _mean_and_error(cells: list[dict], within: bool) -> tuple[float | None, floa
 def write_config_bar_chart(reps: dict[tuple[str, int], list[dict]],
                            configs: list[dict], landscapes: list[int],
                            out_dir: str) -> tuple[str, bool] | None:
-    """Bar chart of mean ``dist_to_needles`` / ``dup_fraction`` per configuration.
+    """Bar chart of mean ``dist_to_needles`` / ``median_nn_spacing`` per configuration.
 
     The by-configuration table is the headline comparison, and with repeats its
     numbers are means of a distribution — five means in a row give no sense of
@@ -593,8 +696,9 @@ def write_config_bar_chart(reps: dict[tuple[str, int], list[dict]],
     for ax, (metric, title, colour) in zip(axes, BAR_METRICS):
         pairs = [_mean_and_error(stats[(n, metric)], within) for n in names]
         idx = [i for i, (mu, _) in enumerate(pairs) if mu is not None]
-        mus = [pairs[i][0] for i in idx]
-        errs = [pairs[i][1] or 0.0 for i in idx]
+        scale = BAR_SCALE.get(metric, 1.0)
+        mus = [pairs[i][0] * scale for i in idx]
+        errs = [(pairs[i][1] or 0.0) * scale for i in idx]
 
         ax.bar(idx, mus, width=0.62, color=colour, zorder=3, yerr=errs, capsize=4,
                error_kw={"ecolor": "#3b3a37", "elinewidth": 1.4, "capthick": 1.4,
@@ -618,7 +722,9 @@ def write_config_bar_chart(reps: dict[tuple[str, int], list[dict]],
 
     scope = ("repeat-to-repeat noise, landscapes held fixed" if within
              else "spread across landscape means")
-    fig.suptitle(f"Mean by configuration, ±95% CI ({scope}) — lower is better",
+    # No global "lower is better" here: the two panels run in OPPOSITE directions, so
+    # each panel states its own in its title.
+    fig.suptitle(f"Mean by configuration, ±95% CI ({scope})",
                  fontsize=12, color="#0b0b0b")
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     path = os.path.join(out_dir, CONFIG_BAR_PLOT)
@@ -691,7 +797,8 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
 
     A("## Results")
     A("")
-    header = (["landscape", "config", "n", "dist to needles", "dup fraction",
+    header = (["landscape", "config", "n", "dist to needles",
+               "median NN spacing (x10^-3)",
                "lines/activation", "activations", "runtime (s)"]
               + [h for _, h in SUMMARY_PLOTS])
     A("| " + " | ".join(header) + " |")
@@ -702,7 +809,7 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
     # can reuse it instead of re-reading the CSVs (the legacy fallback walks every
     # point, so a second pass over a 10-repeat campaign is not cheap).
     reps: dict[tuple[str, int], list[dict]] = {}
-    n_rows = n_missing = n_dist_fallback = 0
+    n_rows = n_missing = n_dist_fallback = n_spacing_missing = 0
     for ls in landscapes:
         for i, c in enumerate(configs):
             found = find_run_dirs(showdown_dir, c["name"], ls)
@@ -722,10 +829,14 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
                         n_dist_fallback += 1
                     else:
                         dist = fixed
+                spacing = median_nn_spacing(run_dir, met.get(NN_SPACING_KEY))
+                if spacing is None:
+                    n_spacing_missing += 1
                 rows.append({
                     "repeat": rep,
                     "run_dir": run_dir,
                     "dist_to_needles": dist,
+                    "median_nn_spacing": spacing,
                     "dup_fraction": met.get("dup_fraction"),
                     "lines_per_activation": mean_full_activations(act_lines),
                     "activations": len(act_lines) or None,
@@ -747,7 +858,7 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
                      f"`{c['name']}`",
                      f"{len(rows)}/{n_repeats}",
                      _fmt(st["dist_to_needles"]["mean"]),
-                     _fmt(st["dup_fraction"]["mean"]),
+                     _fmt_nn(st["median_nn_spacing"]["mean"]),
                      _fmt(st["lines_per_activation"]["mean"], 1),
                      _fmt(st["activations"]["mean"], 1),
                      _fmt(st["runtime_s"]["mean"], 1)]
@@ -764,7 +875,7 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
     cell: dict[tuple[str, int], dict] = {
         k: {
             "dist": describe([r["dist_to_needles"] for r in v])["mean"],
-            "dup": describe([r["dup_fraction"] for r in v])["mean"],
+            "spacing": describe([r["median_nn_spacing"] for r in v])["mean"],
             "lines": describe([r["lines_per_activation"] for r in v])["mean"],
             "acts": describe([r["activations"] for r in v])["mean"],
             "runtime": describe([r["runtime_s"] for r in v])["mean"],
@@ -788,6 +899,28 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
       "the landscape's true best (green) and the best objective value the run actually "
       "observed (blue). Observed Y can sit above true best: each measurement carries "
       "multiplicative output noise.")
+    A("")
+    A("`median NN spacing` is the MEDIAN nearest-neighbour distance between a run's "
+      "samples in composition L2, in units of 10^-3. **Higher is better** — wide "
+      "spacing means the run spread its samples out, small spacing means it kept "
+      "re-measuring the same spot — so it is the one column here that is ranked "
+      "upwards.")
+    A("")
+    A("It replaces `dup fraction`, which is NOT comparable across campaigns. Dup "
+      "fraction counts the samples whose nearest neighbour falls inside a radius of "
+      "`NOISE_LEVEL/2`, and commit `a2deba7` moved `NOISE_LEVEL` from 0.064 to 0.128 "
+      "(the input-noise measurement was redone against `run_39af`, which logs the "
+      "composition the optimiser *sent* rather than inferring it), so campaigns from "
+      "either side of that commit were scored against ceilings differing by 2x. "
+      "Re-scoring both at one common radius does not rescue it either: at a fixed "
+      "0.032 every configuration in both 6d campaigns lands between 0.83 and 0.93 — "
+      "saturated, separating nothing. Spacing has no radius, no noise level and no "
+      "zoom scaling in it, so every era sits on one axis. `dup fraction` is still "
+      "recorded per run in `showdown_runs.csv` and `showdown_stats.csv`.")
+    A("")
+    A("Spacing scales as `N^(-1/d)` in the sample count, so compare it only between "
+      "runs of similar length: at d=6 a 7% difference in sample count moves it under "
+      "1%, but an order of magnitude would not be negligible.")
     A("")
     if legacy_dist:
         A("`dist to needles` is the value stored in each run's `metrics.json`, matched "
@@ -824,6 +957,11 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
           "`ensemble_config.json`, or the landscape could not be rebuilt); those cells "
           "keep their stored greedy value.")
         A("")
+    if n_spacing_missing:
+        A(f"⚠ {n_spacing_missing} run(s) have no `median NN spacing`: metrics.json "
+          "predates the key and `points.csv` could not be read either. Those cells "
+          "average over the repeats that do have it.")
+        A("")
     if n_missing:
         A(f"⚠ {n_missing} of {n_rows * n_repeats} runs are missing `metrics.json` — "
           "they have not finished or they failed. Their cells are kept (see the `n` "
@@ -836,14 +974,14 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
         """One aggregate table: a mean of each metric over a group of cells."""
         A(f"## {title}")
         A("")
-        A(f"| {label} | runs | dist to needles | dup fraction | lines/activation | "
-          "activations | runtime (s) |")
+        A(f"| {label} | runs | dist to needles | median NN spacing (x10^-3) | "
+          "lines/activation | activations | runtime (s) |")
         A("|---|---|---|---|---|---|---|")
         for name, cs in groups:
             n = sum(1 for c in cs if c["dist"] is not None)
             A(f"| {name} | {n}/{len(cs)} | "
               f"{_fmt(_mean(c['dist'] for c in cs))} | "
-              f"{_fmt(_mean(c['dup'] for c in cs))} | "
+              f"{_fmt_nn(_mean(c['spacing'] for c in cs))} | "
               f"{_fmt(_mean(c['lines'] for c in cs), 1)} | "
               f"{_fmt(_mean(c['acts'] for c in cs), 1)} | "
               f"{_fmt(_mean(c['runtime'] for c in cs), 1)} |")
@@ -862,10 +1000,12 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
     chart = write_config_bar_chart(reps, configs, landscapes, out_dir)
     if chart:
         chart_path, within = chart
-        A(f"![Mean dist to needles and dup fraction by configuration]({chart_path})")
+        A(f"![Mean dist to needles and median NN spacing by configuration]({chart_path})")
         A("")
         A("Bars are the two headline columns of the table above — the same means, so "
-          "they cannot drift apart from it.")
+          "they cannot drift apart from it. The two panels run in OPPOSITE directions: "
+          "`dist to needles` is lower-is-better, `median NN spacing` higher-is-better, "
+          "so a configuration that wins both has a SHORT left bar and a TALL right one.")
         A("")
         if within:
             A(f"Error bars are the 95% CI of each mean, built from the repeat-to-repeat "
@@ -908,20 +1048,23 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
 
     A("## Per-landscape winners")
     A("")
-    A("| landscape | best dist to needles | best dup fraction |")
+    A("| landscape | best dist to needles | widest median NN spacing (x10^-3) |")
     A("|---|---|---|")
     for ls in landscapes:
         rows = [(c["name"], float(d["dist"]),
-                 float(d["dup"]) if d["dup"] is not None else float("nan"))
+                 float(d["spacing"]) if d["spacing"] is not None else float("nan"))
                 for c in configs
                 for d in [cell[(c["name"], ls)]]
                 if d["dist"] is not None]
         if not rows:
             A(f"| {ls} | — | — |")
             continue
+        # The two columns are ranked in OPPOSITE directions — dist is a distance to
+        # minimise, spacing is a spread to maximise.
         bd = min(rows, key=lambda r: r[1])
-        bu = min(rows, key=lambda r: r[2])
-        A(f"| {ls} | `{bd[0]}` ({bd[1]:.4f}) | `{bu[0]}` ({bu[2]:.4f}) |")
+        bs = max((r for r in rows if r[2] == r[2]), key=lambda r: r[2], default=None)
+        spacing_cell = f"`{bs[0]}` ({bs[2] * NN_SPACING_SCALE:.2f})" if bs else "—"
+        A(f"| {ls} | `{bd[0]}` ({bd[1]:.4f}) | {spacing_cell} |")
     A("")
 
     runs_csv, stats_csv = write_repeat_csvs(reps, configs, landscapes, out_dir)

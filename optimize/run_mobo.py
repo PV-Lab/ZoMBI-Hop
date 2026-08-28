@@ -1661,6 +1661,7 @@ from eval_metrics import (  # noqa: E402  — after sys.path setup in callers
     metric_avg_pairwise_dist,
     metric_dist_to_needles,
     metric_dup_fraction,
+    metric_median_nn_spacing,
     metric_n_points_penalty,
     zoom_size_fraction,
     metric_pct_matched,

@@ -44,9 +44,9 @@ HPARAM_SPACE: dict[str, tuple] = {
     # must allow reaching it. Kept in sync with evaluate._force_zoom_floors(),
     # which derives the same floor from ZoMBIHop's own defaults.
     "max_zooms":                   (2,      6,     "int"),
-    # Lower bound is 2 so at least min_iters_per_zoom (=2) lines can be sampled
+    # Lower bound is 3 so at least min_iters_per_zoom (=3) lines can be sampled
     # per zoom level before the optimiser may advance or declare a needle.
-    "max_iterations":              (2,      12,    "int"),
+    "max_iterations":              (3,      12,    "int"),
     "top_m_points":                (4,      16,    "int"),
     "n_consecutive_converged":     (2,      5,     "int"),
     # Lower bound is 0.1: the convergence test is EI < GP_output_noise × this,
