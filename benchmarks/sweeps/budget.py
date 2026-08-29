@@ -86,6 +86,7 @@ class BudgetState:
     points_per_line: int
     lines_measured: int = 0
     budget_hit: bool = False
+    never_terminate: bool = True
 
     @property
     def max_adaptive_lines(self) -> int:
@@ -101,12 +102,25 @@ class BudgetState:
             "adaptive_lines_allowed": self.max_adaptive_lines,
             "adaptive_lines_measured": int(self.lines_measured),
             "budget_hit": bool(self.budget_hit),
+            "never_terminate": bool(self.never_terminate),
         }
 
 
 @contextlib.contextmanager
-def line_budget(n_lines: int = DEFAULT_N_LINES, *, state: BudgetState | None = None):
+def line_budget(n_lines: int = DEFAULT_N_LINES, *, state: BudgetState | None = None,
+                never_terminate: bool = True):
     """Cap the enclosed trial at ``n_lines`` measured LineBO lines.
+
+    ``never_terminate`` (default True) is what makes that cap the *binding* stop.
+    ``run_mobo`` calls ``ZoMBIHop.run`` without it, so the optimiser is free to end a
+    cell early through any of its internal pathways -- over-penalisation, an
+    activation failure with no needles, all axes below the noise floor -- and cells
+    then finish having spent only a few hundred of their budgeted points. Under a
+    landscape sweep that is a confound, not a result: a tile would look poor because
+    its run self-terminated rather than because its landscape is hard. With this on,
+    ZoMBIHop shrinks needle penalties and falls back to space-filling exploration
+    instead of stopping, so every cell spends the same measurement budget and the
+    only thing that ends it is :class:`BudgetExhausted` (or the wall-clock ceiling).
 
     Yields the :class:`BudgetState`, which after the block says how many lines were
     actually measured and whether the cap is what stopped the run. Both patches are
@@ -122,6 +136,7 @@ def line_budget(n_lines: int = DEFAULT_N_LINES, *, state: BudgetState | None = N
         n_init_lines=int(rm.N_INIT_LINES),
         points_per_line=int(rm.NUM_EXPERIMENTS),
     )
+    st.never_terminate = bool(never_terminate)
     limit = st.max_adaptive_lines
 
     orig_make = rm.make_linebo_wrapper
@@ -145,6 +160,11 @@ def line_budget(n_lines: int = DEFAULT_N_LINES, *, state: BudgetState | None = N
         return wrapper
 
     def budgeted_run(self, *args, **kwargs):
+        if never_terminate:
+            # run_mobo's call site (optimizer.run(max_activations=inf,
+            # time_limit_hours=...)) does not pass this, and it is keyword-only on
+            # ZoMBIHop.run, so setting it here reaches every caller the sweep uses.
+            kwargs["never_terminate"] = True
         try:
             return orig_run(self, *args, **kwargs)
         except BudgetExhausted as exc:
