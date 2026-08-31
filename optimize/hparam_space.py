@@ -39,14 +39,16 @@ HPARAM_SPACE: dict[str, tuple] = {
     # Acquisition function
     "ucb_beta":                    (0.001,   3.0,   "linear"),
     # Zoom / convergence
-    # Lower bound is 2: a needle can only be declared at zoom level 2+
-    # (ZoMBIHop.min_zoom_for_needle, lowered to 1 post-6d-campaign), so max_zooms
-    # must allow reaching it. Kept in sync with evaluate._force_zoom_floors(),
-    # which derives the same floor from ZoMBIHop's own defaults.
+    # Lower bound is 2 so the Jaccard sliding window has a second box to move to.
+    # (Zoom forcing is gone — ZoMBIHop.min_zoom_for_needle is pinned to 0 — so
+    # depth is no longer a precondition for declaring a needle.) Kept in sync with
+    # evaluate._force_zoom_floors(), which derives the same floor from ZoMBIHop's
+    # own defaults.
     "max_zooms":                   (2,      6,     "int"),
-    # Lower bound is 3 so at least min_iters_per_zoom (=3) lines can be sampled
-    # per zoom level before the optimiser may advance or declare a needle.
-    "max_iterations":              (3,      12,    "int"),
+    # Lower bound is 5: a zoom level must outlast the repeatability gate
+    # (ZoMBIHop.needle_min_repeats = 5), which answers "keep sampling" until the
+    # local best has repeated, as well as min_iters_per_zoom (=3).
+    "max_iterations":              (5,      12,    "int"),
     "top_m_points":                (4,      16,    "int"),
     "n_consecutive_converged":     (2,      5,     "int"),
     # Lower bound is 0.1: the convergence test is EI < GP_output_noise × this,
