@@ -30,7 +30,7 @@ What it does
 Budget
 ------
 Every run gets the same SAMPLING budget — ``--budget-points`` measured points
-(default 4000), converted to evaluate.py's ``--max-lines``. A showdown compares what
+(default 3000), converted to evaluate.py's ``--max-lines``. A showdown compares what
 configurations do with an equal number of experiments; a wall-clock budget instead
 compares them at whatever point count each happened to reach, which drifts with node
 speed and with how expensive a config's own acquisition step is. ``--time-limit`` is
@@ -125,7 +125,7 @@ DEFAULT_N_LANDSCAPES = 5
 # number of experiments, so the comparison is "who does more with the same budget"
 # rather than "who ran on the faster node". The wall-clock --time-limit stays on as a
 # secondary safety cap only.
-DEFAULT_BUDGET_POINTS = 4000
+DEFAULT_BUDGET_POINTS = 3000
 # One LineBO line = NUM_EXPERIMENTS measured points, and every run starts with a fixed
 # preamble of N_INIT_LINES init lines before the optimizer's first objective call.
 # Mirrors run_mobo.NUM_EXPERIMENTS / N_INIT_LINES (run_mobo.py:291); duplicated here so
