@@ -6,11 +6,33 @@
 # zoom 0, so the open-gate regime has never been observed. origin/brianna-v2 pins
 # the floor to 0 and deletes the gate, bundled with four other changes.
 #
-# The prediction, stated before the run: more declarations, LOWER precision. The
-# merge already moved the dial the other way -- tightening min_iters_per_zoom 2 -> 3
-# halved declarations on real3d and took precision 0.449 -> 0.764 -- so opening the
-# gate should walk back along the same trade-off. If it does not, the causal story
-# in RESULTS.md is wrong and needs rewriting before it reaches a report.
+# PRE-REGISTERED PREDICTION, stated before the run. All three clauses, together:
+#
+#   1. n_declared RISES vs `zombihop` on the same core and seeds.
+#   2. peak_ratio (DECLARED recall) RISES with it.
+#   3. precision FALLS.
+#
+# Clause 2 is the one that makes this a real test. "More declarations, lower
+# precision" alone is satisfied trivially by junk needles -- a gate that emits
+# garbage would produce exactly that pattern while REFUTING the claim that the gate
+# was suppressing real finds. The claim is that ZoMBI-Hop's samples already sit on
+# optima it is not allowed to declare (on real3d its samples reach 96% of true
+# optima while it declares 27%), so opening the gate must convert some of that
+# reach into declared recall. If n_declared rises and peak_ratio does not, the
+# needles being unlocked are not on optima and the causal story in RESULTS.md is
+# wrong -- rewrite it before it reaches a report.
+#
+# Read the trade-off on the matched-|S| basis and the full PR curve, not on declared
+# recall alone: |S| differs between the arms by construction, which is the whole
+# point of the arm.
+#
+# Direction check from the merge, which moved the same dial the other way:
+# min_iters_per_zoom 2 -> 3 cut real3d declarations 10.67 -> 5.00 and took precision
+# 0.449 -> 0.764. Note that drop is a tighter declaration BUDGET (each activation
+# must spend ~50% more lines before it may declare), not a choosier gate, and the
+# precision jump is mostly the in-box argmax fix landing needles on the point the
+# zoom actually converged to. mz0 moves the gate itself, so it is a cleaner
+# manipulation than the merge was.
 #
 # 3-D and 4-D only: real6d declares ~15 needles against 68 true optima and sits near
 # the floor on every metric, so it cannot resolve a precision/recall trade-off.

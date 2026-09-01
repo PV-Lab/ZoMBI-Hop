@@ -564,14 +564,32 @@ did not. That is the cleanest evidence yet that the two are separable and that t
 declaration budget is what binds — and it arrived from a change we did not design,
 which makes it better evidence than the s1 correlation was.
 
-**Halving the declarations roughly doubles precision at 3-D** (0.449 → 0.764) at a
-cost of 0.095 recall. So the gate is not merely a cap; it is a precision/recall
-dial, and `zombihop_mz0` is the other end of it.
+**The merged core's defaults sit further toward the high-precision / low-recall
+end**: precision 0.449 → 0.764 at 3-D while declared recall falls 0.357 → 0.262.
 
-Mechanism, for the record: `min_iters_per_zoom` 2 → 3 makes each activation spend
-more lines before it may declare, which is exactly a tighter declaration budget;
-the in-bounds argmax fix moves each needle and therefore the penalty ellipsoid.
-Both push the same way on `n_declared`.
+Attribute that carefully, because two separate changes are doing the work and it
+would be easy to credit the wrong one:
+
+* The **declaration drop is budget arithmetic, not a choosier gate.**
+  `min_iters_per_zoom` 2 → 3 makes every activation spend ~50% more lines before it
+  may declare anything, so fewer declarations fit in the same 2000 samples. The
+  extra local sampling per zoom is also the most likely reason **reach improved**.
+* The **precision jump is mostly the in-box argmax fix.** Needles now land on the
+  point the zoom actually converged to, rather than on the global unpenalized
+  argmax, so a declaration is a better estimate of the optimum it came from — and
+  the penalty ellipsoid it seeds is better placed.
+
+So this is *not* a demonstration that the gate is a precision/recall dial. It is
+consistent with that, and `zombihop_mz0` is the clean manipulation that tests it,
+because it moves `min_zoom_for_needle` and nothing else.
+
+**Consequence for the re-stamped RESULTS.** With declarations roughly halved at
+3-D, matched |S| there falls from 6 to about 5. That coarsens the per-seed
+resolution of the headline comparison (recall still moves in steps of 1/14), which
+is precisely what the 20-seed top-up is for, and it makes the matched-|S| basis and
+the full PR curve more load-bearing than they already were. Declared-recall
+comparisons across the two cores are now doubly misleading: different core *and*
+different |S|.
 
 Caveat on n: three seeds per objective. This sizes the effect and settles that a
 re-run is mandatory; it is **not** the re-run, and none of these numbers should be
