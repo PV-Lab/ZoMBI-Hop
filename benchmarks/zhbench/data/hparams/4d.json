@@ -1,7 +1,7 @@
 {
-  "_provenance": "warm_start/BEST_HPARAMS.md, run_uuid 9dfe (4d MOBO winner)",
+  "_provenance": "warm_start/BEST_HPARAMS.md, run_uuid 9dfe (4d MOBO winner). max_iterations was tuned to 2; raised to 3 when the core merge at baa51de moved min_iters_per_zoom 2->3, which makes 3 the force-zooming floor. The runner would raise it silently anyway (evaluate._force_zoom_floors), so it is written down here instead. Brianna made the same change to optimize/hparams/6d_ensemble.json in 6f6bbaa. See benchmarks/docs/DESIGN.md 23 and 27.",
   "max_zooms": 3,
-  "max_iterations": 2,
+  "max_iterations": 3,
   "top_m_points": 2,
   "n_restarts": 173,
   "raw": 97,

@@ -31,22 +31,36 @@ import pytest
 
 from zhbench._repo import eval_metrics, evaluate, run_mobo
 
-# The core state the published s1_real bundle was produced against.
+# The core state the CURRENT bundle is benchmarked against: origin/brianna at
+# baa51de, merged deliberately. Update this block only together with a re-run.
 PUBLISHED = {
     "min_zoom_for_needle": 1,
-    "min_iters_per_zoom": 2,
+    "min_iters_per_zoom": 3,
     "zoom_floor": 2,          # min_zoom_for_needle + 1
-    "iter_floor": 2,          # min_iters_per_zoom
+    "iter_floor": 3,          # min_iters_per_zoom
     "MATCH_RADIUS": 0.05,
     "NOISE_LEVEL": 0.128,
     "OUTPUT_NOISE_FRAC": 0.045,
 }
 
+# What the ARCHIVED s1_real bundle ran against (core as of 77054a9). Kept so the
+# difference is a fact in the test file rather than folklore: the zombihop and
+# zombihop_nc5 rows of benchmarks/results/s1_real were produced here and must not
+# be compared against post-merge numbers. Measured shift on real3d (DESIGN.md 27):
+# n_declared 10.67 -> 5.00, precision 0.449 -> 0.764.
+ARCHIVED_S1 = {
+    "core": "77054a9",
+    "min_zoom_for_needle": 1,
+    "min_iters_per_zoom": 2,
+    "iter_floor": 2,
+}
+
 _WHY = (
-    "\n\nThe published benchmarks/results/s1_real numbers were produced with "
-    "{k} = {want!r}. If this change is intended, re-run the 60 zombihop / "
-    "zombihop_nc5 cells and update the Provenance section of "
-    "benchmarks/results/s1_real/RESULTS.md. Do not silently republish."
+    "\n\nThe current bundle is pinned to {k} = {want!r} (core baa51de). If this "
+    "change is intended, re-run the affected ZoMBI-Hop cells and update this block "
+    "AND the Provenance section of benchmarks/results/s1_real/RESULTS.md in the "
+    "same commit. Do not silently republish -- the last such move more than halved "
+    "n_declared on real3d."
 )
 
 

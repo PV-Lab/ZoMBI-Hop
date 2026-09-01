@@ -9,6 +9,13 @@ at a comparable value). They are NOT hardware-validated optima.
 
 ## Provenance — these numbers are pinned to a core version
 
+> ⚠️ **The core has since been merged forward (`origin/brianna` @ `baa51de`), and
+> the `zombihop` / `zombihop_nc5` rows below are STALE.** They are kept as the
+> archived pre-merge bundle. Measured shift on real3d over 3 paired seeds:
+> `n_declared` 10.67 → 5.00, `precision` 0.449 → 0.764, `peak_ratio` −0.095
+> (DESIGN.md §27). **Do not compare these two rows against post-merge numbers.**
+> The four `random` / `gp_*` rows are unaffected and remain current.
+
 Run at `benchmarking-v2` commits `d304c411` (170 cells) / `cd568622` (10 cells),
 both carrying the ZoMBI-Hop core as of `77054a9`. `dirty=false` on all 180 cells.
 

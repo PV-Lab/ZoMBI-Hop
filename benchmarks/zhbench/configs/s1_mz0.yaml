@@ -1,0 +1,33 @@
+# The declaration-gate arm: min_zoom_for_needle = 0, everything else per-dim tuned.
+#
+# Tests OUR OWN published causal claim before someone else's branch tests it for us.
+# RESULTS.md attributes ZoMBI-Hop's low peak_ratio to the declaration gate; 496 of
+# 563 logged needles were declared at exactly zoom == 1 (the floor) and NONE at
+# zoom 0, so the open-gate regime has never been observed. origin/brianna-v2 pins
+# the floor to 0 and deletes the gate, bundled with four other changes.
+#
+# The prediction, stated before the run: more declarations, LOWER precision. The
+# merge already moved the dial the other way -- tightening min_iters_per_zoom 2 -> 3
+# halved declarations on real3d and took precision 0.449 -> 0.764 -- so opening the
+# gate should walk back along the same trade-off. If it does not, the causal story
+# in RESULTS.md is wrong and needs rewriting before it reaches a report.
+#
+# 3-D and 4-D only: real6d declares ~15 needles against 68 true optima and sits near
+# the floor on every metric, so it cannot resolve a precision/recall trade-off.
+#
+# 20 cells. Estimated ~2 CPU-h.
+name: s1_mz0
+protocol:
+  n_samples: 2000
+  batch_size: 24
+  n_init_lines: 2
+  noise: hardware
+  eval_at: [250, 500, 1000, 2000]
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+value_tol: 0.25
+timeout_s: 7200
+objectives:
+  - {kind: real_gp, dim: 3}
+  - {kind: real_gp, dim: 4}
+optimizers:
+  - name: zombihop_mz0

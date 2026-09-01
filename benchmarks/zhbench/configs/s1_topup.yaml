@@ -1,0 +1,34 @@
+# Seed top-up: seeds 10-19 for the arms that decide the two unresolved claims.
+#
+# Run AFTER the core merge, so the zombihop seeds sit on the same core as the
+# re-run. Pairing is by seed, and a paired test only uses seeds present in BOTH
+# arms -- so topping up the baselines alone would have added nothing to the
+# comparison that actually matters (zombihop vs gp_ts at matched |S|, currently
+# 4W/3T/3L, p=0.54). zombihop MUST be in this list.
+#
+# gp_qucb and gp_qlogei are deliberately excluded: at ~2000-2600 s/cell they are
+# 85% of the cost of the blanket top-up, and the claim they bear on (random >
+# gp_qlogei at real4d) is ALREADY resolved at 10 seeds (9W/1T/0L, p<0.001).
+#
+# real6d is excluded: everything there sits within ~1 optimum out of 68 of
+# everything else, and it is budget-limited rather than under-powered. More seeds
+# would buy precision on a number that means nothing until the N=6000 run.
+#
+# 60 cells. Estimated ~5 CPU-h.
+name: s1_topup
+protocol:
+  n_samples: 2000
+  batch_size: 24
+  n_init_lines: 2
+  noise: hardware
+  eval_at: [250, 500, 1000, 2000]
+seeds: [10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+value_tol: 0.25
+timeout_s: 7200
+objectives:
+  - {kind: real_gp, dim: 3}
+  - {kind: real_gp, dim: 4}
+optimizers:
+  - name: random
+  - name: gp_ts
+  - name: zombihop
