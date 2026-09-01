@@ -16,7 +16,10 @@ _SPECS: dict[str, dict] = {
     "gp_ts": {},
     "zombihop": {},
     # n_consecutive_converged=5 sensitivity: the value src/default_hparams.py
-    # still carries, versus the 2 the 6-D campaign actually ran with.
+    # still carries (verified unchanged on origin/brianna and origin/brianna-v2),
+    # against whatever the tuned JSON for that dimension carries. That is NOT a
+    # uniform 2: 3d.json has 1, 4d.json and 6d_ensemble.json have 2. So this arm is
+    # "1 vs 5" at 3-D and "2 vs 5" at 4-D/6-D -- do not pool them into one claim.
     "zombihop_nc5": {"n_consecutive_converged": 5},
 }
 
