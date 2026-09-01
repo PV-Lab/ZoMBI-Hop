@@ -2744,8 +2744,8 @@ def run_single_trial(
                 "ackley_seed": ackley_seed}
 
     hp = dict(hparams)
-    if dim > 3 and (hp.get("top_m_points") is None or hp.get("top_m_points", 0) < dim + 1):
-        hp["top_m_points"] = max(dim + 1, 4)
+    # top_m_points is retired (it fed the removed Jaccard sliding window); DataHandler
+    # still auto-computes its own max(d + 1, 4) for the fields that persist it.
 
     try:
         optimizer = ZoMBIHop(

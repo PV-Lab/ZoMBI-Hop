@@ -52,28 +52,29 @@ _TARGETS: dict[str, tuple[tuple[str, str], ...]] = {
     "acquisition_type":   (("dh", "acquisition_type"),   ("gp", "acquisition_type")),
     "ucb_beta":           (("dh", "ucb_beta"),           ("gp", "ucb_beta")),
     "input_noise":        (("dh", "input_noise"),),
-    # ── zoom / convergence (DataHandler-owned) ────────────────────────────
-    "max_zooms":                   (("dh", "max_zooms"),),
-    "max_iterations":              (("dh", "max_iterations"),),
-    "top_m_points":                (("dh", "top_m_points"),),
-    "n_consecutive_converged":     (("dh", "n_consecutive_converged"),),
+    # ── zoom resolution floor (DataHandler-owned) ─────────────────────────
+    # input_noise_threshold_mult sets the minimum width of any zoom box, and so
+    # bounds how deep the basin flood fill can zoom before the printer's own
+    # resolution makes a tighter box meaningless.
     "input_noise_threshold_mult":  (("dh", "input_noise_threshold_mult"),),
-    "output_noise_threshold_mult": (("dh", "output_noise_threshold_mult"),),
     "max_gp_points":               (("dh", "max_gp_points"),),
-    "jaccard_window":              (("dh", "jaccard_window"),),
-    "jaccard_threshold":           (("dh", "jaccard_threshold"),),
     # ── point paring (DataHandler-owned) ──────────────────────────────────
     "paring_spatial_halfnoise":  (("dh", "paring_spatial_halfnoise"),),
     "paring_y_noise_multiplier": (("dh", "paring_y_noise_multiplier"),),
-    # ── penalty / needle (ZoMBIHop-owned) ─────────────────────────────────
+    # ── basin flood fill / zoom / needle (ZoMBIHop-owned) ─────────────────
+    "max_lines_per_activation":     (("zombi", "max_lines_per_activation"),),
+    "flood_ci_z":                   (("zombi", "flood_ci_z"),),
+    "flood_k":                      (("zombi", "flood_k"),),
+    "zoom_volume_fraction":         (("zombi", "zoom_volume_fraction"),),
+    "needle_move_tol":              (("zombi", "needle_move_tol"),),
+    "needle_ci_tol":                (("zombi", "needle_ci_tol"),),
+    "needle_ci_bootstrap":          (("zombi", "needle_ci_bootstrap"),),
+    # ── penalty (ZoMBIHop-owned) ──────────────────────────────────────────
     "max_penalty_radius":           (("zombi", "max_penalty_radius"),),
-    "needle_shrink_factor":         (("zombi", "needle_shrink_factor"),),
-    "needle_stop_noise_multiplier": (("zombi", "needle_stop_noise_multiplier"),),
     "ellipsoid_drop_fraction":      (("zombi", "ellipsoid_drop_fraction"),),
     "ellipsoid_eigenvalue_floor":   (("zombi", "ellipsoid_eigenvalue_floor"),),
     "bounds_shrink_factor":         (("zombi", "bounds_shrink_factor"),),
     "min_axis_noise_mult":          (("zombi", "min_axis_noise_mult"),),
-    "zoom_jaccard_threshold":       (("zombi", "zoom_jaccard_threshold"),),
 }
 
 
@@ -113,25 +114,22 @@ _CASTS: dict[str, Callable[[Any], Any]] = {
     "acquisition_type":   _acq_cast,
     "ucb_beta":           _nonneg_float,
     "input_noise":        _positive_float,
-    "max_zooms":                   _positive_int,
-    "max_iterations":              _positive_int,
-    "top_m_points":                _positive_int,
-    "n_consecutive_converged":     _positive_int,
     "input_noise_threshold_mult":  _nonneg_float,
-    "output_noise_threshold_mult": _nonneg_float,
     "max_gp_points":               _positive_int,
-    "jaccard_window":              _positive_int,
-    "jaccard_threshold":           _nonneg_float,
     "paring_spatial_halfnoise":    _nonneg_float,
     "paring_y_noise_multiplier":   _nonneg_float,
+    "max_lines_per_activation":     _positive_int,
+    "flood_ci_z":                   _positive_float,
+    "flood_k":                      _positive_int,
+    "zoom_volume_fraction":         _positive_float,
+    "needle_move_tol":              _positive_float,
+    "needle_ci_tol":                _nonneg_float,
+    "needle_ci_bootstrap":          _positive_int,
     "max_penalty_radius":           _positive_float,
-    "needle_shrink_factor":         _positive_float,
-    "needle_stop_noise_multiplier": _positive_float,
     "ellipsoid_drop_fraction":      _nonneg_float,
     "ellipsoid_eigenvalue_floor":   _positive_float,
     "bounds_shrink_factor":         _positive_float,
     "min_axis_noise_mult":          _nonneg_float,
-    "zoom_jaccard_threshold":       _nonneg_float,
 }
 
 #: Every hyperparameter that can be changed while a run is in flight.

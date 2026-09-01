@@ -1,0 +1,31 @@
+{
+  "config_name": "basin",
+  "selected_for": "explicit",
+  "source_run": "hand-chosen for the basin flood-fill loop (src/core/zombihop.py)",
+  "notes": {
+    "acquisition": "Mid-range values inside the current HPARAM_SPACE. The 6d MOBO winner's acquisition settings were tuned against the EI-convergence loop and several of them (nat_grad_step 0.232) sit outside the space entirely, so carrying them over would be false provenance rather than a warm start.",
+    "flood_ci_z": "2.0 ~= a 95% posterior interval on each side: a point joins the basin when its 95% best case reaches the incumbent's 95% worst case. Below ~1.5 the basin collapses to the incumbent's own line; above ~2.5 it tunnels through shallow valleys and merges neighbouring peaks.",
+    "flood_k": "6 = d for the 6d ensemble. Each LineBO line contributes ~24 raw points that pare down to a handful, so k must exceed the per-line node count for the fill to bridge to the next line, but stay well under it in total so a single hop cannot cross a valley.",
+    "zoom_volume_fraction": "0.5, per the algorithm spec. Note this is a VOLUME ratio in d dimensions, so it triggers readily while the basin is genuinely local and stops on its own once the basin fills its box.",
+    "needle_move_tol": "0.10 = ten composition points of L2 movement between consecutive lines.",
+    "needle_ci_tol": "0.15 relative change in the bootstrap CI half-width of the median at the best point.",
+    "paring_spatial_halfnoise": "1.0 (not the 0.5 default): this radius (x input_noise = 0.128) now also defines the replicate neighbourhood the median CI is bootstrapped over, and 0.5 catches too few points for a usable CI right after a zoom.",
+    "max_lines_per_activation": "30, unchanged. It is now the only budget an activation has."
+  },
+  "hparams": {
+    "nat_grad_step": 0.05,
+    "nat_grad_max_steps": 40,
+    "n_restarts": 200,
+    "raw": 300,
+    "ucb_beta": 1.0,
+    "max_lines_per_activation": 30,
+    "flood_ci_z": 2.0,
+    "flood_k": 6,
+    "zoom_volume_fraction": 0.5,
+    "needle_move_tol": 0.10,
+    "needle_ci_tol": 0.15,
+    "max_penalty_radius": 0.5,
+    "paring_spatial_halfnoise": 1.0,
+    "paring_y_noise_multiplier": 1.0
+  }
+}
