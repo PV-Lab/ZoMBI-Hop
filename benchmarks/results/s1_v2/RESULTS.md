@@ -22,7 +22,7 @@ cells would have burned ~40 CPU-h to reproduce 120 of them exactly.
 
 | arm group | cells | core | source |
 |---|---|---|---|
-| `random`, `gp_*` seeds 0–9 | 100 | **77054a9** (`d304c411`/`cd568622`) | `s1_real_20260824_221242` |
+| `random`, `gp_*` seeds 0–9 | 120 | **77054a9** (`d304c411`/`cd568622`) | `s1_real_20260824_221242` |
 | `random`, `gp_ts` seeds 10–19 (3D/4D) | 40 | **baa51de** | `s1_topup_20260901_030257` |
 | `zombihop`, `zombihop_nc5` seeds 0–9 | 60 | **baa51de** | `s1_zh_rerun_20260831_223450` |
 | `zombihop` seeds 10–19 (3D/4D) | 20 | **baa51de** | `s1_topup_20260901_030257` |
@@ -47,7 +47,7 @@ difference is not a small effect, it is no effect plus rounding.
 |---|---|
 | Standard BO recovers **fewer** optima than uniform random at 4D | **resolved for all three**: `gp_qlogei` +0.082 (8/2/0, p=0.002/0.008), `gp_qucb` +0.056 (7/3/0, p=0.007/0.016), `gp_ts` +0.048 (14/3/3, p=0.013/0.013) |
 | ZoMBI-Hop's input cost is far below every baseline | **resolved** — no seed overlap at any dimension |
-| ZoMBI-Hop is faster than the GP baselines at 3D/4D | **resolved** — no overlap |
+| ZoMBI-Hop is faster than `gp_qucb` / `gp_qlogei` at 3D/4D | **resolved** — but `gp_ts` is faster than ZoMBI-Hop everywhere |
 | **ZoMBI-Hop recovers more optima than random at matched \|S\|, real3d** | **NOT SUPPORTED.** +0.0036, 8W/3T/9L, p=0.874/1.000 |
 | ZoMBI-Hop vs any baseline, any landscape, matched \|S\| | **nothing resolves** |
 | `n_consecutive_converged` tuned-vs-5 | **not resolved** anywhere (4D: 7/2/1, p(sign)=0.070) |
@@ -56,7 +56,10 @@ difference is not a small effect, it is no effect plus rounding.
 
 The previous bundle's headline — `zombihop` > `random` at matched |S| on real3d —
 was +0.0857, 8W/1T/1L, p(t)=0.009, p(sign)=0.039, the only resolved
-method-vs-method result in the suite. It is now **+0.0036, 8W/3T/9L, p=0.874**.
+**ZoMBI-Hop-versus-baseline** result in the suite. (Three other method-vs-method
+pairs resolved in that bundle, all of them baselines beating a ZoMBI-Hop arm or each
+other: `random` > `gp_qlogei` at real4d, and `gp_qucb` / `gp_qlogei` > `zombihop_nc5`
+at real4d.) It is now **+0.0036, 8W/3T/9L, p=0.874**.
 
 It decayed in two steps, and both are attributable:
 
@@ -102,10 +105,15 @@ we have (peak rarity 0.0349).
 | `zombihop` | **111 ± 6** | **62 ± 5** | **61 ± 3** |
 | cheapest baseline (`gp_ts`) | 367 ± 48 | 723 ± 46 | 816 ± 8 |
 | `random` | 1002 ± 14 | 988 ± 10 | 902 ± 7 |
-| ratio vs cheapest / vs random | 3.3× / 9.0× | 11.6× / 15.9× | 13.4× / 14.8× |
+| ratio vs cheapest / vs random | 3.3× / 9.0× | 11.6× / 15.9× | 13.3× / 14.7× |
 
-No seed overlaps at any dimension. ZoMBI-Hop is also **4–5× cheaper in wall-clock**
-than the GP baselines at 3D and 4D (470 s vs 2374 s / 1960 s at 3D).
+No seed overlaps at any dimension.
+
+**Wall-clock is not a uniform win and should not be quoted as one.** ZoMBI-Hop is
+4–5× cheaper than `gp_qucb` and `gp_qlogei` at 3D and 4D (470 s vs 2374 s / 1960 s at
+3D) — but `gp_ts` is a GP baseline too, and it is **faster than ZoMBI-Hop at every
+dimension** (208 s / 284 s / 445 s against 470 s / 470 s / 2480 s). At 6D ZoMBI-Hop is
+the slowest arm in the suite.
 
 This is the result the project can defend without qualification, and it is the one
 SnAKe framing was brought in for. It currently has **no figure**.
@@ -127,10 +135,13 @@ declarations rise, **declared recall rises with them**, precision falls.
 | | `zombihop` → `mz0` | W/T/L | p(sign) |
 |---|---|---|---|
 | real3d `n_declared` | 4.60 → 7.40 | 7/1/2 | 0.180 |
-| real3d `peak_ratio` | 0.207 → **0.321** | 7/2/1 | 0.070 |
+| real3d `peak_ratio` | 0.236 → **0.321** | 7/2/1 | 0.070 |
 | real3d `precision` | 0.645 → 0.667 | 2/2/6 | 0.289 |
 | real4d `n_declared` | 11.20 → 12.90 | 7/3/0 | **0.016** |
 | real4d `peak_ratio` | 0.148 → **0.148** | 4/2/4 | **1.000** |
+
+`zombihop_mz0` ran on seeds 0–9 only, so every row above is the paired test on those ten
+shared seeds — the `zombihop` 3D mean is 0.236 there, against 0.207 over all 20 seeds.
 
 At **3D** all three clauses hold directionally and `mz0` reaches the highest declared
 recall of any ZoMBI-Hop arm (0.321, above even the pre-merge 0.271) at comparable

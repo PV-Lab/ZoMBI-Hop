@@ -83,14 +83,32 @@ def _legend_all(axes, ax_target, **kw):
     figure ending in real6d its curve appeared unlabelled -- a reader has no way to
     tell which arm it is. Collect across panels and de-duplicate, preserving the
     order the arms were plotted in.
+
+    De-duplication is on the ARM NAME, not the label. ``fig_reached`` and
+    ``fig_dist_to_needles`` label as ``"{arm} (n={seeds})"``, and a mixed bundle has
+    different seed counts per landscape -- 20 for `random` / `gp_ts` / `zombihop` at
+    3-D and 4-D against 10 at 6-D. Keying on the whole label therefore produced a
+    legend with ten entries for seven arms, listing e.g. both ``random (n=20)`` and
+    ``random (n=10)`` in the same colour. Where an arm's count differs across panels
+    the range is shown instead, so one entry stays truthful for every panel.
     """
-    pairs = {}
+    handles: dict[str, object] = {}
+    counts: dict[str, set] = {}
     for ax in axes:
-        h, l = ax.get_legend_handles_labels()
-        for hi, li in zip(h, l):
-            pairs.setdefault(li, hi)
-    if pairs:
-        ax_target.legend(pairs.values(), pairs.keys(), **kw)
+        for hi, li in zip(*ax.get_legend_handles_labels()):
+            arm, _, tail = li.partition(" (n=")
+            handles.setdefault(arm, hi)
+            if tail:
+                counts.setdefault(arm, set()).add(int(tail.rstrip(")")))
+    if not handles:
+        return
+    labels = []
+    for arm in handles:
+        n = sorted(counts.get(arm, ()))
+        labels.append(arm if not n else
+                      f"{arm} (n={n[0]})" if len(n) == 1 else
+                      f"{arm} (n={n[0]}–{n[-1]})")
+    ax_target.legend(handles.values(), labels, **kw)
 
 
 def fig_reached(rows, curves, suite_dir, objectives) -> str:
