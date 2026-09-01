@@ -74,6 +74,25 @@ def _mean_std(rows, opt, key):
     return (float(np.mean(v)), float(np.std(v)), len(v)) if v else (np.nan, np.nan, 0)
 
 
+def _legend_all(axes, ax_target, **kw):
+    """One legend covering every arm drawn in ANY panel.
+
+    Matplotlib builds a legend from the handles of a single axes, and the legend
+    has always been drawn on the last panel. That silently drops any method absent
+    from that panel: `zombihop_mz0` runs at 3-D and 4-D only, so on a three-panel
+    figure ending in real6d its curve appeared unlabelled -- a reader has no way to
+    tell which arm it is. Collect across panels and de-duplicate, preserving the
+    order the arms were plotted in.
+    """
+    pairs = {}
+    for ax in axes:
+        h, l = ax.get_legend_handles_labels()
+        for hi, li in zip(h, l):
+            pairs.setdefault(li, hi)
+    if pairs:
+        ax_target.legend(pairs.values(), pairs.keys(), **kw)
+
+
 def fig_reached(rows, curves, suite_dir, objectives) -> str:
     plt = _mpl()
     opts = _opts(rows)
@@ -99,7 +118,7 @@ def fig_reached(rows, curves, suite_dir, objectives) -> str:
         ax.set_xlabel("samples")
         ax.grid(alpha=0.25)
     axes[0][0].set_ylabel("fraction of true optima reached")
-    axes[0][-1].legend(fontsize=7, loc="upper left")
+    _legend_all(axes[0], axes[0][-1], fontsize=7, loc="upper left")
     fig.suptitle("Sample efficiency: optima reached (near AND high) vs budget",
                  fontsize=11)
     fig.tight_layout()
@@ -179,7 +198,7 @@ def fig_matched_declarations(rows, curves, suite_dir, objectives) -> str:
         ax.set_xlabel("|S| = number of optima declared")
         ax.grid(alpha=0.25)
     axes[0][0].set_ylabel("peak ratio (recall)")
-    axes[0][-1].legend(fontsize=7, loc="lower right")
+    _legend_all(axes[0], axes[0][-1], fontsize=7, loc="lower right")
     fig.suptitle("Matched declarations: recall vs how many optima were declared "
                  "(star = ZoMBI-Hop's own count)", fontsize=11)
     fig.tight_layout()
@@ -294,7 +313,7 @@ def fig_dist_to_needles(rows, suite_dir, objectives) -> str | None:
         plt.close(fig)
         return None
     axes[0][0].set_ylabel("dist_to_needles  (lower is better)")
-    axes[0][-1].legend(fontsize=7, loc="best")
+    _legend_all(axes[0], axes[0][-1], fontsize=7, loc="best")
     fig.suptitle("Distance to the true optima vs budget, at matched |S| "
                  "(Hungarian, capped at 0.5; same extractor for every method)",
                  fontsize=11)
