@@ -170,6 +170,44 @@ def _run_cell(job: dict) -> tuple[str, dict]:
                          "error": err or "no metrics.json written"}
 
 
+def enumerate_cells(config: dict, suite_dir: str, retries: int = 2) -> list[dict]:
+    """Every cell this config defines, in order, as ready-to-run job dicts.
+
+    One source of truth for cell naming. A cluster array job needs the same list the
+    local runner builds -- task ``i`` runs cell ``i`` -- and re-deriving the name in
+    an sbatch script is exactly the kind of duplicated convention that drifts and
+    then silently splits a suite across two directory layouts.
+
+    Resume is NOT applied here: this enumerates the grid, and the caller decides
+    what is already done. ``stagger_s`` is likewise left to the caller, since it is
+    a local-thread-pool concern that means nothing on a cluster.
+    """
+    protocol_kwargs = dict(config.get("protocol", {}))
+    seeds = config.get("seeds", [0])
+    value_tol = float(config.get("value_tol", 0.25))
+    default_timeout = float(config.get("timeout_s", 7200))
+
+    jobs: list[dict] = []
+    for obj_spec in config["objectives"]:
+        # `timeout_s` is a scheduling knob, not part of the objective. It must not
+        # reach objectives.build(): make_ensemble forwards unknown keys straight into
+        # the Ensemble config, so leaving it in would silently define a landscape
+        # parameter named timeout_s and change the cell name via the objective label.
+        obj_spec = dict(obj_spec)
+        cell_timeout = float(obj_spec.pop("timeout_s", default_timeout))
+        for opt_spec in config["optimizers"]:
+            for seed in seeds:
+                cell = (f"{_obj_label(obj_spec).replace(' ', '_').replace('=', '')}"
+                        f"__{opt_spec['name']}__s{seed}")
+                jobs.append({"cell": cell,
+                             "run_dir": os.path.join(suite_dir, cell),
+                             "objective": obj_spec, "optimizer": opt_spec,
+                             "seed": seed, "protocol": protocol_kwargs,
+                             "value_tol": value_tol, "retries": retries,
+                             "timeout_s": cell_timeout})
+    return jobs
+
+
 def run_suite(config: dict, out_root: str, resume: bool = True,
               workers: int = 1, suite_dir: str | None = None,
               retries: int = 2) -> str:
@@ -188,50 +226,27 @@ def run_suite(config: dict, out_root: str, resume: bool = True,
     with open(os.path.join(suite_dir, "config.yaml"), "w", encoding="utf-8") as fh:
         yaml.safe_dump(config, fh, sort_keys=False)
 
-    protocol_kwargs = dict(config.get("protocol", {}))
-    seeds = config.get("seeds", [0])
-    value_tol = float(config.get("value_tol", 0.25))
-
-    # Per-cell wall-clock limit. This was hard-coded at 7200 s and unreachable from
-    # anywhere, which is fine at N=2000 and actively dangerous above it: the slowest
-    # observed cell (real6d / zombihop) took 6374 s = 89% of the limit, so the
-    # planned 6-D run at N=6000 would have started silently recording timeouts as
-    # failures -- and a timeout is deliberately NOT retried, so the cells would just
-    # be missing. Set `timeout_s` in the config, and override per objective with
-    # `timeout_s` on the objective spec, which is where the cost actually varies.
-    default_timeout = float(config.get("timeout_s", 7200))
-
+    # Per-cell wall-clock limit lives in enumerate_cells: `timeout_s` in the config,
+    # overridable per objective. It was hard-coded at 7200 s and unreachable from
+    # anywhere, which is fine at N=2000 and dangerous above it -- the slowest
+    # observed cell (real6d / zombihop) took 6374 s, 89% of the limit, and a timeout
+    # is deliberately NOT retried, so an over-budget cell just goes missing.
     rows: list[dict] = []
     curves: dict[str, list] = {}
     jobs: list[dict] = []
-    for obj_spec in config["objectives"]:
-        # `timeout_s` is a scheduling knob, not part of the objective. It must not
-        # reach objectives.build(): make_ensemble forwards unknown keys straight into
-        # the Ensemble config, so leaving it in would silently define a landscape
-        # parameter named timeout_s and change the cell name via the objective label.
-        obj_spec = dict(obj_spec)
-        cell_timeout = float(obj_spec.pop("timeout_s", default_timeout))
-        for opt_spec in config["optimizers"]:
-            for seed in seeds:
-                cell = (f"{_obj_label(obj_spec).replace(' ', '_').replace('=', '')}"
-                        f"__{opt_spec['name']}__s{seed}")
-                run_dir = os.path.join(suite_dir, cell)
-                done = os.path.join(run_dir, "metrics.json")
-                if resume and os.path.exists(done):
-                    with open(done, encoding="utf-8") as fh:
-                        res = json.load(fh)
-                    print(f"[skip] {cell}")
-                    curves[cell] = {"objective": res.get("objective"),
-                                "optimizer": res.get("optimizer"),
-                                **{k: res.get(k) for k in _CURVE_KEYS}}
-                    rows.append({k: v for k, v in res.items() if k not in _CURVE_KEYS})
-                    continue
-                jobs.append({"cell": cell, "run_dir": run_dir, "objective": obj_spec,
-                             "optimizer": opt_spec, "seed": seed,
-                             "protocol": protocol_kwargs, "value_tol": value_tol,
-                             "retries": retries,
-                             "timeout_s": cell_timeout,
-                             "stagger_s": 3.0 * (len(jobs) % max(1, workers))})
+    for i, job in enumerate(enumerate_cells(config, suite_dir, retries=retries)):
+        done = os.path.join(job["run_dir"], "metrics.json")
+        if resume and os.path.exists(done):
+            with open(done, encoding="utf-8") as fh:
+                res = json.load(fh)
+            print(f"[skip] {job['cell']}")
+            curves[job["cell"]] = {"objective": res.get("objective"),
+                                   "optimizer": res.get("optimizer"),
+                                   **{k: res.get(k) for k in _CURVE_KEYS}}
+            rows.append({k: v for k, v in res.items() if k not in _CURVE_KEYS})
+            continue
+        job["stagger_s"] = 3.0 * (len(jobs) % max(1, workers))
+        jobs.append(job)
 
     def _absorb(cell: str, res: dict) -> None:
         curves[cell] = {"objective": res.get("objective"),
@@ -338,6 +353,9 @@ def main(argv=None) -> int:
                          "cells that have no metrics.json")
     ap.add_argument("--retries", type=int, default=2,
                     help="retries per cell on a hard crash")
+    ap.add_argument("--manifest", default=None,
+                    help="write the cell list as JSON and exit without running. "
+                         "One entry per Slurm array task; index i is array task i.")
     ap.add_argument("--timeout-s", type=float, default=None,
                     help="per-cell wall-clock limit, overriding the config "
                          "(default 7200). A timeout is recorded as a failure and is "
@@ -352,6 +370,21 @@ def main(argv=None) -> int:
         cfg = yaml.safe_load(fh)
     if args.timeout_s is not None:
         cfg["timeout_s"] = args.timeout_s
+    if args.manifest:
+        # The suite dir must already be decided, because every array task writes
+        # into it and none of them may mint a timestamp of its own.
+        if not args.suite_dir:
+            ap.error("--manifest requires --suite-dir (every array task writes "
+                     "into the same suite directory)")
+        cells = enumerate_cells(cfg, args.suite_dir, retries=args.retries)
+        os.makedirs(os.path.dirname(os.path.abspath(args.manifest)) or ".",
+                    exist_ok=True)
+        with open(args.manifest, "w", encoding="utf-8") as fh:
+            json.dump({"suite_dir": args.suite_dir, "config": cfg,
+                       "cells": cells}, fh, indent=1)
+        print(f"{len(cells)} cells -> {args.manifest}")
+        print(f"sbatch --array=0-{len(cells) - 1} slurm/zhbench_array.sbatch")
+        return 0
     run_suite(cfg, args.out, resume=not args.no_resume, workers=args.workers,
               suite_dir=args.suite_dir, retries=args.retries)
     return 0
