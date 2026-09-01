@@ -18,16 +18,23 @@ ZoMBI-Hop hyperparameters are deliberately reduced so it stays fast — **never
 quote a number from the smoke suite.**
 
 ```bash
-python -m benchmarks.zhbench.suite s1_real      # the two real campaigns
+python -m benchmarks.zhbench.suite s1_real      # the three real campaigns (~66 CPU-h)
 python -m benchmarks.zhbench.suite s2_needles   # the needle-count hypothesis
+python -m benchmarks.zhbench.report benchmarks/runs/<suite_dir>   # figures (separate step)
+python -m benchmarks.zhbench.stats  benchmarks/runs/<suite_dir>   # paired statistics
 pytest benchmarks/tests -q -m "not slow"
 ```
 
 One trial directly:
 
 ```bash
-python -m benchmarks.zhbench.runner --objective '{"kind":"ensemble","dim":3,"n_optima":20}' --optimizer '{"name":"zombihop"}' --seed 0 --n-samples 1000 --out /tmp/run
+python -m benchmarks.zhbench.runner --objective '{"kind":"ensemble","dim":3,"n_optima":20}' --optimizer '{"name":"zombihop"}' --seed 0 --protocol '{"n_samples":1000}' --out benchmarks/runs/_scratch
 ```
+
+There is no `--n-samples` flag; every protocol setting goes inside `--protocol`.
+The JSON arguments above work verbatim in Git Bash. **Windows PowerShell 5.1 strips
+the inner double quotes** and `json.loads` then fails with `Expecting property name
+enclosed in double quotes` — escape them there: `'{\"kind\":\"ensemble\"}'`.
 
 Outputs land in `benchmarks/runs/<suite>_<timestamp>/`: one directory per
 `(objective, optimizer, seed)` containing `points.csv`, `declared_optima.csv`,
@@ -53,7 +60,13 @@ courtesy ROBOT extends to single-solution baselines.
 | `t_first_optimum`, `t_half_optima` | samples to the k-th distinct optimum |
 | `input_cost` | SnAKe composition distance travelled |
 | `dup_fraction`, `best_y`, `wall_s` | secondary |
-| `lift` | `peak_ratio / peak_ratio(random)` — the cross-dimension quantity |
+| `lift` | `peak_ratio / peak_ratio(random)` — the cross-dimension quantity. **Defined but not wired in**: no column in `aggregate.csv`. |
+
+`dist_to_needles` is a Hungarian assignment **capped at 0.5**, so every true optimum
+a method leaves unclaimed costs it the full cap. That makes it incomparable across
+methods that declare different numbers of optima — read it only at matched `|S|`
+(`stats.matched_curves`, plotted as `fig6`), never straight from `curves.json`.
+See DESIGN.md §22.
 
 Matching is one-to-one because the reference sets contain optima closer together
 than `2r` (the 3-D campaign GP has a pair 0.067 apart); without it a single needle
@@ -70,8 +83,9 @@ where a 4.5%-of-`y` tolerance would cover 40% of the whole range and do nothing.
 
 | name | source | notes |
 |---|---|---|
-| `{kind: real_gp, dim: 3}` | GP over `data/2nd_real_run.db` (41 lines / 953 rows) | 24 detected peaks |
-| `{kind: real_gp, dim: 4}` | GP over `data/3rd_real_run.db` (61 lines / 1358 rows) | 24 detected peaks |
+| `{kind: real_gp, dim: 3}` | GP over `data/2nd_real_run.db` (41 lines / 953 rows) | n_true 14 after support + merge |
+| `{kind: real_gp, dim: 4}` | GP over `data/3rd_real_run.db` (61 lines / 1358 rows) | n_true 27 |
+| `{kind: real_gp, dim: 6}` | GP over `data/4th_real_run.db` (111 lines / 2423 rows) | n_true 68 |
 | `{kind: ensemble, dim, n_optima, landscape}` | `synthetic_data.ensemble` | sharp, controllable needle count |
 
 Both real objectives are gitignored data. `data/3rd_real_run.db` is the campaign DB
@@ -156,7 +170,8 @@ benchmarks/
     runner.py            one (objective, optimizer, seed) -> run dir
     suite.py             a config grid -> aggregate.csv + summary.md
     spaces.py seeding.py salvaged from the old benchmarking branch
-    configs/             smoke.yaml, s1_real.yaml, s2_needles.yaml
+    configs/             smoke, s1_sanity, s1_real, s1_real_clean, s2_needles
+    stats.py             paired-by-seed statistics -> STATS.md
     data/                hparams/*.json, input_noise_calibration.json
   tests/
 ```

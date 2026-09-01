@@ -335,3 +335,176 @@ The general lesson, and the reason the acceptance tests are written the way they
 are: assert on the artifacts on disk, not on what the protocol intends. "Same
 initial design" held when tested that way. "Exact budget" did not, and nothing
 short of reading `n_samples` out of a written `metrics.json` would have caught it.
+
+---
+
+# Round 3 — statistics and the distance view
+
+## 21. Means were not enough; every claim now carries a paired test
+
+`RESULTS.md` reported means only. On these landscapes that is not a presentation
+detail, it is the difference between a finding and rounding: recall moves in steps
+of `1/n_true` — 0.0714 on real3d — so the 0.021 gap from `zombihop` to `gp_ts`,
+which the mean ordering presented as "ZoMBI-Hop is best of all six", is **under a
+third of one optimum**.
+
+`benchmarks/zhbench/stats.py` pairs every comparison **by seed**, which is legitimate
+here for a reason worth stating: a seed fixes the initial design and the first 48
+samples are byte-identical across all six methods, so seed *s* is the same landscape
+draw and the same starting information for everyone. Two tests are reported because
+they fail differently — a paired t (uses magnitudes, more powerful, but one outlying
+seed can carry it) and an exact sign test (direction only, assumption-free, the
+honest one for a coarsely quantised metric). A claim is **resolved** only when both
+clear p<0.05. Ties are reported and dropped from the sign test, never counted as
+evidence.
+
+What that changed, at 10 seeds:
+
+| claim | before | after |
+|---|---|---|
+| `zombihop` best at matched \|S\| on real3d | stated | only the gap to `random` resolves (+0.086, 8W/1T/1L); vs `gp_ts` +0.021, p=0.54 — **not resolved** |
+| `nc` 2 > 5 | "everywhere" | resolved on real4d (9W/1T/0L, p<0.001); same direction but not resolved on real3d; **no difference at all** on real6d |
+| standard BO worse than random | stated for real4d | resolved for `gp_qlogei` only (+0.089, 9W/1T/0L). And it **reverses at 3-D**, where `gp_ts` beats random — so the claim needs the dimension attached |
+
+The defensible headline is now: at matched declarations ZoMBI-Hop's samples are at
+least as informative as the best baseline and clearly better than uniform random, at
+a tenth of the input cost and a quarter of the compute. Note also that the one
+resolved method win sits on `real3d`, the least discriminative landscape we have
+(rarity 0.0349).
+
+## 22. `dist_to_needles` is only readable at matched |S|
+
+Brianna asked for fig1's view on distance. Drawn the obvious way — each method's own
+declared set, straight out of `curves.json` — it says ZoMBI-Hop is three times worse
+than every baseline on real3d (0.30 vs 0.10). That is an artifact, and it is the
+same one `fig3` exists to remove: `metric_dist_to_needles` is a Hungarian assignment
+**capped at 0.5**, so each of the 8 true optima that ZoMBI-Hop's 6 declarations never
+claimed is charged the full cap, while a baseline's post-hoc set is handed `n_true`
+guesses and leaves none unclaimed.
+
+`stats.matched_curves` recomputes it with the *same* post-hoc extractor applied to
+every method's own samples at the same `|S|` — the distance analogue of the published
+matched-recall column, from stored `points.csv`, no reruns. The ordering inverts:
+ZoMBI-Hop becomes the **best** method on real3d (0.3026 vs random 0.3086), and all
+six sit within ~0.01 of each other on every landscape. `fig6` plots that version and
+says so in its title.
+
+The honest reading of fig6 is that **distance does not discriminate between these
+methods at matched \|S\|**, which is consistent with how shallow these surrogates
+are, and is a result rather than a disappointment.
+
+Two consequences to keep: `fig2`'s `dist_to_needles` bar panel is still the unmatched
+view and will mislead — RESULTS.md now says so. And `curves.json` +
+`matched_curves.json` are committed next to `aggregate.csv`, so `report.py` and
+`stats.py` both run against `benchmarks/results/s1_real` instead of silently emitting
+blank axes (the old trap: `report.py` wrapped the curves load in `os.path.exists` and
+left `curves = {}` with no warning).
+
+## 23. The published bundle is pinned to a core version, and that version moved
+
+`origin/brianna` advanced 11 commits past our base while s1 was being written, and
+`origin/brianna-v2` adds one more. A merge is **textually clean** — `git merge-tree`
+exits 0 against both, the changed-file sets intersect in only `.gitignore` and an
+empty `benchmarks/__init__.py`, and her `benchmarks/{ablations,sweeps,public_db}` are
+disjoint siblings of our `benchmarks/zhbench`. What is not clean is the *meaning* of
+the numbers.
+
+Three verified mechanisms, any one of which moves the ZoMBI-Hop arms:
+
+1. `6f6bbaa` changes `_declare_needle_at_best` from the **global** unpenalized argmax
+   to the argmax **inside the zoom box** (a genuine bug fix — it makes the call site
+   consistent with two others that were already bounded). The declared needle
+   position is fed straight to `determine_penalty_ellipsoid`, so moving it moves the
+   exclusion zone and therefore the whole subsequent trajectory. Blast radius is
+   bounded: `get_best_in_bounds` falls back to `get_best_unpenalized` when no
+   unpenalized point lies in bounds.
+2. `min_iters_per_zoom`'s **signature default** moves 2 → 3. This governs directly,
+   because that parameter appears in none of our hyperparameter files — and worse, it
+   propagates into ours: `zombihop_runner` calls `evaluate._force_zoom_floors()`,
+   which reads ZoMBIHop's `__init__` signature by reflection and raises
+   `max_iterations` to it. `4d.json` and `6d_ensemble.json` both carry
+   `max_iterations: 2`, i.e. exactly the old floor, so the real4d and real6d arms
+   would be silently re-tuned **with no diff under `benchmarks/` at all**.
+3. `brianna-v2` pins `min_zoom_for_needle` to 0 and deletes the zoom-forcing gate.
+   496 of the 563 logged needles (88.1%) in our bundle were declared at exactly
+   `zoom == 1` and none at 0, so v2 removes precisely the constraint our headline
+   attributes the low `peak_ratio` to, in a regime we have no observations of.
+
+The scoring side is safe, but state it at the right granularity. `optimize/
+eval_metrics.py` is **not** byte-identical (md5 `2264ffb1…` → `6fb2a733…`); the diff
+is 44 insertions and 0 deletions, one appended `metric_median_nn_spacing`. What is
+identical is **every symbol we consume**: `MATCH_RADIUS = 0.05` (line 52) and the
+body of `metric_dist_to_needles`, plus `run_mobo`'s `NOISE_LEVEL`,
+`OUTPUT_NOISE_FRAC`, `NUM_EXPERIMENTS`, `NUM_LINES`, `DTYPE` and the whole
+`ZOMBI_FIXED` dict, and all of `synthetic_data/` and `src/utils/`. **The four
+non-ZoMBI arms survive a merge unchanged** — measured at symbol level, not assumed
+from a file hash. `test_core_pins.py` asserts the symbols, which is the check that
+actually matters; a file-hash pin would fire on every unrelated upstream addition.
+
+Consequences, all now in place: RESULTS.md carries a Provenance block naming the
+commit and the three parameters; `benchmarks/tests/test_core_pins.py` fails loudly
+when any of them moves, so the next core change forces a deliberate decision instead
+of a silent re-tune. **The silent-drift channel we guarded against in `eval_metrics`
+turned out to be `evaluate._force_zoom_floors`.**
+
+Note also that UPSTREAM item 2 is *not* actioned: `n_consecutive_converged` is still
+5 in `src/default_hparams.py` and 2 in the JSON on all three refs, and `brianna-v2`
+opens a **second** drift (`max_iterations` 5 vs 3). The request should be re-filed as
+"generate `default_hparams.py` from the JSON", since the manual copy has now drifted
+twice.
+
+## 24. `s2_needles` was testing on the training distribution
+
+Brianna is right, and it is measurable: `random_ensemble_config(d, index=0)` — the
+landscape every s2 row uses — returns `noise_amp = 1123.0`, `aniso_strength = 43.0`
+and `n_plateaus = 2`. The ZoMBI-Hop hyperparameters were MOBO-tuned on exactly this
+family, so the sweep as configured cannot separate "handles many needles" from
+"was tuned here".
+
+`configs/s2_needles_clean.yaml` turns every background family off, using her own
+recipe from `sweeps/needles.py::ensemble_config`. Verified numerically:
+`_background_field` returns identically 0.0, the objective collapses to
+`max(0.5 + 0.5*exp(-b*||x-c||/sqrt(d)), 0.75)`, and 72–80% of the domain sits exactly
+at the 0.75 floor with every true optimum at exactly 1.0. No upstream change is
+needed — `synthetic_data/` is byte-identical on her branch and already exposes a
+switch per family, and `make_ensemble` forwards arbitrary keys.
+
+Two traps found while building it. `plateau_amp: 0.0` does **not** disable plateaus —
+`ensemble.py:834` guards on `len(self.plateau_centers)` with no amplitude test and
+then overwrites the background inside each disk regardless of level; only
+`n_plateaus: 0` works. And the objective name had to gain a `tag`, because without it
+a clean landscape and a full-featured one at the same `(dim, n_optima, landscape)`
+produce identical cell directory names and identical `objective` values in
+`aggregate.csv`, and would be silently poolable.
+
+Achieved counts are unchanged by the cleanup (placement is independent of the
+background), so the existing annotation carries over: d=3 `40->26, 80->33`;
+d=4 `40->32, 80->57`; d=6 `40->39, 80->77`. **Still open:** Brianna's
+`place_optima` + `pinned_optima` hits the requested `n` exactly and removes the
+packing confound altogether. That is the better experiment, but it is a *different*
+one — decide before quoting a number, do not switch silently.
+
+## 25. A needle could be declared and never logged (fixed)
+
+Found while auditing the core-drift question, and unrelated to it. `zombihop_runner`
+has no callback on declaration — the only way to timestamp a needle is to notice it
+appeared — so `obj_wrapper` drained `needle_log` after each objective evaluation.
+A needle declared by the **budget-exhausting** line was therefore never logged:
+`inner()` raises `BudgetExhausted` and the append never runs.
+
+The final metrics were unaffected, because they read `dh.needles` directly through
+the `finally`. The `@N` **prefix curves** were not, and `fig1`, `fig3` and `fig4` are
+all built from those. In the published bundle: 569 needles declared, 563 logged, 6 of
+60 cells short by one, and two headline numbers moved —
+`real4d/zombihop/s6` `peak_ratio@2000` 0.185 against 0.222 final, and
+`real6d/zombihop_nc5/s5` 0.000 against 0.015.
+
+Fixed by draining in the `finally` as well as after each evaluation
+(`_drain_needle_log`). `sample_idx` is an upper bound — the budget when we noticed,
+not when the core decided — which is the semantics the prefix curves want anyway: a
+needle counts at checkpoint N only once the samples that justified it are spent.
+`test_runner.py::test_every_declared_needle_is_logged_even_the_last` pins it by
+asserting the three on-disk needle counts agree, per section 20.
+
+This is a **prerequisite for any re-run**, and it is also why the 88.1% figure in
+section 23 has two defensible denominators (496/563 logged, 496/569 declared).
