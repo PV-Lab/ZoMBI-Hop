@@ -508,3 +508,71 @@ asserting the three on-disk needle counts agree, per section 20.
 
 This is a **prerequisite for any re-run**, and it is also why the 88.1% figure in
 section 23 has two defensible denominators (496/563 logged, 496/569 declared).
+
+---
+
+# Round 4 — measuring the drift, and cluster prep
+
+## 26. The per-cell timeout is a config field now
+
+It was hard-coded at 7200 s and exposed nowhere: `_run_cell` read
+`job.get("timeout_s", 7200)` but `run_suite` never populated the key and no flag
+set it. Harmless at N=2000 and dangerous above it — the slowest observed cell
+(`real6d` / `zombihop`) took 6374 s, **89% of the limit** — and a timeout is
+deliberately not retried, so an over-budget cell would simply be absent from the
+bundle with an error string instead of a result.
+
+`timeout_s` is a config field with a per-objective override, plus `--timeout-s`.
+It is popped from the objective spec *before* the objective is built, because
+`make_ensemble` forwards unknown keys straight into the `Ensemble` config: leaving
+it in would have defined a landscape parameter named `timeout_s` and changed the
+cell name through the objective label.
+
+`enumerate_cells` now owns cell naming, so the cluster array job and the local
+runner cannot disagree about what cell *i* is; `--manifest` writes that list for an
+sbatch array. Cluster spec and template: `benchmarks/docs/ORCD.md`,
+`slurm/zhbench_array.sbatch`.
+
+## 27. What the core change actually does — measured, not inferred
+
+Section 23 argued from the diff that merging `origin/brianna` invalidates the
+ZoMBI-Hop arms. That argument was mechanistic and deliberately stopped short of an
+effect size. Here is the effect size.
+
+Six cells, `zombihop` at N=2000 on real3d and real4d, seeds 0–2, run in a scratch
+worktree holding **our harness at `7534337` with `src/` and `optimize/` checked out
+from `origin/brianna`** — so the only difference from the published cells is the
+core. Paired by seed against the published bundle.
+
+| | real3d 77054a9 → brianna | real4d 77054a9 → brianna |
+|---|---|---|
+| `n_declared` | 10.67 → **5.00** (−5.67, 3/3 down) | 14.00 → **11.00** (−3.00, 3/3 down) |
+| `precision` | 0.449 → **0.764** (+0.315, 3/3 up) | 0.331 → 0.371 (+0.040) |
+| `peak_ratio` | 0.357 → 0.262 (−0.095) | 0.173 → 0.148 (−0.025) |
+| `reached_ratio_final` | 0.952 → 0.929 (−0.024) | 0.407 → **0.593** (+0.185, 3/3 up) |
+| `wall_s` | 634 → 359 (−275) | 382 → 347 (−35) |
+
+**Every metric moved in all six cells.** This is not a rounding-scale shift and the
+published ZoMBI-Hop rows cannot be carried across a merge under any reading.
+
+Two things are worth more than the invalidation itself.
+
+**The declaration-bottleneck claim gets stronger, not weaker.** On `real4d` the
+fixed core's samples reach *46% more* of the true optima (0.407 → 0.593, every
+seed) while it declares *fewer* of them (14 → 11). Search improved and declaration
+did not. That is the cleanest evidence yet that the two are separable and that the
+declaration budget is what binds — and it arrived from a change we did not design,
+which makes it better evidence than the s1 correlation was.
+
+**Halving the declarations roughly doubles precision at 3-D** (0.449 → 0.764) at a
+cost of 0.095 recall. So the gate is not merely a cap; it is a precision/recall
+dial, and `zombihop_mz0` is the other end of it.
+
+Mechanism, for the record: `min_iters_per_zoom` 2 → 3 makes each activation spend
+more lines before it may declare, which is exactly a tighter declaration budget;
+the in-bounds argmax fix moves each needle and therefore the penalty ellipsoid.
+Both push the same way on `n_declared`.
+
+Caveat on n: three seeds per objective. This sizes the effect and settles that a
+re-run is mandatory; it is **not** the re-run, and none of these numbers should be
+quoted as results. `real6d` was not probed at all and is the most expensive arm.
