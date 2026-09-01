@@ -616,3 +616,62 @@ nothing on a cell's import path (`runner` → `_repo`, `protocol`, `seeding`,
 `spaces`, `objectives`, `optimizers`, `metrics`). `stats.py` is imported only by
 `report.py`, which no cell runs. The cells are behaviourally identical; the rule
 still stands and I should not have committed mid-flight.
+
+## 28. The declaration gate: pre-registered test, and a split result
+
+`zombihop_mz0` sets `min_zoom_for_needle = 0` and changes nothing else, on the same
+core and the same seeds as `zombihop`. The prediction was written into
+`configs/s1_mz0.yaml` **before the run**, in three clauses:
+
+1. `n_declared` rises · 2. **declared recall rises with it** · 3. `precision` falls
+
+Clause 2 was the load-bearing one. "More declarations, lower precision" alone is
+satisfied trivially by junk needles — a gate emitting garbage produces exactly that
+pattern while *refuting* the claim that it was suppressing real finds. The claim
+under test is that ZoMBI-Hop's samples already sit on optima it is not permitted to
+declare, so opening the gate must convert reach into recall.
+
+Result, paired over 10 seeds (sign test):
+
+| | `zombihop` → `mz0` | W/T/L | p(sign) | clause |
+|---|---|---|---|---|
+| **real3d** `n_declared` | 4.60 → 7.40 | 7/1/2 | 0.180 | direction only |
+| **real3d** `peak_ratio` | 0.236 → **0.321** | 7/2/1 | 0.070 | direction only |
+| **real3d** `precision` | 0.752 → 0.667 | 2/2/6 | 0.289 | direction only |
+| **real4d** `n_declared` | 11.20 → 12.90 | 7/3/0 | **0.016** | **met** |
+| **real4d** `peak_ratio` | 0.148 → **0.148** | 4/2/4 | 1.000 | **FAILED** |
+| **real4d** `precision` | 0.360 → 0.314 | 4/1/5 | 1.000 | direction only |
+
+**The result splits by dimension, and the split is interpretable.**
+
+At **3-D** all three clauses hold directionally and the pattern is exactly the
+predicted one: the gate opens, declarations rise, and recall rises *with* them
+(0.236 → 0.321, which also exceeds the pre-merge 0.271). Nothing resolves at 10
+seeds — the key clause sits at p=0.070 — so this is a consistent signal, not a
+finding.
+
+At **4-D** clause 1 resolves cleanly (7/3/0, p=0.016) and **clause 2 fails
+outright**: `n_declared` rises by 1.7 while `peak_ratio` moves by *exactly zero*
+(4/2/4). The extra declarations are not landing on optima.
+
+The coherent reading, and the one the reach numbers support: **the gate only
+suppresses real finds where the samples have already covered the optima.** At 3-D
+`reached_ratio` is 0.94, so there is discovered-but-undeclared structure for an open
+gate to convert. At 4-D it is 0.56 — nearly half the optima have never been sampled
+— so unlocking declarations mostly emits points that are not optima. That is a
+sharper statement than "the declaration budget is the bottleneck", and it bounds
+where that claim applies.
+
+**This is why clause 2 was in the pre-registration.** Judged on clauses 1 and 3
+alone, 4-D would have read as a clean confirmation: more declarations, lower
+precision. It is the opposite.
+
+Two consequences. The RESULTS.md claim that declaration is the bottleneck must be
+scoped to landscapes where reach is already high, i.e. real3d, and stated as
+untested-to-unsupported elsewhere. And `origin/brianna-v2`, which deletes this gate
+outright, should be expected to help at 3-D and to add noise at 4-D and 6-D — worth
+telling Brianna before her evaluation lands, since it predicts a dimension-dependent
+result she may otherwise read as instability.
+
+Caveat: `mz0` was not run at 6-D, where reach is 0.013 and the prediction would be
+that opening the gate is purely harmful.
