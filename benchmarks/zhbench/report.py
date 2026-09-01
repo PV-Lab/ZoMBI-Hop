@@ -25,6 +25,7 @@ from collections import defaultdict
 import numpy as np
 
 _ORDER = ["random", "gp_qucb", "gp_qlogei", "gp_ts", "zombihop", "zombihop_nc5",
+          "zombihop_mz0",
           "hebo", "turbo", "rf_bo", "saasbo", "robot"]
 
 

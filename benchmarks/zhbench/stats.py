@@ -48,6 +48,7 @@ import numpy as np
 _MATCHED_METRIC = "pr_curve_peak_ratio"
 
 _ORDER = ["random", "gp_qucb", "gp_qlogei", "gp_ts", "zombihop", "zombihop_nc5",
+          "zombihop_mz0",
           "hebo", "turbo", "rf_bo", "saasbo", "robot"]
 
 _BOOTSTRAP_N = 10000
