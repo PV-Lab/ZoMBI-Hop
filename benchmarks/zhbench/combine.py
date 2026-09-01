@@ -36,13 +36,32 @@ def _cell_key(row: dict) -> tuple:
     return (row["objective"], row["optimizer"], int(float(row["seed"])))
 
 
-def _git_of(suite_dir: str, cell: str) -> dict:
-    """The commit a cell was actually run at, from its own artifact."""
+def _config_of(suite_dir: str, cell: str) -> dict:
     p = os.path.join(suite_dir, cell, "config_resolved.json")
     if not os.path.exists(p):
         return {}
     with open(p, encoding="utf-8") as fh:
-        return json.load(fh).get("git", {})
+        return json.load(fh)
+
+
+def _git_of(suite_dir: str, cell: str) -> dict:
+    """The commit a cell was actually run at, from its own artifact."""
+    return _config_of(suite_dir, cell).get("git", {})
+
+
+# Hyperparameters worth carrying into the combined bundle. A combined directory has
+# no cell subdirectories, so anything that wants to READ what actually ran -- e.g.
+# labelling the nc sensitivity "1 vs 5" at 3-D rather than assuming a uniform 2 --
+# would otherwise have to fall back to a generic label or, worse, to whatever the
+# config files happen to say today.
+_CARRY = ("n_consecutive_converged", "min_zoom_for_needle", "min_iters_per_zoom",
+          "max_iterations", "max_zooms", "input_noise")
+
+
+def _resolved_of(suite_dir: str, cell: str) -> dict:
+    st = _config_of(suite_dir, cell).get("optimizer_state") or {}
+    rh = st.get("resolved_hparams") or {}
+    return {k: rh[k] for k in _CARRY if k in rh}
 
 
 def combine(out_dir: str, sources: list[str], reference: str = "zombihop") -> dict:
@@ -87,13 +106,17 @@ def combine(out_dir: str, sources: list[str], reference: str = "zombihop") -> di
         arm = f"{r['objective']} / {r['optimizer']}"
         src = origin[key]
         commit = _git_of(src, cell_names.get(key, "")).get("commit", "")
-        e = prov.setdefault(arm, {"source_dirs": set(), "commits": set(), "n": 0})
+        e = prov.setdefault(arm, {"source_dirs": set(), "commits": set(), "n": 0,
+                                  "resolved": {}})
         e["source_dirs"].add(os.path.basename(os.path.normpath(src)))
         if commit:
             e["commits"].add(commit[:8])
         e["n"] += 1
+        if not e["resolved"]:
+            e["resolved"] = _resolved_of(src, cell_names.get(key, ""))
     prov = {k: {"source_dirs": sorted(v["source_dirs"]),
-                "commits": sorted(v["commits"]), "n_cells": v["n"]}
+                "commits": sorted(v["commits"]), "n_cells": v["n"],
+                "resolved_hparams": v["resolved"]}
             for k, v in prov.items()}
 
     fields: list[str] = []

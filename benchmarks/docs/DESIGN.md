@@ -533,64 +533,86 @@ runner cannot disagree about what cell *i* is; `--manifest` writes that list for
 sbatch array. Cluster spec and template: `benchmarks/docs/ORCD.md`,
 `slurm/zhbench_array.sbatch`.
 
-## 27. What the core change actually does — measured, not inferred
+## 27. What the core change actually does — measured at 10 seeds
 
 Section 23 argued from the diff that merging `origin/brianna` invalidates the
-ZoMBI-Hop arms. That argument was mechanistic and deliberately stopped short of an
-effect size. Here is the effect size.
+ZoMBI-Hop arms. It does. But the first attempt to size that effect used **three**
+seeds and got the magnitude badly wrong, in a way worth recording because the
+mistake is a generic one.
 
-Six cells, `zombihop` at N=2000 on real3d and real4d, seeds 0–2, run in a scratch
-worktree holding **our harness at `7534337` with `src/` and `optimize/` checked out
-from `origin/brianna`** — so the only difference from the published cells is the
-core. Paired by seed against the published bundle.
+The 3-seed probe reported real3d `n_declared` 10.67 → 5.00 and `precision`
+0.449 → 0.764, which read as "declarations halve, precision nearly doubles".
+Seeds 0–2 simply happened to be high-declaration seeds in the published run: the
+10-seed mean is 6.30, not 10.67. **A paired design does not protect you from a
+small sample; it only removes the between-seed variance you paired on.**
 
-| | real3d 77054a9 → brianna | real4d 77054a9 → brianna |
+The full re-run (`s1_zh_rerun`, 60 cells, 0 errors, 0 retries, every cell spending
+exactly 2000 samples) says this instead, paired over 10 seeds, sign test:
+
+| | real3d | real4d | real6d |
+|---|---|---|---|
+| `n_declared` | 6.30 → 4.60 (**5/0/5**, p=1.00) | 15.10 → 11.20 (**0/0/10**, p=0.002) | 15.10 → 8.60 (**0/0/10**, p=0.002) |
+| `precision` | 0.672 → 0.752 (p=0.11) | 0.333 → 0.360 (p=0.75) | 0.034 → 0.047 (p=1.00) |
+| `peak_ratio` | 0.271 → 0.236 (p=1.00) | 0.185 → 0.148 (p=0.13) | 0.007 → 0.006 (p=1.00) |
+| `reached_ratio` | 0.957 → 0.943 (p=0.73) | 0.507 → 0.559 (p=0.51) | 0.007 → 0.013 (p=0.73) |
+| `wall_s` | 509 → 453 (p=0.75) | 658 → 304 (**p=0.021**) | 4784 → 2480 (**0/0/10**, p=0.002) |
+
+**What the merge robustly did, and nothing more:** it cut declarations at 4-D and
+6-D (every seed, both), and it made the method much faster at 4-D and 6-D (6-D
+nearly halves). Everything else — every precision change, every recall change,
+every reach change, and all of 3-D — is **within noise at 10 seeds**.
+
+So the earlier reading was wrong twice over. "Precision nearly doubles" is not
+supported at any dimension. And the real3d declaration drop, which the 3-seed probe
+made the centrepiece, splits **5/0/5** across seeds.
+
+### The consequence that matters
+
+**The one resolved method-vs-method claim in the whole suite does not survive the
+fixed core.** `zombihop` > `random` at matched |S| on real3d was +0.0857, 8W/1T/1L,
+p(t)=0.009, p(sign)=0.039. On the merged core it is **+0.0429, 6W/1T/3L,
+p(t)=0.260, p(sign)=0.508 — not resolved.**
+
+That is attributable to the core and **not** to the shift in matched |S| (which
+fell 6 → 5 as declarations fell). Computing both cores at both |S| separates them
+cleanly — the basis change moves nothing at all:
+
+| core | \|S\|=5 | \|S\|=6 |
 |---|---|---|
-| `n_declared` | 10.67 → **5.00** (−5.67, 3/3 down) | 14.00 → **11.00** (−3.00, 3/3 down) |
-| `precision` | 0.449 → **0.764** (+0.315, 3/3 up) | 0.331 → 0.371 (+0.040) |
-| `peak_ratio` | 0.357 → 0.262 (−0.095) | 0.173 → 0.148 (−0.025) |
-| `reached_ratio_final` | 0.952 → 0.929 (−0.024) | 0.407 → **0.593** (+0.185, 3/3 up) |
-| `wall_s` | 634 → 359 (−275) | 382 → 347 (−35) |
+| 77054a9 | +0.0857, 8/1/1, p(sign)=0.039 | +0.0857, 8/1/1, p(sign)=0.039 |
+| baa51de | +0.0429, 6/1/3, p(sign)=0.508 | +0.0429, 6/1/3, p(sign)=0.508 |
 
-**Every metric moved in all six cells.** This is not a rounding-scale shift and the
-published ZoMBI-Hop rows cannot be carried across a merge under any reading.
+Two other claims moved with it. `n_consecutive_converged` tuned-vs-5 at real4d
+drops from resolved (9W/1T/0L, p=0.004) to **not** resolved (7W/2T/1L, p(sign)=0.070).
+And Aleks's prediction at real4d got **stronger**: `random` now beats `gp_qucb`
+(7/3/0, p(sign)=0.016) as well as `gp_qlogei` (8/2/0, p(sign)=0.008), where before
+only qLogEI resolved.
 
-Two things are worth more than the invalidation itself.
+**Net, at 10 seeds on the fixed core there is no resolved ZoMBI-Hop advantage on any
+landscape.** What survives is the input-cost and wall-clock gap, and Aleks's
+prediction. The seed top-up to 20 on real3d/real4d for {random, gp_ts, zombihop} is
+exactly the experiment that decides whether the +0.043 is a real halved effect or
+nothing, and it is the reason that top-up was scoped to include `zombihop`.
 
-**The declaration-bottleneck claim gets stronger, not weaker.** On `real4d` the
-fixed core's samples reach *46% more* of the true optima (0.407 → 0.593, every
-seed) while it declares *fewer* of them (14 → 11). Search improved and declaration
-did not. That is the cleanest evidence yet that the two are separable and that the
-declaration budget is what binds — and it arrived from a change we did not design,
-which makes it better evidence than the s1 correlation was.
+Mechanism, unchanged from the diff-level reading and still the best account:
+`min_iters_per_zoom` 2 → 3 makes each activation spend ~50% more lines before it may
+declare, which is a tighter declaration budget (and shows up exactly where the
+budget binds — 4-D and 6-D, every seed); the in-box argmax fix moves each needle and
+therefore the penalty ellipsoid. The precision story the 3-seed probe suggested is
+*not* supported, so the claim that the gate is a precision/recall dial rests
+entirely on `zombihop_mz0`, which moves `min_zoom_for_needle` and nothing else.
 
-**The merged core's defaults sit further toward the high-precision / low-recall
-end**: precision 0.449 → 0.764 at 3-D while declared recall falls 0.357 → 0.262.
+**Consequence for the tables.** Matched |S| falls to 5 / 11 / 9 (from 6 / 15 / 15),
+which coarsens per-seed resolution — recall still moves in steps of 1/14 at 3-D —
+and is what the 20-seed top-up compensates for. Declared-recall comparisons across
+the two cores are doubly misleading: different core *and* different |S|. Use the
+matched-|S| basis and the PR curve.
 
-Attribute that carefully, because two separate changes are doing the work and it
-would be easy to credit the wrong one:
-
-* The **declaration drop is budget arithmetic, not a choosier gate.**
-  `min_iters_per_zoom` 2 → 3 makes every activation spend ~50% more lines before it
-  may declare anything, so fewer declarations fit in the same 2000 samples. The
-  extra local sampling per zoom is also the most likely reason **reach improved**.
-* The **precision jump is mostly the in-box argmax fix.** Needles now land on the
-  point the zoom actually converged to, rather than on the global unpenalized
-  argmax, so a declaration is a better estimate of the optimum it came from — and
-  the penalty ellipsoid it seeds is better placed.
-
-So this is *not* a demonstration that the gate is a precision/recall dial. It is
-consistent with that, and `zombihop_mz0` is the clean manipulation that tests it,
-because it moves `min_zoom_for_needle` and nothing else.
-
-**Consequence for the re-stamped RESULTS.** With declarations roughly halved at
-3-D, matched |S| there falls from 6 to about 5. That coarsens the per-seed
-resolution of the headline comparison (recall still moves in steps of 1/14), which
-is precisely what the 20-seed top-up is for, and it makes the matched-|S| basis and
-the full PR curve more load-bearing than they already were. Declared-recall
-comparisons across the two cores are now doubly misleading: different core *and*
-different |S|.
-
-Caveat on n: three seeds per objective. This sizes the effect and settles that a
-re-run is mandatory; it is **not** the re-run, and none of these numbers should be
-quoted as results. `real6d` was not probed at all and is the most expensive arm.
+**Provenance note.** Three commits landed while the grid was in flight, so
+`real3d / zombihop` spans `63eb780a`, `80aa865e`, `c02ba86b`. DESIGN.md warns
+against exactly this. Checked rather than assumed: those commits touched
+`stats.py`, `combine.py`, `test_combine.py`, `s1_mz0.yaml` and this file, and
+nothing on a cell's import path (`runner` → `_repo`, `protocol`, `seeding`,
+`spaces`, `objectives`, `optimizers`, `metrics`). `stats.py` is imported only by
+`report.py`, which no cell runs. The cells are behaviourally identical; the rule
+still stands and I should not have committed mid-flight.

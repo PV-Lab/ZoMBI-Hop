@@ -253,6 +253,15 @@ def _resolved_hparam(suite_dir: str, rows, objective: str, optimizer: str,
         v = (st.get("resolved_hparams") or {}).get(key)
         if v is not None:
             return v
+
+    # A combined bundle has no cell subdirectories, so combine.py carries the
+    # values forward per arm instead.
+    prov = os.path.join(suite_dir, "provenance.json")
+    if os.path.exists(prov):
+        with open(prov, encoding="utf-8") as fh:
+            per_arm = json.load(fh).get("per_arm") or {}
+        e = per_arm.get(f"{objective} / {optimizer}") or {}
+        return (e.get("resolved_hparams") or {}).get(key)
     return None
 
 
