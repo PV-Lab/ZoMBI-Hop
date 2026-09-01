@@ -1,0 +1,85 @@
+# S2-clean: the needle-count hypothesis on ACKLEY-ONLY landscapes.
+#
+# Brianna's condition, and she is right: the ZoMBI-Hop hyperparameters were MOBO-
+# tuned on full-featured ensembles, so running the needle sweep on those is testing
+# on the training distribution. Landscape 0 at d=3 draws noise_amp 1123.0,
+# aniso_strength 43.0 and 2 plateaus -- measured, not assumed.
+#
+# Here every background family is off, so `Ensemble._background_field` returns
+# identically 0.0 (verified numerically) and the objective collapses to the closed
+# form y = max(0.5 + 0.5*exp(-b*||x-c||/sqrt(d)), 0.75): plain at 0.75, every true
+# optimum at exactly 1.0. That makes the true optima unambiguous -- which is the
+# whole point, and what neither real campaign can offer.
+#
+# The kwargs below are Brianna's own recipe, copied from
+# `origin/brianna:benchmarks/sweeps/needles.py::ensemble_config`. Nothing upstream
+# needs to change: `synthetic_data/ensemble.py` is byte-identical on her branch and
+# already exposes an off switch for each family, and `objectives.make_ensemble`
+# forwards arbitrary keys straight into the config.
+#
+# `tag: clean` is load-bearing. Without it these cells get exactly the same
+# directory names and the same `objective` values in aggregate.csv as the
+# full-featured s2_needles run, and the two would be silently poolable.
+#
+# ACHIEVED counts, measured on THESE landscapes (optima placement is independent of
+# the background, so they match the s2_needles annotation):
+#   d=3:  5->5  10->10  20->18  40->26  80->33   (2-simplex packing limit ~33)
+#   d=4:  5->5  10->9   20->19  40->32  80->57
+#   d=6:  5->5  10->10  20->20  40->39  80->77
+# d=3 n=80 is dropped: 80 requested and 40 requested both land near 26-33, so the
+# point adds cost and a spurious plateau. report.py plots the ACHIEVED count.
+#
+# OPEN DECISION (do not resolve silently): Brianna's `sweeps/needles.py` places
+# optima with a separation-aware `place_optima` + `pinned_optima`, which hits the
+# requested n EXACTLY and removes the packing confound entirely. This config keeps
+# our sampled-and-pared placement, so n saturates. Porting her placement is the
+# better experiment but it is a different one -- decide before quoting any number.
+#
+# Cost: 14 objectives x 4 optimizers x 5 seeds = 280 cells at N=2000.
+name: s2_needles_clean
+protocol:
+  n_samples: 2000
+  batch_size: 24
+  n_init_lines: 2
+  noise: hardware
+  eval_at: [250, 500, 1000, 2000]
+seeds: [0, 1, 2, 3, 4]
+value_tol: 0.25
+
+# Every background family off -> pure Ackley needles.
+_ackley_only: &ackley_only
+  landscape: 0
+  tag: clean
+  n_weak: 0
+  weak_amp: 0.0
+  n_ridges: 0
+  ridge_amp: 0.0
+  noise_amp: 0.0
+  aniso_strength: 0.0
+  n_plateaus: 0
+  plateau_amp: 0.0
+  edge_region: null
+  edge_amp: 0.0
+  basin_smoothing: 0.0
+
+objectives:
+  - {kind: ensemble, dim: 3, n_optima: 5,  <<: *ackley_only}
+  - {kind: ensemble, dim: 3, n_optima: 10, <<: *ackley_only}
+  - {kind: ensemble, dim: 3, n_optima: 20, <<: *ackley_only}
+  - {kind: ensemble, dim: 3, n_optima: 40, <<: *ackley_only}
+  - {kind: ensemble, dim: 4, n_optima: 5,  <<: *ackley_only}
+  - {kind: ensemble, dim: 4, n_optima: 10, <<: *ackley_only}
+  - {kind: ensemble, dim: 4, n_optima: 20, <<: *ackley_only}
+  - {kind: ensemble, dim: 4, n_optima: 40, <<: *ackley_only}
+  - {kind: ensemble, dim: 4, n_optima: 80, <<: *ackley_only}
+  - {kind: ensemble, dim: 6, n_optima: 5,  <<: *ackley_only}
+  - {kind: ensemble, dim: 6, n_optima: 10, <<: *ackley_only}
+  - {kind: ensemble, dim: 6, n_optima: 20, <<: *ackley_only}
+  - {kind: ensemble, dim: 6, n_optima: 40, <<: *ackley_only}
+  - {kind: ensemble, dim: 6, n_optima: 80, <<: *ackley_only}
+
+optimizers:
+  - name: random
+  - name: gp_ts
+  - name: gp_qucb
+  - name: zombihop

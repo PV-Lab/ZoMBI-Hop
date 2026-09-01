@@ -70,7 +70,7 @@ class Objective:
 
 def make_ensemble(dim: int = 3, n_optima: int | None = None, landscape: int = 0,
                   seed: int = 0, basin_width: float | None = None,
-                  domain: str = "simplex", **overrides) -> Objective:
+                  domain: str = "simplex", tag: str = "", **overrides) -> Objective:
     """A random ensemble landscape, optionally with ``n_optima`` pinned.
 
     ``landscape`` indexes the Sobol' sweep of ensemble configurations, so
@@ -78,6 +78,13 @@ def make_ensemble(dim: int = 3, n_optima: int | None = None, landscape: int = 0,
     configuration space and each index is a stable, reproducible landscape.
     Overriding ``n_optima`` while leaving everything else on that path is exactly
     the needle-count sweep: same family of landscapes, more needles.
+
+    Any other keyword is forwarded verbatim into the ``Ensemble`` config, which is
+    how the Ackley-only variant is built (every background family set to zero) --
+    see ``configs/s2_needles_clean.yaml``. ``tag`` is appended to the objective
+    name, so an ackley-only landscape can never be confused with the full-featured
+    one at the same ``(dim, n_optima, landscape)``: without it the two produce
+    identical cell directory names and identical rows in ``aggregate.csv``.
 
     Note ``basin_width`` is an Ackley sharpness: LARGER means NARROWER basins.
     """
@@ -105,7 +112,7 @@ def make_ensemble(dim: int = 3, n_optima: int | None = None, landscape: int = 0,
     if n_optima is not None:
         name += f"_n{n_optima}"
     return Objective(
-        name=f"{name}_L{landscape}",
+        name=f"{name}_L{landscape}" + (f"_{tag}" if tag else ""),
         dim=int(dim),
         fn=lambda x, _l=land: float(_l(np.asarray(x, dtype=float).ravel())),
         true_optima=P,
