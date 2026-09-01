@@ -124,3 +124,41 @@ def test_nc5_arm_still_means_what_it_says():
         "src/default_hparams.py no longer carries n_consecutive_converged=5. "
         "The zombihop_nc5 arm's justification in DESIGN.md 13 is now stale -- "
         "relabel it before the next bundle.")
+
+
+@pytest.mark.slow
+def test_a_run_records_the_full_zombihop_configuration(tmp_path):
+    """Every ``ZoMBIHop.__init__`` argument must land in ``config_resolved.json``.
+
+    The drift that motivated this file lived entirely in parameters we never pass:
+    ``min_zoom_for_needle`` and ``min_iters_per_zoom`` are in none of our
+    hyperparameter JSONs, so their values came from the core's signature and were
+    recorded nowhere. The published bundle stored ``n_needles`` and a provenance
+    path, and could not answer "what was ``min_iters_per_zoom`` on that run?" at all.
+    """
+    from zhbench.protocol import Protocol
+    from zhbench.runner import run_one
+
+    out = tmp_path / "mz0"
+    res = run_one({"kind": "ensemble", "dim": 3, "n_optima": 8, "landscape": 0,
+                   "seed": 0},
+                  {"name": "zombihop_mz0", "hparams": "smoke"}, seed=0,
+                  protocol=Protocol(n_samples=120, batch_size=24, noise="hardware",
+                                    eval_at=[120]),
+                  out_dir=str(out))
+    assert res["error"] == ""
+
+    with open(os.path.join(out, "config_resolved.json"), encoding="utf-8") as fh:
+        st = json.load(fh)["optimizer_state"]
+    rh = st["resolved_hparams"]
+
+    for key in ("min_zoom_for_needle", "min_iters_per_zoom", "max_iterations",
+                "max_zooms", "n_consecutive_converged", "input_noise"):
+        assert key in rh, f"{key} missing from resolved_hparams"
+
+    # The arm's whole purpose: the gate is open, and it is recorded as open.
+    assert rh["min_zoom_for_needle"] == 0
+    # ... while the parameter that silently moved upstream is now written down.
+    assert rh["min_iters_per_zoom"] == PUBLISHED["min_iters_per_zoom"]
+    # The floors are always recorded, whether or not they changed anything.
+    assert any(a["key"] == "_force_zoom_floors" for a in st["hparam_adjustments"])

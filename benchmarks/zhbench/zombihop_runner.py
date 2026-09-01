@@ -26,6 +26,56 @@ from .protocol import BudgetExhausted, ObjectiveRun, Protocol
 _HPARAM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "hparams")
 
 
+def _jsonable(obj):
+    """Coerce a value into something ``json.dump`` will accept, losslessly if it can.
+
+    ``config_resolved.json`` is written with a plain ``json.dump``, and the resolved
+    hyperparameter set contains torch dtypes, numpy scalars and occasionally a
+    sentinel object. Dropping those keys would defeat the point of recording the set
+    at all, so unknown types are stringified rather than skipped.
+    """
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, (str, bool, int, float)) or obj is None:
+        return obj
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return repr(obj)
+
+
+def _resolve_full_hparams(cls, passed: dict) -> dict:
+    """``passed`` plus every ``cls.__init__`` default it did not override.
+
+    The drift that motivated this lived entirely in parameters we never passed:
+    ``min_zoom_for_needle`` and ``min_iters_per_zoom`` appear in none of our
+    hyperparameter JSONs, so their values came from the core's signature and were
+    recorded nowhere. Writing the full set down makes a run reproducible against a
+    core that has since moved, and makes the diff visible when it does.
+
+    Runtime plumbing (the objective, the initial tensors, device/dtype) is excluded:
+    it is recorded elsewhere and is not a hyperparameter.
+    """
+    import inspect
+
+    skip = {"self", "objective", "X_init_actual", "X_init_expected", "Y_init",
+            "device", "dtype", "run_uuid", "checkpoint_dir"}
+    out = dict(passed)
+    try:
+        params = inspect.signature(cls.__init__).parameters
+    except (TypeError, ValueError):  # pragma: no cover - C-level or exotic __init__
+        return out
+    for name, p in params.items():
+        if name in skip or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+            continue
+        if name not in out and p.default is not inspect.Parameter.empty:
+            out[name] = p.default
+    return out
+
+
 def load_hparams(name: str | None, dim: int) -> tuple[dict, str]:
     """Resolve a hyperparameter set and say where it came from.
 
@@ -80,6 +130,7 @@ class ZoMBIHopRunner:
         self.needle_log: list[dict] = []
         self.provenance = ""
         self.resolved_hparams: dict = {}
+        self.hparam_adjustments: list[dict] = []
         self.stop_reason = ""
 
     def declared_optima(self):
@@ -88,7 +139,18 @@ class ZoMBIHopRunner:
     def state(self) -> dict:
         return {"name": self.name, "hparams_provenance": self.provenance,
                 "n_needles": int(self._needles.shape[0]),
-                "stop_reason": self.stop_reason}
+                "stop_reason": self.stop_reason,
+                # The full ZoMBIHop configuration this cell actually ran, every
+                # __init__ argument resolved -- not just the ones we passed. Without
+                # this, a core-side default change re-tunes an arm and leaves no
+                # trace in any artifact: the published bundle recorded `n_needles`
+                # and a provenance path, and could not answer "what was
+                # min_iters_per_zoom on that run?" at all. See DESIGN.md 23.
+                "resolved_hparams": _jsonable(self.resolved_hparams),
+                # Anything the runner changed out from under the tuned JSON, with
+                # the reason. Empty is the expected state; a non-empty list means
+                # this arm is not running its tuned configuration.
+                "hparam_adjustments": self.hparam_adjustments}
 
     def _drain_needle_log(self, dh, run: ObjectiveRun) -> None:
         """Record every needle the core has declared but we have not logged yet.
@@ -182,10 +244,31 @@ class ZoMBIHopRunner:
               if k not in _drop and not k.startswith("_")}
         hp.update({k: v for k, v in self.kwargs.items() if not k.startswith("_")})
         if dim > 3 and (hp.get("top_m_points") is None or hp.get("top_m_points", 0) < dim + 1):
+            _prev = hp.get("top_m_points")
             hp["top_m_points"] = max(dim + 1, 4)
+            self.hparam_adjustments.append(
+                {"key": "top_m_points", "from": _prev, "to": hp["top_m_points"],
+                 "reason": f"tuned value below dim+1 at d={dim}"})
+        # The floors are read from ZoMBIHop.__init__ BY REFLECTION
+        # (evaluate._force_zoom_floors), so a core-side default change silently
+        # re-tunes an arm with no diff under benchmarks/. That is not hypothetical:
+        # min_iters_per_zoom moved 2 -> 3 on origin/brianna, and 4d.json /
+        # 6d_ensemble.json both carry max_iterations exactly at the old floor.
+        # Keep the raise -- the core genuinely cannot declare a needle below it --
+        # but RECORD it, so "this arm is not running its tuned configuration" is
+        # visible in config_resolved.json instead of being inferable only from a
+        # core commit nobody wrote down. test_core_pins.py is the tripwire.
         zoom_floor, iter_floor = _force_zoom_floors()
+        self.hparam_adjustments.append(
+            {"key": "_force_zoom_floors", "from": None,
+             "to": {"max_zooms": zoom_floor, "max_iterations": iter_floor},
+             "reason": "read from ZoMBIHop.__init__ signature by reflection"})
         for key, floor in (("max_zooms", zoom_floor), ("max_iterations", iter_floor)):
             if hp.get(key) is not None and hp[key] < floor:
+                self.hparam_adjustments.append(
+                    {"key": key, "from": hp[key], "to": floor,
+                     "reason": "raised to the core's force-zooming floor; the tuned "
+                               "value is NOT what ran"})
                 hp[key] = floor
 
         zombi_fixed = dict(rm.ZOMBI_FIXED)
@@ -193,7 +276,13 @@ class ZoMBIHopRunner:
         for k in ("input_noise", "max_gp_points", "acquisition_type", "verbose"):
             if k in hp:
                 zombi_fixed[k] = hp.pop(k)
-        self.resolved_hparams = {**zombi_fixed, **hp}
+        # Record EVERY ZoMBIHop.__init__ argument, not just the ones we pass. The
+        # parameters that caused the drift (min_zoom_for_needle, min_iters_per_zoom)
+        # appear in no hparam file we own, so they are governed entirely by the
+        # core's signature -- and a run that does not write them down cannot be
+        # reproduced or even diagnosed after the core moves.
+        self.resolved_hparams = _resolve_full_hparams(
+            rm.ZoMBIHop, {**zombi_fixed, **hp})
 
         to_t = lambda a: torch.as_tensor(np.asarray(a, dtype=float), device=device, dtype=dtype)
         optimizer = rm.ZoMBIHop(
