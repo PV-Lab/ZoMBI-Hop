@@ -90,6 +90,31 @@ class ZoMBIHopRunner:
                 "n_needles": int(self._needles.shape[0]),
                 "stop_reason": self.stop_reason}
 
+    def _drain_needle_log(self, dh, run: ObjectiveRun) -> None:
+        """Record every needle the core has declared but we have not logged yet.
+
+        The core does not call back on declaration, so the only way to timestamp a
+        needle is to notice it appeared. Called after every objective evaluation and
+        once more in the ``finally``, which is what catches the needles declared by
+        the budget-exhausting line.
+
+        ``sample_idx`` is therefore an upper bound -- the budget at the moment we
+        noticed, not the moment the core decided -- which is exactly the semantics
+        the prefix curves need: a needle is counted at checkpoint N only once the
+        samples that justified it have been spent.
+        """
+        if dh is None or dh.needles is None or not dh.needles.shape[0]:
+            return
+        n = int(dh.needles.shape[0])
+        while len(self.needle_log) < n:
+            self.needle_log.append({
+                "needle_idx": len(self.needle_log),
+                "sample_idx": int(run.n_samples),
+                "batch_idx": int(run.batch_idx),
+                "activation": int(dh.current_activation),
+                "zoom": int(getattr(dh, "current_zoom", -1)),
+            })
+
     # -- the run ---------------------------------------------------------------
     def run(self, objective, run: ObjectiveRun, protocol: Protocol, seed: int) -> None:
         from ._repo import evaluate, run_mobo
@@ -142,18 +167,7 @@ class ZoMBIHopRunner:
             # is spent, which unwinds out of ZoMBIHop.run exactly the way
             # evaluate._LineBudgetReached does.
             x_req, x_act, y = inner(x_tell, bounds, acq_fn)
-            dh = dh_ref[0]
-            if dh is not None and dh.needles is not None and dh.needles.shape[0]:
-                n = int(dh.needles.shape[0])
-                while len(self.needle_log) < n:
-                    k = len(self.needle_log)
-                    self.needle_log.append({
-                        "needle_idx": k,
-                        "sample_idx": int(run.n_samples),
-                        "batch_idx": int(run.batch_idx),
-                        "activation": int(dh.current_activation),
-                        "zoom": int(getattr(dh, "current_zoom", -1)),
-                    })
+            self._drain_needle_log(dh_ref[0], run)
             return x_req, x_act, y
 
         # 3. Hyperparameters, with the force-zooming floors the core requires.
@@ -203,6 +217,16 @@ class ZoMBIHopRunner:
             raise
         finally:
             dh = optimizer.data_handler
+            # Drain once more. ``obj_wrapper`` logs a needle only on the NEXT
+            # objective call, so a needle declared by the budget-exhausting line --
+            # or by anything after the final call -- was never recorded: ``inner()``
+            # raises and the append never runs. In the published s1_real bundle that
+            # left 6 of 60 cells short by one (569 declared, 563 logged), which is
+            # invisible in the final metrics (they read ``dh.needles`` directly) but
+            # NOT in the ``@N`` prefix curves, and fig1/fig3/fig4 are all built from
+            # those. Two cells disagreed on the headline: real4d/zombihop/s6
+            # peak_ratio@2000 0.185 vs 0.222 final, real6d/nc5/s5 0.000 vs 0.015.
+            self._drain_needle_log(dh, run)
             t = dh.get_all_needle_locations()
             self._needles = (t.detach().cpu().numpy() if t is not None and t.numel()
                              else np.empty((0, dim)))

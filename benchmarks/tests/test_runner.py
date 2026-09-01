@@ -103,3 +103,47 @@ def test_budget_is_spent_exactly_even_when_not_divisible_by_q():
     for spec in ({"name": "random"}, {"name": "zombihop", "hparams": "smoke"}):
         res = run_one(_ENS3, spec, seed=0, protocol=p)
         assert res["n_samples"] == 200, (spec["name"], res["n_samples"])
+
+
+def test_every_declared_needle_is_logged_even_the_last(tmp_path):
+    """The needle declared by the budget-exhausting line must reach the curves.
+
+    ``obj_wrapper`` logs a needle only on the NEXT objective call, so a needle
+    declared as the budget runs out was never recorded: ``inner()`` raises
+    ``BudgetExhausted`` and the append never runs. The final metrics were still
+    right (they read ``dh.needles`` directly), but the ``@N`` prefix curves were
+    short -- and fig1, fig3 and fig4 are all built from those. In the published
+    s1_real bundle this hit 6 of 60 cells (569 declared, 563 logged) and moved two
+    headline numbers: real4d/zombihop/s6 peak_ratio@2000 0.185 vs 0.222 final.
+
+    Asserting on the written artifacts, per DESIGN.md 20: the three places a needle
+    count appears must agree, and the last checkpoint must equal the final value
+    when the budget was spent exactly.
+    """
+    import csv
+    import json
+    import os
+
+    out = tmp_path / "zh"
+    res = run_one(_ENS3, {"name": "zombihop", "hparams": "smoke"}, seed=0,
+                  protocol=Protocol(n_samples=240, batch_size=24, noise="hardware",
+                                    eval_at=[120, 240]),
+                  out_dir=str(out))
+    assert res["error"] == ""
+    assert res["n_samples"] == 240
+
+    with open(os.path.join(out, "config_resolved.json"), encoding="utf-8") as fh:
+        n_state = int(json.load(fh)["optimizer_state"]["n_needles"])
+    n_log = len(list(csv.DictReader(open(os.path.join(out, "needles.csv"),
+                                        encoding="utf-8"))))
+    n_dec = len(list(csv.DictReader(open(os.path.join(out, "declared_optima.csv"),
+                                        encoding="utf-8"))))
+    assert n_state == n_log == n_dec, (
+        f"needle count disagrees across artifacts: optimizer_state={n_state}, "
+        f"needles.csv={n_log}, declared_optima.csv={n_dec}. A needle declared "
+        f"after the final objective call was not drained into needle_log.")
+
+    # The budget was spent exactly, so the last checkpoint IS the end of the run.
+    if n_state:
+        assert res["n_declared@240"] == res["n_declared"]
+        assert res["peak_ratio@240"] == pytest.approx(res["peak_ratio"])
