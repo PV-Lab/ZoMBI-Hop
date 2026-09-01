@@ -228,6 +228,34 @@ def matched_curves(suite_dir: str, reference: str = "zombihop",
     return out
 
 
+def _resolved_hparam(suite_dir: str, rows, objective: str, optimizer: str,
+                     key: str):
+    """Read a hyperparameter out of a cell's own ``config_resolved.json``.
+
+    Reported values must come from the artifacts rather than from whatever the
+    config files say today: the runner can raise a tuned value to the core's
+    force-zooming floor, and the core defaults themselves have moved once already.
+    Returns None for a bundle written before ``resolved_hparams`` existed (the
+    archived s1_real run), in which case the caller falls back to a generic label
+    instead of asserting a number it cannot verify.
+    """
+    for r in rows:
+        if r["objective"] != objective or r["optimizer"] != optimizer:
+            continue
+        cell = _cell_dir(suite_dir, r)
+        if cell is None:
+            continue
+        p = os.path.join(cell, "config_resolved.json")
+        if not os.path.exists(p):
+            continue
+        with open(p, encoding="utf-8") as fh:
+            st = json.load(fh).get("optimizer_state") or {}
+        v = (st.get("resolved_hparams") or {}).get(key)
+        if v is not None:
+            return v
+    return None
+
+
 def _cell_dir(suite_dir: str, row: dict) -> str | None:
     """Locate a row's run directory.
 
@@ -389,21 +417,34 @@ def build(suite_dir: str, reference: str = "zombihop") -> str:
             ["peak_ratio", "precision", "reached_ratio_final", "input_cost", "wall_s"],
             opts) + [""]
 
-        # nc2 vs nc5 is a hyperparameter question, not a method question, so it
-        # gets its own paired line on the metric it was chosen by.
+        # The nc sensitivity is a hyperparameter question, not a method question, so
+        # it gets its own paired line on the metric it was chosen by -- and it is
+        # labelled with the ACTUAL values, per dimension. The `zombihop` arm does not
+        # run nc=2 everywhere: it takes whatever the tuned JSON for that dimension
+        # carries, and 3d.json carries 1 while 4d.json and 6d_ensemble.json carry 2.
+        # Reporting all three as "2 vs 5" would pool a 1->5 perturbation with a 2->5
+        # one and quietly overstate what was tested.
         if "zombihop" in per_seed and "zombihop_nc5" in opts:
             a = per_seed_column(rows, obj, "zombihop", "peak_ratio")
             b = per_seed_column(rows, obj, "zombihop_nc5", "peak_ratio")
             if a and b:
                 c = paired_compare(a, b)
+                lo = _resolved_hparam(suite_dir, rows, obj, "zombihop",
+                                      "n_consecutive_converged")
+                hi = _resolved_hparam(suite_dir, rows, obj, "zombihop_nc5",
+                                      "n_consecutive_converged")
+                label = (f"{lo} vs {hi}" if lo is not None and hi is not None
+                         else "tuned vs 5")
                 md += [
-                    "### `n_consecutive_converged` 2 vs 5 (declared recall)", "",
+                    f"### `n_consecutive_converged` {label} (declared recall)", "",
                     f"mean diff {c['mean_diff']:+.4f} "
                     f"[{c['ci_lo']:+.3f}, {c['ci_hi']:+.3f}], "
                     f"W/T/L {c['wins']}/{c['ties']}/{c['losses']}, "
                     f"t={c['t']:+.2f} p={_fmt_p(c['p_t'])}, "
                     f"sign p={_fmt_p(c['p_sign'])} -- "
-                    f"{'**resolved**' if resolved(c) else 'not resolved'}.", "",
+                    f"{'**resolved**' if resolved(c) else 'not resolved'}."
+                    + ("" if lo is None else
+                       f" Values read from the runs themselves, not assumed."), "",
                 ]
 
         # Aleks's prediction: standard BO recovers fewer optima than uniform random.
