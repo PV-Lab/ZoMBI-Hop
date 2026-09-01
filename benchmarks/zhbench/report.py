@@ -1,6 +1,6 @@
 """Figures and tables for a finished suite.
 
-Five figures, no more. Each one answers a question somebody actually asked:
+Six figures, no more. Each one answers a question somebody actually asked:
 
 1. ``reached_ratio(t)``      -- are we finding optima faster than random? (Aleks)
 2. ``peak_ratio`` / ``precision`` / ``dist_to_needles`` bars at the end of budget
@@ -8,6 +8,7 @@ Five figures, no more. Each one answers a question somebody actually asked:
    7 needles are not scored against a baseline's 24 guesses
 4. ``needles_declared(t)``   -- the structural ceiling on ZoMBI-Hop's needle count
 5. ``peak_ratio`` vs ``n_optima`` -- the needle-count hypothesis (s2 only)
+6. ``dist_to_needles(t)``   -- the same view as 1, on distance rather than hits (Brianna)
 
 Everything is drawn from ``aggregate.csv`` + ``curves.json``, so a report can be
 regenerated without re-running anything.
@@ -224,6 +225,85 @@ def fig_needles(rows, curves, suite_dir, objectives) -> str | None:
     return path
 
 
+def fig_dist_to_needles(rows, suite_dir, objectives) -> str | None:
+    """dist_to_needles vs budget, at MATCHED |S| -- fig1's view on distance. (Brianna)
+
+    ``peak_ratio`` is a hit/miss count at ``r``: a declared point 0.051 away scores
+    exactly like one on the far side of the simplex. ``dist_to_needles`` is the
+    Hungarian assignment cost (capped at 0.5), so it keeps moving while a method is
+    still closing in. Lower is better.
+
+    **Read at matched |S|, and only at matched |S|.** The cap charges 0.5 for every
+    true optimum left unclaimed, so the raw per-method sets in ``curves.json`` --
+    ZoMBI-Hop's ~6 declarations against a baseline's ``n_true`` post-hoc guesses --
+    make ZoMBI-Hop look 3x worse for a purely structural reason. That is the same
+    unfairness ``fig3`` exists to remove, so this figure applies the identical
+    post-hoc extractor to every method's own samples at the same ``|S|``
+    (``stats.matched_curves``). Computed from stored ``points.csv``; no reruns.
+    """
+    plt = _mpl()
+    from .stats import matched_curves
+    try:
+        mc = matched_curves(suite_dir)
+    except (FileNotFoundError, ValueError, KeyError):
+        return None
+    if not mc:
+        return None
+
+    opts = _opts(rows)
+    col = _colors(opts)
+    fig, axes = plt.subplots(1, len(objectives), figsize=(5.2 * len(objectives), 4.2),
+                             squeeze=False)
+    any_line = False
+    for ax, obj in zip(axes[0], objectives):
+        k_here = None
+        for o in opts:
+            series = []
+            for c in mc.values():
+                if c.get("objective") != obj or c.get("optimizer") != o:
+                    continue
+                k_here = c.get("matched_k", k_here)
+                pts = [(int(n), blk.get("dist_to_needles"))
+                       for n, blk in (c.get("by_n") or {}).items()]
+                pts = [(n, v) for n, v in sorted(pts)
+                       if v is not None and np.isfinite(v)]
+                if pts:
+                    series.append(dict(pts))
+            if not series:
+                continue
+            # Cells can stop at different checkpoints (a prefix above the samples
+            # actually spent is skipped), so intersect on the checkpoints every
+            # seed reached rather than padding with NaN.
+            common = sorted(set.intersection(*[set(s) for s in series]))
+            if not common:
+                continue
+            Y = np.vstack([[s[n] for n in common] for s in series])
+            x = np.asarray(common, dtype=float)
+            m, sd = Y.mean(0), Y.std(0)
+            ax.plot(x, m, label=f"{o} (n={Y.shape[0]})", color=col[o],
+                    lw=2.2 if o.startswith("zombihop") else 1.6,
+                    ls="--" if o == "random" else "-", marker="o", ms=3.5)
+            ax.fill_between(x, m - sd, m + sd, color=col[o], alpha=0.13, lw=0)
+            any_line = True
+        ax.set_title(f"{obj}  (|S| = {k_here})" if k_here else obj, fontsize=10)
+        ax.set_xlabel("samples")
+        ax.set_xscale("log")
+        ax.grid(alpha=0.25, which="both")
+    if not any_line:
+        plt.close(fig)
+        return None
+    axes[0][0].set_ylabel("dist_to_needles  (lower is better)")
+    axes[0][-1].legend(fontsize=7, loc="best")
+    fig.suptitle("Distance to the true optima vs budget, at matched |S| "
+                 "(Hungarian, capped at 0.5; same extractor for every method)",
+                 fontsize=11)
+    fig.tight_layout()
+    path = os.path.join(suite_dir, "fig6_dist_to_needles.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
 def fig_needle_count(rows, suite_dir) -> str | None:
     """peak_ratio vs n_optima -- the needle-count hypothesis. s2 only."""
     plt = _mpl()
@@ -304,7 +384,8 @@ def build(suite_dir: str) -> str:
             fig_endpoint_bars(rows, suite_dir, objectives),
             fig_matched_declarations(rows, curves, suite_dir, objectives),
             fig_needles(rows, curves, suite_dir, objectives),
-            fig_needle_count(rows, suite_dir)]
+            fig_needle_count(rows, suite_dir),
+            fig_dist_to_needles(rows, suite_dir, objectives)]
     figs = [f for f in figs if f]
 
     md = ["# Report", "",
