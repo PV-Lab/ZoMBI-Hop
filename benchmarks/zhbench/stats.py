@@ -148,7 +148,7 @@ _MATCHED_CURVES = "matched_curves.json"
 
 
 def matched_curves(suite_dir: str, reference: str = "zombihop",
-                   *, rebuild: bool = False) -> dict:
+                   *, rebuild: bool = False, ks: dict | None = None) -> dict:
     """``dist_to_needles`` at MATCHED |S|, per cell per checkpoint.
 
     ``curves.json``'s ``by_n`` blocks cannot answer this. There, a baseline's set is
@@ -166,15 +166,23 @@ def matched_curves(suite_dir: str, reference: str = "zombihop",
     Reads only ``points.csv`` and ``true_optima.csv`` from each cell directory, so
     no optimizer is re-run. Cached to ``matched_curves.json``.
     """
+    # `ks` bypasses the cache in both directions: it is a DIFFERENT quantity from
+    # the one cached here. A combined bundle takes its ZoMBI-Hop rows from one run
+    # and its baselines from another, so the matched |S| must be computed on the
+    # combined table and pushed down -- deriving it per source directory would score
+    # each half at its own |S| and silently make the two halves incomparable, which
+    # is the exact failure this whole metric exists to prevent.
     cache = os.path.join(suite_dir, _MATCHED_CURVES)
-    if os.path.exists(cache) and not rebuild:
+    if ks is None and os.path.exists(cache) and not rebuild:
         with open(cache, encoding="utf-8") as fh:
             return json.load(fh)
 
     from .metrics import merge_true_optima, posthoc_solution_set, solution_set_scores
 
     rows, _ = load(suite_dir)
-    ks = {obj: matched_k(rows, obj, reference) for obj in objectives(rows)}
+    ks_was_derived = ks is None
+    if ks is None:
+        ks = {obj: matched_k(rows, obj, reference) for obj in objectives(rows)}
     eval_at = sorted({int(c.split("@")[1]) for c in rows[0] if "@" in c})
 
     out: dict[str, dict] = {}
@@ -214,8 +222,9 @@ def matched_curves(suite_dir: str, reference: str = "zombihop",
             "seed": int(r["seed"]), "matched_k": k, "by_n": by_n,
         }
 
-    with open(cache, "w", encoding="utf-8") as fh:
-        json.dump(out, fh)
+    if ks_was_derived:
+        with open(cache, "w", encoding="utf-8") as fh:
+            json.dump(out, fh)
     return out
 
 
