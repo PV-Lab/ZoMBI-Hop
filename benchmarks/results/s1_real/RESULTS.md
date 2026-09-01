@@ -1,4 +1,14 @@
-# s1_real -- results
+# s1_real -- results (SUPERSEDED, pre-merge archive)
+
+> **Superseded by `benchmarks/results/s1_v2/`.** This bundle is retained as the
+> pre-merge archive. Its `zombihop` / `zombihop_nc5` rows were produced against core
+> `77054a9` and **must not be quoted**; its `random` / `gp_*` rows are still valid and
+> are carried forward into s1_v2.
+>
+> The headline claim below -- `zombihop` > `random` at matched |S| on real3d,
+> +0.0857, p(sign)=0.039 -- **does not survive**. On the merged core at 20 seeds it is
+> **+0.0036, 8W/3T/9L, p=0.874**. Part core fix, part seed luck; see DESIGN.md 27.
+
 
 180/180 cells, 0 failures. 3 real campaigns x 6 methods x 10 seeds, N=2000 samples,
 q=24 per decision, hardware-matched noise. Generated from `benchmarks/zhbench/configs/s1_real.yaml`.

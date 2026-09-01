@@ -1,0 +1,287 @@
+{
+ "sources": [
+  "C:\\Users\\Colin\\Documents\\ZoMBI-Hop-v2\\benchmarks\\runs\\s1_real_20260824_221242",
+  "C:\\Users\\Colin\\Documents\\ZoMBI-Hop-v2\\benchmarks\\runs\\s1_zh_rerun_20260831_223450",
+  "C:\\Users\\Colin\\Documents\\ZoMBI-Hop-v2\\benchmarks\\runs\\s1_mz0_20260901_022236",
+  "C:\\Users\\Colin\\Documents\\ZoMBI-Hop-v2\\benchmarks\\runs\\s1_topup_20260901_030257"
+ ],
+ "precedence": "last wins per (objective, optimizer, seed)",
+ "n_cells": 260,
+ "matched_k": {
+  "real3d": 5,
+  "real4d": 11,
+  "real6d": 9
+ },
+ "per_arm": {
+  "real3d / random": {
+   "source_dirs": [
+    "s1_real_20260824_221242",
+    "s1_topup_20260901_030257"
+   ],
+   "commits": [
+    "50dec439",
+    "cd568622"
+   ],
+   "n_cells": 20,
+   "resolved_hparams": {}
+  },
+  "real3d / gp_qucb": {
+   "source_dirs": [
+    "s1_real_20260824_221242"
+   ],
+   "commits": [
+    "d304c411"
+   ],
+   "n_cells": 10,
+   "resolved_hparams": {}
+  },
+  "real3d / gp_qlogei": {
+   "source_dirs": [
+    "s1_real_20260824_221242"
+   ],
+   "commits": [
+    "d304c411"
+   ],
+   "n_cells": 10,
+   "resolved_hparams": {}
+  },
+  "real3d / gp_ts": {
+   "source_dirs": [
+    "s1_real_20260824_221242",
+    "s1_topup_20260901_030257"
+   ],
+   "commits": [
+    "d304c411",
+    "d4d6488e"
+   ],
+   "n_cells": 20,
+   "resolved_hparams": {}
+  },
+  "real3d / zombihop": {
+   "source_dirs": [
+    "s1_topup_20260901_030257",
+    "s1_zh_rerun_20260831_223450"
+   ],
+   "commits": [
+    "63eb780a",
+    "80aa865e",
+    "c02ba86b",
+    "d4d6488e"
+   ],
+   "n_cells": 20,
+   "resolved_hparams": {
+    "n_consecutive_converged": 1,
+    "min_zoom_for_needle": 1,
+    "min_iters_per_zoom": 3,
+    "max_iterations": 8,
+    "max_zooms": 3,
+    "input_noise": 0.128
+   }
+  },
+  "real3d / zombihop_nc5": {
+   "source_dirs": [
+    "s1_zh_rerun_20260831_223450"
+   ],
+   "commits": [
+    "c02ba86b"
+   ],
+   "n_cells": 10,
+   "resolved_hparams": {
+    "n_consecutive_converged": 5,
+    "min_zoom_for_needle": 1,
+    "min_iters_per_zoom": 3,
+    "max_iterations": 8,
+    "max_zooms": 3,
+    "input_noise": 0.128
+   }
+  },
+  "real4d / random": {
+   "source_dirs": [
+    "s1_real_20260824_221242",
+    "s1_topup_20260901_030257"
+   ],
+   "commits": [
+    "d304c411",
+    "d4d6488e"
+   ],
+   "n_cells": 20,
+   "resolved_hparams": {}
+  },
+  "real4d / gp_qucb": {
+   "source_dirs": [
+    "s1_real_20260824_221242"
+   ],
+   "commits": [
+    "d304c411"
+   ],
+   "n_cells": 10,
+   "resolved_hparams": {}
+  },
+  "real4d / gp_qlogei": {
+   "source_dirs": [
+    "s1_real_20260824_221242"
+   ],
+   "commits": [
+    "d304c411"
+   ],
+   "n_cells": 10,
+   "resolved_hparams": {}
+  },
+  "real4d / gp_ts": {
+   "source_dirs": [
+    "s1_real_20260824_221242",
+    "s1_topup_20260901_030257"
+   ],
+   "commits": [
+    "d304c411",
+    "d4d6488e"
+   ],
+   "n_cells": 20,
+   "resolved_hparams": {}
+  },
+  "real4d / zombihop": {
+   "source_dirs": [
+    "s1_topup_20260901_030257",
+    "s1_zh_rerun_20260831_223450"
+   ],
+   "commits": [
+    "c02ba86b",
+    "d4d6488e"
+   ],
+   "n_cells": 20,
+   "resolved_hparams": {
+    "n_consecutive_converged": 2,
+    "min_zoom_for_needle": 1,
+    "min_iters_per_zoom": 3,
+    "max_iterations": 3,
+    "max_zooms": 3,
+    "input_noise": 0.128
+   }
+  },
+  "real4d / zombihop_nc5": {
+   "source_dirs": [
+    "s1_zh_rerun_20260831_223450"
+   ],
+   "commits": [
+    "c02ba86b"
+   ],
+   "n_cells": 10,
+   "resolved_hparams": {
+    "n_consecutive_converged": 5,
+    "min_zoom_for_needle": 1,
+    "min_iters_per_zoom": 3,
+    "max_iterations": 3,
+    "max_zooms": 3,
+    "input_noise": 0.128
+   }
+  },
+  "real6d / random": {
+   "source_dirs": [
+    "s1_real_20260824_221242"
+   ],
+   "commits": [
+    "d304c411"
+   ],
+   "n_cells": 10,
+   "resolved_hparams": {}
+  },
+  "real6d / gp_qucb": {
+   "source_dirs": [
+    "s1_real_20260824_221242"
+   ],
+   "commits": [
+    "d304c411"
+   ],
+   "n_cells": 10,
+   "resolved_hparams": {}
+  },
+  "real6d / gp_qlogei": {
+   "source_dirs": [
+    "s1_real_20260824_221242"
+   ],
+   "commits": [
+    "d304c411"
+   ],
+   "n_cells": 10,
+   "resolved_hparams": {}
+  },
+  "real6d / gp_ts": {
+   "source_dirs": [
+    "s1_real_20260824_221242"
+   ],
+   "commits": [
+    "d304c411"
+   ],
+   "n_cells": 10,
+   "resolved_hparams": {}
+  },
+  "real6d / zombihop": {
+   "source_dirs": [
+    "s1_zh_rerun_20260831_223450"
+   ],
+   "commits": [
+    "c02ba86b"
+   ],
+   "n_cells": 10,
+   "resolved_hparams": {
+    "n_consecutive_converged": 2,
+    "min_zoom_for_needle": 1,
+    "min_iters_per_zoom": 3,
+    "max_iterations": 3,
+    "max_zooms": 3,
+    "input_noise": 0.128
+   }
+  },
+  "real6d / zombihop_nc5": {
+   "source_dirs": [
+    "s1_zh_rerun_20260831_223450"
+   ],
+   "commits": [
+    "c02ba86b"
+   ],
+   "n_cells": 10,
+   "resolved_hparams": {
+    "n_consecutive_converged": 5,
+    "min_zoom_for_needle": 1,
+    "min_iters_per_zoom": 3,
+    "max_iterations": 3,
+    "max_zooms": 3,
+    "input_noise": 0.128
+   }
+  },
+  "real3d / zombihop_mz0": {
+   "source_dirs": [
+    "s1_mz0_20260901_022236"
+   ],
+   "commits": [
+    "50dec439"
+   ],
+   "n_cells": 10,
+   "resolved_hparams": {
+    "n_consecutive_converged": 1,
+    "min_zoom_for_needle": 0,
+    "min_iters_per_zoom": 3,
+    "max_iterations": 8,
+    "max_zooms": 3,
+    "input_noise": 0.128
+   }
+  },
+  "real4d / zombihop_mz0": {
+   "source_dirs": [
+    "s1_mz0_20260901_022236"
+   ],
+   "commits": [
+    "50dec439"
+   ],
+   "n_cells": 10,
+   "resolved_hparams": {
+    "n_consecutive_converged": 2,
+    "min_zoom_for_needle": 0,
+    "min_iters_per_zoom": 3,
+    "max_iterations": 3,
+    "max_zooms": 3,
+    "input_noise": 0.128
+   }
+  }
+ }
+}
