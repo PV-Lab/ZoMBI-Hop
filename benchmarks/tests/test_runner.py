@@ -147,3 +147,50 @@ def test_every_declared_needle_is_logged_even_the_last(tmp_path):
     if n_state:
         assert res["n_declared@240"] == res["n_declared"]
         assert res["peak_ratio@240"] == pytest.approx(res["peak_ratio"])
+
+
+def test_per_cell_timeout_is_configurable_and_per_objective(tmp_path, monkeypatch):
+    """The 7200 s limit must be reachable from config, and overridable per objective.
+
+    It was hard-coded and exposed nowhere. Fine at N=2000; dangerous above it. The
+    slowest observed cell (real6d / zombihop) took 6374 s = 89% of the limit, so the
+    planned 6-D run at N=6000 would have started recording timeouts as failures --
+    and a timeout is deliberately NOT retried, so those cells would simply be absent
+    from the bundle with only an `error` string to show for it.
+
+    Captures the jobs the suite builds rather than running them: what matters is the
+    number that reaches ``subprocess.run(timeout=...)``.
+    """
+    from zhbench import suite as S
+
+    seen = []
+
+    def _fake(job):
+        seen.append((job["cell"], job["timeout_s"]))
+        return job["cell"], {"objective": S._obj_label(job["objective"]),
+                             "optimizer": job["optimizer"]["name"],
+                             "seed": job["seed"], "error": "stubbed"}
+
+    monkeypatch.setattr(S, "_run_cell", _fake)
+    monkeypatch.setattr(S, "_run_cell_inprocess", _fake)
+
+    cfg = {"name": "t", "protocol": {"n_samples": 48, "batch_size": 24},
+           "seeds": [0], "value_tol": 0.25,
+           "timeout_s": 111.0,
+           "objectives": [
+               {"kind": "ensemble", "dim": 3, "n_optima": 5, "landscape": 0},
+               {"kind": "ensemble", "dim": 4, "n_optima": 5, "landscape": 0,
+                "timeout_s": 222.0},
+           ],
+           "optimizers": [{"name": "random"}]}
+    S.run_suite(cfg, str(tmp_path), workers=1)
+
+    got = dict(seen)
+    assert len(got) == 2
+    # cell names strip "=" (_obj_label -> replace("=", "")), so it is "dim3".
+    assert any(t == 111.0 for c, t in got.items() if "dim3" in c), got
+    assert any(t == 222.0 for c, t in got.items() if "dim4" in c), got
+
+    # ...and timeout_s must NOT have leaked into the objective spec, or it would
+    # become an Ensemble config key and change the cell name.
+    assert all("timeout_s" not in c for c in got), got

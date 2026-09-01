@@ -192,10 +192,25 @@ def run_suite(config: dict, out_root: str, resume: bool = True,
     seeds = config.get("seeds", [0])
     value_tol = float(config.get("value_tol", 0.25))
 
+    # Per-cell wall-clock limit. This was hard-coded at 7200 s and unreachable from
+    # anywhere, which is fine at N=2000 and actively dangerous above it: the slowest
+    # observed cell (real6d / zombihop) took 6374 s = 89% of the limit, so the
+    # planned 6-D run at N=6000 would have started silently recording timeouts as
+    # failures -- and a timeout is deliberately NOT retried, so the cells would just
+    # be missing. Set `timeout_s` in the config, and override per objective with
+    # `timeout_s` on the objective spec, which is where the cost actually varies.
+    default_timeout = float(config.get("timeout_s", 7200))
+
     rows: list[dict] = []
     curves: dict[str, list] = {}
     jobs: list[dict] = []
     for obj_spec in config["objectives"]:
+        # `timeout_s` is a scheduling knob, not part of the objective. It must not
+        # reach objectives.build(): make_ensemble forwards unknown keys straight into
+        # the Ensemble config, so leaving it in would silently define a landscape
+        # parameter named timeout_s and change the cell name via the objective label.
+        obj_spec = dict(obj_spec)
+        cell_timeout = float(obj_spec.pop("timeout_s", default_timeout))
         for opt_spec in config["optimizers"]:
             for seed in seeds:
                 cell = (f"{_obj_label(obj_spec).replace(' ', '_').replace('=', '')}"
@@ -215,6 +230,7 @@ def run_suite(config: dict, out_root: str, resume: bool = True,
                              "optimizer": opt_spec, "seed": seed,
                              "protocol": protocol_kwargs, "value_tol": value_tol,
                              "retries": retries,
+                             "timeout_s": cell_timeout,
                              "stagger_s": 3.0 * (len(jobs) % max(1, workers))})
 
     def _absorb(cell: str, res: dict) -> None:
@@ -322,6 +338,11 @@ def main(argv=None) -> int:
                          "cells that have no metrics.json")
     ap.add_argument("--retries", type=int, default=2,
                     help="retries per cell on a hard crash")
+    ap.add_argument("--timeout-s", type=float, default=None,
+                    help="per-cell wall-clock limit, overriding the config "
+                         "(default 7200). A timeout is recorded as a failure and is "
+                         "NOT retried, so size it above the slowest cell: real6d / "
+                         "zombihop took 6374 s at N=2000 and scales with the budget.")
     args = ap.parse_args(argv)
 
     path = args.config
@@ -329,6 +350,8 @@ def main(argv=None) -> int:
         path = os.path.join(here, "configs", f"{args.config}.yaml")
     with open(path, encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh)
+    if args.timeout_s is not None:
+        cfg["timeout_s"] = args.timeout_s
     run_suite(cfg, args.out, resume=not args.no_resume, workers=args.workers,
               suite_dir=args.suite_dir, retries=args.retries)
     return 0
