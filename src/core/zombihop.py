@@ -134,7 +134,7 @@ class ZoMBIHop:
                  jaccard_window: int = 3,
                  jaccard_threshold: float = 0.9,
                  min_zoom_for_needle: int = 1,
-                 min_iters_per_zoom: int = 2,
+                 min_iters_per_zoom: int = 3,
                  max_lines_per_activation: int = 30):
         """Initialize ZoMBIHop optimizer.
 
@@ -145,7 +145,7 @@ class ZoMBIHop:
             ``min_zoom_for_needle + 1`` times before it can localise an optimum.
           * ``min_iters_per_zoom`` — at least this many objective lines must be
             sampled at the current zoom level before the optimiser may declare a
-            needle or zoom in/out from it (default 2).
+            needle or zoom in/out from it (default 3).
           * ``max_lines_per_activation`` — hard ceiling on objective lines
             measured in one activation (default 30). Without it an activation's
             cost is bounded only by ``max_zooms × max_iterations`` multiplied by
@@ -451,15 +451,26 @@ class ZoMBIHop:
         zoom: int,
         iteration: int,
         reason: str = "converged",
+        bounds: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """
-        Declare a needle at the current best unpenalized point.
+        Declare a needle at the best unpenalized point of the active region.
 
-        Selects the point via ``get_best_unpenalized`` and delegates to
-        ``_declare_needle_from_point``.  Returns the needle tensor, or None
-        when no unpenalized points exist.
+        ``bounds``: the search box the convergence decision was made in. When it
+        is a zoom box, the needle is placed at the best unpenalized point *inside
+        that box* (``get_best_in_bounds``) — convergence is judged on local EI and
+        local improvement, so the declared optimum must come from the same region.
+        Placing it at the global best would drop the needle somewhere the current
+        zoom never examined. Falls back to ``get_best_unpenalized`` on the full box
+        (or when no bounds are given).
+
+        Delegates to ``_declare_needle_from_point``.  Returns the needle tensor,
+        or None when no unpenalized points exist.
         """
-        needle_X, needle_Y, global_idx = dh.get_best_unpenalized()
+        if bounds is not None and not self._is_global_bounds(bounds):
+            needle_X, needle_Y, global_idx = dh.get_best_in_bounds(bounds)
+        else:
+            needle_X, needle_Y, global_idx = dh.get_best_unpenalized()
         if needle_X is None:
             self._log("  [declare_needle] no unpenalized points — cannot declare needle.")
             return None
@@ -656,9 +667,10 @@ class ZoMBIHop:
                     candidates_out.append(entry)
                     continue
 
-            # The activation's best UNPENALIZED measured point — the same rule
-            # the live path applies (``_declare_needle_at_best`` selects via
-            # ``get_best_unpenalized``), restricted to this activation's rows.
+            # The activation's best UNPENALIZED measured point. The live path
+            # (``_declare_needle_at_best``) restricts the same rule to the zoom
+            # box it converged in; replay has no stored bounds per trigger, so
+            # the activation's own rows stand in for that locality.
             # Points already inside a penalty region are skipped rather than
             # re-declared, so an activation that converged onto ground a
             # previous needle already owns contributes its best *uncovered*
@@ -1268,7 +1280,12 @@ class ZoMBIHop:
                                                  event="all_penalized")
                         break
 
-                    curr_best_X, curr_best_Y, _ = dh.get_best_unpenalized()
+                    # Same locality as prev_best_* above, so the logged "current
+                    # max" tracks the region convergence is actually judged in.
+                    if self._is_global_bounds(bounds):
+                        curr_best_X, curr_best_Y, _ = dh.get_best_unpenalized()
+                    else:
+                        curr_best_X, curr_best_Y, _ = dh.get_best_in_bounds(bounds)
 
                     converged, ei, log_ei = self._check_convergence_to_needle(
                         candidate, unpenalized_X, unpenalized_Y, prev_best_X, prev_best_Y,
@@ -1299,7 +1316,8 @@ class ZoMBIHop:
                         sampled_enough = iters_this_zoom >= self.min_iters_per_zoom
                         if deep_enough and sampled_enough:
                             needle = self._declare_needle_at_best(
-                                dh, zoom, global_iteration, reason="EI convergence"
+                                dh, zoom, global_iteration, reason="EI convergence",
+                                bounds=bounds,
                             )
                             if needle is not None:
                                 dh.take_snapshot(
@@ -1450,7 +1468,8 @@ class ZoMBIHop:
                                 f"  → repeated zoom (Jaccard={repeated_jac:.3f}) — forcing needle."
                             )
                             needle = self._declare_needle_at_best(
-                                dh, zoom, global_iteration, reason="Jaccard convergence"
+                                dh, zoom, global_iteration, reason="Jaccard convergence",
+                                bounds=bounds,
                             )
                             if needle is None:
                                 activation_failed = True

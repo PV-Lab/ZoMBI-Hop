@@ -5,20 +5,39 @@ Interactive Dash app (with an optional static-PNG export mode) that plots every
 datapoint collected during a *real* ZoMBI-Hop run on a simplex diagram, over a
 Random-Forest-interpolated background of those same points.
 
-The dimensionality is **detected from the data**, and the diagram type follows
-from it — the composition is never projected down to fit a fixed diagram:
+Both the **constraint** and the **dimensionality** are detected from the data, and
+the diagram follows from the pair — the data is never projected down, or onto a
+constraint it does not have, to fit a fixed diagram.
+
+*Simplex* sources (compositions: rows sum to 1) get the composition diagrams:
 
   * **d=3** — a 3-component composition lives on a triangle, drawn as the usual
     **ternary** diagram over an interpolated background.
   * **d=4** — a 4-component composition lives on a 3-simplex, drawn as a 3D
     **quaternary** tetrahedron: the four components are the four corners, every
     measured point sits inside the solid, and the background fills the volume.
-  * **d>=5** — a simplex of 5+ components has no faithful 2D/3D embedding, so the
-    run is drawn as a **CoNet** (``plot_10d``'s co-occurrence-network UMAP map,
-    the same view ``conet.png`` shows). This is the plain single-dataset CoNet;
-    the uniform baseline of ``paired_conet.py`` is not involved.
 
-Two data sources are supported, selectable in the app:
+*Non-simplex* sources (a box of independent physical parameters, each with its
+own unit and range) get plain axes in those units instead — putting them on a
+triangle would assert a sum-to-one relationship they do not have:
+
+  * **d=2** — a **heatmap** of the surrogate with the measured points over it.
+  * **d=3** — a **3D scatter** in the parameter box, ticked and labelled, with a
+    translucent voxel cloud of the surrogate filling the volume.
+  * **d=4** — a **scatter-plot matrix**, every axis pair coloured by the
+    objective. A 4D box, unlike a 4-component simplex, has no sum-to-one
+    constraint to collapse it into a solid, so there is no faithful 3D embedding
+    to draw. Deliberately no surrogate background: see ``build_splom_figure``.
+
+  * **d>=5** — in *either* family, 5+ dimensions have no faithful 2D/3D
+    embedding, so the run is drawn as a **CoNet** (``plot_10d``'s
+    co-occurrence-network UMAP map, the same view ``conet.png`` shows). This is
+    the plain single-dataset CoNet; the uniform baseline of ``paired_conet.py``
+    is not involved. Non-simplex inputs are **unit-scaled before embedding**
+    (``Dataset.embed_X``) — on raw ``hplc`` units one column would otherwise be
+    94% of every row and the map would describe that column alone.
+
+Three data sources are supported, selectable in the app:
 
   * **Run directory** (e.g. ``runs/run_7eb9``) — the full measured dataset
     ``(X, Y)`` is reconstructed from the run's delta snapshots
@@ -29,11 +48,23 @@ Two data sources are supported, selectable in the app:
     (see ``detect_comp_columns``), so ``3d.db``/``4d.db``/``6d.db`` each plot at
     their own dimensionality, and a chosen value column (default ``Objective``)
     forms ``Y``. The format is detected from the file extension.
+  * **Public dataset** (e.g. ``hplc``) — an Olympus dataset cached under
+    ``benchmarks/public_db/data`` by ``benchmarks/public_db/olympus.py``. These
+    are the only sources that are not necessarily compositions and not
+    necessarily maximised, so they are what carry ``simplex``/``bounds``/``goal``
+    onto ``Dataset``. Of the four curated ones, ``photo_pce10`` and
+    ``photo_wf3`` are 4-component simplices (tetrahedron), ``crossed_barrel`` is
+    a 4-parameter box (scatter-plot matrix) and ``hplc`` is a 6-parameter box
+    (CoNet). ``crossed_barrel`` against the ``photo_*`` pair is the clearest
+    case for detecting the constraint rather than assuming it: same ``d=4``,
+    different diagram entirely.
 
-For d=3 / d=4 the app trains a Random-Forest (or GP) surrogate on ``(X, Y)``,
-evaluates it over a dense simplex grid as a smooth background heatmap, and
-overlays every measured datapoint coloured by its value on the same viridis
-scale, with a black outline so individual measurements stay legible.
+Where a background applies (every diagram but the d=4 scatter-plot matrix and the
+CoNet) the app trains a Random-Forest (or GP) surrogate on ``(X, Y)``, evaluates
+it over a dense grid — a simplex grid for a composition, a box grid in the
+columns' own units otherwise — and overlays every measured datapoint coloured by
+its value on the same viridis scale, with a black outline so individual
+measurements stay legible.
 
 Two optional panels, each behind a checkbox in the left panel:
 
@@ -66,8 +97,7 @@ a file read. See "precomputed time-slider steps" below.
 
 Usage
 -----
-  conda activate zombi-hop
-  python visualization/plot_run.py                      # launch the Dash app
+  .venv/Scripts/python.exe visualization/plot_run.py    # launch the Dash app
   python visualization/plot_run.py --port 8051          # app on a custom port
 
   # Static PNG export (legacy behaviour), no server:
@@ -76,16 +106,27 @@ Usage
   python visualization/plot_run.py --export --db data/6d.db --out conet.png
   python visualization/plot_run.py --export --db data/campaign1a.csv --out csv.png
 
+  # Public Olympus datasets (fetch them first):
+  python benchmarks/public_db/olympus.py --fetch all
+  python visualization/plot_run.py --export --public photo_pce10     # tetrahedron
+  python visualization/plot_run.py --export --public crossed_barrel  # SPLOM
+  python visualization/plot_run.py --export --public hplc            # CoNet
+
 Flags
 -----
   --port N          Port for the Dash app (default: 8050).
   --export          Render a static PNG instead of launching the app.
   --run PATH        Run directory for --export (default: runs/run_7eb9).
   --db PATH         Data file (.db or .csv) for --export (overrides --run).
+  --public NAME     Public Olympus dataset for --export (overrides --db/--run):
+                    photo_pce10, photo_wf3, hplc, crossed_barrel, or any other
+                    name cached under benchmarks/public_db/data.
   --value COL       DB value column to plot as the objective (default: Objective).
   --snapshot NAME   Snapshot to reconstruct up to (default: latest.txt).
   --out PATH        Output PNG path for --export.
-  --grid-n N        Ternary grid resolution for the background (default: 200).
+  --grid-n N        Grid resolution for the background (default: 200). Capped
+                    per diagram: a simplex/box grid grows as O(n^(d-1))/O(n^d),
+                    so d>=3 clamps far below the 2D range.
   --n-estimators N  Number of trees in the RF surrogate (default: 500).
   --background M    Background surrogate: rf, gp, or none (default: rf).
   --no-points       (export only) Hide the measured sampled points.
@@ -183,8 +224,25 @@ DB_COMP_COLS: list[str] = ["FAPbI3", "MAPbI3", "MAPbBr3"]
 _COMP_SPAN = ("Iteration", "X")
 _MODULE_RE = re.compile(r"module\d+$", re.IGNORECASE)
 
-# d>=5 has no faithful simplex diagram, so it is drawn as a CoNet instead.
+# d>=5 has no faithful simplex diagram, so it is drawn as a CoNet instead. The
+# same threshold applies to non-simplex sources: d=2 gets real axes, d=3 a 3-D
+# box, d=4 a scatter-plot matrix, and d>=5 the CoNet.
 CONET_MIN_D = 5
+
+# Total points allowed in a non-simplex box background grid. A box grid is n**d,
+# so this caps the product rather than the per-axis resolution (see _box_grid_n):
+# ~360x360 at d=2, ~50^3 at d=3.
+BOX_GRID_MAX_PTS = 130_000
+
+# Per-axis cap for the d=3 box background specifically. Every grid point is a
+# translucent 3-D marker the browser must depth-composite, which bites well before
+# the fit does — the same reason TETRA_GRID_N is far below the ternary's.
+BOX3D_GRID_MAX_N = 30
+
+# Above this many samples the d=4 scatter-plot matrix draws smaller, more
+# transparent markers — a SPLOM puts every point in every one of its d*(d-1)
+# panels, so a few thousand samples becomes a solid block without it.
+SPLOM_DENSE_N = 400
 
 # Nominal points per deposition line. Only a fallback: run directories carry no
 # ``Iteration`` column, so their lines are assumed to be exactly this long. Data
@@ -272,6 +330,23 @@ class Dataset:
     each. The two columns differ because a needle is declared *at the best point so
     far*, which is usually an earlier sample than the moment of declaration — see
     ``run_needles``.
+
+    ``simplex`` says whether ``X`` lives on a simplex (rows summing to 1) or in a
+    plain box of independent parameters. It is what selects the *family* of
+    diagram, before dimensionality selects the member: a composition goes on a
+    ternary/tetrahedron, a box of unrelated physical parameters (ml, ml/min, Hz,
+    s) goes on ordinary axes in its own units. Run directories and the
+    ``.db``/``.csv`` result logs are all compositions, so it defaults True; the
+    public Olympus datasets set it from their upstream ``constraints`` field.
+
+    ``bounds`` is the (d, 2) ``[low, high]`` per column for non-simplex sources —
+    the declared design-space extent, which fixes the axis ranges and the
+    background grid so those do not float with whatever subset is on screen. It
+    is None for simplex sources, which get their extent from the simplex itself.
+
+    ``goal`` is ``"minimize"`` or ``"maximize"``. The convergence panel's
+    best-so-far envelope follows it; a hard-coded ``max`` would draw a rising
+    curve for a dataset whose objective is a degradation to be minimised.
     """
 
     X: np.ndarray
@@ -282,6 +357,9 @@ class Dataset:
     value_name: str = DEFAULT_DB_VALUE
     activations: np.ndarray | None = None
     needles: np.ndarray | None = None
+    simplex: bool = True
+    bounds: np.ndarray | None = None
+    goal: str = "maximize"
 
     def __iter__(self):
         """Unpack as the legacy ``(X, Y, labels, title)`` tuple.
@@ -298,6 +376,51 @@ class Dataset:
     @property
     def d(self) -> int:
         return int(self.X.shape[1])
+
+    @property
+    def axis_bounds(self) -> np.ndarray:
+        """(d, 2) plotting extent per column, always defined.
+
+        The declared ``bounds`` when the source has them, else the observed
+        column range padded by 5% so points do not sit on the frame. A degenerate
+        column (every row identical) is widened to a unit interval, since a
+        zero-width axis range is not renderable.
+        """
+        if self.bounds is not None and len(self.bounds) == self.d:
+            return np.asarray(self.bounds, dtype=float)
+        lo = self.X.min(axis=0) if len(self.X) else np.zeros(self.d)
+        hi = self.X.max(axis=0) if len(self.X) else np.ones(self.d)
+        pad = np.where(hi > lo, (hi - lo) * 0.05, 0.5)
+        return np.column_stack([lo - pad, hi + pad])
+
+    @property
+    def unit_X(self) -> np.ndarray:
+        """``X`` rescaled into [0, 1] per column against ``axis_bounds``.
+
+        Anything that measures a *distance* between samples must use this rather
+        than ``X`` when the source is not a simplex. A simplex is already
+        commensurate — every column is a fraction of the same whole — but a box
+        of physical parameters is not: ``hplc`` mixes millilitres (0-0.08) with
+        hertz (80-150), so on raw units the Euclidean distance between two
+        samples is, to three decimal places, the difference in ``push_speed``
+        alone, and any embedding built on it describes that one column.
+        """
+        b = self.axis_bounds
+        lo, hi = b[:, 0], b[:, 1]
+        span = np.where(hi > lo, hi - lo, 1.0)
+        return np.clip((self.X - lo) / span, 0.0, 1.0)
+
+    @property
+    def embed_X(self) -> np.ndarray:
+        """The coordinates a distance-based view (the CoNet) should embed.
+
+        A simplex passes its compositions through untouched; a box is unit-scaled
+        first (see ``unit_X``). ``plot_10d._reduce_comp`` row-normalises whatever
+        it is handed, which is meaningful for a composition and meaningless for a
+        box of mixed units — unit-scaling first at least makes every column
+        contribute on comparable terms before that happens.
+        """
+        return self.X if self.simplex else self.unit_X
 
     @property
     def n_lines(self) -> int:
@@ -782,6 +905,76 @@ def load_db_dataset(db_path: Path, value_col: str = DEFAULT_DB_VALUE) -> Dataset
     )
 
 
+# ── data loading: public datasets (Olympus) ───────────────────────────────────
+
+#: Preference order for the app's default public dataset. Falls back to whatever
+#: is cached; kept here so plot_run does not import the benchmarks package just to
+#: pick a default when the package is absent.
+CURATED_PUBLIC: tuple[str, ...] = ("photo_pce10", "photo_wf3", "hplc",
+                                  "crossed_barrel")
+
+
+def _list_public_datasets() -> list[str]:
+    """Names of the public datasets cached under ``benchmarks/public_db/data``.
+
+    Returns [] if the package is missing rather than raising, so the app still
+    starts (with the public source simply offering nothing) on a checkout where
+    the datasets were never fetched.
+    """
+    try:
+        from benchmarks.public_db import available
+    except Exception:
+        return []
+    try:
+        return available()
+    except Exception:
+        return []
+
+
+def load_public_dataset(name: str) -> Dataset:
+    """Load an Olympus dataset from ``benchmarks/public_db`` into a ``Dataset``.
+
+    Carries three things across that the run/``.db`` sources never have to think
+    about, because for them they are constant:
+
+      * ``simplex`` — whether the parameters are a composition. The ``photo_*``
+        sets are (4-component, so they draw as a tetrahedron); ``hplc`` is not
+        (6 independent process parameters, so it draws as a CoNet), and neither
+        is ``crossed_barrel`` (4 independent geometry parameters, so it draws as
+        a scatter-plot matrix rather than as the tetrahedron its ``d`` alone
+        would suggest).
+      * ``bounds`` — the declared design-space extent per column, which fixes the
+        non-simplex axis ranges to the space that was searched rather than to the
+        part of it that happened to be sampled.
+      * ``goal`` — ``photo_*`` minimise degradation while ``hplc`` maximises peak
+        area and ``crossed_barrel`` maximises toughness, and the convergence
+        envelope follows it.
+
+    ``lines`` is a **pseudo**-deposition-line index: these are published datasets,
+    not ZoMBI-Hop campaigns, so there is no deposition-line column and no
+    guarantee that file order is acquisition order (for the ``photo_*`` grids it
+    is certainly a design enumeration instead). Rows are chunked into blocks of
+    ``NOMINAL_LINE_POINTS`` in file order purely so the time slider has something
+    to step through; it replays the file, and should not be read as a campaign
+    unfolding.
+    """
+    from benchmarks.public_db import load as _load_public
+
+    src = _load_public(name)
+    X = np.asarray(src.X, dtype=float)
+    Y = np.asarray(src.Y, dtype=float)
+    lines = np.arange(len(X)) // NOMINAL_LINE_POINTS
+    kind = "simplex" if src.simplex else "box"
+    return Dataset(
+        X=X, Y=Y, labels=tuple(src.labels),
+        title=(f"{src.name} — {len(X)} points, d={src.d} ({kind}), "
+               f"{src.goal} {src.target_name}"),
+        lines=lines, value_name=src.target_name,
+        simplex=src.simplex, bounds=np.asarray(src.bounds, dtype=float),
+        goal=src.goal,
+    )
+
+
 # ── background surrogates ────────────────────────────────────────────────────
 
 BACKGROUND_MODES: tuple[str, ...] = ("rf", "gp", "none")
@@ -829,6 +1022,84 @@ def fit_gp_background(
     grid_pts = simplex_grid(grid_n, X.shape[1])
     grid_vals = gp.predict(grid_pts) * y_std + y_mean
     return grid_pts, grid_vals
+
+
+def box_grid(n: int, bounds: np.ndarray) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Regular ``n**d`` lattice filling the box ``bounds`` ((d, 2) low/high).
+
+    Returns ``(pts (n**d, d), axes)`` where ``axes[i]`` is the 1-D tick vector of
+    column i. The axes come back alongside the points because the 2-D background
+    is drawn as a ``Heatmap``, which wants the two vectors and a rectangular
+    ``z``, not a flat list of coordinates.
+
+    Built with ``indexing="ij"``, so reshaping values to ``(n,) * d`` puts column
+    0 on the first axis.
+    """
+    axes = [np.linspace(lo, hi, n) for lo, hi in np.asarray(bounds, dtype=float)]
+    mesh = np.meshgrid(*axes, indexing="ij")
+    return np.column_stack([m.ravel() for m in mesh]), axes
+
+
+def _box_grid_n(grid_n: int, d: int) -> int:
+    """Per-axis resolution for a d-dimensional box grid, capped by total points.
+
+    A box grid is ``n**d`` points, so the UI's single resolution slider (which
+    goes to 400, sensible for a 2-D heatmap) has to mean something much smaller
+    at d=3, where 400 would be 64 million points to fit a surrogate over and
+    depth-composite. The cap is on the product, mirroring how ``TETRA_GRID_MAX_N``
+    keeps the d=4 simplex grid tractable.
+    """
+    n = max(int(grid_n), 2)
+    if d <= 1:
+        return min(n, BOX_GRID_MAX_PTS)
+    return max(2, min(n, int(BOX_GRID_MAX_PTS ** (1.0 / d))))
+
+
+def fit_box_background(
+    X: np.ndarray, Y: np.ndarray, grid_n: int, n_estimators: int, mode: str,
+    bounds: np.ndarray, *, length_scale: float = 0.3,
+) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]] | None:
+    """``fit_background``'s non-simplex counterpart: a surrogate over a box grid.
+
+    The surrogate is fitted on **unit-scaled** inputs and asked for predictions at
+    unit-scaled grid points, while the grid points are *returned* in the columns'
+    own physical units. That split matters for the GP: a single isotropic Matern
+    length scale is only meaningful when every axis is commensurate, and on raw
+    ``hplc`` units (ml against Hz) one fixed length scale is simultaneously far
+    too wide for one column and far too narrow for another. The RF is invariant
+    to the rescaling, so it is unaffected either way.
+
+    Returns ``(grid_pts (M, d), grid_vals (M,), axes)``, or None for ``"none"``.
+    """
+    if mode == "none":
+        return None
+    b = np.asarray(bounds, dtype=float)
+    n = _box_grid_n(grid_n, X.shape[1])
+    grid_pts, axes = box_grid(n, b)
+
+    lo, hi = b[:, 0], b[:, 1]
+    span = np.where(hi > lo, hi - lo, 1.0)
+    Xu = (X - lo) / span
+    Gu = (grid_pts - lo) / span
+
+    if mode == "gp":
+        y_mean, y_std = float(Y.mean()), float(Y.std()) or 1.0
+        kernel = (
+            ConstantKernel(1.0, (1e-3, 1e3))
+            * Matern(length_scale=length_scale, length_scale_bounds="fixed", nu=2.5)
+            + WhiteKernel(noise_level=1e-2, noise_level_bounds=(1e-6, 1e1))
+        )
+        gp = GaussianProcessRegressor(
+            kernel=kernel, normalize_y=False, n_restarts_optimizer=2, random_state=42
+        )
+        gp.fit(Xu, (Y - y_mean) / y_std)
+        vals = gp.predict(Gu) * y_std + y_mean
+    else:
+        rf = RandomForestRegressor(
+            n_estimators=n_estimators, n_jobs=-1, random_state=42)
+        rf.fit(Xu, Y)
+        vals = rf.predict(Gu)
+    return grid_pts, vals, axes
 
 
 def fit_background(
@@ -1218,23 +1489,322 @@ def build_quaternary_figure(
     return fig
 
 
-def build_figure(X: np.ndarray, Y: np.ndarray, labels: tuple[str, ...], **kwargs):
-    """Dispatch to the ternary (d=3) or quaternary tetrahedron (d=4) builder.
+# ── non-simplex diagrams ──────────────────────────────────────────────────────
+#
+# A source whose parameters are *not* a composition has no simplex to sit on: its
+# columns are independent physical quantities with their own units and ranges, and
+# projecting them onto a triangle or a tetrahedron would assert a
+# sum-to-one relationship that does not exist. They are drawn on ordinary axes in
+# their own units instead, with dimensionality choosing the diagram exactly as it
+# does on the simplex side:
+#
+#   d=2  → a flat heatmap of the surrogate with the measured points over it: the
+#          direct analogue of the ternary, and the only case where the background
+#          is a genuine dense picture of the landscape rather than a slice of one.
+#   d=3  → a 3-D scatter in the parameter box (the analogue of the tetrahedron),
+#          with a translucent voxel cloud of the surrogate filling the volume.
+#   d=4  → a scatter-plot matrix. A 4-D box has no faithful 2-D or 3-D embedding,
+#          and unlike a 4-component simplex it cannot borrow one from a
+#          sum-to-one constraint (which is what collapses that case to a solid
+#          tetrahedron). Every axis pair is shown instead, coloured by the
+#          objective, with no surrogate background: a 2-D projection of a 4-D
+#          surrogate would have to marginalise over the two hidden axes, and the
+#          resulting smooth field would look far more informative than it is.
+#   d>=5 → the CoNet, the same as the simplex side.
 
-    d>=5 has no simplex diagram and is handled by ``conet_png_src`` instead.
+def _box_axis(label: str, rng: tuple[float, float], scale: float) -> dict:
+    """Shared linear-axis styling for the non-simplex diagrams."""
+    return dict(
+        title=dict(text=label, font=dict(size=15 * scale)),
+        range=list(rng), tickfont=dict(size=12 * scale),
+        showline=True, linecolor="black", linewidth=1,
+        gridcolor="rgba(0,0,0,0.10)", zeroline=False,
+    )
+
+
+def build_box2d_figure(
+    X: np.ndarray,
+    Y: np.ndarray,
+    labels: tuple[str, ...],
+    *,
+    bounds: np.ndarray,
+    grid_n: int,
+    n_estimators: int,
+    title: str,
+    value_name: str = "Objective",
+    background: str = "rf",
+    show_points: bool = True,
+    gp_length_scale: float = 0.3,
+    scale: float = 1.0,
+    plot_size: float = 0.80,
+    color_limits: tuple[float, float] | None = None,
+    highlight: np.ndarray | None = None,
+):
+    """d=2 non-simplex: surrogate heatmap in real units + measured points.
+
+    The counterpart of ``build_ternary_figure`` for two independent parameters.
+    Axis ranges come from ``bounds`` (the declared design space) rather than from
+    the plotted subset, so the frame holds still while the time slider fills it.
+    """
+    import plotly.graph_objects as go
+
+    bg = fit_box_background(X, Y, grid_n, n_estimators, background, bounds,
+                            length_scale=gp_length_scale)
+    grid_vals = None if bg is None else bg[1]
+    vmin, vmax = (color_limits if color_limits is not None
+                  else _color_limits(grid_vals, Y))
+
+    fig = go.Figure()
+    colorbar = dict(
+        title=dict(text=value_name, font=dict(size=14 * scale)),
+        thickness=28, len=0.9, x=min(plot_size + 0.06, 0.98), xpad=0,
+        tickfont=dict(size=14 * scale),
+    )
+
+    if bg is not None:
+        _, vals, axes = bg
+        n = len(axes[0])
+        # box_grid builds with indexing="ij", so vals reshapes to [x, y]; Heatmap
+        # indexes z as [y][x], hence the transpose.
+        fig.add_trace(go.Heatmap(
+            x=axes[0], y=axes[1], z=vals.reshape(n, n).T,
+            colorscale="Viridis", zmin=vmin, zmax=vmax, zsmooth="best",
+            hoverinfo="skip", showscale=not show_points,
+            colorbar=colorbar if not show_points else None,
+        ))
+
+    if show_points:
+        edge_color, edge_width = _point_edges(len(X), highlight)
+        fig.add_trace(go.Scatter(
+            x=X[:, 0], y=X[:, 1], mode="markers",
+            marker=dict(
+                size=9 * scale, color=Y, colorscale="Viridis",
+                cmin=vmin, cmax=vmax, showscale=True, colorbar=colorbar,
+                line=dict(width=edge_width, color=edge_color),
+            ),
+            customdata=np.column_stack([Y]),
+            hovertemplate=(
+                f"{labels[0]}=%{{x:.4g}}<br>{labels[1]}=%{{y:.4g}}<br>"
+                f"{value_name}=%{{customdata[0]:.4g}}<extra></extra>"),
+            name="measured", showlegend=False,
+        ))
+
+    b = np.asarray(bounds, dtype=float)
+    fig.update_layout(
+        title=dict(text=title, x=0.5, y=0.98, yanchor="top", font=dict(size=17)),
+        font=dict(size=15),
+        xaxis=_box_axis(labels[0], (b[0, 0], b[0, 1]), scale),
+        yaxis=_box_axis(labels[1], (b[1, 0], b[1, 1]), scale),
+        plot_bgcolor="white",
+        margin=dict(l=int(40 + 40 * scale), r=40, t=90, b=int(50 + 30 * scale)),
+        height=720,
+    )
+    fig.update_xaxes(domain=[0.0, plot_size])
+    return fig
+
+
+def build_box3d_figure(
+    X: np.ndarray,
+    Y: np.ndarray,
+    labels: tuple[str, ...],
+    *,
+    bounds: np.ndarray,
+    grid_n: int,
+    n_estimators: int,
+    title: str,
+    value_name: str = "Objective",
+    background: str = "rf",
+    show_points: bool = True,
+    gp_length_scale: float = 0.3,
+    scale: float = 1.0,
+    color_limits: tuple[float, float] | None = None,
+    highlight: np.ndarray | None = None,
+):
+    """d=3 non-simplex: 3-D scatter in the parameter box, real units on all axes.
+
+    The counterpart of ``build_quaternary_figure``. Unlike the tetrahedron there
+    is no enclosing solid to draw — the domain *is* the axis box — so the frame is
+    the axes themselves, kept at ``bounds`` and shown with ticks, because here
+    the numbers carry units worth reading.
+
+    ``aspectmode="cube"`` is deliberate: the three axes are different physical
+    quantities, so there is no meaningful common scale between them and a cube is
+    the honest neutral choice.
+    """
+    import plotly.graph_objects as go
+
+    grid_n = int(min(grid_n, BOX3D_GRID_MAX_N))
+    bg = fit_box_background(X, Y, grid_n, n_estimators, background, bounds,
+                            length_scale=gp_length_scale)
+    grid_vals = None if bg is None else bg[1]
+    vmin, vmax = (color_limits if color_limits is not None
+                  else _color_limits(grid_vals, Y))
+
+    fig = go.Figure()
+    colorbar = dict(
+        title=dict(text=value_name, font=dict(size=14 * scale)),
+        thickness=28, len=0.9, tickfont=dict(size=14 * scale),
+    )
+
+    if bg is not None:
+        pts, vals, _ = bg
+        fig.add_trace(go.Scatter3d(
+            x=pts[:, 0], y=pts[:, 1], z=pts[:, 2], mode="markers",
+            marker=dict(size=_tetra_bg_marker_size(grid_n), color=vals,
+                        colorscale="Viridis", cmin=vmin, cmax=vmax,
+                        opacity=0.10, line=dict(width=0),
+                        colorbar=None if show_points else colorbar,
+                        showscale=not show_points),
+            hoverinfo="skip", name=f"{background.upper()} background",
+            showlegend=False,
+        ))
+
+    if show_points:
+        edge_color, edge_width = _point_edges(len(X), highlight)
+        fig.add_trace(go.Scatter3d(
+            x=X[:, 0], y=X[:, 1], z=X[:, 2], mode="markers",
+            marker=dict(size=5 * scale, color=Y, colorscale="Viridis",
+                        cmin=vmin, cmax=vmax, showscale=True, colorbar=colorbar,
+                        line=dict(width=edge_width, color=edge_color)),
+            customdata=np.column_stack([Y]),
+            hovertemplate=(
+                f"{labels[0]}=%{{x:.4g}}<br>{labels[1]}=%{{y:.4g}}<br>"
+                f"{labels[2]}=%{{z:.4g}}<br>"
+                f"{value_name}=%{{customdata[0]:.4g}}<extra></extra>"),
+            name="measured", showlegend=False,
+        ))
+
+    b = np.asarray(bounds, dtype=float)
+    fig.update_layout(
+        title=dict(text=title, x=0.5, y=0.98, yanchor="top", font=dict(size=17)),
+        font=dict(size=15),
+        scene=dict(
+            xaxis=_box_axis(labels[0], (b[0, 0], b[0, 1]), scale),
+            yaxis=_box_axis(labels[1], (b[1, 0], b[1, 1]), scale),
+            zaxis=_box_axis(labels[2], (b[2, 0], b[2, 1]), scale),
+            aspectmode="cube",
+            camera=dict(eye=dict(x=1.5, y=1.5, z=1.0)),
+        ),
+        margin=dict(l=0, r=0, t=90, b=10),
+        autosize=True,
+    )
+    return fig
+
+
+def build_splom_figure(
+    X: np.ndarray,
+    Y: np.ndarray,
+    labels: tuple[str, ...],
+    *,
+    bounds: np.ndarray,
+    title: str,
+    value_name: str = "Objective",
+    scale: float = 1.0,
+    color_limits: tuple[float, float] | None = None,
+    highlight: np.ndarray | None = None,
+    **_ignored,
+):
+    """d=4 non-simplex: scatter-plot matrix of every axis pair, coloured by value.
+
+    Only the lower triangle is drawn — the upper half is the same six panels
+    transposed — and the diagonal is dropped, so the grid shows each of the six
+    distinct pairings once.
+
+    No surrogate background, deliberately: see the note above ``_box_axis``. Each
+    panel here is an honest *projection* of the samples (every point appears in
+    every panel, at its true coordinates), and adding a fitted field behind it
+    would imply a 2-D landscape that the other two axes are silently averaged out
+    of.
+
+    ``**_ignored`` swallows the background/grid knobs the shared renderer passes
+    to every builder; none of them apply to a SPLOM.
+    """
+    import plotly.graph_objects as go
+
+    vmin, vmax = color_limits if color_limits is not None else _color_limits(None, Y)
+    dense = len(X) > SPLOM_DENSE_N
+    edge_color, edge_width = _point_edges(len(X), highlight)
+    if highlight is None or not np.any(highlight):
+        # A SPLOM repeats every sample across six panels, so at these counts the
+        # per-point outline is most of the ink. Drop it unless it is carrying the
+        # time slider's red ring.
+        edge_color, edge_width = ("rgba(0,0,0,0.35)", 0.5) if dense else ("black", 1.0)
+
+    b = np.asarray(bounds, dtype=float)
+    fig = go.Figure(go.Splom(
+        dimensions=[dict(label=labels[i], values=X[:, i],
+                         axis=dict(matches=False))
+                    for i in range(X.shape[1])],
+        showupperhalf=False, diagonal=dict(visible=False),
+        marker=dict(
+            size=(4 if dense else 7) * scale, color=Y, colorscale="Viridis",
+            cmin=vmin, cmax=vmax, showscale=True,
+            opacity=0.65 if dense else 0.9,
+            line=dict(width=edge_width, color=edge_color),
+            colorbar=dict(title=dict(text=value_name, font=dict(size=14 * scale)),
+                          thickness=24, len=0.85, tickfont=dict(size=13 * scale)),
+        ),
+        text=[f"{value_name}={v:.4g}" for v in Y],
+        hovertemplate="%{text}<extra></extra>",
+    ))
+
+    axis_style = dict(showline=True, linecolor="black", linewidth=1,
+                      gridcolor="rgba(0,0,0,0.10)", zeroline=False,
+                      tickfont=dict(size=11 * scale))
+    layout = {"xaxis" if i == 0 else f"xaxis{i + 1}":
+              dict(range=[b[i, 0], b[i, 1]], **axis_style)
+              for i in range(X.shape[1])}
+    layout |= {"yaxis" if i == 0 else f"yaxis{i + 1}":
+               dict(range=[b[i, 0], b[i, 1]], **axis_style)
+               for i in range(X.shape[1])}
+    fig.update_layout(
+        title=dict(text=title, x=0.5, y=0.99, yanchor="top", font=dict(size=17)),
+        font=dict(size=13), plot_bgcolor="white", dragmode="select",
+        margin=dict(l=70, r=40, t=95, b=60), height=760, **layout,
+    )
+    return fig
+
+
+def build_figure(X: np.ndarray, Y: np.ndarray, labels: tuple[str, ...], **kwargs):
+    """Dispatch to the diagram for this source's constraint *and* dimensionality.
+
+    ``simplex=True`` (the default, and every run directory / result log) picks the
+    composition diagrams: ternary at d=3, tetrahedron at d=4. ``simplex=False``
+    picks the plain-axes diagrams: heatmap at d=2, 3-D box at d=3, scatter-plot
+    matrix at d=4.
+
+    d>=5 has no diagram in either family and is handled by ``conet_png_src``
+    instead; ``render_state`` routes it there before ever calling this.
     """
     d = X.shape[1]
-    # plot_size only applies to the flat ternary; the d=4 scene is sized by the
-    # camera, so zooming already covers it.
+    simplex = kwargs.pop("simplex", True)
+    bounds = kwargs.pop("bounds", None)
+    # plot_size only applies to the flat 2-D diagrams; the 3-D scenes are sized by
+    # the camera, so zooming already covers them, and a SPLOM sizes its own grid.
     plot_size = kwargs.pop("plot_size", None)
-    if d == 3:
+
+    if simplex:
+        if d == 3:
+            if plot_size is not None:
+                kwargs["plot_size"] = plot_size
+            return build_ternary_figure(X, Y, labels, **kwargs)
+        if d == 4:
+            return build_quaternary_figure(X, Y, labels, **kwargs)
+        raise ValueError(
+            f"d={d} has no simplex diagram; use conet_png_src for d>={CONET_MIN_D}.")
+
+    if bounds is None:
+        raise ValueError("a non-simplex source needs bounds to fix its axes")
+    if d == 2:
         if plot_size is not None:
             kwargs["plot_size"] = plot_size
-        return build_ternary_figure(X, Y, labels, **kwargs)
+        return build_box2d_figure(X, Y, labels, bounds=bounds, **kwargs)
+    if d == 3:
+        return build_box3d_figure(X, Y, labels, bounds=bounds, **kwargs)
     if d == 4:
-        return build_quaternary_figure(X, Y, labels, **kwargs)
+        return build_splom_figure(X, Y, labels, bounds=bounds, **kwargs)
     raise ValueError(
-        f"d={d} has no simplex diagram; use conet_png_src for d>={CONET_MIN_D}.")
+        f"d={d} has no box diagram; use conet_png_src for d>={CONET_MIN_D}.")
 
 
 # ── CoNet (d >= 5) ────────────────────────────────────────────────────────────
@@ -1292,7 +1862,12 @@ def fit_conet_frame(ds: Dataset, *, key: tuple) -> dict:
     """
     import plot_10d as p10
 
-    comp, active = p10._reduce_comp(ds.X)
+    # embed_X, not X: _reduce_comp row-normalises whatever it is given, which is
+    # the identity on a composition but arbitrary on a box of mixed physical
+    # units. Unit-scaling a non-simplex source first is what stops the single
+    # widest-ranged column (hplc's push_speed, 80-150 Hz against sample_loop's
+    # 0-0.08 ml) from being the only thing the embedding can see.
+    comp, active = p10._reduce_comp(ds.embed_X)
     names = [n for n, a in zip(ds.labels, active) if a]
     resp = ds.Y.reshape(-1, 1)
     # plot_10d rims the points of the LATEST iteration in red. Its standalone
@@ -1737,8 +2312,12 @@ def simplex_step_renderer(ds: Dataset, **kw):
         # A background surrogate needs something to fit; the early steps can be
         # empty or near-empty, so drop to no background there.
         bg = background if len(sub.X) >= 2 else "none"
+        # simplex/bounds come from the FULL dataset, not the prefix: they say what
+        # kind of space this is and how far it extends, which a slider step must
+        # not be able to change under the animation.
         return build_figure(sub.X, sub.Y, sub.labels, background=bg,
-                            highlight=highlight, **kw)
+                            highlight=highlight, simplex=ds.simplex,
+                            bounds=ds.axis_bounds, **kw)
     return render
 
 
@@ -1846,20 +2425,27 @@ def build_convergence_figure(
     # One envelope per activation (or a single global one when there is no
     # activation record). Each segment is its own trace, so nothing bridges a
     # boundary — the reset is a real break in the line, not a steep climb.
+    # "Best" follows the source's own goal. Every simplex source here maximises,
+    # but the public photodegradation sets minimise, and running np.maximum over
+    # those would draw a confidently rising curve for a campaign whose whole
+    # object is to drive the value down.
+    minimizing = str(ds.goal).lower().startswith("min")
+    accumulate = np.minimum.accumulate if minimizing else np.maximum.accumulate
     if len(sel):
+        best_word = "running best (min)" if minimizing else "running best"
         if acts is None:
             groups = [sel]
-            best_label = "running best"
+            best_label = best_word
         else:
             sel_acts = acts[sel]
             cuts = np.flatnonzero(np.diff(sel_acts)) + 1
             groups = np.split(sel, cuts)
-            best_label = "running best (reset/activation)"
+            best_label = f"{best_word} (reset/activation)"
         for gi, g in enumerate(groups):
             if not len(g):
                 continue
             fig.add_trace(go.Scatter(
-                x=g, y=np.maximum.accumulate(Y_all[g]), mode="lines",
+                x=g, y=accumulate(Y_all[g]), mode="lines",
                 name=best_label, legendgroup="best", showlegend=(gi == 0),
                 line=dict(color="darkorange", width=2, shape="hv"),
                 hovertemplate="best through %{x}: %{y:.4f}<extra></extra>",
@@ -1914,11 +2500,17 @@ _DATA_CACHE_MAX = 8
 
 
 def _source_key(source_type: str, run_name: str | None, db_name: str | None,
-                db_value: str | None) -> tuple:
+                db_value: str | None, public_name: str | None = None) -> tuple:
     """Cache key identifying a source, including its mtime so edits are picked up."""
     if source_type == "run":
         p = _resolve_run_dir(run_name or "")
         return ("run", str(p), p.stat().st_mtime)
+    if source_type == "public":
+        # Keyed on the cached data.csv's mtime, the same way the others are keyed
+        # on their file, so a re-fetch of the upstream dataset invalidates it.
+        from benchmarks.public_db.olympus import DATA_DIR as _PUB_DIR
+        p = _PUB_DIR / (public_name or "") / "data.csv"
+        return ("public", public_name or "", p.stat().st_mtime)
     p = _resolve_db_path(db_name or "")
     return ("db", str(p), p.stat().st_mtime, db_value)
 
@@ -1928,8 +2520,12 @@ def load_source(key: tuple) -> Dataset:
     hit = _DATA_CACHE.get(key)
     if hit is not None:
         return hit
-    ds = (load_run_source(Path(key[1]), None) if key[0] == "run"
-          else load_db_dataset(Path(key[1]), key[3]))
+    if key[0] == "run":
+        ds = load_run_source(Path(key[1]), None)
+    elif key[0] == "public":
+        ds = load_public_dataset(key[1])
+    else:
+        ds = load_db_dataset(Path(key[1]), key[3])
     if len(_DATA_CACHE) >= _DATA_CACHE_MAX:
         _DATA_CACHE.pop(next(iter(_DATA_CACHE)))
     _DATA_CACHE[key] = ds
@@ -1942,6 +2538,7 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
 
     run_names = _list_run_dirs()
     db_names = _list_db_files()
+    public_names = _list_public_datasets()
 
     step_btn_style = {
         "flex": "0 0 auto", "width": "28px", "height": "28px", "padding": "0",
@@ -1954,6 +2551,8 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
                       db_names[0] if db_names else None)
     default_run = DEFAULT_RUN if DEFAULT_RUN in run_names else (
         run_names[0] if run_names else None)
+    default_public = next((n for n in CURATED_PUBLIC if n in public_names),
+                          public_names[0] if public_names else None)
 
     label_style = {"fontWeight": "600", "marginTop": "12px", "display": "block"}
     panel_style = {
@@ -1977,6 +2576,7 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
                 options=[
                     {"label": " Run directory", "value": "run"},
                     {"label": " Data file (.db/.csv)", "value": "db"},
+                    {"label": " Public dataset (Olympus)", "value": "public"},
                 ],
                 value="db" if default_db else "run",
                 labelStyle={"display": "block"},
@@ -2000,6 +2600,22 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
                 ),
                 html.Label("Value column", style=label_style),
                 dcc.Dropdown(id="db-value-dropdown", clearable=False),
+            ]),
+
+            html.Div(id="public-controls", children=[
+                html.Label("Public dataset", style=label_style),
+                dcc.Dropdown(
+                    id="public-dropdown",
+                    options=[{"label": n, "value": n} for n in public_names],
+                    value=default_public, clearable=False,
+                ),
+                html.Div(
+                    "Fetched from the-matter-lab/olympus into "
+                    "benchmarks/public_db/data. Run "
+                    "`python benchmarks/public_db/olympus.py --fetch all` "
+                    "to populate.",
+                    style={"fontSize": "11px", "color": "#777", "marginTop": "6px"},
+                ),
             ]),
 
             html.Label("Background", style=label_style),
@@ -2173,15 +2789,17 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         ]),
     ])
 
-    # Show/hide the run vs db control groups.
+    # Show/hide the run vs db vs public control groups.
     @app.callback(
         Output("run-controls", "style"),
         Output("db-controls", "style"),
+        Output("public-controls", "style"),
         Input("source-type", "value"),
     )
     def _toggle(source_type):
         show, hide = {}, {"display": "none"}
-        return (show, hide) if source_type == "run" else (hide, show)
+        return tuple(show if source_type == t else hide
+                     for t in ("run", "db", "public"))
 
     # Start/stop auto-rotation: flip the stored on/off state, relabel the button,
     # and enable/disable the interval that drives the camera spin.
@@ -2306,10 +2924,12 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         Input("run-dropdown", "value"),
         Input("db-dropdown", "value"),
         Input("db-value-dropdown", "value"),
+        Input("public-dropdown", "value"),
     )
-    def _timeline_range(source_type, run_name, db_name, db_value):
+    def _timeline_range(source_type, run_name, db_name, db_value, public_name):
         try:
-            ds = load_source(_source_key(source_type, run_name, db_name, db_value))
+            ds = load_source(_source_key(source_type, run_name, db_name,
+                                         db_value, public_name))
         except Exception:
             return 1, 1, None
         n = max(ds.n_lines, 1)
@@ -2384,6 +3004,9 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         Input("timeline-on", "value"),
         Input("timeline", "value"),
         Input("convergence-on", "value"),
+        # Appended last so render_state's existing positional signature — which
+        # several tests and sibling scripts call directly — keeps its meaning.
+        Input("public-dropdown", "value"),
     )
     def _render(*args):
         return render_state(*args, no_update=no_update)
@@ -2391,10 +3014,31 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
     return app
 
 
+_SIMPLEX_DIAGRAMS = {3: "ternary triangle (d=3, simplex)",
+                     4: "tetrahedron (d=4, simplex)"}
+_BOX_DIAGRAMS = {2: "axes heatmap (d=2, non-simplex)",
+                 3: "3-D box scatter (d=3, non-simplex)",
+                 4: "scatter-plot matrix (d=4, non-simplex)"}
+
+
+def _diagram_name(ds: Dataset) -> str:
+    """Human-readable name of the diagram ``ds`` dispatches to, for the status panel.
+
+    Says which *family* was chosen as well as which member, since that is the
+    part a reader cannot infer from d alone — a d=4 source is a tetrahedron or a
+    scatter-plot matrix depending entirely on whether its columns are a
+    composition.
+    """
+    if ds.d >= CONET_MIN_D:
+        return f"CoNet (d={ds.d}, {'simplex' if ds.simplex else 'non-simplex'})"
+    table = _SIMPLEX_DIAGRAMS if ds.simplex else _BOX_DIAGRAMS
+    return table.get(ds.d, f"unsupported (d={ds.d})")
+
+
 def render_state(source_type, run_name, db_name, db_value, background, show_points,
                  gn, ntrees, gp_ls, scale, plot_size, color_override, color_min,
-                 color_max, timeline_on, timeline, convergence_on, *, no_update=None,
-                 precompute=None):
+                 color_max, timeline_on, timeline, convergence_on, public_name=None,
+                 *, no_update=None, precompute=None):
     """Everything the main Dash callback renders, as a plain function.
 
     Split out of the callback body so it can be exercised (and its eight outputs
@@ -2414,8 +3058,13 @@ def render_state(source_type, run_name, db_name, db_value, background, show_poin
         if source_type == "db" and not (db_name and db_value):
             return ((no_update,) * 7
                     + ("No database / value column selected.", no_update))
+        if source_type == "public" and not public_name:
+            return ((no_update,) * 7
+                    + ("No public dataset selected — fetch one with "
+                       "`python benchmarks/public_db/olympus.py --fetch all`.",
+                       no_update))
 
-        key = _source_key(source_type, run_name, db_name, db_value)
+        key = _source_key(source_type, run_name, db_name, db_value, public_name)
         full = load_source(key)
 
         # The time slider cuts the dataset to its first N deposition lines.
@@ -2456,7 +3105,7 @@ def render_state(source_type, run_name, db_name, db_value, background, show_poin
         conet = full.d >= CONET_MIN_D
         if conet:
             simplex_style, conet_style = hide, show_block
-            diagram = f"CoNet (d={full.d})"
+            diagram = _diagram_name(full)
             # None of the surrogate knobs feed the CoNet, so its signature is the
             # source alone — twiddling them never invalidates a rendered step.
             sig = ("conet", key)
@@ -2471,7 +3120,7 @@ def render_state(source_type, run_name, db_name, db_value, background, show_poin
                     f"samples to embed; the time slider is showing {len(rows)}.")
         else:
             simplex_style, conet_style = show_block, hide
-            diagram = "tetrahedron (d=4)" if full.d == 4 else "ternary (d=3)"
+            diagram = _diagram_name(full)
             sig = ("simplex", key, int(gn), int(ntrees), background,
                    bool(show_points), float(gp_ls), float(scale),
                    float(plot_size), color_limits)
@@ -2527,11 +3176,17 @@ def render_state(source_type, run_name, db_name, db_value, background, show_poin
             act_note += "\nneedles: none recorded"
         else:
             act_note += f"\nneedles: {len(full.needles)} (marked on the convergence plot)"
+        # The background knobs do nothing on a CoNet, and nothing on the d=4
+        # scatter-plot matrix either (which deliberately fits no surrogate), so
+        # say 'n/a' rather than naming a mode that is not being applied.
+        has_bg = full.d < CONET_MIN_D and not (full.d == 4 and not full.simplex)
         status = (
             f"{len(ds.X)}/{len(full.X)} points · {full.n_lines} lines\n"
             f"Y range: {yr}\n"
+            f"space: {'simplex' if full.simplex else 'box (non-simplex)'}"
+            f" · d={full.d} · goal={full.goal}\n"
             f"diagram: {diagram}\n"
-            f"background: {background if full.d < CONET_MIN_D else 'n/a'}\n"
+            f"background: {background if has_bg else 'n/a'}\n"
             f"components: {full.labels}\n"
             f"{act_note}"
         )
@@ -2550,7 +3205,10 @@ def export_png(args: argparse.Namespace) -> None:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    if args.db:
+    if args.public:
+        ds = load_public_dataset(args.public)
+        out_default = DATA_DIR / f"{args.public}.png"
+    elif args.db:
         db_path = _resolve_db_path(args.db)
         ds = load_db_dataset(db_path, args.value)
         out_default = db_path.with_suffix(".png")
@@ -2561,14 +3219,26 @@ def export_png(args: argparse.Namespace) -> None:
 
     X, Y, labels, title, value_name, d = (
         ds.X, ds.Y, ds.labels, ds.title, ds.value_name, ds.d)
-    diagram = (f"CoNet (d={d})" if d >= CONET_MIN_D else
-               "tetrahedron (d=4)" if d == 4 else "ternary (d=3)")
     print(f"Title  : {title}")
     print(f"Labels : {labels}")
-    print(f"Diagram: {diagram}")
+    print(f"Space  : {'simplex' if ds.simplex else 'box (non-simplex)'}"
+          f"   goal: {ds.goal}")
+    print(f"Diagram: {_diagram_name(ds)}")
     print(f"Points : {X.shape[0]}   Y range: [{Y.min():.4f}, {Y.max():.4f}]")
 
-    # d>=5 has no simplex diagram; export the CoNet PNG that the app shows.
+    # A non-simplex source below the CoNet threshold gets the plain-axes diagrams
+    # rather than any of the composition ones.
+    if not ds.simplex and d < CONET_MIN_D:
+        out = Path(args.out) if args.out else out_default.with_name(
+            f"{out_default.stem}_box.png")
+        fig = _export_box_png(ds, args, plt)
+        fig.savefig(out, dpi=150, bbox_inches="tight")
+        print(f"Saved figure -> {out}")
+        if args.show:
+            plt.show()
+        return
+
+    # d>=5 has no diagram in either family; export the CoNet PNG the app shows.
     if d >= CONET_MIN_D:
         out = Path(args.out) if args.out else out_default.with_name(
             f"{out_default.stem}_conet.png")
@@ -2628,6 +3298,100 @@ def export_png(args: argparse.Namespace) -> None:
     print(f"Saved figure -> {out}")
     if args.show:
         plt.show()
+
+
+def _export_box_png(ds: Dataset, args: argparse.Namespace, plt):
+    """Static PNG for a **non-simplex** source below the CoNet threshold.
+
+    The matplotlib counterpart of ``build_box2d_figure`` /
+    ``build_box3d_figure`` / ``build_splom_figure``, and it makes the same three
+    choices for the same reasons: d=2 gets a filled surrogate field with the
+    points over it, d=3 a 3-D scatter in the parameter box, and d=4 a lower-
+    triangle scatter-plot matrix with no surrogate behind it.
+
+    Returns the figure; the caller saves it.
+    """
+    b = ds.axis_bounds
+    X, Y, labels, d = ds.X, ds.Y, ds.labels, ds.d
+
+    if d == 2:
+        bg = fit_box_background(X, Y, args.grid_n, args.n_estimators,
+                                args.background, b,
+                                length_scale=args.gp_length_scale)
+        vmin, vmax = _color_limits(None if bg is None else bg[1], Y)
+        fig, ax = plt.subplots(figsize=(8.4, 7.0))
+        mappable = None
+        if bg is not None:
+            _, vals, axes = bg
+            n = len(axes[0])
+            # box_grid is indexing="ij" (column 0 first), imshow wants row=y.
+            mappable = ax.imshow(
+                vals.reshape(n, n).T, origin="lower", aspect="auto",
+                cmap="viridis", vmin=vmin, vmax=vmax,
+                extent=(b[0, 0], b[0, 1], b[1, 0], b[1, 1]), zorder=1)
+        if not args.no_points:
+            mappable = ax.scatter(X[:, 0], X[:, 1], c=Y, cmap="viridis",
+                                  vmin=vmin, vmax=vmax, s=28, zorder=3,
+                                  edgecolors="black", linewidths=0.7)
+        ax.set_xlim(b[0, 0], b[0, 1])
+        ax.set_ylim(b[1, 0], b[1, 1])
+        ax.set_xlabel(labels[0])
+        ax.set_ylabel(labels[1])
+        ax.set_title(ds.title, fontsize=11)
+        if mappable is not None:
+            fig.colorbar(mappable, ax=ax, label=ds.value_name,
+                         fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        return fig
+
+    if d == 3:
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d)
+
+        vmin, vmax = _color_limits(None, Y)
+        fig = plt.figure(figsize=(8.6, 7.6))
+        ax = fig.add_subplot(111, projection="3d")
+        sc = ax.scatter(X[:, 0], X[:, 1], X[:, 2], c=Y, cmap="viridis",
+                        vmin=vmin, vmax=vmax, s=22, depthshade=False,
+                        edgecolors="black", linewidths=0.4)
+        ax.set_xlim(*b[0])
+        ax.set_ylim(*b[1])
+        ax.set_zlim(*b[2])
+        ax.set_xlabel(labels[0])
+        ax.set_ylabel(labels[1])
+        ax.set_zlabel(labels[2])
+        ax.set_title(ds.title, fontsize=11)
+        fig.colorbar(sc, ax=ax, label=ds.value_name, fraction=0.03, pad=0.10)
+        return fig
+
+    # d == 4: lower-triangle scatter-plot matrix, no surrogate behind it.
+    vmin, vmax = _color_limits(None, Y)
+    fig, axes = plt.subplots(d - 1, d - 1, figsize=(10.0, 9.2),
+                             squeeze=False)
+    sc = None
+    for r in range(d - 1):          # y is column r+1
+        for c in range(d - 1):      # x is column c
+            ax = axes[r][c]
+            if c > r:
+                ax.axis("off")
+                continue
+            sc = ax.scatter(X[:, c], X[:, r + 1], c=Y, cmap="viridis",
+                            vmin=vmin, vmax=vmax, s=8, alpha=0.75,
+                            linewidths=0.0)
+            ax.set_xlim(*b[c])
+            ax.set_ylim(*b[r + 1])
+            ax.tick_params(labelsize=7)
+            if r == d - 2:
+                ax.set_xlabel(labels[c], fontsize=9)
+            else:
+                ax.set_xticklabels([])
+            if c == 0:
+                ax.set_ylabel(labels[r + 1], fontsize=9)
+            else:
+                ax.set_yticklabels([])
+    fig.suptitle(ds.title, fontsize=11)
+    if sc is not None:
+        fig.colorbar(sc, ax=axes, label=ds.value_name, fraction=0.030, pad=0.02)
+    return fig
 
 
 def _export_tetra_png(X, Y, labels, title, value_name, grid_pts, grid_vals,
@@ -2690,6 +3454,11 @@ def main() -> None:
                         help="Run directory or bare run name (export; default: run_7eb9).")
     parser.add_argument("--db", default=None,
                         help="Data file (.db or .csv) or bare name (export; overrides --run).")
+    parser.add_argument("--public", default=None,
+                        help="Public Olympus dataset name (export; overrides "
+                             "--db/--run). One of "
+                             f"{', '.join(CURATED_PUBLIC)}, or any other name "
+                             "cached under benchmarks/public_db/data.")
     parser.add_argument("--value", default=DEFAULT_DB_VALUE,
                         help="DB value column to plot (default: Objective).")
     parser.add_argument("--snapshot", default=None,

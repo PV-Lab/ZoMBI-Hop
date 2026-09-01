@@ -228,6 +228,50 @@ def metric_dup_fraction(
     return float((nn < thr).mean())
 
 
+def metric_median_nn_spacing(
+    X_all: np.ndarray,
+    *,
+    dim: int | None = None,
+) -> float:
+    """Median nearest-neighbour distance between a run's samples, in composition L2.
+
+    The threshold-free counterpart to ``metric_dup_fraction``, and the reason it
+    exists: dup fraction counts the samples whose nearest neighbour falls inside a
+    radius, so its value depends entirely on that radius. ``NOISE_LEVEL`` moved from
+    0.064 to 0.128 in a2deba7 (the input-noise measurement was redone against
+    ``run_39af``, which logs the composition the optimiser *sent* rather than
+    inferring it), which doubled the radius and left dup fractions from before and
+    after the change answering two different questions. Nor can the two eras simply
+    be re-scored at one common radius: at any radius wide enough to catch the older
+    campaigns' duplicates the newer ones saturate near 1.0 and the metric separates
+    nothing, and vice versa.
+
+    This measures directly what dup fraction was a proxy for — how far apart the
+    points a run actually sampled are. No radius, no noise level and no zoom scaling
+    enter it, so runs from any era sit on one axis.
+
+    **Direction is FLIPPED relative to dup fraction: higher is better.** Wide spacing
+    means the run spread its samples out; small spacing means it kept re-measuring
+    the same spot.
+
+    Note that spacing scales as ``N**(-1/d)`` in the sample count, so it is only
+    comparable at similar N — at d=6 a 7% difference in sample count moves it under
+    1%, but an order of magnitude would not be negligible.
+
+    Returns 0.0 for fewer than two samples (no spacing is defined).
+    """
+    X_all = as_numpy(X_all, dtype=float)
+    n = len(X_all)
+    if n <= 1:
+        return 0.0
+    infer_metric_dim(dim, X_all)   # validates shape the same way dup_fraction does
+    # Same KD-tree query as metric_dup_fraction: the naive N x N x D difference array
+    # would peak at tens of GiB for the N~20k samples these runs produce.
+    tree = cKDTree(X_all)
+    nn_dist, _ = tree.query(X_all, k=2)  # k=2: self (dist 0) + nearest other
+    return float(np.median(nn_dist[:, 1]))
+
+
 def metric_pct_matched_comp(
     discovered: np.ndarray,
     true_optima: list[np.ndarray],

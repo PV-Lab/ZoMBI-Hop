@@ -26,7 +26,7 @@ DEFAULT_HPARAMS: dict = {
     "raw": 300,
     "ucb_beta": 3.0,
     "max_zooms": 3,
-    "max_iterations": 2,
+    "max_iterations": 3,
     "top_m_points": 8,
     "n_consecutive_converged": 5,
     "input_noise_threshold_mult": 3.0,
