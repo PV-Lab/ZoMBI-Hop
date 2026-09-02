@@ -37,8 +37,13 @@ Workflow
      Right – ZoMBI-Hop exploration:
                • all sampled points (older = more transparent),
                • red ★ + faded-purple ellipse per discovered needle,
-               • grey ✕ + grey circle per "old" (demoted) needle,
-               • dashed-red boundary for current search bounds,
+               • grey ✕ + faded-grey region per capped-activation exclusion zone,
+               • dashed-red boundary for the current zoom box (grey dotted when the
+                 search is back on the full box) — exact box ∩ simplex polygon,
+               • dashed-blue circle of radius ``needle_move_tol`` around the
+                 incumbent (the best unpenalized point in the active box, whose
+                 value is the local median of its replicates): the incumbent
+                 staying inside it between lines is half the needle test,
                • orange solid line for LineBO's main suggested line,
                • dotted cornflower-blue line for LineBO's cache line,
                • thin dim-grey lines for every candidate line sampled this step
@@ -58,6 +63,16 @@ Flags
       the maxima, so the run is forced to maximize and the analytic optima are
       drawn as reference extrema (the interactive picker / CSV load are skipped).
         python interactive_testing/interactive_test_zombi.py --ackley centroid
+
+  --ensemble
+      Use the layered ``synthetic_data/ensemble.py`` objective on the 3-simplex
+      (true optima + weak distractors + ridges + roughness + plateaus + edge bias)
+      instead of the RF surrogate. A NEW RANDOM landscape is drawn every run. Like
+      ``--ackley`` the optima are known analytically, so the run maximizes and
+      neither the min/max prompt nor the click-picker appears. The landscape that
+      was drawn is written to ``interactive_testing/plots/ensemble_config.json``,
+      so a run worth repeating can be rebuilt with ``Ensemble(**config)``.
+        python interactive_testing/interactive_test_zombi.py --ensemble
 
   --hparams PATH
       Load ZoMBI hyperparameters from a previous hparam-opt run and use them to
@@ -122,6 +137,7 @@ from src import ZoMBIHop, LineBO
 from src.core.linebo import line_simplex_segment, zero_sum_dirs
 from src.utils.simplex import Ellipsoid, composition_to_ilr, ilr_to_composition, proj_simplex
 from synthetic_data.ackley import Ackley
+from synthetic_data.ensemble import Ensemble, random_ensemble_config
 from optimize.composition_prediction import physics_simulate_line
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -136,6 +152,7 @@ NUM_EXPERIMENTS = 24     # points sampled per suggested line (mirrors run_zombi_
 NUM_LINES = 10           # LineBO candidate lines per iteration
 TERNARY_GRID_N = 120     # ternary grid resolution for reference heatmap
 N_INIT_LINES = 2         # random lines to build the initial GP dataset
+ENSEMBLE_OPTIMA_MARGIN = 0.2  # --ensemble: gap between the true optima and the capped background
 
 SAVE_PLOTS = True        # save per-iteration PNG to interactive_testing/plots/
 
@@ -165,18 +182,21 @@ DTYPE = torch.float64
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ZoMBI hyperparameters (mirror run_zombi_main.py)
+#
+# This script targets the basin flood-fill loop: an activation is a flat sequence
+# of measured lines, zoom depth is decided by the basin's volume ratio rather than
+# by a zoom/iteration budget, and a needle is declared when the incumbent stops
+# moving.  The old budget knobs (max_zooms / max_iterations / top_m_points /
+# n_consecutive_converged / output_noise_threshold_mult / needle_shrink_factor /
+# needle_stop_noise_multiplier) are RETIRED — ZoMBIHop still accepts them so old
+# configs construct, but nothing reads them, so they are not set here.
 ZOMBI_PARAMS: dict = dict(
-    max_zooms=6,
-    max_iterations=6,
-    top_m_points=4,
     n_restarts=100,
     raw=1323,
     input_noise_threshold_mult=3.0,
-    output_noise_threshold_mult=0.5,
-    n_consecutive_converged=5,
     max_gp_points=3000,
     acquisition_type="ucb",
-    ucb_beta=0.6677950695897094,
+    ucb_beta=0.0,
     nat_grad_step=0.024757059158665974,
     nat_grad_max_steps=67,
     max_penalty_radius=1.0,
@@ -184,9 +204,15 @@ ZOMBI_PARAMS: dict = dict(
     paring_spatial_halfnoise=0.5,
     paring_y_noise_multiplier=1.0,
     input_noise_ilr=NOISE_LEVEL_ILR,
-    # Needle-ellipsoid failure handling
-    needle_shrink_factor=0.85,
-    needle_stop_noise_multiplier=3.0,
+    # Basin flood fill → zoom
+    flood_k=6,
+    flood_ci_z=2.0,
+    zoom_volume_fraction=0.5,
+    max_lines_per_activation=30,
+    # Needle stability (the incumbent must stay within needle_move_tol of where it
+    # was on the previous line — this is the circle drawn on the exploration panel)
+    needle_move_tol=0.10,
+    needle_ci_tol=0.15,
     verbose=True,
 )
 
@@ -603,6 +629,8 @@ def make_plotting_wrapper(
     maximize: bool,
     show_sampling: bool = False,
     gp_ref: list | None = None,
+    opt_ref: list | None = None,
+    ref_name: str = "RF",
 ):
     """
     Wrap ``inner_wrapper`` so that after every objective call a snapshot of
@@ -629,7 +657,52 @@ def make_plotting_wrapper(
         needles       = getattr(dh, "needles", None)
         needle_M_list = getattr(dh, "needle_M_list", None)
         needle_B      = getattr(dh, "needle_B", None)
-        curr_bounds   = getattr(dh, "bounds", None)
+        # The ACTIVE search region of the flood-fill loop. ``bounds`` and
+        # ``current_zoom_bounds`` are kept in sync by every zoom-in / zoom-out /
+        # needle-declaration path in ZoMBIHop, so either reads the live box;
+        # prefer current_zoom_bounds, which is also what checkpoints store.
+        curr_bounds   = getattr(dh, "current_zoom_bounds", None)
+        if curr_bounds is None:
+            curr_bounds = getattr(dh, "bounds", None)
+
+        # Zoom state: depth, and whether the active box is still the full one.
+        opt = opt_ref[0] if opt_ref else None
+        full_bounds = getattr(opt, "full_bounds", None)
+        is_full_box = bool(
+            curr_bounds is not None and full_bounds is not None
+            and torch.allclose(curr_bounds, full_bounds)
+        )
+        zoom_depth = getattr(dh, "current_zoom", None)
+
+        # Incumbent + needle-stability tolerance: the best unpenalized point in
+        # the active box (its Y is the local median of the replicates around it),
+        # and the radius it must stay inside for a needle to be declared.
+        best_X = None
+        move_tol = float(getattr(opt, "needle_move_tol", 0.10)) if opt else 0.10
+        try:
+            if curr_bounds is not None and hasattr(dh, "get_best_in_bounds"):
+                bx, _, _ = dh.get_best_in_bounds(curr_bounds)
+            else:
+                bx, _, _ = dh.get_best_unpenalized()
+            if bx is not None:
+                best_X = bx.detach().cpu().numpy().ravel()
+        except Exception:
+            best_X = None
+
+        # Capped-activation exclusion zones (regions later activations are repelled
+        # from without a needle ever being declared there).
+        excl = getattr(dh, "exclusions", None)
+        if excl is not None and excl.numel() > 0:
+            excl_np = excl.detach().cpu().numpy()
+            excl_radii = getattr(dh, "exclusion_radii", None)
+            excl_radii_np = (excl_radii.detach().cpu().numpy().ravel()
+                             if excl_radii is not None and excl_radii.numel() else
+                             np.zeros(len(excl_np)))
+            excl_M = list(getattr(dh, "exclusion_M_list", []) or [])
+        else:
+            excl_np = None
+            excl_radii_np = None
+            excl_M = []
 
         # Pared dataset — what the GP sees (noise-deduplicated).
         xp = getattr(dh, "X_pared", None)
@@ -657,10 +730,18 @@ def make_plotting_wrapper(
             needle_M_list=[_clone(m) for m in (needle_M_list or [])],
             needle_B=_clone(needle_B),
             trust_ellipsoid=_clone(curr_bounds),
+            bounds_is_full=is_full_box,
+            zoom_depth=zoom_depth,
+            best_X=best_X,
+            move_tol=move_tol,
+            exclusions=excl_np,
+            exclusion_radii=excl_radii_np,
+            exclusion_M_list=[_clone(m) for m in excl_M],
             line_0=plot_state.get("line_0"),
             line_1=plot_state.get("line_1"),
             sampling_lines=plot_state.get("sampling_lines") if show_sampling else None,
             iteration_num=plot_state["iter"],
+            ref_name=ref_name,
             save_dir=save_dir,
             gp_grid_vals=_gp_landscape_vals(
                 gp_ref[0] if gp_ref else None, grid_pts, maximize),
@@ -673,22 +754,100 @@ def make_plotting_wrapper(
 
 # ── Plotting helpers ──────────────────────────────────────────────────────────
 
-def _draw_bounds_region(ax, bounds, n_sample: int = 5000) -> None:
+# comp_to_xy restricted to the zero-sum plane is a similarity: an orthonormal
+# tangent basis maps to orthogonal ternary vectors of length 1/√2 (check with
+# u = (1,-1,0)/√2 → (-1/√2, 0) and v = (1,1,-2)/√6 → (0, -1/√2)).  So a ball of
+# radius r in composition L2 is exactly a CIRCLE of radius r/√2 on the ternary —
+# no sampling or projection needed to draw one.
+_COMP_TO_XY_SCALE = 1.0 / np.sqrt(2.0)
+
+
+def clip_simplex_box(bounds: torch.Tensor) -> np.ndarray | None:
+    """Exact polygon of ``{x ∈ simplex : lo ≤ x ≤ hi}`` in composition coords.
+
+    The current zoom region is an axis-aligned box (``_basin_box``), and its
+    intersection with the 2-simplex is a convex polygon with up to 9 vertices — a
+    corner-clipped triangle, not a rectangle.  Sutherland–Hodgman clips the
+    triangle against the 2·d half-planes ``x_i ≥ lo_i`` and ``x_i ≤ hi_i``;
+    every vertex stays on the simplex plane, so the clip is planar and exact.
+
+    Returns ``(k, 3)`` polygon vertices in order, or None if the box misses the
+    simplex entirely (or ``bounds`` is not a 3-simplex box).
     """
-    Draw the trust-region (tensor bounds or Ellipsoid) as a dashed-red convex hull on the ternary.
+    b = bounds.detach().cpu().numpy().astype(float)
+    if b.shape != (2, 3):
+        return None
+    lo, hi = b[0], b[1]
+    poly = [np.eye(3)[i] for i in range(3)]
+
+    def _clip(poly_in: list, axis: int, bound: float, keep_upper: bool) -> list:
+        """Keep the side of ``x[axis] == bound`` requested; interpolate crossings."""
+        if not poly_in:
+            return []
+        # signed distance > 0 == inside
+        sd = [(p[axis] - bound) if keep_upper else (bound - p[axis]) for p in poly_in]
+        out = []
+        n = len(poly_in)
+        for i in range(n):
+            p, s = poly_in[i], sd[i]
+            q, t = poly_in[(i + 1) % n], sd[(i + 1) % n]
+            if s >= 0:
+                out.append(p)
+            if (s > 0) != (t > 0) and abs(s - t) > 1e-15:
+                out.append(p + (s / (s - t)) * (q - p))
+        return out
+
+    for axis in range(3):
+        poly = _clip(poly, axis, lo[axis], keep_upper=True)
+        poly = _clip(poly, axis, hi[axis], keep_upper=False)
+        if not poly:
+            return None
+    # Vertices sitting exactly on a clip plane are emitted twice (once as "inside",
+    # once as the crossing); drop the consecutive duplicates.
+    out = [poly[0]]
+    for p in poly[1:]:
+        if np.linalg.norm(p - out[-1]) > 1e-12:
+            out.append(p)
+    if len(out) > 1 and np.linalg.norm(out[0] - out[-1]) <= 1e-12:
+        out.pop()
+    return np.array(out, dtype=float)
+
+
+def _draw_bounds_region(ax, bounds, *, is_full: bool = False,
+                        n_sample: int = 5000):
+    """Draw the active search region (the current zoom box) on the ternary.
+
+    The basin flood-fill loop keeps the active region as an axis-aligned box
+    ``(2, d)`` — ``DataHandler.bounds`` / ``current_zoom_bounds`` — which is drawn
+    exactly via :func:`clip_simplex_box`.  ``is_full`` marks the un-zoomed state
+    (the box equals the run's full search bounds): it is drawn grey and dotted so
+    "zoomed into a basin" is visually distinct from "searching the whole simplex".
+    The legacy ``Ellipsoid`` branch is kept only for old checkpoints.
     """
-    from src.utils.simplex import random_simplex
-    try:
-        if isinstance(bounds, torch.Tensor) and bounds.shape[0] == 2:
-            lo = bounds[0]
-            hi = bounds[1]
-            samp = random_simplex(n_sample, lo, hi, device=str(lo.device), torch_dtype=lo.dtype)
-        elif isinstance(bounds, Ellipsoid):
-            # Fallback for old Ellipsoid format (should not occur after refactor)
-            from src.utils.simplex import sample_ellipsoid as _se
-            samp = _se(n_sample, bounds, scale=1.0)
-        else:
+    colour = "grey" if is_full else "red"
+    style = ":" if is_full else "--"
+    label = "Search box (full)" if is_full else "Zoom box"
+
+    if isinstance(bounds, torch.Tensor) and bounds.shape[0] == 2:
+        poly = clip_simplex_box(bounds)
+        if poly is None or poly.shape[0] < 3:
             return
+        verts = comp_to_xy(poly)
+        verts_c = np.vstack([verts, verts[0]])
+        if not is_full:
+            ax.fill(verts[:, 0], verts[:, 1], color=colour, alpha=0.06, zorder=4)
+        (h,) = ax.plot(
+            verts_c[:, 0], verts_c[:, 1],
+            style, color=colour, lw=2.0, alpha=0.75, zorder=5, label=label,
+        )
+        return h
+
+    if not isinstance(bounds, Ellipsoid):
+        return
+    # Fallback for old Ellipsoid checkpoints (pre-AABB bounds).
+    try:
+        from src.utils.simplex import sample_ellipsoid as _se
+        samp = _se(n_sample, bounds, scale=1.0)
     except Exception:
         return
     pts = samp.detach().cpu().numpy()
@@ -706,6 +865,68 @@ def _draw_bounds_region(ax, bounds, n_sample: int = 5000) -> None:
         )
     except Exception:
         pass
+
+
+def _draw_move_tol_ball(ax, center: np.ndarray, radius: float):
+    """Draw the needle-stability tolerance around the current incumbent.
+
+    ``center`` is the best unpenalized point in the active box — the point a
+    needle would be declared at, and whose value is the MEDIAN of the replicate
+    measurements around it (``DataHandler._relabel_pared_with_medians`` /
+    ``_median_ci_halfwidth`` both work on that local median).  ``radius`` is
+    ``needle_move_tol`` (default 0.10, i.e. ten composition points in L2): if the
+    incumbent's next position stays inside this circle — and its median CI has
+    stopped sharpening — the needle is declared here and the search zooms out.
+
+    Composition-L2 balls are exact circles on the ternary (see
+    ``_COMP_TO_XY_SCALE``), so this is drawn analytically rather than sampled.
+    """
+    c_xy = comp_to_xy(np.asarray(center, dtype=float).reshape(1, 3))[0]
+    r_xy = float(radius) * _COMP_TO_XY_SCALE
+    ang = np.linspace(0, 2 * np.pi, 181)
+    ring = np.column_stack([c_xy[0] + r_xy * np.cos(ang),
+                            c_xy[1] + r_xy * np.sin(ang)])
+    ax.fill(ring[:, 0], ring[:, 1], color="deepskyblue", alpha=0.10, zorder=5)
+    (h,) = ax.plot(
+        ring[:, 0], ring[:, 1], "--", color="deepskyblue", lw=1.8, alpha=0.95,
+        zorder=8, label=f"needle_move_tol ({radius:.2f}) around incumbent",
+    )
+    ax.scatter(
+        c_xy[0], c_xy[1], marker="P", s=130, c="deepskyblue",
+        zorder=10, edgecolors="black", linewidths=0.9,
+    )
+    return h
+
+
+def _draw_exclusion_zone(ax, center: np.ndarray, M, B, radius: float) -> None:
+    """Draw a capped-activation exclusion zone (grey ✕ + faded grey region).
+
+    An activation that burns ``max_lines_per_activation`` without declaring a
+    needle records the region it was stuck in as an exclusion zone
+    (``_penalize_capped_zone``), which repels later activations exactly like a
+    needle's penalty does.  Drawn so points being avoided have a visible reason.
+    """
+    xy = comp_to_xy(np.asarray(center, dtype=float).reshape(1, 3))
+    ax.scatter(
+        xy[0, 0], xy[0, 1], marker="X", s=170, c="dimgray",
+        zorder=9, edgecolors="black", linewidths=0.9,
+    )
+    try:
+        if M is not None:
+            for ring, penalty in _needle_penalty_bands(np.asarray(center, float), M, B):
+                ax.add_patch(MplPolygon(
+                    comp_to_xy(ring), closed=True,
+                    facecolor="dimgray", edgecolor="none",
+                    alpha=0.45 * penalty, linewidth=0, zorder=6,
+                ))
+        elif radius and radius > 0:
+            # Sphere fallback: exact circle on the ternary (see _COMP_TO_XY_SCALE).
+            r_xy = float(radius) * _COMP_TO_XY_SCALE
+            ang = np.linspace(0, 2 * np.pi, 181)
+            ax.fill(xy[0, 0] + r_xy * np.cos(ang), xy[0, 1] + r_xy * np.sin(ang),
+                    color="dimgray", alpha=0.15, zorder=6)
+    except Exception as exc:
+        print(f"  [exclusion warn] {exc}")
 
 
 def _needle_penalty_bands(
@@ -815,6 +1036,14 @@ def _plot_iteration(
     save_dir: str | None = None,
     sampling_lines: list | None = None,
     gp_grid_vals: np.ndarray | None = None,
+    bounds_is_full: bool = False,
+    zoom_depth: int | None = None,
+    best_X: np.ndarray | None = None,
+    move_tol: float = 0.10,
+    exclusions: np.ndarray | None = None,
+    exclusion_radii: np.ndarray | None = None,
+    exclusion_M_list: list | None = None,
+    ref_name: str = "RF",
 ) -> plt.Figure:
     """
     Generate the two-panel ternary figure for one iteration and optionally save it.
@@ -829,7 +1058,17 @@ def _plot_iteration(
     needles             : (k, d) tensor or None.
     needle_M_list       : per-needle ellipsoid M matrices (list of (2,2) tensors or None).
     needle_B            : shared tangent basis (3, 2) tensor or None.
-    trust_ellipsoid     : Trust-region ``Ellipsoid``, or None.
+    trust_ellipsoid     : active search region — a ``(2, d)`` box in the current
+                          (flood-fill) loop, or a legacy ``Ellipsoid``; None to skip.
+    bounds_is_full      : True when that box is still the full search box (drawn
+                          grey/dotted rather than red/dashed).
+    zoom_depth          : current zoom depth, for the summary box.
+    best_X, move_tol    : incumbent (best unpenalized point in the active box, whose
+                          value is the local median of its replicates) and the
+                          ``needle_move_tol`` radius it must stay inside for a needle
+                          to be declared.  None skips the circle.
+    exclusions, exclusion_radii, exclusion_M_list :
+                          capped-activation exclusion zones (grey ✕ + faded region).
     line_0, line_1      : each is (left_np, right_np) or None.
     iteration_num       : counter shown in the title and filename.
     save_dir            : directory to write the PNG, or None.
@@ -845,14 +1084,15 @@ def _plot_iteration(
 
     # ── Left panel: RF reference ───────────────────────────────────────────────
     draw_ternary_frame(ax_ref)
-    ax_ref.set_title("Reference: RF landscape", fontsize=11)
+    ax_ref.set_title(f"Reference: {ref_name} landscape", fontsize=11)
     gxy = comp_to_xy(grid_pts)
     sc_ref = ax_ref.scatter(
         gxy[:, 0], gxy[:, 1],
         c=grid_vals, cmap="viridis",
         s=6, alpha=0.72, zorder=2, rasterized=True,
     )
-    fig.colorbar(sc_ref, ax=ax_ref, label="RF Objective", fraction=0.046, pad=0.04)
+    fig.colorbar(sc_ref, ax=ax_ref, label=f"{ref_name} objective",
+                 fraction=0.046, pad=0.04)
     ref_lbl = "True maxima" if maximize else "True minima"
     if true_minima:
         mc = np.array([m[0] for m in true_minima])
@@ -902,9 +1142,12 @@ def _plot_iteration(
             f"ZoMBI-Hop exploration  ({n} pared pts)", fontsize=11
         )
 
-    # Current trust ellipsoid (dashed red polygon)
+    # Active search region: the current zoom box (red dashed) or the full search
+    # box (grey dotted) — see _draw_bounds_region.
     if trust_ellipsoid is not None:
-        _draw_bounds_region(ax_exp, trust_ellipsoid)
+        h_box = _draw_bounds_region(ax_exp, trust_ellipsoid, is_full=bounds_is_full)
+        if h_box is not None:
+            legend_handles.append(h_box)
 
     # Active needles: red ★ + purple ellipse
     if needles is not None and needles.shape[0] > 0:
@@ -913,6 +1156,29 @@ def _plot_iteration(
         for i, nx in enumerate(nx_np):
             Mi = M_list[i] if i < len(M_list) else None
             _draw_needle_ellipsoid(ax_exp, nx, Mi, needle_B)
+
+    # Capped-activation exclusion zones: grey ✕ + faded grey penalty region.
+    if exclusions is not None and len(exclusions) > 0:
+        eM = exclusion_M_list or [None] * len(exclusions)
+        eR = (exclusion_radii if exclusion_radii is not None
+              else np.zeros(len(exclusions)))
+        for i, ex in enumerate(exclusions):
+            _draw_exclusion_zone(
+                ax_exp, ex,
+                eM[i] if i < len(eM) else None,
+                needle_B,
+                float(eR[i]) if i < len(eR) else 0.0,
+            )
+        legend_handles.append(Line2D(
+            [], [], marker="X", color="none", markerfacecolor="dimgray",
+            markeredgecolor="black", markersize=9,
+            label=f"Exclusion zone ({len(exclusions)})",
+        ))
+
+    # Needle-stability tolerance around the incumbent (the median-valued best
+    # point): stay inside this circle between lines and a needle is declared.
+    if best_X is not None:
+        legend_handles.append(_draw_move_tol_ball(ax_exp, best_X, move_tol))
 
     # Sampling overlay: every candidate line the acquisition was integrated over.
     # Thin and semi-transparent so the chosen main/cache lines remain readable.
@@ -974,14 +1240,22 @@ def _plot_iteration(
         if isinstance(trust_ellipsoid, torch.Tensor) and trust_ellipsoid.shape[0] == 2:
             lo_cpu = trust_ellipsoid[0].detach().cpu().numpy()
             hi_cpu = trust_ellipsoid[1].detach().cpu().numpy()
-            summary_lines.append("Trust lo: [" + " ".join(f"{v:.4f}" for v in lo_cpu) + "]")
-            summary_lines.append("Trust hi: [" + " ".join(f"{v:.4f}" for v in hi_cpu) + "]")
+            depth_str = "full box" if bounds_is_full else (
+                f"zoom {zoom_depth}" if zoom_depth is not None else "zoomed")
+            summary_lines.append(f"Box ({depth_str})")
+            summary_lines.append("  lo: [" + " ".join(f"{v:.4f}" for v in lo_cpu) + "]")
+            summary_lines.append("  hi: [" + " ".join(f"{v:.4f}" for v in hi_cpu) + "]")
+            summary_lines.append("  w : [" + " ".join(f"{v:.4f}" for v in (hi_cpu - lo_cpu)) + "]")
         elif isinstance(trust_ellipsoid, Ellipsoid):
             c_cpu = trust_ellipsoid.c.detach().cpu().numpy()
             wM, _ = torch.linalg.eigh(trust_ellipsoid.M)
             wcpu = np.sort(wM.detach().cpu().numpy())
             summary_lines.append("Trust c: [" + " ".join(f"{v:.4f}" for v in c_cpu) + "]")
             summary_lines.append("Trust M eig: [" + " ".join(f"{v:.4f}" for v in wcpu) + "]")
+    if best_X is not None:
+        summary_lines.append(
+            "Incumbent: [" + " ".join(f"{v:.4f}" for v in best_X) + "]"
+            f"  ±{move_tol:.2f}")
     if line_0 is not None:
         a, b = np.round(line_0[0], 3), np.round(line_0[1], 3)
         summary_lines.append(f"Line0: {list(a)} → {list(b)}")
@@ -1147,11 +1421,35 @@ def load_hparams(path: str) -> dict:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def build_ensemble() -> tuple[Ensemble, dict]:
+    """Draw a fresh random layered ``synthetic_data.ensemble`` objective.
+
+    Returns ``(fn, config)``.  Every run gets a different landscape — random
+    feature counts / widths / amplitudes / on-off toggles / optima layout — the
+    same "Randomize" draw ``synthetic_data/plot_ensemble.py`` and
+    ``optimize/evaluate.py --dataset ensemble`` use, from a seed taken from the OS
+    entropy pool rather than a fixed sweep position.  The kwargs are returned (and
+    written next to the plots by the caller) so a run that turns up something
+    interesting can still be reconstructed exactly with ``Ensemble(**config)``.
+
+    The dimension is pinned to 3: everything downstream here is ternary (the grid,
+    both panels, the LineBO wrapper).  Use ``optimize/evaluate.py --dataset
+    ensemble --dim D`` for higher-dimensional ensembles.
+    """
+    rng = np.random.default_rng()
+    seed = int(rng.integers(0, 2 ** 31 - 1))
+    index = int(rng.integers(0, 1_000_000))
+    cfg = random_ensemble_config(3, index, seed=seed,
+                                 optima_margin=ENSEMBLE_OPTIMA_MARGIN)
+    return Ensemble(**cfg), cfg
+
+
 def main(
     hparams_path: str | None = None,
     show_sampling: bool = False,
     background: bool = False,
     ackley: str | None = None,
+    ensemble: bool = False,
 ) -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(script_dir, "campaign1a.csv")
@@ -1160,7 +1458,12 @@ def main(
     save_dir = os.path.join(script_dir, "plots")
     ckpt_dir = os.path.join(script_dir, "checkpoints")
 
-    surrogate_name = f"Ackley ({ackley})" if ackley else "RF Surrogate on campaign1a.csv"
+    if ackley:
+        surrogate_name = f"Ackley ({ackley})"
+    elif ensemble:
+        surrogate_name = "Ensemble (random landscape)"
+    else:
+        surrogate_name = "RF Surrogate on campaign1a.csv"
     print("=" * 70)
     print(f"ZoMBI-Hop Interactive Test — {surrogate_name}")
     print(f"Device : {DEVICE}")
@@ -1179,6 +1482,23 @@ def main(
         # Ackley peaks are maxima; ZoMBI maximizes them directly.
         maximize = True
         print("    Mode forced: MAXIMIZE (Ackley peaks are maxima).")
+    elif ensemble:
+        print("\n[1] Drawing a random layered Ensemble objective — no CSV / RF training.")
+        rf, ens_cfg = build_ensemble()
+        print(f"    {rf!r}")
+        # Record the exact landscape next to the plots (same file evaluate.py /
+        # run_mobo.py write) so this run's random surface can be rebuilt later with
+        # ``Ensemble(**json.load(open(path)))``.
+        os.makedirs(save_dir, exist_ok=True)
+        cfg_out = os.path.join(save_dir, "ensemble_config.json")
+        with open(cfg_out, "w") as f:
+            json.dump(ens_cfg, f, indent=2)
+        print(f"    Landscape config written to {cfg_out}")
+        grid_pts = ternary_grid(TERNARY_GRID_N)
+        grid_vals = rf.predict(grid_pts)
+        # Ensemble optima are maxima (its output is mapped into [0.5, 1]).
+        maximize = True
+        print("    Mode forced: MAXIMIZE (Ensemble optima are maxima).")
     else:
         print("\n[1] Loading data and training RF …")
         X_data, y_data = load_data(csv_path)
@@ -1203,11 +1523,14 @@ def main(
     # Under --ackley the optima are known analytically, so the picker is skipped
     # and the analytic maxima are used directly.
     goal_pl = "maxima" if maximize else "minima"
-    if ackley:
+    if ackley or ensemble:
+        # Both analytic objectives expose ``known_maxima`` (composition, value), so
+        # the reference optima are known exactly — no min/max prompt, no clicking.
         true_minima = rf.known_maxima
+        flag = "--ackley" if ackley else "--ensemble"
         if not background:
             plt.ion()   # keep Tk root alive for the live per-iteration figures
-        print(f"\n[2] --ackley: using {len(true_minima)} analytic reference {goal_pl}:")
+        print(f"\n[2] {flag}: using {len(true_minima)} analytic reference {goal_pl}:")
         for i, (c, v) in enumerate(true_minima):
             print(f"      #{i + 1}  comp={np.round(c, 4)}  y={v:.5f}")
     elif background:
@@ -1232,8 +1555,10 @@ def main(
     plot_state: dict = {"line_0": None, "line_1": None, "fig": None, "iter": 0}
     dh_ref: list = [None]   # filled with optimizer.data_handler after construction
     gp_ref: list = [None]   # filled with optimizer.gp_handler after construction
+    opt_ref: list = [None]  # filled with the optimizer itself (zoom state, tolerances)
     plot_queue: queue.Queue = queue.Queue()
 
+    ref_name = ("Ackley" if ackley else "Ensemble" if ensemble else "RF")
     print("    Building sim objective …")
     sim_obj = make_sim_objective(rf, DEVICE, DTYPE, maximize=maximize)
     print("    Building LineBO wrapper …")
@@ -1249,6 +1574,8 @@ def main(
         maximize=maximize,
         show_sampling=show_sampling,
         gp_ref=gp_ref,
+        opt_ref=opt_ref,
+        ref_name=ref_name,
     )
 
     print(f"    Generating initial data ({N_INIT_LINES} lines × {NUM_EXPERIMENTS} pts) …")
@@ -1274,6 +1601,7 @@ def main(
     )
     dh_ref[0] = optimizer.data_handler  # connect plotting wrapper to live DataHandler
     gp_ref[0] = optimizer.gp_handler    # GP belief landscape for the panel background
+    opt_ref[0] = optimizer             # full_bounds / needle_move_tol for the overlays
     print("    ZoMBIHop ready.")
 
     # ── Step 4: run ZoMBI in background; main thread owns all Tk/matplotlib ───
@@ -1410,6 +1738,16 @@ if __name__ == "__main__":
              "as reference extrema, and the interactive picker / CSV load are skipped.",
     )
     parser.add_argument(
+        "--ensemble",
+        action="store_true",
+        help="Use the layered synthetic_data/ensemble.py objective (3-simplex) "
+             "instead of the campaign1a RF surrogate. A NEW RANDOM landscape is "
+             "drawn every run. Like --ackley the optima are known analytically, so "
+             "the run is forced to maximize and the min/max prompt and the "
+             "interactive picker are both skipped. The landscape that was drawn is "
+             "written to interactive_testing/plots/ensemble_config.json.",
+    )
+    parser.add_argument(
         "--hparams",
         metavar="PATH",
         default=None,
@@ -1433,9 +1771,13 @@ if __name__ == "__main__":
              "interactive_testing/plots/. Skips the interactive extrema picker.",
     )
     args = parser.parse_args()
+    use_ensemble = bool(args.ensemble)
+    if args.ackley and use_ensemble:
+        parser.error("--ackley and --ensemble select different objectives; pick one.")
     main(
         hparams_path=args.hparams,
         show_sampling=args.show_sampling,
         background=args.background,
         ackley=args.ackley,
+        ensemble=use_ensemble,
     )
