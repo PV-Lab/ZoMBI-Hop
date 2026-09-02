@@ -25,7 +25,6 @@ import sys
 import csv
 import json
 import glob
-import datetime
 from collections import Counter
 
 
@@ -766,18 +765,6 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
     A(f"# Showdown — {manifest['dim']}D ensemble, "
       f"{len(configs)} configs × {len(landscapes)} landscapes")
     A("")
-    A(f"Generated {datetime.datetime.now().isoformat(timespec='seconds')}. "
-      f"Planned {manifest['generated']}.")
-    A("")
-    A(f"Every configuration was run on the **same** {len(landscapes)} ensemble "
-      f"landscapes (Sobol indices `{landscapes}`, seed `{manifest['landscape_seed']}`) "
-      f"at a {manifest['time_limit_hours']} h per-run budget, so differences between "
-      "rows within a landscape block are attributable to the hyperparameters rather "
-      "than to landscape luck.")
-    A("")
-    A("**Rows are grouped by landscape**, not by configuration: read down a block to "
-      "compare all configurations on one landscape.")
-    A("")
 
     A("## Configurations")
     A("")
@@ -789,10 +776,6 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
           f"{c.get('rank') if c.get('rank') is not None else '—'} | "
           f"`{c.get('source_run') or '—'}` | {c.get('trial') if c.get('trial') is not None else '—'} | "
           f"{_fmt(m.get('dist_to_needles'))} | {_fmt(m.get('dup_fraction'))} |")
-    A("")
-    A("`selected for` is the objective the configuration topped on the source Pareto "
-      "front; `source dist` / `source dup` are its metrics THERE (each on its own "
-      "landscapes), which is exactly what this showdown re-measures on common ground.")
     A("")
 
     A("## Results")
@@ -883,94 +866,16 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
         for k, v in reps.items()
     }
 
-    A("")
-    A("Every number in the table above is a MEAN over that cell's repeats; `n` is how "
-      "many completed. Median, variance, p5, p95 and the individual per-repeat values "
-      "are in `showdown_stats.csv` and `showdown_runs.csv` beside this file — the "
-      "spread is the point of repeating, and it does not fit in a table cell.")
-    A("")
-    A("`lines/activation` is the mean number of measured lines (objective calls) per "
-      "activation — the length of one orange running-best segment in the convergence "
-      "plot, which restarts at every activation. The final activation is excluded "
-      "because the wall-clock budget cuts it off mid-flight. `activations` is how many "
-      "the run got through in total.")
-    A("")
-    A("`needle values` plots each needle at the iteration it was declared on, against "
-      "the landscape's true best (green) and the best objective value the run actually "
-      "observed (blue). Observed Y can sit above true best: each measurement carries "
-      "multiplicative output noise.")
-    A("")
-    A("`median NN spacing` is the MEDIAN nearest-neighbour distance between a run's "
-      "samples in composition L2, in units of 10^-3. **Higher is better** — wide "
-      "spacing means the run spread its samples out, small spacing means it kept "
-      "re-measuring the same spot — so it is the one column here that is ranked "
-      "upwards.")
-    A("")
-    A("It replaces `dup fraction`, which is NOT comparable across campaigns. Dup "
-      "fraction counts the samples whose nearest neighbour falls inside a radius of "
-      "`NOISE_LEVEL/2`, and commit `a2deba7` moved `NOISE_LEVEL` from 0.064 to 0.128 "
-      "(the input-noise measurement was redone against `run_39af`, which logs the "
-      "composition the optimiser *sent* rather than inferring it), so campaigns from "
-      "either side of that commit were scored against ceilings differing by 2x. "
-      "Re-scoring both at one common radius does not rescue it either: at a fixed "
-      "0.032 every configuration in both 6d campaigns lands between 0.83 and 0.93 — "
-      "saturated, separating nothing. Spacing has no radius, no noise level and no "
-      "zoom scaling in it, so every era sits on one axis. `dup fraction` is still "
-      "recorded per run in `showdown_runs.csv` and `showdown_stats.csv`.")
-    A("")
-    A("Spacing scales as `N^(-1/d)` in the sample count, so compare it only between "
-      "runs of similar length: at d=6 a 7% difference in sample count moves it under "
-      "1%, but an order of magnitude would not be negligible.")
-    A("")
-    if legacy_dist:
-        A("`dist to needles` is the value stored in each run's `metrics.json`, matched "
-          "GREEDILY (`--legacy-dist`).")
-    else:
-        A(f"`dist to needles` is **recomputed here**, not read from `metrics.json`. "
-          f"Needle positions come from each run's `needles.csv` and the true optima "
-          f"are rebuilt from its `ensemble_config.json`; the two sets are then paired "
-          f"by MINIMUM-COST assignment (`scipy.optimize.linear_sum_assignment`) with "
-          f"each matched distance capped at `{dist_cutoff:g}`, which is also the "
-          f"penalty charged for every unmatched needle or optimum.")
-        A("")
-        A(f"Since 2026-08-11 that is exactly what `eval_metrics.metric_dist_to_needles` "
-          f"does at write time, so for runs scored after that date this column simply "
-          f"REPRODUCES `metrics.json` and the recomputation is a no-op. Its purpose is "
-          f"runs scored BEFORE it: those were matched greedily — walking the optima in "
-          f"list order and letting each take its nearest unclaimed needle, which is "
-          f"order-dependent and can only over-state the distance — at an unmatched "
-          f"penalty of 10.0. Recomputing puts both eras on one axis, which a showdown "
-          f"spanning the change needs.")
-        A("")
-        A(f"The penalty moved from 10.0 to {dist_cutoff:g} because of scale: measured "
-          f"matched distances are 0.05–0.55 and composition L2 cannot exceed ~1.414, "
-          f"so 10.0 was 20–200x anything it was averaged with and left the score ~99% "
-          f"a needle-COUNT comparison with the distances as noise on top. The cost is "
-          f"deterrence — a run padded with 200 needles scattered through the densest "
-          f"optima cluster scores 51.8x an honest run at 10.0 but only 2.6x at 0.5. "
-          f"Over-declaration is still penalised, via the `(n_declared - n_true)` term, "
-          f"just no longer to the exclusion of everything else. Use `--dist-cutoff 10` "
-          f"for the old weighting, or `--legacy-dist` for the stored values verbatim.")
-    A("")
+    # The per-run counters below are reported to the console rather than to the
+    # Markdown: the summary carries tables, plots and headings only.
     if n_dist_fallback:
-        A(f"⚠ {n_dist_fallback} run(s) could not be re-scored (no `needles.csv` / "
-          "`ensemble_config.json`, or the landscape could not be rebuilt); those cells "
-          "keep their stored greedy value.")
-        A("")
+        print(f"  ⚠ {n_dist_fallback} run(s) could not be re-scored; those cells keep "
+              "their stored greedy dist_to_needles.")
     if n_spacing_missing:
-        A(f"⚠ {n_spacing_missing} run(s) have no `median NN spacing`: metrics.json "
-          "predates the key and `points.csv` could not be read either. Those cells "
-          "average over the repeats that do have it.")
-        A("")
-    if n_missing:
-        A(f"⚠ {n_missing} of {n_rows * n_repeats} runs are missing `metrics.json` — "
-          "they have not finished or they failed. Their cells are kept (see the `n` "
-          "column) so the gaps stay visible; every statistic covers only the repeats "
-          "that exist.")
-        A("")
+        print(f"  ⚠ {n_spacing_missing} run(s) have no median NN spacing.")
 
-    def agg_table(title: str, label: str, groups: list[tuple[str, list[dict]]],
-                  note: str) -> None:
+    def agg_table(title: str, label: str,
+                  groups: list[tuple[str, list[dict]]]) -> None:
         """One aggregate table: a mean of each metric over a group of cells."""
         A(f"## {title}")
         A("")
@@ -986,53 +891,20 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
               f"{_fmt(_mean(c['acts'] for c in cs), 1)} | "
               f"{_fmt(_mean(c['runtime'] for c in cs), 1)} |")
         A("")
-        A(note)
-        A("")
 
     agg_table("Averages by configuration", "config",
               [(f"`{c['name']}`", [cell[(c["name"], ls)] for ls in landscapes])
-               for c in configs],
-              "Each row averages one configuration over all "
-              f"{len(landscapes)} landscapes — the headline comparison, since every "
-              "configuration saw the same set. `runs` is how many of those cells "
-              "have finished; the averages cover only those.")
+               for c in configs])
 
     chart = write_config_bar_chart(reps, configs, landscapes, out_dir)
     if chart:
-        chart_path, within = chart
+        chart_path, _within = chart
         A(f"![Mean dist to needles and median NN spacing by configuration]({chart_path})")
-        A("")
-        A("Bars are the two headline columns of the table above — the same means, so "
-          "they cannot drift apart from it. The two panels run in OPPOSITE directions: "
-          "`dist to needles` is lower-is-better, `median NN spacing` higher-is-better, "
-          "so a configuration that wins both has a SHORT left bar and a TALL right one.")
-        A("")
-        if within:
-            A(f"Error bars are the 95% CI of each mean, built from the repeat-to-repeat "
-              f"variance WITHIN each landscape (`1.96 · sqrt(Σ var/n) / {len(landscapes)}`). "
-              f"Landscape-to-landscape variation is deliberately excluded: every "
-              f"configuration saw the same {len(landscapes)} landscapes, so that "
-              f"variation is common to all five bars and cancels in the comparison. "
-              f"Including it would widen every bar by the same large amount and hide "
-              f"the differences this showdown exists to measure. Two bars whose "
-              f"intervals do not overlap differ by more than run-to-run noise; two "
-              f"that overlap heavily are not separated by this campaign.")
-        else:
-            A(f"At least one cell has a single repeat and therefore no within-landscape "
-              f"variance, so the error bars fall back to the 95% CI across the "
-              f"{len(landscapes)} landscape means (`1.96 · stdev / sqrt(k)`). That "
-              f"interval includes landscape-to-landscape variation, which is common to "
-              f"every configuration and so is wider than the comparison between "
-              f"configurations warrants — read it as a bound, not as the resolution of "
-              f"the comparison.")
         A("")
 
     agg_table("Averages by landscape", "landscape",
               [(f"**{ls}**", [cell[(c["name"], ls)] for c in configs])
-               for ls in landscapes],
-              "Each row averages all configurations on one landscape, which measures "
-              "the landscape rather than the hyperparameters: a high mean distance "
-              "means every configuration struggled there.")
+               for ls in landscapes])
 
     # The spread section. Imported here rather than at module scope because it needs
     # matplotlib, and this module is imported by the SLURM epilogue path where the

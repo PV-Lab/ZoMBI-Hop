@@ -64,8 +64,26 @@ separation ``s*`` between optima:
 
 The target is ``s* = max(sigma_x, s_prom(b, d))``. Condition 2 binds only at the
 broadest sharpness in the sweep (``b = 2.2``): at ``b >= 6`` a basin is narrow
-enough that ``sigma_x`` is the stricter of the two at every dimension, so 48 of the
-64 grid cells place at a plain 0.128 and the other 16 spread out.
+enough that ``sigma_x`` is the stricter of the two at every dimension.
+
+One separation per row, not per cell
+------------------------------------
+Because ``s_prom`` goes as ``1/b``, letting each cell place at its *own* ``s*``
+makes the sharpness axis vary two things at once — the basin shape and the layout
+the basin shape forced. On this grid that splits the axis in half: ``b = 2.2``
+places at ``s_prom`` (0.1485 at dim 3, rising to 0.2711 at dim 10) while ``b >= 6``
+all place at the plain 0.128 floor, so the broadest column — the one the sharp
+columns are read against — is the only one laid out differently.
+
+So the whole ``(dim, n_needles, draw)`` row is placed **once**, at the strictest
+width's target (:func:`placement_width`), and every sharpness reuses those exact
+centers: :meth:`NeedleFactory.placement_seed` leaves ``basin_width`` out of the
+hash, so the four cells share a seed as well as a separation. Sharpness then varies
+sharpness alone, and a comparison along the axis is paired — the layout cancels
+instead of being one more thing the draws have to average over. The strictest
+width is the safe standard because it is the only one no column has to be relaxed
+below, so no cell is placed tighter than its own prominence rule wanted; each cell
+still records ``separation_own_target`` next to the shared ``separation_target``.
 
 The pairwise form is *necessary* but not quite sufficient — the field is a max over
 all basins, so a third peak near a pair can only lift their saddle. The prominence
@@ -77,8 +95,10 @@ Where the geometry runs out
 ---------------------------
 ``s*`` and ``n`` can be jointly impossible: a 2-simplex is a triangle of area
 0.866, so it holds about ``1/s*^2`` points at separation ``s*`` — 61 at 0.128 but
-only ~45 at the 0.1485 that ``b = 2.2`` demands. :func:`plan_feasibility` reports
-that at *plan* time, before any GPU time is spent, and :func:`place_optima` falls
+only ~45 at the 0.1485 that ``b = 2.2`` demands. Since the whole row now places at
+that separation, this is a property of the row rather than of one cell.
+:func:`plan_feasibility` reports it at *plan* time, before any GPU time is spent,
+and :func:`place_optima` falls
 back to the largest separation it can actually achieve (never below ``sigma_x``, so
 the count stays exact) while recording ``separation_target`` alongside
 ``separation_achieved``, so such a cell is analysed knowing its optima are packed
@@ -151,6 +171,32 @@ def target_separation(basin_width: float, dim: int) -> float:
     return max(float(SIGMA_X), prominence_separation(basin_width, dim))
 
 
+def placement_width(dim: int, widths=GRID_BASIN_WIDTH) -> float:
+    """The width in ``widths`` that demands the LARGEST separation at ``dim``.
+
+    Every cell in a ``(dim, n_needles, draw)`` row is placed at this one width's
+    ``target_separation``, so the sharpness axis varies sharpness ALONE. Placing
+    each cell at its own ``target_separation`` — which is what this sweep did
+    before — makes the axis change two things at once: ``prominence_separation``
+    goes as ``1/b``, so the broadest column is placed under a materially stricter
+    spacing rule than the rest, and a difference read along the axis cannot be
+    attributed to the basin shape rather than to the layout it forced. The effect
+    is confined to the columns where the prominence rule actually beats the
+    ``sigma_x`` floor (on the shipped grid: ``b = 2.2`` only, by 16% at dim 3
+    rising to 112% at dim 10), which is precisely the column the sharp ones are
+    compared against.
+
+    The strictest width is the safe one to standardise on: it is the only choice
+    that no column has to be relaxed below, so every cell keeps peaks its own
+    prominence rule would call resolvable. Since ``prominence_separation`` is
+    monotone decreasing in ``b`` this is the smallest width on the grid, but it is
+    computed rather than assumed so a custom ``--basin-widths`` list still gets the
+    right answer, floor clamping included.
+    """
+    return max((float(b) for b in widths),
+               key=lambda b: target_separation(b, dim))
+
+
 def basin_plain_radius(basin_width: float, dim: int) -> float:
     """Distance from an optimum at which its basin meets the plain (``E = 0.5``).
 
@@ -188,13 +234,18 @@ def plan_feasibility(dims=GRID_DIM, needles=GRID_N_NEEDLES,
     """
     rows = []
     for dim in dims:
+        # Every width at this dim is placed at the strictest one's separation, so
+        # feasibility is a property of the row, not of the individual cell.
+        pw = placement_width(dim, widths)
+        s = target_separation(pw, dim)
+        cap = simplex_capacity(dim, s)
         for n in needles:
             for b in widths:
-                s = target_separation(b, dim)
-                cap = simplex_capacity(dim, s)
                 rows.append({
                     "dim": int(dim), "n_needles": int(n), "basin_width": float(b),
+                    "separation_width": float(pw),
                     "separation_target": round(s, 6),
+                    "separation_own_target": round(target_separation(b, dim), 6),
                     "prominence_binds": bool(prominence_separation(b, dim) > SIGMA_X),
                     "basin_plain_radius": round(basin_plain_radius(b, dim), 6),
                     "capacity_estimate": round(cap, 1),
@@ -283,7 +334,8 @@ def _relax(X: np.ndarray, sep: float, rng, iters: int = 4000) -> np.ndarray:
     return X
 
 
-def place_optima(dim: int, n: int, basin_width: float, seed: int) -> dict:
+def place_optima(dim: int, n: int, basin_width: float, seed: int,
+                 *, separation_width: float | None = None) -> dict:
     """``n`` mutually resolvable optima on the ``dim``-simplex.
 
     Returns the centers plus the placement record that goes into the cell's
@@ -294,10 +346,18 @@ def place_optima(dim: int, n: int, basin_width: float, seed: int) -> dict:
     is only guaranteed while every pair clears the distance ``Ensemble`` pares on.
     The prominence target is the *preferred* separation and is the one abandoned
     first if both cannot be had.
+
+    ``basin_width`` enters ONLY through the separation, so ``separation_width``
+    overrides it there and leaves the rest of the call unchanged: the sweep passes
+    :func:`placement_width` so every cell in a ``(dim, n, draw)`` row is laid out
+    identically and the sharpness axis is sharpness alone. ``basin_width`` is still
+    recorded, as ``separation_own_target``, so a row says what this cell would have
+    asked for on its own.
     """
     dim, n = int(dim), int(n)
     rng = np.random.default_rng(int(seed))
-    s_target = target_separation(basin_width, dim) * SEPARATION_MARGIN
+    s_width = float(basin_width if separation_width is None else separation_width)
+    s_target = target_separation(s_width, dim) * SEPARATION_MARGIN
     s_floor = float(SIGMA_X) * SEPARATION_MARGIN
 
     def _attempt(sep: float) -> np.ndarray | None:
@@ -327,6 +387,8 @@ def place_optima(dim: int, n: int, basin_width: float, seed: int) -> dict:
     return {
         "centers": X,
         "separation_target": float(s_target / SEPARATION_MARGIN),
+        "separation_width": s_width,
+        "separation_own_target": float(target_separation(basin_width, dim)),
         "separation_floor": float(SIGMA_X),
         "separation_achieved": float(_min_pairwise(X)),
         "prominence_target_met": bool(prominence_met),
@@ -426,6 +488,10 @@ class NeedleFactory:
     time_limit_hours: float | None = None
     kind: str = "needles"
     n_available: int | None = None      # placement seeds: effectively unbounded
+    # The campaign's full sharpness axis, which sets the shared placement
+    # separation via ``placement_width``. Defaults to the shipped grid so a
+    # factory built by hand still lands on the same layout as the sweep's.
+    placement_widths: tuple[float, ...] = GRID_BASIN_WIDTH
     _base: LandscapeSpec | None = field(default=None, repr=False, compare=False)
 
     @property
@@ -436,21 +502,41 @@ class NeedleFactory:
         return {
             "kind": self.kind, "dim": self.dim, "n_needles": self.n_needles,
             "basin_width": self.basin_width, "seed": self.seed,
-            "separation_target": round(target_separation(self.basin_width, self.dim), 6),
+            "separation_width": self.placement_width,
+            "separation_target": round(
+                target_separation(self.placement_width, self.dim), 6),
+            "separation_own_target": round(
+                target_separation(self.basin_width, self.dim), 6),
             "basin_plain_radius": round(basin_plain_radius(self.basin_width, self.dim), 6),
             "time_limit_hours": self.time_limit_hours,
         }
 
     def placement_seed(self, index: int) -> int:
-        """Deterministic in ``(cell, draw)`` so a landscape is reproducible from the
-        manifest alone — and distinct across cells, so two grid cells at the same
-        draw index do not inherit correlated layouts."""
+        """Deterministic in ``(dim, n_needles, draw)`` so a landscape is reproducible
+        from the manifest alone.
+
+        ``basin_width`` is deliberately NOT mixed in. Together with the shared
+        :func:`placement_width` this is what pairs the sharpness axis: all four
+        widths at one ``(dim, n, draw)`` get the same seed AND the same separation,
+        so they are the same centers under different basin shapes, and a paired
+        comparison across the axis cancels the layout entirely. It used to be mixed
+        in, so no two cells shared a layout and every width comparison also
+        compared terrain — re-running an older campaign against this code will
+        therefore build different landscapes than it did originally.
+
+        Rows still differ from one another: ``dim`` and ``n_needles`` are mixed in,
+        so two grid rows at the same draw index do not inherit correlated layouts.
+        """
         h = (int(self.seed) * 1_000_003
              ^ int(self.dim) * 2_654_435_761
              ^ int(self.n_needles) * 40_503
-             ^ int(round(self.basin_width * 10)) * 97_499
              ^ int(index) * 15_485_863)
         return int(abs(h) % 1_000_000)
+
+    @property
+    def placement_width(self) -> float:
+        """The separation-setting width shared by this cell's whole sharpness row."""
+        return placement_width(self.dim, self.placement_widths)
 
     def _base_spec(self) -> LandscapeSpec:
         """The heavy ``LandscapeSpec`` (dim-3 render grid included), built once.
@@ -468,12 +554,14 @@ class NeedleFactory:
 
     def build(self, index: int) -> tuple[LandscapeSpec, dict]:
         seed = self.placement_seed(index)
-        placed = place_optima(self.dim, self.n_needles, self.basin_width, seed)
+        placed = place_optima(self.dim, self.n_needles, self.basin_width, seed,
+                              separation_width=self.placement_width)
         cfg = ensemble_config(self.dim, self.basin_width, placed["centers"], seed)
         return self._base_spec(), cfg
 
 
-def build_landscape(dim: int, n: int, basin_width: float, seed: int) -> dict:
+def build_landscape(dim: int, n: int, basin_width: float, seed: int,
+                    *, separation_width: float | None = None) -> dict:
     """Place, build and VERIFY one landscape. Returns the record for the cell file.
 
     The verification is the point: it asserts the built ``Ensemble`` advertises
@@ -483,7 +571,8 @@ def build_landscape(dim: int, n: int, basin_width: float, seed: int) -> dict:
     """
     from synthetic_data.ensemble import Ensemble
 
-    placed = place_optima(dim, n, basin_width, seed)
+    placed = place_optima(dim, n, basin_width, seed,
+                          separation_width=separation_width)
     cfg = ensemble_config(dim, basin_width, placed["centers"], seed)
     fn = Ensemble(**cfg)
     n_true = len(fn.centers)

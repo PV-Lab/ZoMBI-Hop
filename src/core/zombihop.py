@@ -133,7 +133,7 @@ class ZoMBIHop:
                  min_axis_noise_mult: float = 2.0,
                  jaccard_window: int = 3,
                  jaccard_threshold: float = 0.9,
-                 min_zoom_for_needle: int = 0,  # deprecated/ignored: zoom forcing removed
+                 min_zoom_for_needle: int = 2,
                  min_iters_per_zoom: int = 3,
                  needle_min_repeats: int = 5,
                  needle_repeat_radius_frac: float = 0.10,
@@ -152,12 +152,17 @@ class ZoMBIHop:
             the argmax of the cluster but the repeat whose Y is CLOSEST TO THE
             CLUSTER MEDIAN — the median is the noise-free estimate of the local
             value, so declaring the argmax would systematically bias every needle
-            value upward by one noise excursion. This gate replaces the old
-            ``min_zoom_for_needle`` zoom forcing, which bought reliability by
-            spending zoom levels rather than by checking reproducibility.
-          * ``min_zoom_for_needle`` — DEPRECATED and ignored. Needles may now be
-            declared at any zoom level; the repeatability gate above is what
-            decides whether a declaration is trustworthy.
+            value upward by one noise excursion. The gate sits alongside the
+            ``min_zoom_for_needle`` depth requirement below rather than replacing
+            it: depth buys a tighter region to declare in, repeatability buys
+            confidence that the point in it is real.
+          * ``min_zoom_for_needle`` — a needle may only be declared once the
+            search has zoomed to this 0-indexed level or deeper (default 2 ⇒
+            the log's "Zoom 3" and beyond). Zoom index 0 is the full search box,
+            so the level index equals the number of zoom-ins performed: the
+            default forces the optimiser to zoom in at least TWICE before it can
+            localise an optimum, and ``max_zooms`` must be > this to be able to
+            reach it at all.
           * ``min_iters_per_zoom`` — at least this many objective lines must be
             sampled at the current zoom level before the optimiser may declare a
             needle or zoom in/out from it (default 3).
@@ -202,9 +207,7 @@ class ZoMBIHop:
         self.zoom_jaccard_threshold = float(zoom_jaccard_threshold)
         self.bounds_shrink_factor = float(bounds_shrink_factor)
         self.min_axis_noise_mult = float(min_axis_noise_mult)
-        # Zoom forcing is gone: kept as an attribute (config files and retro still
-        # name it) but pinned to 0, so no code path can gate a declaration on depth.
-        self.min_zoom_for_needle = 0
+        self.min_zoom_for_needle = int(min_zoom_for_needle)
         self.min_iters_per_zoom = int(min_iters_per_zoom)
         self.needle_min_repeats = int(needle_min_repeats)
         # Why the last declaration attempt did not produce a needle; see
@@ -213,19 +216,6 @@ class ZoMBIHop:
         self.last_needle_status = "ok"
         self.needle_repeat_radius_frac = float(needle_repeat_radius_frac)
         self.max_lines_per_activation = int(max_lines_per_activation)
-
-        # A zoom level must be able to outlast the repeatability gate. The gate
-        # answers "keep sampling" until the neighbourhood of the local best has
-        # repeated; if the zoom's line budget runs out first the activation zooms
-        # away from a region it was one or two lines from confirming. So the
-        # per-zoom line budget is floored at the number of repeats the gate asks
-        # for (and at 5 regardless), overriding tuned configs that predate the gate.
-        _iter_floor = max(5, self.needle_min_repeats)
-        if int(max_iterations) < _iter_floor:
-            if verbose:
-                print(f"max_iterations {max_iterations} < repeatability floor "
-                      f"{_iter_floor} — raising to {_iter_floor}.")
-            max_iterations = _iter_floor
 
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
@@ -1438,7 +1428,9 @@ class ZoMBIHop:
 
                     # --- Declare needle after N consecutive converged iterations ---
                     if consecutive_converged >= dh.n_consecutive_converged:
-                        if iters_this_zoom >= self.min_iters_per_zoom:
+                        deep_enough = zoom >= self.min_zoom_for_needle
+                        sampled_enough = iters_this_zoom >= self.min_iters_per_zoom
+                        if deep_enough and sampled_enough:
                             needle = self._declare_needle_at_best(
                                 dh, zoom, global_iteration, reason="EI convergence",
                                 bounds=bounds,
@@ -1459,6 +1451,15 @@ class ZoMBIHop:
                                     iteration=iteration, event="repeat_gate_hold")
                             else:
                                 break
+                        elif sampled_enough and not deep_enough:
+                            # Converged, but the search is too shallow to declare a
+                            # needle (min_zoom_for_needle). Zoom in further instead.
+                            self._log(
+                                f"  Converged at zoom {zoom+1} < minimum zoom "
+                                f"{self.min_zoom_for_needle+1} for needle — zooming in."
+                            )
+                            consecutive_converged = 0
+                            break
                         # else: converged but fewer than min_iters_per_zoom lines
                         # sampled at this zoom — keep sampling until the minimum is met.
 
@@ -1588,6 +1589,11 @@ class ZoMBIHop:
                     # so the next activation is repelled from it instead of grinding
                     # back in. A genuine optimum here still gets declared: it goes
                     # through EI convergence and the repeatability gate like any other.
+                    #
+                    # The one exception is a zoom too shallow to declare in at all
+                    # (``min_zoom_for_needle``): ending there would abandon the region
+                    # before the forced zoom-in that is the only way it could ever
+                    # produce a needle, so the search advances the zoom instead.
                     if not self._is_global_bounds(new_bounds):
                         repeated_jac = 0.0
                         for prev_bounds in zoom_bounds_history:
@@ -1597,7 +1603,8 @@ class ZoMBIHop:
                             if jac > self.zoom_jaccard_threshold:
                                 repeated_jac = jac
                                 break
-                        if repeated_jac > self.zoom_jaccard_threshold:
+                        if (repeated_jac > self.zoom_jaccard_threshold
+                                and zoom >= self.min_zoom_for_needle):
                             self._log(
                                 f"  → no novel zoom window (Jaccard={repeated_jac:.3f} vs "
                                 f"an already-searched box) — ending the activation."
@@ -1606,6 +1613,14 @@ class ZoMBIHop:
                                                      event="no_novel_window")
                             no_novel_window = True
                             break
+                        elif repeated_jac > self.zoom_jaccard_threshold:
+                            # Repeated region but too shallow to declare a needle
+                            # (min_zoom_for_needle) — advance the zoom anyway.
+                            self._log(
+                                f"  → repeated zoom (Jaccard={repeated_jac:.3f}) but zoom "
+                                f"{zoom+1} < minimum zoom {self.min_zoom_for_needle+1} "
+                                f"for needle — advancing zoom."
+                            )
                         zoom_bounds_history.append(new_bounds.clone())
                         if len(zoom_bounds_history) > dh.max_zooms:
                             zoom_bounds_history.pop(0)

@@ -60,7 +60,11 @@ def describe(args) -> None:
     print(f"  dimensions   {dims}")
     print(f"\nResolvability (sigma_x = {nd.SIGMA_X}, sigma_y at a peak = "
           f"{nd.sigma_y_at_peak():.4f}):")
-    print(f"  {'dim':>4} {'b':>5} {'sep target':>11} {'binds':>7} "
+    # "placed at" is the row's SHARED separation (the strictest width's target, see
+    # needles.placement_width); "own" is what this width would have asked for alone.
+    # They differ only where the prominence rule beats the sigma_x floor, and that
+    # gap is exactly the confound the shared placement removes.
+    print(f"  {'dim':>4} {'b':>5} {'placed at':>11} {'own':>9} {'binds':>7} "
           f"{'basin radius':>13} {'capacity':>9}")
     seen = set()
     for r in rows:
@@ -70,6 +74,7 @@ def describe(args) -> None:
         seen.add(key)
         binds = "prom" if r["prominence_binds"] else "noise"
         print(f"  {r['dim']:>4} {r['basin_width']:>5g} {r['separation_target']:>11.4f} "
+              f"{r['separation_own_target']:>9.4f} "
               f"{binds:>7} {r['basin_plain_radius']:>13.4f} "
               f"{r['capacity_estimate']:>9g}")
     tight = [r for r in rows if not r["feasible"]]

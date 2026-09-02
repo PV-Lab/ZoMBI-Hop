@@ -26,9 +26,7 @@ DEFAULT_HPARAMS: dict = {
     "raw": 300,
     "ucb_beta": 3.0,
     "max_zooms": 3,
-    # Floored at 5 by ZoMBIHop itself (the repeatability gate needs room to keep
-    # sampling within a zoom level); 3 is the value the 6d winner was tuned at.
-    "max_iterations": 5,
+    "max_iterations": 3,
     "top_m_points": 8,
     "n_consecutive_converged": 5,
     "input_noise_threshold_mult": 3.0,

@@ -426,18 +426,25 @@ def run_one_cell(task: dict, out_dir: str, manifest: dict, target: str,
         dim=task["dim"], n_needles=task["n_needles"],
         basin_width=task["basin_width"], seed=int(manifest.get("seed_base", 0)),
         time_limit_hours=float(manifest["cell_max_hours"]),
+        # From the manifest, not the module default: a campaign planned with a
+        # custom --basin-widths must place at ITS strictest width, or its cells
+        # would be laid out for an axis it is not running.
+        placement_widths=tuple(
+            float(v) for v in manifest["grid"]["basin_widths"]),
     )
     hparams = manifest["hparams"][str(task["dim"])]["hparams"]
 
     # The landscape is built once here so its verified record (exact optima count,
     # measured prominence, achieved separation) can be written even though
     # ``run_ablation_trial`` builds its own copy from the same seed. Both calls go
-    # through ``place_optima`` with the same seed, so they are the same landscape;
+    # through ``place_optima`` with the same seed AND the same ``separation_width``
+    # (the factory's, so the row's shared one), so they are the same landscape;
     # this one exists to be *checked*, and build_landscape raises if the count is
     # ever not exactly n.
     seed = factory.placement_seed(task["draw"])
     built = nd.build_landscape(task["dim"], task["n_needles"],
-                               task["basin_width"], seed)
+                               task["basin_width"], seed,
+                               separation_width=factory.placement_width)
 
     state = BudgetState(n_lines=int(manifest["n_lines"]),
                         n_init_lines=_n_init_lines(),

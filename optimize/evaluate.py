@@ -1046,18 +1046,15 @@ def _force_zoom_floors() -> tuple[int, int]:
 
     Mirrors the HPARAM_SPACE lower bounds run_mobo enforces during hparam search,
     but derived from ZoMBIHop's actual search-discipline defaults so the two can't
-    drift. Zoom forcing is gone (``min_zoom_for_needle`` is pinned to 0), so the
-    binding floor is now the REPEATABILITY GATE: a zoom level must be able to keep
-    sampling until the local best has ``needle_min_repeats`` repeats, otherwise the
-    activation zooms away from regions it was one line short of confirming. Two zoom
-    levels are still required so the sliding window has somewhere to go.
+    drift: a needle can only be declared once the search has zoomed to level
+    ``min_zoom_for_needle`` (so ``max_zooms`` must exceed it) and only
+    after at least ``min_iters_per_zoom`` lines have been sampled at that zoom.
     """
     import inspect
     params = inspect.signature(rm.ZoMBIHop.__init__).parameters
     min_zoom = int(params["min_zoom_for_needle"].default)
     min_iters = int(params["min_iters_per_zoom"].default)
-    min_repeats = int(params["needle_min_repeats"].default)
-    return max(2, min_zoom + 1), max(5, min_iters, min_repeats)
+    return min_zoom + 1, min_iters
 
 
 def run_single_eval(

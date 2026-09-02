@@ -209,7 +209,7 @@ def test_no_zoom_arm_pins_bounds_to_the_global_box():
 def test_no_zoom_arm_keeps_needles_declarable():
     arm = ARMS["no_zoom"]
     assert arm.hparam_overrides["max_zooms"] == 1
-    # Without this the default min_zoom_for_needle=1 makes zoom level 1 unreachable
+    # Without this the default min_zoom_for_needle=2 makes zoom level 1 unreachable
     # at max_zooms=1, and the arm would measure "no needles", not "no zooming".
     assert arm.hparam_overrides["min_zoom_for_needle"] == 0
 
