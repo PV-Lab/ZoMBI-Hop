@@ -63,6 +63,13 @@ MAX_PRINTABLE_COMPONENTS = 10
 
 NOISE_MODES = ("hardware", "physics", "none")
 
+#: Radial shapes for the placement error. Both are directionally isotropic in the
+#: tangent space and both are calibrated to the same realized per-component std --
+#: they differ only in how the error MAGNITUDE is distributed, and that difference
+#: decides whether the benchmark has any headroom above random. See DESIGN.md 29.
+NOISE_SHAPES = ("directional", "iid")
+DEFAULT_NOISE_SHAPE = "directional"
+
 
 class BudgetExhausted(Exception):
     """Raised by the objective wrapper once N samples have been consumed.
@@ -85,6 +92,10 @@ class Protocol:
     batch_size: int = DEFAULT_BATCH
     n_init_lines: int = DEFAULT_INIT_LINES
     noise: str = "hardware"
+    #: Radial shape of the placement error: "directional" (published default) or
+    #: "iid". Recorded per cell; see _perturb and DESIGN.md 29 -- the choice decides
+    #: whether an oracle has headroom above random at 4-D and 6-D.
+    noise_shape: str = DEFAULT_NOISE_SHAPE
     #: Override the target per-component realization std. None -> run_mobo.NOISE_LEVEL.
     noise_level: float | None = None
     output_noise_frac: float | None = None  # None -> run_mobo.OUTPUT_NOISE_FRAC
@@ -95,6 +106,9 @@ class Protocol:
     eval_at: tuple[int, ...] = (250, 500, 1000, 2000)
 
     def __post_init__(self):
+        if self.noise_shape not in NOISE_SHAPES:
+            raise ValueError(
+                f"noise_shape must be one of {NOISE_SHAPES}, got {self.noise_shape!r}")
         if self.noise not in NOISE_MODES:
             raise ValueError(f"noise must be one of {NOISE_MODES}, got {self.noise!r}")
         self.eval_at = tuple(int(n) for n in self.eval_at if int(n) <= self.n_samples)
@@ -241,15 +255,17 @@ def _base_pairs(dim: int, kind: str, rng: np.random.Generator, n: int
 
 
 def _realized_std(scale: float, X_req: np.ndarray, X_base: np.ndarray,
-                  rng: np.random.Generator) -> float:
+                  rng: np.random.Generator,
+                  shape: str = DEFAULT_NOISE_SHAPE) -> float:
     """Pooled per-component std of (realized - requested) at a given scale."""
     n, dim = X_base.shape
-    X_act = project_simplex(X_base + _perturb(n, dim, scale, rng))
+    X_act = project_simplex(X_base + _perturb(n, dim, scale, rng, shape))
     return float(np.std(X_act - X_req))
 
 
 def calibrate_hardware_noise(dims=(3, 4, 5, 6, 8, 10, 12), target: float | None = None,
-                             seed: int = 0, n: int = 960, path: str = _HW_PATH) -> dict:
+                             seed: int = 0, n: int = 960, path: str = _HW_PATH,
+                             shape: str = DEFAULT_NOISE_SHAPE) -> dict:
     """Solve for the perturbation scale that realizes ``target`` per-component std.
 
     Bisection, because there is no closed form: projection back to the simplex
@@ -267,32 +283,60 @@ def calibrate_hardware_noise(dims=(3, 4, 5, 6, 8, 10, 12), target: float | None 
         entry = {}
         for kind in kinds:
             X_req, X_base = _base_pairs(d, kind, np.random.default_rng(seed), n)
-            floor = _realized_std(0.0, X_req, X_base, np.random.default_rng(seed))
+            floor = _realized_std(0.0, X_req, X_base, np.random.default_rng(seed), shape)
             lo, hi = 0.0, 1.0
             for _ in range(30):
                 mid = 0.5 * (lo + hi)
                 if _realized_std(mid, X_req, X_base,
-                                 np.random.default_rng(seed)) < target:
+                                 np.random.default_rng(seed), shape) < target:
                     lo = mid
                 else:
                     hi = mid
             scale = 0.5 * (lo + hi)
-            got = _realized_std(scale, X_req, X_base, np.random.default_rng(seed + 1))
+            got = _realized_std(scale, X_req, X_base,
+                                np.random.default_rng(seed + 1), shape)
             entry[kind] = {"scale": float(scale), "realized_std": float(got),
                            "unperturbed_std": float(floor)}
         out[str(d)] = entry
     os.makedirs(_DATA_DIR, exist_ok=True)
+    note = ("scale is pre-projection; realized_std is what the samples actually come "
+            "out at; unperturbed_std is the print model's own contribution (0 for "
+            "batches)")
+    # A non-default shape is written UNDER the existing table rather than over it.
+    # The top level is the `directional` calibration every published run used, and
+    # overwriting it would silently re-scale s1_v2's noise.
+    blob = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            blob = json.load(fh)
+    if shape == DEFAULT_NOISE_SHAPE:
+        blob.update({"target_per_component_std": float(target), "seed": seed,
+                     "note": note, "dims": out})
+    else:
+        blob.setdefault("shapes", {})[shape] = {
+            "target_per_component_std": float(target), "seed": seed,
+            "note": note, "dims": out}
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump({"target_per_component_std": float(target), "seed": seed,
-                   "note": "scale is pre-projection; realized_std is what the "
-                           "samples actually come out at; unperturbed_std is the "
-                           "print model's own contribution (0 for batches)",
-                   "dims": out}, fh, indent=2)
+        json.dump(blob, fh, indent=2)
     return out
 
 
-def _hardware_scale(dim: int, kind: str) -> float:
-    tbl = _load_json(_HW_PATH, "hardware noise calibration")["dims"]
+def _hardware_scale(dim: int, kind: str,
+                    shape: str = DEFAULT_NOISE_SHAPE) -> float:
+    """Calibrated perturbation scale for (dim, kind, shape).
+
+    The scale is shape-specific: the same injected magnitude realizes a different
+    per-component std once projection clips it, so each shape is bisected
+    separately. The committed table's top level is the ``directional`` calibration
+    (it predates the switch); other shapes live under a ``shapes`` key.
+    """
+    blob = _load_json(_HW_PATH, "hardware noise calibration")
+    tbl = (blob["dims"] if shape == DEFAULT_NOISE_SHAPE
+           else (blob.get("shapes", {}).get(shape) or {}).get("dims"))
+    if not tbl:
+        raise KeyError(
+            f"no hardware noise calibration for shape {shape!r}. Regenerate with: "
+            f"python -m benchmarks.zhbench.protocol --calibrate --noise-shape {shape}")
     if str(dim) in tbl and kind in tbl[str(dim)]:
         return float(tbl[str(dim)][kind]["scale"])
     sub = {k: v[kind] for k, v in tbl.items() if kind in v}
@@ -310,8 +354,34 @@ def _zero_sum_unit(n: int, dim: int, rng: np.random.Generator) -> np.ndarray:
     return u / nrm
 
 
-def _perturb(n: int, dim: int, scale: float, rng: np.random.Generator) -> np.ndarray:
-    """Isotropic tangent-space perturbation with the given per-component scale."""
+def _perturb(n: int, dim: int, scale: float, rng: np.random.Generator,
+             shape: str = DEFAULT_NOISE_SHAPE) -> np.ndarray:
+    """Tangent-space placement error with the given per-component scale.
+
+    ``directional`` (the shape every published run used): a uniform random unit
+    direction times ONE SHARED half-normal magnitude, ``scale*sqrt(d)*|Z|``. Note
+    this is isotropic in DIRECTION but its radial profile is half-normal, not chi
+    with ``d-1`` degrees of freedom -- so a large share of draws land near zero at
+    every dimension, and small errors stay common as ``d`` grows.
+
+    ``iid``: an independent Gaussian per syringe, projected to the tangent space.
+    This is what "isotropic Gaussian placement error" normally means, and its radial
+    profile IS chi_{d-1}, so typical error grows like ``sqrt(d)`` and near-zero draws
+    become rare in high dimension.
+
+    The two are not interchangeable. Matched at per-component std 0.128, an oracle
+    aiming every sample at a true optimum reaches 1.000 / 0.941 at 4-D / 6-D under
+    ``directional`` and 0.667 / 0.059 under ``iid`` -- against uniform random's
+    0.570 / 0.026. Which is physical is a hardware question (independent syringe
+    error argues ``iid``; a dominant shared mis-registration argues ``directional``),
+    and it is currently unresolved. Default stays ``directional`` so every published
+    number remains reproducible.
+    """
+    if shape == "iid":
+        e = rng.standard_normal((n, dim)) * (scale * np.sqrt(dim / max(dim - 1, 1)))
+        return e - e.mean(axis=1, keepdims=True)
+    if shape != "directional":
+        raise ValueError(f"noise_shape must be one of {NOISE_SHAPES}, got {shape!r}")
     return _zero_sum_unit(n, dim, rng) * (scale * np.sqrt(dim) *
                                           np.abs(rng.standard_normal((n, 1))))
 
@@ -327,7 +397,9 @@ def realize(X_requested: np.ndarray, protocol: Protocol,
     if protocol.noise == "none":
         return X.copy()
     if protocol.noise == "hardware":
-        pert = _perturb(n, dim, _hardware_scale(dim, "batch"), rng)
+        shape = getattr(protocol, "noise_shape", DEFAULT_NOISE_SHAPE)
+        pert = _perturb(n, dim, _hardware_scale(dim, "batch", shape),
+                        rng, shape)
     elif protocol.noise == "physics":
         q = np.asarray(_interp_dim(
             _load_json(_CALIB_PATH, "input-noise calibration")["dims"],
@@ -386,7 +458,9 @@ def realize_line(left: np.ndarray, right: np.ndarray, n_points: int,
                      dtype=float)
     if mode == "physics":
         return act
-    act = act + _perturb(n_points, dim, _hardware_scale(dim, "line"), rng)
+    shape = getattr(protocol, "noise_shape", DEFAULT_NOISE_SHAPE)
+    act = act + _perturb(n_points, dim, _hardware_scale(dim, "line", shape),
+                         rng, shape)
     return project_simplex(act)
 
 
@@ -438,6 +512,13 @@ class ObjectiveRun:
     def _check_budget(self) -> None:
         if self.n_samples >= self.protocol.n_samples:
             raise BudgetExhausted(self.n_samples)
+
+    @property
+    def rng(self) -> np.random.Generator:
+        """The run's own generator, so an optimizer that realizes its own batch
+        draws from the same stream the protocol would have used. Sharing it keeps a
+        cell reproducible from its seed alone."""
+        return self._rng
 
     def evaluate_batch(self, X_requested: np.ndarray,
                        X_actual: np.ndarray | None = None
@@ -561,14 +642,23 @@ if __name__ == "__main__":
                     help="regenerate both calibration tables")
     ap.add_argument("--n-lines", type=int, default=200)
     ap.add_argument("--dims", type=int, nargs="+", default=[3, 4, 5, 6, 8, 10, 12])
+    ap.add_argument("--noise-shape", default=DEFAULT_NOISE_SHAPE, choices=NOISE_SHAPES,
+                    help="radial shape to calibrate. A non-default shape is written "
+                         "under a 'shapes' key and leaves the published "
+                         "'directional' table untouched.")
     args = ap.parse_args()
     if args.calibrate:
-        phys = [d for d in args.dims if d <= MAX_PRINTABLE_COMPONENTS]
-        print("physics residual distribution:")
-        for d, v in calibrate_input_noise(dims=tuple(phys), n_lines=args.n_lines).items():
-            print(f"  d={d:>3} mean_l2={v['mean_l2']:.4f} per_comp_std={v['per_component_std']:.4f}")
+        phys = ([d for d in args.dims if d <= MAX_PRINTABLE_COMPONENTS]
+                if args.noise_shape == DEFAULT_NOISE_SHAPE else [])
+        if phys:
+            print("physics residual distribution:")
+            for d, v in calibrate_input_noise(dims=tuple(phys),
+                                              n_lines=args.n_lines).items():
+                print(f"  d={d:>3} mean_l2={v['mean_l2']:.4f} "
+                      f"per_comp_std={v['per_component_std']:.4f}")
         print("\nhardware-matched scales (solved so realized std == NOISE_LEVEL):")
-        for d, v in calibrate_hardware_noise(dims=tuple(args.dims)).items():
+        for d, v in calibrate_hardware_noise(dims=tuple(args.dims),
+                                             shape=args.noise_shape).items():
             parts = " ".join(f"{k}: scale={x['scale']:.4f} realized={x['realized_std']:.4f}"
                              for k, x in v.items())
             print(f"  d={d:>3} {parts}")

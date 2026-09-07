@@ -1,0 +1,51 @@
+# The noise-off control. Configured since round 2, never run until now.
+#
+# WHY THIS AND NOT MORE ORACLE ALGEBRA. An oracle bounds what the SCORING RULE
+# permits; it says nothing about what is LEARNABLE from a smooth landscape carrying
+# 4.5% output noise. Two explanations survive for s1_v2's null result and the oracle
+# cannot separate them:
+#
+#   (a) the landscapes have no exploitable structure  -> Brianna's position; no noise
+#       model rescues the real campaigns, and they are a control at best;
+#   (b) the noise destroys a signal that is really there -> the ruler is the problem
+#       and DESIGN.md 29's noise-shape question decides s1_v2's fate.
+#
+# Turning noise off entirely separates them, and it is the cheapest discriminating
+# experiment available. `noise: none` is clean inputs AND clean outputs: the method
+# asks for a composition and gets exactly that composition's true value.
+#
+# PRE-REGISTERED PREDICTION, written before the run:
+#   * If `zombihop` still tracks `random` at 4-D with noise off, explanation (a)
+#     holds. The real campaigns are demoted to a control, as Brianna asked, and no
+#     amount of fixing the noise model or the match radius will make them
+#     discriminate. This is the outcome that settles the dataset argument.
+#   * If `zombihop` pulls clearly ahead of `random` with noise off, explanation (b)
+#     holds, the structure is real and recoverable, and the noise model becomes the
+#     highest-priority fix.
+#   * Either way `random_lines` vs `random` isolates how much of the input-cost gap
+#     is the instrument, with the placement noise removed as a confound.
+#
+# 3-D is included but cannot inform this: it is saturated under every noise model
+# (oracle headroom +0.004, DESIGN.md 29), so read 4-D. 6-D is excluded -- it is
+# budget-limited, not noise-limited, and would only add cost.
+#
+# 100 cells. gp_qucb dominates the runtime (~2100 s/cell); the other four are cheap.
+name: s1_clean_ctrl
+protocol:
+  n_samples: 2000
+  batch_size: 24
+  n_init_lines: 2
+  noise: none
+  eval_at: [250, 500, 1000, 2000]
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+value_tol: 0.25
+timeout_s: 7200
+objectives:
+  - {kind: real_gp, dim: 3}
+  - {kind: real_gp, dim: 4}
+optimizers:
+  - name: random
+  - name: random_lines
+  - name: gp_ts
+  - name: gp_qucb
+  - name: zombihop

@@ -741,6 +741,28 @@ Two things are settled regardless, and both survive either model:
   floor the hardware can execute is a random chord. Confirmed absent from the
   registry. Until it exists the input-cost gap has no like-for-like comparator.
 
+**Update — the numbers above used an ad-hoc iid draw; these are the calibrated ones.**
+`noise_shape` is now a `Protocol` field (`directional` | `iid`), each with its own
+bisected scale table, and both realize per-component std ~0.127 against the 0.128
+target. Oracle reach through the real protocol path:
+
+| | `directional` (published) | `iid` | `random` |
+|---|---|---|---|
+| real3d | 1.000 (**+0.004**) | 1.000 (**+0.004**) | 0.996 |
+| real4d | 1.000 (**+0.430**) | 0.778 (**+0.208**) | 0.570 |
+| real6d | 0.853 (**+0.826**) | 0.029 (**+0.003**) | 0.026 |
+
+This refines the conclusion in an important way. **The ruler is binding only at 6-D,
+and only if `iid` is the right shape.** At 4-D there is real headroom under *either*
+shape (+0.43 or +0.21), so the 4-D null result is informative about the algorithms
+rather than about the scoring rule — the review's "an oracle cannot beat uniform
+random at 4-D" does not hold under either candidate. At 3-D nothing has headroom
+under any shape. At 6-D the two shapes disagree completely, which is exactly why the
+N=6000 run stays held until the shape is settled.
+
+Per-cell `P(||x_act - x_req|| <= 0.05)` at 4-D, measured end to end: 13.75%
+(`directional`) against 0.83% (`iid`) — a factor of 17 from one line of code.
+
 Caveat on the table: the iid arm mean-centres to reach the tangent space, which
 shrinks per-component std by `sqrt(1-1/d)` (~9% at d=6), so it is if anything
 slightly *optimistic*; matching realized std exactly would lower its headroom

@@ -47,7 +47,7 @@ import numpy as np
 # for every baseline.
 _MATCHED_METRIC = "pr_curve_peak_ratio"
 
-_ORDER = ["random", "gp_qucb", "gp_qlogei", "gp_ts", "zombihop", "zombihop_nc5",
+_ORDER = ["random", "random_lines", "gp_qucb", "gp_qlogei", "gp_ts", "zombihop", "zombihop_nc5",
           "zombihop_mz0",
           "hebo", "turbo", "rf_bo", "saasbo", "robot"]
 

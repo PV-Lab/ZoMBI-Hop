@@ -79,7 +79,14 @@ def run_one(objective_spec: dict, optimizer_spec: dict, seed: int,
             while run.n_samples < protocol.n_samples:
                 X_req = np.atleast_2d(np.asarray(optimizer.suggest(protocol.batch_size),
                                                  dtype=float))
-                X_act, y = run.evaluate_batch(X_req)
+                # An arm whose batch is physically a printed line realizes it
+                # itself, through realize_line rather than the point-wise
+                # perturbation a scattered batch gets. Without this hook
+                # random_lines would be scored as if the printer could scatter,
+                # which is the confound it exists to remove.
+                X_act_pre = (optimizer.realize_request(X_req, run)
+                             if hasattr(optimizer, "realize_request") else None)
+                X_act, y = run.evaluate_batch(X_req, X_act_pre)
                 optimizer.observe(X_act, y)
     except BudgetExhausted:
         pass

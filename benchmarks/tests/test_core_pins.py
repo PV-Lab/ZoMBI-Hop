@@ -176,3 +176,41 @@ def test_a_run_records_the_full_zombihop_configuration(tmp_path):
     assert rh["min_iters_per_zoom"] == PUBLISHED["min_iters_per_zoom"]
     # The floors are always recorded, whether or not they changed anything.
     assert any(a["key"] == "_force_zoom_floors" for a in st["hparam_adjustments"])
+
+
+@pytest.mark.parametrize("shape", ["directional", "iid"])
+def test_noise_shape_is_calibrated_and_recorded(shape):
+    """Both radial shapes must realize the target std, and say which one ran.
+
+    The shape is not cosmetic: at 4-D it moves P(||x_act - x_req|| <= 0.05) from
+    13.75% to 0.83%, and it decides whether an oracle has headroom above uniform
+    random at 6-D (+0.826 vs +0.003). A run that does not record which shape it used
+    cannot be interpreted at all -- which is the position every s1_v2 cell was in
+    until the switch existed. See DESIGN.md 29.
+    """
+    import numpy as np
+
+    from zhbench.protocol import (DEFAULT_NOISE_SHAPE, Protocol, _hardware_scale,
+                                  _perturb)
+
+    assert DEFAULT_NOISE_SHAPE == "directional", (
+        "the published bundles used 'directional'; changing the default silently "
+        "re-scales every historical comparison")
+
+    # a calibrated scale must exist for every dimension the suites use
+    for dim in (3, 4, 6):
+        scale = _hardware_scale(dim, "batch", shape)
+        assert 0.0 < scale < 1.0, (dim, shape, scale)
+
+    p = Protocol(noise="hardware", noise_shape=shape)
+    assert p.to_dict()["noise_shape"] == shape
+
+    # the two shapes must actually differ, and in the documented direction:
+    # iid concentrates magnitude away from zero as d grows, directional does not.
+    rng = np.random.default_rng(0)
+    e = np.linalg.norm(_perturb(20000, 6, 0.128, rng, shape), axis=1)
+    near = (e <= 0.05).mean()
+    if shape == "iid":
+        assert near < 0.01, f"iid at d=6 should almost never land within r; got {near:.2%}"
+    else:
+        assert near > 0.05, f"directional at d=6 should often land within r; got {near:.2%}"

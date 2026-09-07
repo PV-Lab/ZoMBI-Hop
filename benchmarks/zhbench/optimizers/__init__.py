@@ -11,6 +11,9 @@ from .base import BaseOptimizer, Optimizer
 #: name -> default kwargs
 _SPECS: dict[str, dict] = {
     "random": {},
+    # The hardware-feasible floor: scattered batches are not printable, so `random`
+    # is not a baseline the lab could run. See random_lines.py.
+    "random_lines": {},
     "gp_qucb": {"kind": "ucb"},
     "gp_qlogei": {"kind": "logei"},
     "gp_ts": {},
@@ -41,6 +44,9 @@ def _resolve(name: str):
     if name == "random":
         from .random_simplex import RandomSearch
         return RandomSearch
+    if name == "random_lines":
+        from .random_lines import RandomLines
+        return RandomLines
     if name in ("gp_qucb", "gp_qlogei"):
         from .gp import GPBatch
         return GPBatch

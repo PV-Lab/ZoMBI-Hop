@@ -1,0 +1,33 @@
+# The hardware-feasible floor, run at the s1_v2 protocol so it drops into those tables.
+#
+# `random` scatters 24 unrelated compositions per decision. The printer cannot do that
+# -- it deposits a chord. So `random` is not a baseline the lab could execute, and the
+# ~10-16x input_cost gap the project has been quoting as ZoMBI-Hop's clearest result
+# is partly just scattered-batch vs printed-line: a difference of INSTRUMENT, not of
+# algorithm. This arm shares ZoMBI-Hop's instrument exactly (same realize_line path,
+# same print model + hardware residual) and is entirely non-adaptive, so any gap
+# between the two is attributable to search.
+#
+# Pre-registered, before looking: a 240-sample probe put random_lines at input_cost
+# 8.7 against random's 101.2, which extrapolates to ~72 at N=2000 -- essentially
+# ZoMBI-Hop's 62. PREDICTION: the input-cost advantage over `random` survives, but
+# the advantage over `random_lines` is small or absent, and the honest claim becomes
+# "printing lines is cheap" rather than "ZoMBI-Hop is cheap". If instead ZoMBI-Hop is
+# materially below random_lines, the cost claim is genuinely the algorithm's.
+#
+# 60 cells, ~2 s/cell.
+name: s1_random_lines
+protocol:
+  n_samples: 2000
+  batch_size: 24
+  n_init_lines: 2
+  noise: hardware
+  eval_at: [250, 500, 1000, 2000]
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+value_tol: 0.25
+objectives:
+  - {kind: real_gp, dim: 3}
+  - {kind: real_gp, dim: 4}
+  - {kind: real_gp, dim: 6}
+optimizers:
+  - name: random_lines
