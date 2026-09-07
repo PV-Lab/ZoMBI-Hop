@@ -767,3 +767,68 @@ Caveat on the table: the iid arm mean-centres to reach the tangent space, which
 shrinks per-component std by `sqrt(1-1/d)` (~9% at d=6), so it is if anything
 slightly *optimistic*; matching realized std exactly would lower its headroom
 further. And the oracle knows every optimum, so it is an upper bound, not a target.
+
+## 30. The input-cost result belongs to the instrument, not to the search
+
+`random_lines` — two uniform Dirichlet endpoints, the chord between them printed
+through ZoMBI-Hop's own `realize_line`, no adaptation of any kind — ran at the
+s1_v2 protocol, 20 seeds, all three landscapes. 60/60 cells, 0 errors.
+
+The prediction was written into `configs/s1_random_lines.yaml` before the run: the
+cost advantage over `random` survives, the advantage over `random_lines` is small or
+absent, and the honest claim becomes "printing lines is cheap" rather than
+"ZoMBI-Hop is cheap". That is what happened.
+
+**Input cost** (mean over seeds):
+
+| | `random` | `random_lines` | `zombihop` | lines vs random | zh vs lines |
+|---|---|---|---|---|---|
+| real3d | 1002.1 | 84.4 | 110.8 | **11.9x** | **0.76x** |
+| real4d | 987.7 | 83.8 | 62.2 | **11.8x** | 1.35x |
+| real6d | 901.7 | 76.2 | 61.3 | **11.8x** | 1.24x |
+
+Every paired comparison here is resolved (20/0/0, 0/0/20, 0/0/10). **Printing lines
+buys ~11.8x at every dimension, and it buys it without any search at all.** Against
+that floor ZoMBI-Hop adds 1.24-1.35x at 4-D and 6-D, and at 3-D it is *31% more
+expensive* than random chords.
+
+So the project's most-quoted result — "an order of magnitude lower input cost" —
+is a property of LineBO's movement model, not of ZoMBI-Hop's search. The number is
+real and it still matters for the printer; it just has the wrong owner.
+
+**Quality, at matched |S|** (the fair basis — same post-hoc extractor, same `|S|`;
+the raw `peak_ratio` column is not comparable here because a baseline gets `n_true`
+guesses while ZoMBI-Hop gets its own ~5-15 declarations):
+
+| | \|S\| | `zombihop` | `random_lines` | `random` | zh − lines | W/T/L |
+|---|---|---|---|---|---|---|
+| real3d | 5 | 0.2321 | 0.2286 | 0.2286 | +0.0036 | 7/7/6 |
+| real4d | 11 | 0.1611 | 0.1611 | 0.2056 | **+0.0000** | 7/5/8 |
+| real6d | 9 | 0.0088 | 0.0125 | 0.0118 | −0.0059 | 0/6/4 |
+
+**Nothing resolves anywhere**, and at 4-D the two are identical to four decimals.
+`random_lines` vs `random` does not resolve either, so the printing constraint costs
+no recall on these landscapes.
+
+The honest summary: **a completely non-adaptive random line search matches
+ZoMBI-Hop on every quality metric, at comparable cost, on all three real campaigns.**
+
+Two things stop this being a verdict on the algorithm:
+
+* 3-D is saturated and 6-D under `iid` has no oracle headroom (section 29), so
+  neither can separate any pair of methods.
+* But **4-D has real headroom under either noise shape** (+0.430 / +0.208), and it
+  is exactly where the difference is 0.0000. That one is not a ruler artifact, and
+  it is the strongest evidence yet for Brianna's position that these landscapes
+  cannot test a needle-finder.
+
+What this does *not* say: that ZoMBI-Hop fails on landscapes with real needles.
+Every landscape here is a smooth campaign surrogate (peak rarity 0.035 / 0.011 /
+0.002). The placed-needle s2 study is where the claim gets its first real test, and
+`random_lines` is now the floor it has to clear there.
+
+Process note: one cell (`real4d/random_lines/s0`) crashed with a `NameError` because
+the noise-shape patch landed while the grid was in flight -- the same rule broken in
+section 27, by the same person, four days later. Re-run under `--suite-dir`; the
+other 59 were unaffected because the default path is byte-identical. The lesson is
+not "be careful", it is that nothing enforces the rule and something should.
