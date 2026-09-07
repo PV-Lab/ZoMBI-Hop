@@ -675,3 +675,73 @@ result she may otherwise read as instability.
 
 Caveat: `mz0` was not run at 6-D, where reach is 0.013 and the prediction would be
 that opening the gate is purely harmful.
+
+---
+
+# Round 5 — the ruler, and a noise model nobody validated
+
+## 29. Is there headroom above random? It depends on a line of code, not on `r`
+
+An external review argued that the null result in `s1_v2` is an artifact of the
+scoring rule: we score a hit when a *realized* sample lands within `r = 0.05` while
+simulating 0.128/component placement noise, so "an oracle cannot beat uniform random
+at 4-D or 6-D". The derivation modelled the tangential error as isotropic Gaussian,
+giving `P(hit) = chi2.cdf((r/sigma_t)^2, d-1)` = 4.96% / 1.00% / 0.03% at d = 3/4/6.
+
+**That is the right question and the wrong number.** Measured directly from the
+stored `points.csv` (20 cells per arm per dimension, no modelling):
+
+| | `random` (batch points) | `zombihop` (printed line) | chi2 model |
+|---|---|---|---|
+| real3d | 16.9% | 10.4% | 4.96% |
+| real4d | 13.5% | 8.1% | 1.00% |
+| real6d | **8.5%** | **4.2%** | **0.03%** |
+
+The model is off by 3x at 3-D and **280x at 6-D**. The cause is `protocol._perturb`:
+
+```python
+return _zero_sum_unit(n, dim, rng) * (scale * np.sqrt(dim) *
+                                      np.abs(rng.standard_normal((n, 1))))
+```
+
+A random unit direction times **one shared half-normal scalar**. The magnitude is
+`sigma*sqrt(d)*|Z|`, not a chi with `d-1` degrees of freedom, so a large share of
+draws are near-zero at every dimension. The docstring calls it "isotropic", which is
+true of the *direction* and false of the *radial profile* — and reading it as
+isotropic Gaussian is exactly the assumption the review made.
+
+Running an oracle that aims all 2000 samples at true optima, through the real code:
+
+| | current `_perturb` | iid Gaussian per component | `random` |
+|---|---|---|---|
+| | P(hit) / reach / headroom | P(hit) / reach / headroom | reach |
+| real3d | 18.1% / 1.000 / **+0.004** | 9.6% / 1.000 / **+0.004** | 0.996 |
+| real4d | 15.9% / 1.000 / **+0.430** | 2.3% / 0.667 / **+0.097** | 0.570 |
+| real6d | 13.0% / 0.941 / **+0.915** | 0.05% / 0.059 / **+0.032** | 0.026 |
+
+**The conclusion flips on the noise shape alone.** Under the model we actually ran
+there is large headroom at 4-D and 6-D and the methods simply are not using it — a
+finding about the algorithms. Under independent per-syringe error there is almost
+none, and the review's conclusion is right — a finding about the ruler.
+
+Which is physical is a **hardware question for Aleks**, and it is now the single
+highest-leverage open item in the project: it decides whether `s1_v2`'s null result
+is informative or vacuous. Independent errors on ten syringes argue for iid; a
+dominant shared mis-registration argues for the current shape. DESIGN.md §11
+calibrated the *scale* by bisection against `NOISE_LEVEL` and never examined the
+*shape*, and the hardware measurement behind §11 (~87% of the residual perpendicular
+to the requested line) constrains direction, not radial profile.
+
+Two things are settled regardless, and both survive either model:
+
+* **3-D is saturated and must retire from headline claims.** Oracle headroom is
+  +0.004 under both models — 12% of the 2-simplex lies within `r` of an optimum and
+  2000 draws put ~17 samples on every one. Nothing can win there.
+* **`random_lines` was never built.** Scattered batches are not printable; the only
+  floor the hardware can execute is a random chord. Confirmed absent from the
+  registry. Until it exists the input-cost gap has no like-for-like comparator.
+
+Caveat on the table: the iid arm mean-centres to reach the tangent space, which
+shrinks per-component std by `sqrt(1-1/d)` (~9% at d=6), so it is if anything
+slightly *optimistic*; matching realized std exactly would lower its headroom
+further. And the oracle knows every optimum, so it is an upper bound, not a target.
