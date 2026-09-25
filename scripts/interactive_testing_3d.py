@@ -1091,7 +1091,7 @@ def run_interactive_3d() -> None:
         penalty_max_radius         = 0.33633,
         penalty_radius_step        = None,
         convergence_pi_threshold   = 4.8e-5,
-        input_noise_threshold_mult = 2.0,
+        input_noise_threshold_mult = 3.0,
         output_noise_threshold_mult= 0.5,
         n_consecutive_converged    = 5,
         max_gp_points              = 2000,

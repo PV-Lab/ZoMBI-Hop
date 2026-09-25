@@ -28,10 +28,12 @@ and the full ``ensemble_configs`` list (plus per-repeat metrics) is recorded in
 reproducible; ``--ensemble-margin`` sets the optima/background gap.
 
 Three objectives (all minimised):
-  1. dist_to_needles    – symmetric greedy matching distance between needles and
-                          true optima (no-repeat matching; both unmatched true
-                          optima AND unmatched/spurious needles incur
-                          UNMATCHED_PENALTY, mean over max(#needles, #optima))
+  1. dist_to_needles    – symmetric MINIMUM-COST matching distance between needles
+                          and true optima (one-to-one pairing at minimum total cost
+                          via scipy's Hungarian solver; each matched distance capped
+                          at UNMATCHED_PENALTY, which both unmatched true optima AND
+                          unmatched/spurious needles also incur; mean over
+                          max(#needles, #optima), so the score ranges [0, PENALTY])
   2. dup_fraction       – fraction of sampled points whose nearest neighbour in
                           input space is within a zoom-scaled duplicate distance
                           (noise/2 at full domain, shrinking with the zoom-zone
@@ -279,10 +281,10 @@ DATASET_CHOICES = sorted([*DATASET_DIMS, ENSEMBLE_DATASET,
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE  = torch.float64
 
-# Simulated input noise: per-component composition std, matched to the measured
-# average input noise of data/2nd_real_run.db (per-component std ≈ 0.064; see
-# visualization/input_noise.py). Also fed to ZoMBI as the known ``input_noise``.
-NOISE_LEVEL       = 0.064
+# Simulated input noise: per-component composition std, measured from runs/run_39af/composition_log.jsonl, the 6-dim hardware run of 2026-08-12 (109 lines / 2042 samples), which logs the sent composition directly: pooled per-component std 0.128, mean L2 0.271
+# (see visualization/input_noise.py and default_hparams.DEFAULT_INPUT_NOISE).
+# Also fed to ZoMBI as the known ``input_noise``.
+NOISE_LEVEL       = 0.128
 # Simulated output noise: the measured objective is within ~4.5% of the true value,
 # so y-noise is multiplicative (std = OUTPUT_NOISE_FRAC × |y|), not absolute.
 OUTPUT_NOISE_FRAC = 0.045
@@ -385,65 +387,14 @@ def unique_run_dir(parent: str, prefix: str) -> str:
 
 
 # ─── Hyperparameter search space ──────────────────────────────────────────────
-# Each entry: (lo, hi, transform) — transform ∈ {"log", "linear", "int"}
-# Normalised to [0, 1] for MOBO; unnormalised when calling ZoMBI.
-
-HPARAM_SPACE: dict[str, tuple] = {
-    # Acquisition optimisation
-    # Upper bound is 0.1: _optimize_acquisition is fixed-step mirror ascent with
-    # no line search and no early stop — the update is x ← x·exp(clamp(step·(g−ḡ),
-    # ±10)) — so a large step is not "faster convergence", it is a multiplicative
-    # jump onto a simplex face repeated nat_grad_max_steps times.
-    "nat_grad_step":               (0.001,  0.1,   "log"),
-    "nat_grad_max_steps":          (10,     400,   "int"),
-    "n_restarts":                  (20,     300,   "int"),
-    # Lower bound is 20 (= n_restarts' lower bound): `raw` is the candidate pool
-    # the top-n_restarts unpenalised seeds are drawn from, so raw < n_restarts
-    # sends GPSimplex into its resample-retry loop every iteration and still
-    # yields fewer restarts than requested.
-    "raw":                         (20,    300,  "int"),
-    # Acquisition function
-    "ucb_beta":                    (0.001,   3.0,   "linear"),
-    # Zoom / convergence
-    # Lower bound is 3: a needle can only be declared at zoom level 3+
-    # (ZoMBIHop.min_zoom_for_needle), so max_zooms must allow reaching it.
-    "max_zooms":                   (3,      10,    "int"),
-    # Lower bound is 2 so at least min_iters_per_zoom (=2) lines can be sampled
-    # per zoom level before the optimiser may advance or declare a needle.
-    "max_iterations":              (2,      30,    "int"),
-    "top_m_points":                (2,      8,     "int"),
-    "n_consecutive_converged":     (1,      5,    "int"),
-    "input_noise_threshold_mult":  (0.5,    6.0,   "linear"),
-    # Lower bound is 0.1: the convergence test is EI < GP_output_noise × this,
-    # so below ~0.1 it is effectively unsatisfiable — EI convergence stops
-    # declaring needles at all and every needle has to come from the Jaccard
-    # force-declare fallback, at the cost of the wasted zoom iterations.
-    "output_noise_threshold_mult": (0.1,    2.0,   "linear"),
-    # Penalisation & needle
-    "max_penalty_radius":          (0.01,    5.0,   "linear"),
-    # Bounds are set by the failure-retry budget (MAX_STALLED_RETRIES = 40 in
-    # ZoMBIHop.run). Case-3 recovery shrinks every semi-axis by this factor per
-    # no-new-data retry and stops once max radius < needle_stop_noise_multiplier
-    # × input_noise_ilr. Above ~0.95 the axes cannot reach the noise floor within
-    # 40 retries, so recovery never completes and the run terminates instead;
-    # below ~0.5 the first retry drops straight through the floor, turning the
-    # shrink mechanism into a one-shot stop button rather than a retry.
-    "needle_shrink_factor":        (0.5,   0.95,  "linear"),
-    "needle_stop_noise_multiplier":(1.0,    8.0,   "linear"),
-    # Point paring (deduplication)
-    # Upper bound is 2.0: this radius (× input_noise_ilr) is reused for three
-    # things — duplicate detection, the post-activation median relabelling of
-    # every pared Y, and the needle's recorded median value. At 5σ the median
-    # smooths over a ~10σ-wide ball, flattening the peaks the search exists to
-    # find and blurring the value recorded for each needle.
-    "paring_spatial_halfnoise":    (0.1,    2.0,   "linear"),
-    # Upper bound is 5.0: two points whose Y differ by more than a few output-
-    # noise σ are a real signal difference, not a duplicate; merging them via
-    # the keep/replace coin flip discards measured optima.
-    "paring_y_noise_multiplier":   (0.1,    5.0,   "linear"),
-}
-HPARAM_NAMES = list(HPARAM_SPACE.keys())
-N_HPARAMS    = len(HPARAM_NAMES)
+# Defined in hparam_space.py so pareto.py can read the same dict without importing
+# torch/botorch. Re-exported here because evaluate.py and the checkpoint writers
+# reach for it as rm.HPARAM_SPACE / rm.HPARAM_NAMES. (Works whether launched as a
+# script, with optimize/ on the path, or as the optimize.run_mobo package module.)
+try:
+    from optimize.hparam_space import HPARAM_SPACE, HPARAM_NAMES, N_HPARAMS
+except ImportError:
+    from hparam_space import HPARAM_SPACE, HPARAM_NAMES, N_HPARAMS
 
 
 def norm_to_hparams(x_norm: torch.Tensor) -> dict:
@@ -1710,6 +1661,7 @@ from eval_metrics import (  # noqa: E402  — after sys.path setup in callers
     metric_avg_pairwise_dist,
     metric_dist_to_needles,
     metric_dup_fraction,
+    metric_median_nn_spacing,
     metric_n_points_penalty,
     zoom_size_fraction,
     metric_pct_matched,

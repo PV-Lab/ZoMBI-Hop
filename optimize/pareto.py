@@ -115,25 +115,14 @@ def _pretty_label(label: str) -> str:
     return label.replace("_", " ").title()
 
 
-HPARAM_SPACE: dict[str, tuple] = {
-    "nat_grad_step":               (0.001,  0.5,   "log"),
-    "nat_grad_max_steps":          (10,     200,   "int"),
-    "n_restarts":                  (20,     300,   "int"),
-    "raw":                         (1,      300,   "int"),
-    "ucb_beta":                    (0.05,   3.0,   "linear"),
-    "max_zooms":                   (2,      10,    "int"),
-    "max_iterations":              (2,      10,    "int"),
-    "top_m_points":                (2,      8,     "int"),
-    "n_consecutive_converged":     (1,      5,     "int"),
-    "input_noise_threshold_mult":  (0.5,    6.0,   "linear"),
-    "output_noise_threshold_mult": (0.1,    2.0,   "linear"),
-    "max_penalty_radius":          (0.2,    5.0,   "linear"),
-    "needle_shrink_factor":        (0.55,   0.99,  "linear"),
-    "needle_stop_noise_multiplier":(1.0,    8.0,   "linear"),
-    "paring_spatial_halfnoise":    (0.1,    2.0,   "linear"),
-    "paring_y_noise_multiplier":   (0.1,    5.0,   "linear"),
-}
-HPARAM_NAMES = list(HPARAM_SPACE.keys())
+# The tuned search space, imported rather than copied: this module used to hold its
+# own edition of the dict, which drifted from run_mobo's (stale bounds, plus the
+# retired input_noise_threshold_mult). hparam_space.py imports nothing heavy, so
+# reading it here costs nothing.
+try:
+    from optimize.hparam_space import HPARAM_SPACE, HPARAM_NAMES
+except ImportError:
+    from hparam_space import HPARAM_SPACE, HPARAM_NAMES
 
 
 # ─── Collaborator runs directories (cross-user shared history) ───────────────────
@@ -654,13 +643,21 @@ def _final_plot_for_trial(runs_dir: str, source_run: str, trial: int) -> str | N
 
 
 def _hparam_normalised(value: float, name: str) -> float:
-    """Map a raw hyperparameter value to [0, 1] within its HPARAM_SPACE bounds."""
+    """Map a raw hyperparameter value to [0, 1] within its HPARAM_SPACE bounds.
+
+    Clamped to the ends: HPARAM_SPACE is re-tightened as campaigns provide evidence,
+    so a pooled trial from before a tightening can sit outside the current bounds
+    (a max_zooms=9 trial against today's (2, 6), say). Without the clamp its marker
+    lands off the number line's axis and is silently clipped away, which reads as
+    "that trial has no value for this hparam" rather than "it is out of range".
+    """
     lo, hi, tfm = HPARAM_SPACE[name]
     if tfm == "log":
         import math
-        return (math.log(value) - math.log(lo)) / (math.log(hi) - math.log(lo))
+        v = (math.log(value) - math.log(lo)) / (math.log(hi) - math.log(lo))
     else:
-        return (value - lo) / (hi - lo)
+        v = (value - lo) / (hi - lo)
+    return min(1.0, max(0.0, v))
 
 
 def plot_pareto_interactive(

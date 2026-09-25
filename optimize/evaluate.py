@@ -668,10 +668,24 @@ def build_ensemble_ds(config: dict, dataset: str, *, time_limit_hours: float | N
 _ZOMBI_OVERRIDE_KEYS = frozenset({"input_noise", "max_gp_points", "acquisition_type", "verbose"})
 
 
-def _split_hparams(hp: dict) -> tuple[dict, dict]:
-    """Return (mobo_hparams, zombi_fixed_overrides)."""
+def _split_hparams(hp: dict, *, source: str = "hparams") -> tuple[dict, dict]:
+    """Return (mobo_hparams, zombi_fixed_overrides).
+
+    Keys in neither set are DROPPED — they never reach ZoMBIHop, which falls back to
+    its constructor default for them. That is the intended behaviour for a trial
+    recorded by an older code revision whose search space has since lost a knob, but
+    it is silent, and a silently ignored hyperparameter is indistinguishable from an
+    honoured one when reading a config file. So say so: the showdown_6d_clamped_reps10_v2
+    configs advertise input_noise_threshold_mult 0.5-6.0, retired from HPARAM_SPACE in
+    56dd11d, and every one of those 200 runs actually used ZoMBIHop's default of 3.0.
+    """
     mobo = {k: hp[k] for k in rm.HPARAM_NAMES if k in hp}
     overrides = {k: hp[k] for k in _ZOMBI_OVERRIDE_KEYS if k in hp}
+    ignored = sorted(set(hp) - set(mobo) - set(overrides))
+    if ignored:
+        print(f"      [run] {source}: ignoring {len(ignored)} key(s) that are not in "
+              f"the current search space — ZoMBIHop's defaults apply instead: "
+              + ", ".join(f"{k}={hp[k]}" for k in ignored))
     return mobo, overrides
 
 
@@ -679,7 +693,7 @@ def _normalize_hparams(hp: dict, *, source: str) -> dict:
     missing = [k for k in rm.HPARAM_NAMES if k not in hp]
     if missing:
         sys.exit(f"{source}: missing hparams {missing} (stale hyperparameter set?).")
-    mobo, overrides = _split_hparams(hp)
+    mobo, overrides = _split_hparams(hp, source=source)
     return {**mobo, **overrides}
 
 
@@ -759,7 +773,7 @@ def load_hparams_from_json(json_path: str) -> dict[int, dict]:
     if missing:
         sys.exit(f"--hparams-json: missing hparams {missing} "
                  f"(stale hyperparameter set?).")
-    mobo, overrides = _split_hparams(hp)
+    mobo, overrides = _split_hparams(hp, source=os.path.basename(json_path))
     hp = {**mobo, **overrides}
     print(f"  [hparams-json] loaded {len(hp)} hyperparameters from {json_path}")
     return {0: hp}
@@ -1124,7 +1138,8 @@ def run_single_eval(
         X_a, X_e, Y = gen_init_data(fn, maximize, dim)
     except RuntimeError as exc:
         print(f"      [run] init failed: {exc}")
-        return {"dist": rm.UNMATCHED_PENALTY, "dup": 1.0, "runtime": 0.0}
+        return {"dist": rm.UNMATCHED_PENALTY, "dup": 1.0,
+                "nn_spacing": 0.0, "runtime": 0.0}
 
     hp = dict(hparams)
     if dim > 3 and (hp.get("top_m_points") is None or hp.get("top_m_points", 0) < dim + 1):
@@ -1197,8 +1212,13 @@ def run_single_eval(
     # penalised. Without this eval over-reports dup vs. the tuned/selected objective.
     zoom_sizes = rm._zoom_size_per_point(X_all_np.shape[0], snap_records)
     dup = rm.metric_dup_fraction(X_all_np, dim=dim, zoom_sizes=zoom_sizes)
+    # Threshold-free companion to dup: dup's radius is tied to NOISE_LEVEL, which has
+    # moved, so dup fractions from different eras are not comparable. Spacing is, and
+    # it is what the showdown summary reports (higher is better).
+    nn_spacing = rm.metric_median_nn_spacing(X_all_np, dim=dim)
     pct_comp = rm.metric_pct_matched_comp(discovered, true_optima, dim=dim)
     print(f"      [run]  iters={call_counter[0]}  dist={dist:.4f}  dup={dup:.4f}"
+          f"  nn={nn_spacing:.5f}"
           f"  pct_comp={pct_comp:.2f}  t={runtime:.1f}s"
           f"  needles={len(discovered)}/{len(true_optima)}")
 
@@ -1355,6 +1375,7 @@ def run_single_eval(
     metrics = {
         "dist_to_needles": round(dist, 6),
         "dup_fraction": round(dup, 6),
+        "median_nn_spacing": round(nn_spacing, 8),
         "pct_matched_comp": round(pct_comp, 4),
         "pct_matched": round(pct_comp, 4),
         "runtime_s": round(runtime, 3),
@@ -1377,7 +1398,7 @@ def run_single_eval(
     if interrupted:
         raise KeyboardInterrupt
     return {
-        "dist": dist, "dup": dup,
+        "dist": dist, "dup": dup, "nn_spacing": nn_spacing,
         "pct_comp": pct_comp, "pct": pct_comp,
         "runtime": runtime,
     }
@@ -1399,9 +1420,13 @@ def write_summary(path: str, per_trial: dict) -> None:
     for trial_num, runs in per_trial.items():
         entry = {"trial": trial_num, "n_runs": len(runs), "runs": runs}
         if runs:
-            for key in ("dist_to_needles", "dup_fraction",
+            for key in ("dist_to_needles", "dup_fraction", "median_nn_spacing",
                         "pct_matched_comp", "pct_matched", "runtime_s"):
-                entry[key] = _agg([r[key] for r in runs])
+                # A run recorded before a key existed simply drops out of its
+                # aggregate rather than taking the whole summary down.
+                vals = [r[key] for r in runs if key in r]
+                if vals:
+                    entry[key] = _agg(vals)
         summary["trials"].append(entry)
     with open(path, "w") as f:
         json.dump(summary, f, indent=2)
@@ -1639,6 +1664,7 @@ def evaluate_dataset(
                     "run": k,
                     "dist_to_needles": round(res["dist"], 6),
                     "dup_fraction": round(res["dup"], 6),
+                    "median_nn_spacing": round(res.get("nn_spacing", float("nan")), 8),
                     "pct_matched_comp": round(res["pct_comp"], 4),
                     "pct_matched": round(res["pct_comp"], 4),
                     "runtime_s": round(res["runtime"], 3),

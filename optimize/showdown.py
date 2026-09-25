@@ -27,6 +27,16 @@ What it does
    (``tasks.tsv``) and a SLURM script. With 4 configs and 5 landscapes that is 20
    runs — the 20 rows of the summary table.
 
+Budget
+------
+Every run gets the same SAMPLING budget — ``--budget-points`` measured points
+(default 3000), converted to evaluate.py's ``--max-lines``. A showdown compares what
+configurations do with an equal number of experiments; a wall-clock budget instead
+compares them at whatever point count each happened to reach, which drifts with node
+speed and with how expensive a config's own acquisition step is. ``--time-limit`` is
+still passed, but only as a safety cap, so runs normally end on the point budget.
+Pass ``--budget-points 0`` for the old wall-clock-only behaviour.
+
 Repeats
 -------
 ``--n-repeats N`` runs every (config, landscape) cell N times. One run of a cell is
@@ -111,6 +121,17 @@ from summary_table import write_landscape_summary  # noqa: E402
 
 
 DEFAULT_N_LANDSCAPES = 5
+# Sampling budget per run, in MEASURED POINTS. Every run of a showdown gets the same
+# number of experiments, so the comparison is "who does more with the same budget"
+# rather than "who ran on the faster node". The wall-clock --time-limit stays on as a
+# secondary safety cap only.
+DEFAULT_BUDGET_POINTS = 3000
+# One LineBO line = NUM_EXPERIMENTS measured points, and every run starts with a fixed
+# preamble of N_INIT_LINES init lines before the optimizer's first objective call.
+# Mirrors run_mobo.NUM_EXPERIMENTS / N_INIT_LINES (run_mobo.py:291); duplicated here so
+# planning stays importable without pulling in torch.
+POINTS_PER_LINE = 24
+N_INIT_LINES = 2
 # Sobol landscape indices are drawn from [0, LANDSCAPE_INDEX_MAX). The sequence is
 # low-discrepancy over the whole ensemble configuration space, so any window works;
 # this one is wide enough that a 5-draw collision is negligible and small enough to
@@ -203,6 +224,24 @@ def select_configs(records: list[dict], *, n_per_objective: int = 2) -> list[dic
               f"{c['source_run']} trial {c['trial']}:  "
               f"dist={m[DIST_KEY]:.4f}  dup={m[DUP_KEY]:.4f}")
     return chosen
+
+
+def budget_to_max_lines(budget_points: int) -> int | None:
+    """Measured-point budget -> the ``--max-lines`` cap evaluate.py takes.
+
+    ``--max-lines`` counts objective calls, i.e. lines the OPTIMIZER asked for; the
+    ``N_INIT_LINES`` init lines are a deterministic preamble that runs before the first
+    such call, so they come off the budget rather than counting against the cap.
+    Returns None when the budget is <= 0, meaning "no point cap, time budget only".
+    """
+    if budget_points is None or budget_points <= 0:
+        return None
+    n_lines = int(budget_points // POINTS_PER_LINE) - N_INIT_LINES
+    if n_lines < 1:
+        raise SystemExit(
+            f"--budget-points {budget_points} leaves no optimizer lines after the "
+            f"{N_INIT_LINES} init line(s) of {POINTS_PER_LINE} point(s) each")
+    return n_lines
 
 
 def pick_landscapes(n: int, seed: int) -> list[int]:
@@ -308,7 +347,7 @@ while [ "$out_of_time" -eq 0 ]; do
             --ensemble-landscape-indices "$LS" \\
             --ensemble-seed {landscape_seed} \\
             --time-limit-min {time_limit_min} \\
-            --device cuda \\
+            {max_lines_flag}--device cuda \\
             --no-video $PLOTFLAG \\
             --out-dir "$RUN_OUT" < /dev/null
         # `< /dev/null` matters: without it the child inherits this loop's stdin and can
@@ -350,10 +389,13 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
                       f, indent=2, default=str)
 
     n_repeats = max(1, int(args.n_repeats))
+    max_lines = budget_to_max_lines(args.budget_points)
     manifest = {
         "generated": datetime.datetime.now().isoformat(timespec="seconds"),
         "dim": args.dim,
         "time_limit_hours": args.time_limit,
+        "budget_points": args.budget_points if max_lines is not None else None,
+        "max_lines": max_lines,
         "landscape_seed": args.landscape_seed,
         "landscapes": landscapes,
         "n_repeats": n_repeats,
@@ -396,14 +438,22 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
     # A worker uses this to decide whether it still has room for one more task.
     task_h = args.time_limit + args.walltime_margin
     walltime_h = max(1, int(args.worker_hours))
-    # Two estimates, because the no-plot repeats are much cheaper than the reserve a
-    # worker has to hold back for the plotted one. The low end assumes tasks cost the
-    # optimizer budget plus a little; the high end assumes every task needs the full
-    # reserve. Reality sits near the low end.
+    # ``walltime_margin`` is a SAFETY RESERVE — what a worker holds back before
+    # claiming one more task — NOT a per-task cost. Estimating the drain from it
+    # overstates the campaign by ~2.5x and cries wolf about needing a resubmit:
+    # the 200-run showdown_6d_clamped_reps10 was measured at 0.507 h/task against
+    # a 0.5 h optimizer budget (5 workers x 40 tasks, drained in 20.3 h of a 24 h
+    # wall-time, one submission, zero out-of-time events). Per-task overhead —
+    # landscape construction, metrics, and the repeat-1 CoNet renders — is minutes,
+    # not the reserve. So the expected drain is the budget plus that overhead, and
+    # the reserve only sets the worst case.
+    PER_TASK_OVERHEAD_H = 0.05
     n_plotted = sum(1 for t in tasks if t[4] == 0)
-    lo_h = (n_plotted * task_h + (len(tasks) - n_plotted) * (args.time_limit + 0.15))
-    lo_h /= max(1, args.n_workers)
-    est_h = len(tasks) * task_h / max(1, args.n_workers)
+    exp_h = len(tasks) * (args.time_limit + PER_TASK_OVERHEAD_H) / max(1, args.n_workers)
+    worst_h = len(tasks) * task_h / max(1, args.n_workers)
+    # A worker stops claiming once less than one task-reserve of wall-time is left,
+    # so this — not the raw wall-time — is the budget the campaign has to drain in.
+    claim_h = walltime_h - task_h
     sbatch = SBATCH_TEMPLATE.format(
         job_name=args.job_name or f"showdown_{args.dim}d",
         out_dir=out_dir,
@@ -416,6 +466,8 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
         n_tasks=len(tasks),
         dim=args.dim,
         time_limit_min=f"{time_limit_min:g}",
+        max_lines_flag=(f"--max-lines {max_lines} \\\n            "
+                        if max_lines is not None else ""),
         landscape_seed=args.landscape_seed,
     )
     sbatch_path = os.path.join(out_dir, "showdown.sbatch")
@@ -427,14 +479,26 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
     print(f"    {len(names)} config(s) x {len(landscapes)} landscape(s) x "
           f"{n_repeats} repeat(s) = {len(tasks)} run(s)")
     print(f"    landscapes: {landscapes}")
+    if max_lines is not None:
+        print(f"    budget: {args.budget_points} point(s)/run = {N_INIT_LINES} init + "
+              f"{max_lines} optimizer line(s) @ {POINTS_PER_LINE} point(s); "
+              f"--time-limit {args.time_limit:g} h is only a safety cap, so runs "
+              "usually finish well inside the estimates below")
+    else:
+        print(f"    budget: wall-clock only ({args.time_limit:g} h/run, no point cap)")
     print(f"    queue -> {queue_path}")
     print(f"    {args.n_workers} persistent worker(s) @ {walltime_h} h; "
-          f"~{lo_h:.1f}-{est_h:.1f} h to drain "
-          f"({n_plotted} plotted @ <={task_h:.2g} h, {len(tasks) - n_plotted} --no-plots)")
-    if lo_h > walltime_h:
-        print(f"    NOTE: that exceeds the {walltime_h} h worker wall-time — workers will "
-              "stop cleanly when out of time;")
-        print(f"          re-submit (after --reset-stale) to finish the remainder.")
+          f"~{exp_h:.1f} h to drain (worst case {worst_h:.1f} h) "
+          f"({n_plotted} plotted, {len(tasks) - n_plotted} --no-plots)")
+    print(f"    workers stop claiming with {task_h:.2g} h left, so the drain budget "
+          f"is {claim_h:.1f} h")
+    if exp_h > claim_h:
+        over = exp_h / max(1e-9, claim_h)
+        print(f"    NOTE: the expected drain exceeds that budget by {over:.1f}x — this "
+              "campaign will NOT finish in one submission.")
+        print(f"          Either raise --n-workers to >= "
+              f"{int(-(-len(tasks) * (args.time_limit + PER_TASK_OVERHEAD_H) // claim_h))}, "
+              "or re-submit (after --reset-stale) to finish the remainder.")
     print(f"    submit with:  sbatch {sbatch_path}")
     return sbatch_path
 
@@ -525,6 +589,12 @@ def main() -> None:
     ap.add_argument("--dim", type=int, default=6, help="ensemble simplex dimension")
     ap.add_argument("--time-limit", type=float, default=0.5,
                     help="per-run wall-clock budget in HOURS (6d: 0.5, 10d: 0.7)")
+    ap.add_argument("--budget-points", type=int, default=DEFAULT_BUDGET_POINTS,
+                    help="measured-point budget per run, converted to evaluate.py's "
+                         "--max-lines so every config spends the same number of "
+                         "experiments. --time-limit then acts only as a safety cap. "
+                         "0 disables the cap and reverts to a pure wall-clock budget "
+                         "(default: %(default)s)")
     ap.add_argument("--n-landscapes", type=int, default=DEFAULT_N_LANDSCAPES,
                     help="how many shared landscapes every config is run on")
     ap.add_argument("--n-per-objective", type=int, default=2,

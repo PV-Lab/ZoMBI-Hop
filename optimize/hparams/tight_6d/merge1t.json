@@ -1,0 +1,130 @@
+{
+  "config_name": "merge1t",
+  "hparams": {
+    "nat_grad_step": 0.1,
+    "nat_grad_max_steps": 10,
+    "n_restarts": 300,
+    "raw": 300,
+    "ucb_beta": 0.5,
+    "max_zooms": 4,
+    "max_iterations": 2,
+    "top_m_points": 8,
+    "n_consecutive_converged": 5,
+    "output_noise_threshold_mult": 2.0,
+    "max_penalty_radius": 1.0,
+    "needle_shrink_factor": 0.5,
+    "needle_stop_noise_multiplier": 8.0,
+    "paring_spatial_halfnoise": 2.0,
+    "paring_y_noise_multiplier": 0.1
+  },
+  "source_run": "hand-crafted",
+  "trial": null,
+  "selected_for": "merged",
+  "unclamped_metrics": {},
+  "clamped_from": {},
+  "rationale": {
+    "goal": "Raise the needle RATE (needles per wall-clock hour) without raising the cost per line. dist_to_needles is dominated by |n_declared - n_true|: matched needles cost ~0.19 each on average while every count error costs UNMATCHED_PENALTY/max(n_disc,n_opt) ~= 0.35. Across the 5 showdown landscapes n_peaks is 28/78/8/83/18, and every existing config declares a near-constant count (dup1c ~14, dist1c ~30) regardless. The count model says the best constant count over these landscapes is ~78 (mean dist 4.84) versus ~30 (5.01) and ~14 (5.69) - the penalty for over-declaring saturates while the gain on peak-rich landscapes keeps paying, so the whole asymmetry favours MORE needles.",
+    "mechanism": "Every needle in the 200-run showdown was declared by 'EI convergence' - the Jaccard force-declare never fired once. So a needle costs exactly one 5-line run of converged lines whose 5th line lands at zoom index >= min_zoom_for_needle (2). max_iterations < n_consecutive_converged (dup1c's structure) is what keeps an activation short: 2 lines per zoom, then advance. The number of chances to land that streak is the number of lines at zoom >= 2, which is (max_zooms - 2) * max_iterations.",
+    "per_hparam": {
+      "max_iterations": "2 (dup1c). Below n_consecutive_converged=5 so each zoom advances after 2 lines instead of lingering; 2 is also the floor set by min_iters_per_zoom, under which no needle can ever be declared.",
+      "max_zooms": "4, NOT dup1c's 3. With max_zooms=3 only lines 5-6 sit at zoom>=2, so a needle needs lines 1-5 to converge in a row - dup1c converts only ~47% of activations and both worst_* configs (also max_zooms=3) declared ZERO needles. max_zooms=4 puts lines 5-8 at qualifying depth: four streak windows instead of two, for a 33% line cost. This corner (short activations WITH a reachable streak) is what MOBO never sampled - its trials sit at max_zooms=3 with short activations or max_zooms=9-10 with long ones.",
+      "nat_grad_max_steps": "10 (dist1c/dist2c) instead of dup1c's 400. The single biggest cost cut: dup1c pays 7.13 s/iter versus ~3.0 s/iter for the dist winners, which is why its short activations bought it no extra needles.",
+      "nat_grad_step": "0.1 (dist2c/dup1c). With only 10 mirror-ascent steps the step has to be large to move at all.",
+      "n_restarts / raw": "300/300 (dist1c). raw >= n_restarts avoids the GPSimplex resample-retry loop - worst_dist ran at raw=1 and declared no needles at all.",
+      "ucb_beta": "0.5. Interpolates between the dist winners' pure exploitation (0.001) and dup1c's max exploration (3.0). Exploitation is what makes a 5-line convergence streak complete inside a short activation; some beta is still needed to leave a basin once its needle ellipsoid is placed.",
+      "output_noise_threshold_mult": "2.0 (dup1c, top of range). The loosest EI convergence gate, so the 5-streak actually completes within an 8-line activation. Localisation loss is cheap: the matched-distance term is worth ~0.19 against ~0.35 per missed needle, and min_zoom_for_needle=2 still bounds how sloppy a declaration can be.",
+      "max_penalty_radius": "1.0 (dist1c). A cap on an ellipsoid semi-axis, not the ellipsoid itself - Hessian ellipsoids are usually far smaller, so it only binds on flat basins, where ~1.0 (about the simplex radius) stops one needle walling off the space.",
+      "top_m_points": "8 (3 of 4 good configs). The zoom box is the bounding box of the top-k unpenalised points; a larger k is a gentler zoom, which matters when each zoom level only sees 2 lines.",
+      "n_consecutive_converged": "5. Unanimous across all four good configs.",
+      "needle_shrink_factor / needle_stop_noise_multiplier": "0.5 / 8.0 (dist2c, dup2c). Case-3 recovery resolves in a few retries and exits into the space-filling fallback instead of grinding through the 40-retry budget.",
+      "paring_spatial_halfnoise / paring_y_noise_multiplier": "2.0 / 0.1 (dist1c). Aggressive spatial dedup keeps the GP small and fits fast; conservative Y merging keeps real peak values from being averaged away.",
+      "input_noise_threshold_mult": "6.0 (majority). Inert axis - DataHandler stores and serialises it but nothing in the optimiser reads it, which is why MOBO's trials drift to whichever bound they started near."
+    },
+    "prediction": "~8 lines/activation at ~3 s/iter, so roughly 2x dist1c's needle rate: 50-70 needles per 0.5 h run against dist1c's ~30. If the count model holds this lands mean dist near 4.8-5.0 versus the current best 5.12. dup_fraction is expected to RISE, since it measures nearest-neighbour density over all measured points and this config measures more of them."
+  },
+  "reclamped_from": {
+    "source_config": "merge1",
+    "source_file": "optimize/hparams/clamped_6d/merge1.json",
+    "moved": {},
+    "dropped_axes": [
+      "input_noise_threshold_mult"
+    ]
+  },
+  "hparam_space": {
+    "nat_grad_step": [
+      0.01,
+      0.1,
+      "log"
+    ],
+    "nat_grad_max_steps": [
+      10,
+      80,
+      "int"
+    ],
+    "n_restarts": [
+      100,
+      300,
+      "int"
+    ],
+    "raw": [
+      150,
+      400,
+      "int"
+    ],
+    "ucb_beta": [
+      0.001,
+      3.0,
+      "linear"
+    ],
+    "max_zooms": [
+      3,
+      6,
+      "int"
+    ],
+    "max_iterations": [
+      2,
+      12,
+      "int"
+    ],
+    "top_m_points": [
+      4,
+      16,
+      "int"
+    ],
+    "n_consecutive_converged": [
+      2,
+      5,
+      "int"
+    ],
+    "output_noise_threshold_mult": [
+      0.1,
+      2.0,
+      "linear"
+    ],
+    "max_penalty_radius": [
+      0.15,
+      1.5,
+      "linear"
+    ],
+    "needle_shrink_factor": [
+      0.5,
+      0.95,
+      "linear"
+    ],
+    "needle_stop_noise_multiplier": [
+      1.0,
+      8.0,
+      "linear"
+    ],
+    "paring_spatial_halfnoise": [
+      0.1,
+      2.0,
+      "linear"
+    ],
+    "paring_y_noise_multiplier": [
+      0.1,
+      5.0,
+      "linear"
+    ]
+  }
+}
