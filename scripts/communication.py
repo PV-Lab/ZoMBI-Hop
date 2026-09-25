@@ -365,7 +365,16 @@ def _write_objective_row(vals, db_path, log_skip: bool = False):
     """
     Write objective values to the `objective` table.
     If the table already has data, check if the new data is different from memory DB.
-    Only allow overwrite if data is actually new. Set handshake flag when new data is written.
+    Only allow overwrite if data is actually new.
+
+    NOTE: this deliberately does NOT raise the handshake flag. The objective values
+    and the compositions matrix are two separate writes; raising the flag here let
+    `get_y_measurements` read new y values against the *previous* batch's
+    compositions table, which then got zero-padded (or silently truncated) to
+    length. The caller must raise the flag via `_set_objective_ready()` only after
+    every table for the packet has landed.
+
+    Returns True if rows were written, False if the write was skipped as a duplicate.
     """
     global _objective_writing
     
@@ -425,7 +434,7 @@ def _write_objective_row(vals, db_path, log_skip: bool = False):
                                         print(f"[_write_objective_row] Data identical to memory DB, skipping write to prevent race condition")
                                     mem_conn.close()
                                     conn.close()
-                                    return
+                                    return False
                                 else:
                                     # Data is different, allow overwrite
                                     if log_skip:
@@ -449,19 +458,12 @@ def _write_objective_row(vals, db_path, log_skip: bool = False):
                 cur.execute("DELETE FROM objective")
                 rows = [(None if v is None else float(v),) for v in vals]
                 cur.executemany("INSERT INTO objective (val) VALUES (?)", rows)
-                
-                # Set handshake flag
-                cur.execute('''CREATE TABLE IF NOT EXISTS handshake (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    new_objective_available INTEGER DEFAULT 0
-                )''')
-                cur.execute('INSERT OR IGNORE INTO handshake (id, new_objective_available) VALUES (1, 0)')
-                cur.execute('UPDATE handshake SET new_objective_available = 1 WHERE id = 1')
-                
+
                 conn.commit()
                 if log_skip:
-                    print(f"[_write_objective_row] Successfully wrote {len(rows)} values to objective table and set handshake flag")
-                
+                    print(f"[_write_objective_row] Successfully wrote {len(rows)} values to objective table")
+                return True
+
             except Exception as e:
                 conn.rollback()
                 raise e
@@ -472,17 +474,88 @@ def _write_objective_row(vals, db_path, log_skip: bool = False):
 
 # ─── Helper to write an n×M compositions matrix ────────────────────────────
 def _write_compositions_matrix(mat, db_path):
+    """
+    Replace the `compositions` table with `mat`.
+
+    Holds `_objective_db_lock` / `_objective_writing` for the same reason
+    `_write_objective_row` does: the table is dropped and rebuilt, so a reader that
+    lands mid-write sees either an absent table or a partial one. Combined with the
+    handshake flag now being raised only after this returns, `get_y_measurements`
+    can no longer pair a new y vector with a stale compositions table.
+    """
+    global _objective_writing
+
     mat = np.asarray(mat, dtype=float)
     n, M = mat.shape
-    conn = sqlite3.connect(db_path)
-    cur  = conn.cursor()
-    cur.execute("DROP TABLE IF EXISTS compositions")
-    cols = ", ".join(f"c{i} REAL" for i in range(M))
-    cur.execute(f"CREATE TABLE compositions ({cols})")
-    ph = ", ".join("?" for _ in range(M))
-    cur.executemany(f"INSERT INTO compositions VALUES ({ph})", mat.tolist())
-    conn.commit()
-    conn.close()
+    with _objective_db_lock:
+        _objective_writing = True
+        try:
+            conn = sqlite3.connect(db_path, timeout=30.0)
+            cur  = conn.cursor()
+            try:
+                cur.execute("DROP TABLE IF EXISTS compositions")
+                cols = ", ".join(f"c{i} REAL" for i in range(M))
+                cur.execute(f"CREATE TABLE compositions ({cols})")
+                ph = ", ".join("?" for _ in range(M))
+                cur.executemany(f"INSERT INTO compositions VALUES ({ph})", mat.tolist())
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        finally:
+            _objective_writing = False
+
+
+# ─── Helper to drop a stale compositions table ─────────────────────────────
+def _drop_compositions_table(db_path):
+    """Remove the `compositions` table so a reader cannot pair fresh y values with
+    a previous packet's compositions."""
+    global _objective_writing
+
+    with _objective_db_lock:
+        _objective_writing = True
+        try:
+            conn = sqlite3.connect(db_path, timeout=30.0)
+            cur  = conn.cursor()
+            try:
+                cur.execute("DROP TABLE IF EXISTS compositions")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        finally:
+            _objective_writing = False
+
+
+# ─── Helper to raise the "new objective ready" handshake ───────────────────
+def _set_objective_ready(db_path):
+    """
+    Raise `handshake.new_objective_available` for a fully-written packet.
+
+    Must be called only after BOTH the objective row and (when the packet carried
+    one) the compositions matrix have committed — this is the barrier that makes
+    the two-table write appear atomic to `get_y_measurements`.
+    """
+    with _objective_db_lock:
+        conn = sqlite3.connect(db_path, timeout=30.0)
+        cur  = conn.cursor()
+        try:
+            cur.execute("""CREATE TABLE IF NOT EXISTS handshake (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                new_objective_available INTEGER DEFAULT 0
+            )""")
+            cur.execute("INSERT OR IGNORE INTO handshake (id, new_objective_available) VALUES (1, 0)")
+            cur.execute("UPDATE handshake SET new_objective_available = 1 WHERE id = 1")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 # ─── THREAD: receive JSON objective+comps & write to DB ─────────────────────
@@ -658,7 +731,9 @@ def objective_receiver(hz, obj_db_path, mem_db_path, verbose=False, super_verbos
             if super_verbose:
                 print(f"[objective_receiver] memory_diff={memory_diff}, obj_empty={obj_empty}")
             if memory_diff and obj_empty:
-                # write to both DBs with retry logic
+                # Write objective + compositions, THEN raise the handshake flag.
+                # The flag is the barrier that tells get_y_measurements the packet is
+                # complete, so nothing may raise it until every table has landed.
                 success = False
                 for attempt in range(3):
                     try:
@@ -679,7 +754,9 @@ def objective_receiver(hz, obj_db_path, mem_db_path, verbose=False, super_verbos
                     consecutive_errors += 1
 
                 # write compositions if present
-                if isinstance(comps, list) and comps and isinstance(comps[0], list):
+                comps_ok = True
+                has_comps = isinstance(comps, list) and comps and isinstance(comps[0], list)
+                if has_comps:
                     try:
                         if super_verbose:
                             print(f"[objective_receiver] Writing compositions matrix: {len(comps)}x{len(comps[0]) if comps else 0}")
@@ -687,7 +764,36 @@ def objective_receiver(hz, obj_db_path, mem_db_path, verbose=False, super_verbos
                         if verbose: print(f"[objective_receiver] ✔ wrote comps ({len(comps)}×{len(comps[0])})")
                     except Exception as e:
                         print(f"[objective_receiver] ERROR writing comps: {e!r}")
+                        comps_ok = False
                         consecutive_errors += 1
+                else:
+                    # No compositions in this packet. Drop any table left over from the
+                    # previous packet so the reader cannot silently pair these y values
+                    # against the last batch's compositions.
+                    try:
+                        _drop_compositions_table(obj_db_path)
+                        print("[objective_receiver] WARNING packet carried no comps; dropped stale compositions table")
+                    except Exception as e:
+                        print(f"[objective_receiver] ERROR dropping stale comps: {e!r}")
+                        comps_ok = False
+
+                if success and comps_ok:
+                    try:
+                        _set_objective_ready(obj_db_path)
+                        if super_verbose:
+                            print("[objective_receiver] handshake raised (packet complete)")
+                    except Exception as e:
+                        print(f"[objective_receiver] ERROR raising handshake: {e!r}")
+                        consecutive_errors += 1
+                        # Flag not raised -> allow the next ~1 Hz re-send of this same
+                        # packet through the ts dedup so the write can be retried,
+                        # rather than waiting forever for genuinely new data.
+                        _last_objective_ts = None
+                else:
+                    # Partial write: leave the flag down and re-arm the dedup so the
+                    # re-send retries. A consumer must never see half a packet.
+                    print("[objective_receiver] WARNING partial packet write; handshake NOT raised, will retry on re-send")
+                    _last_objective_ts = None
             else:
                 if super_verbose:
                     print(f"[objective_receiver] skip (mem_diff={memory_diff}, empty={obj_empty})")

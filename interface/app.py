@@ -903,6 +903,11 @@ class RunBrowserPanel(ttk.Frame):
         ttk.Button(bf, text="Delete",   width=_bw, command=self._delete_selected,
                    style="Danger.TButton").pack(side="left", padx=2)
 
+        bf2 = ttk.Frame(self)
+        bf2.pack(fill="x", padx=4, pady=(0, 2))
+        ttk.Button(bf2, text="Correct Data…", command=self._correct_selected).pack(
+            side="left", padx=2)
+
         # Active hardware-run UUID indicator
         self._hw_uuid_var = tk.StringVar(value="")
         self._hw_uuid_lbl = ttk.Label(
@@ -1037,6 +1042,22 @@ class RunBrowserPanel(ttk.Frame):
                                     "The run will be terminated after the current iteration."):
             return
         self._app.stop_run(run_id)
+
+    def _correct_selected(self):
+        sel = self._lb.curselection()
+        if not sel:
+            messagebox.showinfo("Select", "Click a run first.")
+            return
+        run_info = self._runs[sel[0]]
+        run_id = run_info["run_id"]
+        if run_id in self._app._active_runs:
+            messagebox.showwarning(
+                "Active run",
+                f"{run_id} is currently running.\n\nStop the run before uploading "
+                "corrected data — the correction rewrites its snapshots and must "
+                "not race the live loop.")
+            return
+        UploadCorrectionDialog(self, self._app, run_info)
 
     def set_hw_uuid(self, uuid_or_none: str | None):
         """Update the active-hardware-run UUID indicator in the left panel."""
@@ -2561,6 +2582,15 @@ class ManualControlFrame(ttk.Frame):
     #: how often "Randomize" rewrites the compositions, in seconds
     RANDOMIZE_PERIOD_S = 60
 
+    #: Every compositions.db packet fills BOTH the main and cache slots, and DiSCO
+    #: consumes them with two different transporters (front reads main, back reads
+    #: cache) at different times — returning a SEPARATE objective packet, i.e. a
+    #: distinct handshake, for each rail. The queue feeder must therefore wait for
+    #: this many handshakes before overwriting compositions.db with the next pair;
+    #: advancing after only one lets the next write clobber the still-unread cache
+    #: rail on DiSCO's side (the "sent once instead of twice" bug).
+    RAILS_PER_PAIR = 2
+
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
         self._proc: Optional[subprocess.Popen] = None
@@ -2571,6 +2601,31 @@ class ManualControlFrame(ttk.Frame):
         self._end_sum_var   = tk.StringVar(value="")
         self._rand_var  = tk.BooleanVar(value=False)
         self._rand_job: Optional[str] = None
+        # ── composition queue ─────────────────────────────────────────────
+        # A FIFO of legs. Pressing "Queue" appends two identical copies of the
+        # current inlet/outlet: one "main" leg + one "cache" leg. The feeder
+        # thread emulates run_zombi_main.objective(): it writes the front
+        # (main, cache) pair to compositions.db with a fresh timestamp, then
+        # blocks on the objective handshake (exactly get_y_measurements' gate)
+        # before advancing — so the next pair can never overwrite a pair the
+        # hardware has not finished consuming.
+        # Each entry: {"id", "pair", "role": "main"|"cache",
+        #              "start": np.ndarray(10), "end": np.ndarray(10),
+        #              "n": int, "status": "pending"|"sending"|"consumed"}
+        self._queue: list[dict] = []
+        self._queue_lock = threading.Lock()
+        self._pair_seq = 0
+        self._q_id = 0
+        self._conn_state = "disconnected"
+        self._feeder_thread: Optional[threading.Thread] = None
+        self._feeder_stop = threading.Event()
+        self._feeder_active = tk.BooleanVar(value=True)
+        self._feeder_status_sv = tk.StringVar(value="idle")
+        # Plain (thread-safe) mirrors of the Tk vars the feeder thread must read —
+        # Tk variables may only be touched on the main thread.
+        self._feeder_active_flag = True
+        self._feeder_comp_db = ""
+        self._feeder_obj_db = ""
         self._build_ui()
         self.bind("<Destroy>", self._on_destroy, add="+")
 
@@ -2598,6 +2653,7 @@ class ManualControlFrame(ttk.Frame):
         self._build_comp_section(inner, "Inlet  (Start) Composition", is_start=True)
         self._build_comp_section(inner, "Outlet (End) Composition",   is_start=False)
         self._build_controls(inner)
+        self._build_queue(inner)
         self._build_display(inner)
 
     def _build_connection(self, parent):
@@ -2685,9 +2741,11 @@ class ManualControlFrame(ttk.Frame):
         ttk.Button(fr, text="▶ Update",
                    command=self._do_update,
                    style="Accent.TButton" if "Accent.TButton" in ttk.Style().theme_names()
-                   else "TButton").pack(side="left", padx=20)
+                   else "TButton").pack(side="left", padx=(20, 4))
+        ttk.Button(fr, text="＋ Queue",
+                   command=self._queue_current).pack(side="left", padx=(0, 8))
         ttk.Label(fr,
-                  text="← writes to compositions.db; hardware starts sending immediately",
+                  text="← Update sends now;  Queue appends a main+cache pair below",
                   foreground="gray", font=("TkDefaultFont", 8)).pack(side="left")
 
         rf = ttk.Frame(parent)
@@ -2736,8 +2794,17 @@ class ManualControlFrame(ttk.Frame):
         script  = str(Path(__file__).resolve().parent.parent / "scripts" / "serial_only.py")
         proj    = str(Path(__file__).resolve().parent.parent)
 
+        # Pin the objective/memory DBs to the SAME folder as compositions.db so the
+        # serial process raises the handshake in the exact file the queue feeder polls
+        # (_objective_db_path derives obj-db from comp_db's parent). Without this,
+        # serial_only.py falls back to ./sql/objective.db (cwd=proj); if the user points
+        # the Compositions DB anywhere but <proj>/sql, the feeder would wait on a
+        # different objective.db forever while the hardware round-trip completes silently.
+        obj_db = str(Path(comp_db).parent / "objective.db")
+        mem_db = str(Path(comp_db).parent / "objective_memory.db")
         cmd = [sys.executable, script,
-               "--com",  com, "--baud", str(baud), "--comp-db", comp_db]
+               "--com",  com, "--baud", str(baud), "--comp-db", comp_db,
+               "--obj-db", obj_db, "--mem-db", mem_db]
 
         try:
             env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
@@ -2786,7 +2853,8 @@ class ManualControlFrame(ttk.Frame):
                 if "PORT_OPEN" in s:
                     self.after(0, lambda: self._set_conn_state("testing", com))
                 elif "LINK_OK" in s:
-                    self.after(0, lambda: self._set_conn_state("connected", com))
+                    self.after(0, lambda: (self._set_conn_state("connected", com),
+                                           self._feeder_ensure_running()))
                 elif "LINK_FAIL" in s or "PORT_FAIL" in s:
                     self.after(0, lambda: self._set_conn_state("failed", com))
             try:
@@ -2829,6 +2897,7 @@ class ManualControlFrame(ttk.Frame):
     def stop_serial(self, graceful: bool = True, timeout: float = 12.0) -> None:
         """Synchronously stop the serial child, if any. Safe to call from the app's
         close handler and before a hardware run takes over the port."""
+        self._feeder_stop.set()          # halt the queue feeder before the port goes
         proc = self._proc
         if proc is None or proc.poll() is not None:
             self._proc = None
@@ -2893,6 +2962,7 @@ class ManualControlFrame(ttk.Frame):
             self._schedule_proc_poll()
 
     def _on_proc_exit(self):
+        self._feeder_stop.set()          # halt the queue feeder; the port is gone
         if self._poll_job:
             self.after_cancel(self._poll_job)
             self._poll_job = None
@@ -2919,6 +2989,7 @@ class ManualControlFrame(ttk.Frame):
     }
 
     def _set_conn_state(self, state: str, detail: str = ""):
+        self._conn_state = state
         label, colour, can_connect, can_disconnect = self._CONN_STATES[state]
         if detail and state not in ("disconnected",):
             label = f"{label}  ({detail})"
@@ -2979,6 +3050,20 @@ class ManualControlFrame(ttk.Frame):
         reports failures in the log instead of raising modal dialogs at the
         user every 60 s. Returns True if the DB write succeeded.
         """
+        # Never let a direct write race the queue feeder: it would overwrite the
+        # in-flight pair's composition (and timestamp) before DiSCO reads it, so the
+        # hardware would measure this composition while the queue still credits the
+        # queued pair. Refuse while the feeder is actively feeding.
+        if self._feeder_busy():
+            msg = ("The composition queue is feeding. Pause 'Auto-send when connected' "
+                   "(or clear the queue) before writing a composition directly, so a "
+                   "manual write can't overwrite a queued pair mid-measurement.")
+            if quiet:
+                self._append_display(f"[{self._ts()}] Update skipped — {msg}\n", tag="error")
+            else:
+                messagebox.showwarning("Queue is feeding", msg)
+            return False
+
         start = self._get_comp(is_start=True)
         end   = self._get_comp(is_start=False)
 
@@ -3064,6 +3149,436 @@ class ManualControlFrame(ttk.Frame):
             var.set(f"{val:.6f}")
         return True
 
+    # ── composition queue ──────────────────────────────────────────────────
+
+    def _build_queue(self, parent):
+        fr = ttk.LabelFrame(
+            parent, text="Composition Queue  (one main+cache pair fed per measurement — same path as ZoMBI)")
+        fr.pack(fill="both", expand=True, padx=6, pady=(2, 3))
+
+        tb = ttk.Frame(fr); tb.pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Button(tb, text="＋ Queue current",
+                   command=self._queue_current).pack(side="left")
+        ttk.Button(tb, text="▲ Up",
+                   command=lambda: self._queue_move(-1)).pack(side="left", padx=(8, 0))
+        ttk.Button(tb, text="▼ Down",
+                   command=lambda: self._queue_move(1)).pack(side="left", padx=(2, 0))
+        ttk.Button(tb, text="🗑 Delete",
+                   command=self._queue_delete).pack(side="left", padx=(8, 0))
+        ttk.Button(tb, text="Clear consumed",
+                   command=self._queue_clear_consumed).pack(side="left", padx=(8, 0))
+        cb = ttk.Checkbutton(tb, text="Auto-send when connected",
+                             variable=self._feeder_active,
+                             command=self._on_feeder_toggle)
+        cb.pack(side="left", padx=(16, 0))
+        ToolTip(cb, "When on and the port is connected, the queue is fed one main+cache "
+                    "pair at a time: each pair is written to compositions.db and the feeder "
+                    "waits for the measurement to come back (the same objective handshake the "
+                    "ZoMBI run uses) before sending the next pair. Turn off to pause without "
+                    "losing the queue.")
+        ttk.Label(tb, textvariable=self._feeder_status_sv, foreground="#555555",
+                  font=("Consolas", 8)).pack(side="right")
+
+        tblf = ttk.Frame(fr); tblf.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        cols = ("pos", "role", "inlet", "outlet", "n", "status")
+        headings = {"pos": "#", "role": "Rail", "inlet": "Inlet (start)",
+                    "outlet": "Outlet (end)", "n": "N", "status": "Status"}
+        widths = {"pos": 34, "role": 52, "inlet": 300, "outlet": 300, "n": 34, "status": 96}
+        anchors = {"pos": "e", "role": "center", "inlet": "w",
+                   "outlet": "w", "n": "e", "status": "w"}
+        self._q_tree = ttk.Treeview(tblf, columns=cols, show="headings", height=8)
+        for c in cols:
+            self._q_tree.heading(c, text=headings[c])
+            self._q_tree.column(c, width=widths[c], minwidth=widths[c], anchor=anchors[c],
+                                 stretch=(c in ("inlet", "outlet")))
+        self._q_tree.tag_configure("pending",  foreground="#666666")
+        self._q_tree.tag_configure("sending",  foreground="#886600", font=("Consolas", 8, "bold"))
+        self._q_tree.tag_configure("consumed", foreground="#007700")
+        vsb = ttk.Scrollbar(tblf, orient="vertical",   command=self._q_tree.yview)
+        hsb = ttk.Scrollbar(tblf, orient="horizontal", command=self._q_tree.xview)
+        self._q_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self._q_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tblf.rowconfigure(0, weight=1)
+        tblf.columnconfigure(0, weight=1)
+        self._queue_refresh()
+
+    # ── queue helpers (main thread) ────────────────────────────────────────
+
+    @staticmethod
+    def _fmt_vec(v) -> str:
+        return "[" + ", ".join(f"{x:.3f}" for x in np.asarray(v, float)) + "]"
+
+    def _queue_current(self):
+        """Append two identical legs (main + cache) for the current inlet/outlet."""
+        start = self._get_comp(is_start=True)
+        end   = self._get_comp(is_start=False)
+        if start is None or end is None:
+            messagebox.showerror("Invalid input",
+                                 "All 10 values in both rows must be valid numbers.")
+            return
+        s_sum, e_sum = start.sum(), end.sum()
+        if s_sum > 0:
+            start = start / s_sum
+        if e_sum > 0:
+            end = end / e_sum
+        try:
+            n = max(2, int(self._n_var.get()))
+        except (ValueError, tk.TclError):
+            n = NUM_EXPERIMENTS
+        with self._queue_lock:
+            self._pair_seq += 1
+            pair = self._pair_seq
+            for role in ("main", "cache"):
+                self._q_id += 1
+                self._queue.append({
+                    "id": self._q_id, "pair": pair, "role": role,
+                    "start": start.copy(), "end": end.copy(), "n": int(n),
+                    "status": "pending",
+                })
+        self._append_display(
+            f"[{self._ts()}] Queued pair #{pair} (main+cache), N={n}.\n", tag="header")
+        self._queue_refresh()
+        self._feeder_ensure_running()
+
+    def _queue_refresh(self):
+        tree = getattr(self, "_q_tree", None)
+        if tree is None:
+            return
+        try:
+            sel = [iid for iid in tree.selection() if tree.exists(iid)]
+            tree.delete(*tree.get_children())
+            with self._queue_lock:
+                snapshot = list(self._queue)
+            pos = 0
+            for e in snapshot:
+                st = e["status"]
+                if st == "consumed":
+                    posdisp, status = "—", "✓ consumed"
+                elif st == "sending":
+                    pos += 1
+                    posdisp, status = str(pos), "● sending"
+                else:
+                    pos += 1
+                    posdisp, status = str(pos), "pending"
+                tree.insert("", "end", iid=str(e["id"]), tags=(st,),
+                            values=(posdisp, e["role"],
+                                    self._fmt_vec(e["start"]), self._fmt_vec(e["end"]),
+                                    e["n"], status))
+            for iid in sel:
+                if tree.exists(iid):
+                    tree.selection_add(iid)
+        except tk.TclError:
+            pass
+
+    def _queue_move(self, delta: int):
+        tree = getattr(self, "_q_tree", None)
+        if tree is None:
+            return
+        sel = tree.selection()
+        if not sel:
+            return
+        with self._queue_lock:
+            idx = {str(e["id"]): i for i, e in enumerate(self._queue)}
+            i = idx.get(sel[0])
+            if i is None:
+                return
+            j = i + delta
+            if j < 0 or j >= len(self._queue):
+                return
+            # only reorder among not-yet-sent items so an in-flight/consumed pair
+            # can never be shuffled under the feeder
+            if self._queue[i]["status"] != "pending" or self._queue[j]["status"] != "pending":
+                return
+            self._queue[i], self._queue[j] = self._queue[j], self._queue[i]
+        self._queue_refresh()
+        if tree.exists(sel[0]):
+            tree.selection_set(sel[0])
+
+    def _queue_delete(self):
+        tree = getattr(self, "_q_tree", None)
+        if tree is None:
+            return
+        sel = set(tree.selection())
+        if not sel:
+            return
+        removed = 0
+        with self._queue_lock:
+            keep = []
+            for e in self._queue:
+                if str(e["id"]) in sel and e["status"] == "pending":
+                    removed += 1
+                    continue
+                keep.append(e)
+            self._queue = keep
+        if removed:
+            self._append_display(
+                f"[{self._ts()}] Removed {removed} pending queue item(s).\n", tag="serial")
+        self._queue_refresh()
+
+    def _queue_clear_consumed(self):
+        with self._queue_lock:
+            self._queue = [e for e in self._queue if e["status"] != "consumed"]
+        self._queue_refresh()
+
+    # ── feeder (background thread) ─────────────────────────────────────────
+
+    def _is_connected(self) -> bool:
+        return self._conn_state == "connected"
+
+    def _feeder_busy(self) -> bool:
+        """True while the feeder thread is alive, auto-send is on, and there is work
+        in flight or pending — i.e. a direct write to compositions.db would race the
+        queue and make the hardware measure a composition the queue didn't send."""
+        t = self._feeder_thread
+        if t is None or not t.is_alive() or not self._feeder_active_flag:
+            return False
+        with self._queue_lock:
+            return any(e["status"] in ("sending", "pending") for e in self._queue)
+
+    def _objective_db_path(self) -> str:
+        comp_db = self._compdb_var.get().strip()
+        try:
+            return str(Path(comp_db).parent / "objective.db")
+        except Exception:
+            return str(Path(__file__).resolve().parent.parent / "sql" / "objective.db")
+
+    def _ui(self, fn):
+        try:
+            self.after(0, fn)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _q_log(self, msg: str, tag: str = "serial"):
+        self._ui(lambda: self._append_display(f"[{self._ts()}] {msg}\n", tag))
+
+    def _set_feeder_status(self, text: str):
+        self._ui(lambda: self._feeder_status_sv.set(text))
+
+    def _on_feeder_toggle(self):
+        """Checkbutton handler (main thread): mirror the Tk var to a plain flag the
+        feeder thread can read, then (re)start the feeder if needed."""
+        self._feeder_active_flag = bool(self._feeder_active.get())
+        self._feeder_ensure_running()
+
+    def _feeder_ensure_running(self):
+        """Start the feeder thread if we are connected and it is not already alive.
+        Runs on the main thread, so it snapshots the Tk-var paths for the thread."""
+        old = self._feeder_thread
+        if old is not None and old.is_alive():
+            # If a stop was requested, a prior-generation thread is winding down; it
+            # must fully exit before we start a fresh one, otherwise the _feeder_stop
+            # we clear below gets re-observed as set by the old thread and the shared
+            # Event leaves the new session with no running feeder. Join it briefly.
+            if not self._feeder_stop.is_set():
+                return                      # healthy running feeder — leave it
+            old.join(timeout=1.0)
+            if old.is_alive():
+                return                      # still stuck; a later enqueue/toggle retries
+        if not self._is_connected():
+            return
+        self._feeder_active_flag = bool(self._feeder_active.get())
+        self._feeder_comp_db = self._compdb_var.get().strip()
+        self._feeder_obj_db = self._objective_db_path()
+        self._feeder_stop.clear()
+        self._feeder_thread = threading.Thread(target=self._feeder_loop, daemon=True)
+        self._feeder_thread.start()
+
+    def _feeder_mark(self, entries, status: str):
+        with self._queue_lock:
+            for e in entries:
+                e["status"] = status
+        self._ui(self._queue_refresh)
+
+    def _feeder_begin_pair(self):
+        """Atomically claim the first two pending legs and mark them 'sending' so a
+        concurrent Delete/reorder cannot touch them. Returns (main, cache) or None."""
+        with self._queue_lock:
+            pend = [e for e in self._queue if e["status"] == "pending"]
+            if not pend:
+                return None
+            if len(pend) == 1:
+                pend[0]["status"] = "sending"     # odd leftover after an edit: mirror it
+                return (pend[0], pend[0])
+            pend[0]["status"] = "sending"
+            pend[1]["status"] = "sending"
+            return (pend[0], pend[1])
+
+    def _feeder_loop(self):
+        """Emulates run_zombi_main.objective(): write the front (main, cache) pair,
+        then block on the objective handshake before advancing."""
+        obj_db = self._feeder_obj_db
+        # Clear any stale handshake/objective so the first wait blocks on a FRESH result.
+        try:
+            from scripts.communication import clear_in_flight_objective_state
+            clear_in_flight_objective_state(obj_db)
+        except Exception as exc:
+            self._q_log(f"feeder: could not clear objective state: {exc!r}", "error")
+
+        while not self._feeder_stop.is_set():
+            if not self._is_connected():
+                self._set_feeder_status("disconnected")
+                break
+            if not self._feeder_active_flag:
+                self._set_feeder_status("paused")
+                if self._feeder_stop.wait(0.5):
+                    break
+                continue
+            pair = self._feeder_begin_pair()
+            if pair is None:
+                self._set_feeder_status("idle (queue empty)")
+                if self._feeder_stop.wait(0.5):
+                    break
+                continue
+
+            main_e, cache_e = pair
+            legs = [main_e] if main_e is cache_e else [main_e, cache_e]
+            self._ui(self._queue_refresh)            # reflect the 'sending' state
+            self._set_feeder_status(f"sending pair #{main_e['pair']} …")
+
+            if not self._write_pair(main_e, cache_e):
+                self._q_log("feeder: write to compositions.db failed — pausing.", "error")
+                self._feeder_mark(legs, "pending")
+                self._feeder_active_flag = False
+                self._ui(lambda: self._feeder_active.set(False))
+                self._set_feeder_status("write error — paused")
+                continue
+
+            self._set_feeder_status(
+                f"pair #{main_e['pair']} sent — waiting for BOTH rails …")
+            if not self._await_both_rails(obj_db, main_e["pair"]):
+                # stopped / paused / disconnected before BOTH rails were confirmed:
+                # revert the WHOLE pair to pending so main+cache stay paired and are
+                # re-sent as a unit on resume (never advance on a partial confirmation).
+                self._feeder_mark(legs, "pending")
+                continue
+
+            self._feeder_mark(legs, "consumed")
+            self._q_log(
+                f"pair #{main_e['pair']} fully consumed (both rails measured by DiSCO).",
+                "header")
+
+        # On exit, un-stick any leg left mid-flight so it can be retried later.
+        with self._queue_lock:
+            for e in self._queue:
+                if e["status"] == "sending":
+                    e["status"] = "pending"
+        self._ui(self._queue_refresh)
+        self._set_feeder_status("stopped")
+
+    @staticmethod
+    def _interp_line(start, end, n: int):
+        """Build (start_norm, end_norm, array) exactly as _do_update / objective() do."""
+        start = np.asarray(start, float)
+        end   = np.asarray(end, float)
+        s_sum, e_sum = start.sum(), end.sum()
+        if s_sum > 0:
+            start = start / s_sum
+        if e_sum > 0:
+            end = end / e_sum
+        array = np.linspace(start, end, max(2, int(n)))
+        row_sums = array.sum(axis=1, keepdims=True)
+        array = array / np.where(row_sums == 0, 1.0, row_sums)
+        return start, end, array
+
+    def _write_pair(self, main_e, cache_e) -> bool:
+        try:
+            m_s, m_e, m_arr = self._interp_line(main_e["start"], main_e["end"], main_e["n"])
+            c_s, c_e, c_arr = self._interp_line(cache_e["start"], cache_e["end"], cache_e["n"])
+        except Exception as exc:
+            self._q_log(f"feeder: bad composition ({exc}).", "error")
+            return False
+        comp_db = self._feeder_comp_db
+        try:
+            os.makedirs(Path(comp_db).parent, exist_ok=True)
+            from scripts.communication import write_compositions
+            write_compositions(
+                start=m_s, end=m_e, array=m_arr,
+                timestamp=time.time(),
+                start_cache=c_s, end_cache=c_e, array_cache=c_arr,
+                db_path=comp_db,
+            )
+            return True
+        except Exception as exc:
+            self._q_log(f"feeder: write_compositions failed: {exc!r}", "error")
+            return False
+
+    def _drain_handshake(self, obj_db: str):
+        """Lower any handshake that is ALREADY raised. Called once right after writing
+        a pair: DiSCO cannot have measured it yet, so a raised flag here is stale (e.g.
+        a re-sending DiSCO ingested by a freshly launched serial process whose ts-dedup
+        was reset). Lowering it means we accept only a handshake raised AFTER this write.
+        DiSCO's ~1 Hz re-send of the same objective ts won't re-raise (dedup by ts), so
+        this cannot drop a genuine result."""
+        import sqlite3
+        try:
+            c = sqlite3.connect(obj_db, timeout=10.0)
+            cur = c.cursor()
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS handshake (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    new_objective_available INTEGER DEFAULT 0
+                )""")
+            cur.execute("INSERT OR IGNORE INTO handshake (id, new_objective_available) VALUES (1, 0)")
+            cur.execute("UPDATE handshake SET new_objective_available = 0 WHERE id = 1")
+            c.commit(); c.close()
+        except Exception:
+            pass
+
+    def _wait_one_handshake(self, obj_db: str) -> bool:
+        """Block until the objective handshake is raised, then lower it — one rail's
+        confirmation (the same edge get_y_measurements consumes). Returns False if the
+        feeder is stopped, paused, or the port disconnects while waiting."""
+        import sqlite3
+        while not self._feeder_stop.is_set():
+            if not self._is_connected() or not self._feeder_active_flag:
+                return False
+            try:
+                conn = sqlite3.connect(obj_db, timeout=10.0)
+                cur = conn.cursor()
+                cur.execute(
+                    """CREATE TABLE IF NOT EXISTS handshake (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        new_objective_available INTEGER DEFAULT 0
+                    )""")
+                cur.execute("INSERT OR IGNORE INTO handshake (id, new_objective_available) VALUES (1, 0)")
+                cur.execute("SELECT new_objective_available FROM handshake WHERE id = 1")
+                row = cur.fetchone()
+                if row and row[0] == 1:
+                    cur.execute("UPDATE handshake SET new_objective_available = 0 WHERE id = 1")
+                    conn.commit()
+                    conn.close()
+                    return True
+                conn.close()
+            except Exception:
+                pass
+            if self._feeder_stop.wait(0.5):
+                return False
+        return False
+
+    def _await_both_rails(self, obj_db: str, pair_id) -> bool:
+        """Wait until DiSCO has confirmed BOTH rails of the current packet before the
+        feeder may advance. DiSCO reads `main` with one transporter and `cache` with the
+        other at different times, returning a separate objective (a fresh handshake) per
+        rail (verified against the DiSCO measurement pipeline). If the feeder advanced on
+        the first, the next write would bump compositions.db's timestamp and DiSCO's
+        composition_receiver would DELETE+reinsert the still-unread cache, dropping that
+        rail — the "sent once instead of twice" bug. So we require RAILS_PER_PAIR (2)
+        confirmations. Returns True only after both; False if interrupted."""
+        try:
+            from scripts.communication import reset_objective
+            reset_objective(obj_db)                # clear stale rows (as objective() does)
+        except Exception:
+            pass
+        self._drain_handshake(obj_db)              # discard any stale raise (once)
+        for rail in range(self.RAILS_PER_PAIR):
+            if not self._wait_one_handshake(obj_db):
+                return False
+            self._set_feeder_status(
+                f"pair #{pair_id}: {rail + 1}/{self.RAILS_PER_PAIR} rails consumed by DiSCO …")
+        return True
+
     # ── randomize timer ────────────────────────────────────────────────────
 
     def _toggle_randomize(self):
@@ -3119,6 +3634,7 @@ class ManualControlFrame(ttk.Frame):
     def _on_destroy(self, event=None):
         if event is not None and event.widget is not self:
             return
+        self._feeder_stop.set()
         self._cancel_randomize()
 
     # ── display helpers ────────────────────────────────────────────────────
@@ -4244,6 +4760,245 @@ class HardwareResumeDialog(tk.Toplevel):
             hparams_path = self._hparams_var.get().strip() or None,
         )
         self.destroy()
+
+
+class UploadCorrectionDialog(tk.Toplevel):
+    """Upload a corrected results DB and re-ingest it into a run.
+
+    Runs ``scripts/apply_correction.py`` as a subprocess (streaming its output
+    into the panel below). *Preview* is a dry run — it reports how many objective
+    scores changed and where each needle would move, writing nothing. *Apply*
+    creates a corrected COPY of the run (new UUID) with the corrected scores
+    baked into its snapshots and needles re-derived, leaving the original
+    untouched; the new run is then loaded so the plots refresh, and it can be
+    resumed like any other run.
+    """
+
+    def __init__(self, parent, app: "ZoMBIApp", run_info: dict):
+        super().__init__(parent)
+        self._app = app
+        self._run_info = run_info
+        self._run_id = run_info["run_id"]
+        self._uuid = self._run_id.removeprefix("run_")
+        self._proc: Optional[subprocess.Popen] = None
+        self._new_uuid: Optional[str] = None
+        self.title(f"Upload Corrected Data — {self._run_id}")
+        self.resizable(True, True)
+        self.geometry("720x520")
+        self._build()
+        self.grab_set()
+
+    def _build(self):
+        run_dir = Path(self._run_info["run_dir"])
+        dims = "?"
+        for fname in ("hw_config.json", "config.json"):
+            p = run_dir / fname
+            if p.exists():
+                try:
+                    v = json.loads(p.read_text()).get("dims")
+                    if v:
+                        dims = v if isinstance(v, str) else ",".join(str(x) for x in v)
+                        break
+                except Exception:
+                    pass
+
+        pad = {"padx": 8, "pady": 4}
+        f = ttk.Frame(self, padding=10)
+        f.pack(fill="both", expand=True)
+        f.columnconfigure(1, weight=1)
+
+        row = 0
+        ttk.Label(f, text="Run to correct:").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Label(f, text=f"{self._run_id}   (dims {dims})", foreground="#007700",
+                  font=("Consolas", 9, "bold")).grid(row=row, column=1, columnspan=2,
+                                                     sticky="w", **pad)
+
+        row += 1
+        ttk.Label(f, text="Corrected results DB:").grid(row=row, column=0, sticky="w", **pad)
+        self._db_var = tk.StringVar(value="")
+        ttk.Entry(f, textvariable=self._db_var).grid(row=row, column=1, sticky="ew", **pad)
+        ttk.Button(f, text="…", width=3, command=self._browse_db).grid(
+            row=row, column=2, sticky="w", padx=(0, 8))
+
+        row += 1
+        ttk.Label(f, text="New run UUID:").grid(row=row, column=0, sticky="w", **pad)
+        self._newuuid_var = tk.StringVar(value="")
+        ttk.Entry(f, textvariable=self._newuuid_var, width=16).grid(
+            row=row, column=1, sticky="w", **pad)
+        ttk.Label(f, text="(blank = auto-generate)", foreground="gray").grid(
+            row=row, column=1, sticky="e", **pad)
+
+        row += 1
+        ttk.Label(f, text="Device:").grid(row=row, column=0, sticky="w", **pad)
+        self._device_var = tk.StringVar(value="cpu")
+        ttk.Combobox(f, textvariable=self._device_var, values=["cpu", "cuda"],
+                     width=8, state="readonly").grid(row=row, column=1, sticky="w", **pad)
+
+        row += 1
+        ttk.Label(f, text="Compositions are matched to the corrected DB; only the "
+                          "objective scores change.\nActivations and sample order stay "
+                          "the same. Apply writes a corrected COPY;\nthe original run is "
+                          "never modified.", foreground="gray",
+                  justify="left").grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
+
+        row += 1
+        bf = ttk.Frame(f)
+        bf.grid(row=row, column=0, columnspan=3, sticky="w", pady=6)
+        self._preview_btn = ttk.Button(bf, text="Preview (Dry Run)", command=self._preview)
+        self._preview_btn.pack(side="left", padx=4)
+        self._apply_btn = ttk.Button(bf, text="Apply & Create Corrected Copy",
+                                     command=self._apply)
+        self._apply_btn.pack(side="left", padx=4)
+        self._close_btn = ttk.Button(bf, text="Close", command=self._on_close)
+        self._close_btn.pack(side="left", padx=4)
+
+        row += 1
+        f.rowconfigure(row, weight=1)
+        of = ttk.Frame(f)
+        of.grid(row=row, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
+        sb = ttk.Scrollbar(of, orient="vertical")
+        sb.pack(side="right", fill="y")
+        self._out = tk.Text(of, wrap="word", font=("Consolas", 8), height=14,
+                            state="disabled", yscrollcommand=sb.set)
+        self._out.pack(side="left", fill="both", expand=True)
+        sb.config(command=self._out.yview)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ── helpers ────────────────────────────────────────────────────────────
+    def _browse_db(self):
+        p = filedialog.askopenfilename(
+            title="Select corrected results database",
+            filetypes=[("SQLite DB", "*.db"), ("All", "*")])
+        if p:
+            self._db_var.set(p)
+
+    def _append(self, text: str):
+        self._out.config(state="normal")
+        self._out.insert("end", text)
+        self._out.see("end")
+        self._out.config(state="disabled")
+
+    def _set_running(self, running: bool):
+        state = "disabled" if running else "normal"
+        self._preview_btn.config(state=state)
+        self._apply_btn.config(state=state)
+
+    def _on_close(self):
+        if self._proc is not None and self._proc.poll() is None:
+            if not messagebox.askyesno(
+                    "Correction running",
+                    "A correction is still running. Close anyway?\n\n(The background "
+                    "process will be terminated.)", parent=self):
+                return
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+        self.destroy()
+
+    # ── run apply_correction.py ──────────────────────────────────────────────
+    def _validate_db(self) -> Optional[str]:
+        db = self._db_var.get().strip()
+        if not db:
+            messagebox.showinfo("Select database",
+                                "Choose the corrected results .db first.", parent=self)
+            return None
+        if not Path(db).exists():
+            messagebox.showerror("Not found", f"Database not found:\n{db}", parent=self)
+            return None
+        return db
+
+    def _preview(self):
+        db = self._validate_db()
+        if db is None:
+            return
+        self._launch(db, dry_run=True)
+
+    def _apply(self):
+        db = self._validate_db()
+        if db is None:
+            return
+        if not messagebox.askyesno(
+                "Apply correction",
+                f"Create a corrected copy of {self._run_id} from:\n\n{Path(db).name}\n\n"
+                "The corrected scores will be baked in and needles re-derived. The "
+                "original run is left untouched. Continue?", parent=self):
+            return
+        self._launch(db, dry_run=False)
+
+    def _launch(self, db: str, dry_run: bool):
+        proj = Path(__file__).resolve().parent.parent
+        script = proj / "scripts" / "apply_correction.py"
+        cmd = [sys.executable, str(script),
+               "--uuid", self._uuid,
+               "--corrected-db", db,
+               "--checkpoint-dir", self._app.ckpt_dir,
+               "--device", self._device_var.get()]
+        newu = self._newuuid_var.get().strip()
+        if newu and not dry_run:
+            cmd += ["--new-uuid", newu]
+        if dry_run:
+            cmd += ["--dry-run"]
+
+        self._new_uuid = None
+        self._set_running(True)
+        self._append(("── PREVIEW (dry run) ──\n" if dry_run else "── APPLY ──\n")
+                     + " ".join(cmd) + "\n\n")
+
+        def _worker():
+            captured: list[str] = []
+            try:
+                env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+                self._proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace", bufsize=1,
+                    cwd=str(proj), env=env)
+                for line in self._proc.stdout:
+                    captured.append(line)
+                    self.after(0, self._append, line)
+                self._proc.wait()
+                rc = self._proc.returncode
+            except Exception as exc:  # pragma: no cover - defensive
+                self.after(0, self._append, f"\n[error] {exc}\n")
+                rc = -1
+            self.after(0, self._on_done, dry_run, rc, "".join(captured))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_done(self, dry_run: bool, rc: int, output: str):
+        self._set_running(False)
+        self._proc = None
+        if rc != 0:
+            self._append(f"\n[correction failed — exit code {rc}]\n")
+            self.set_status_safe(f"Correction failed (exit {rc}).")
+            return
+        if dry_run:
+            self._append("\n[preview complete — nothing was changed]\n")
+            return
+        # Parse the new UUID from the apply output.
+        new_uuid = None
+        for line in output.splitlines():
+            if line.startswith("NEW_RUN_UUID:"):
+                new_uuid = line.split(":", 1)[1].strip()
+        if not new_uuid:
+            self._append("\n[apply finished but no new run UUID was reported]\n")
+            return
+        self._new_uuid = new_uuid
+        new_dir = Path(self._app.ckpt_dir) / f"run_{new_uuid}"
+        self._append(f"\n[done — corrected run created: run_{new_uuid}]\n")
+        try:
+            self._app.run_browser.refresh()
+            self._app.load_run(new_dir)
+        except Exception as exc:
+            self._append(f"[loaded with issues: {exc}]\n")
+        self.set_status_safe(f"Corrected run_{new_uuid} created and loaded.")
+
+    def set_status_safe(self, msg: str):
+        try:
+            self._app.set_status(msg)
+        except Exception:
+            pass
 
 
 # ── main application window ───────────────────────────────────────────────────

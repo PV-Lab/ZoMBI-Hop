@@ -110,6 +110,7 @@ from uuid import uuid4
 
 import numpy as np
 import plotly.graph_objects as go
+from plotly.colors import sample_colorscale
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))  # repo root, so synthetic_data is importable
@@ -184,6 +185,13 @@ WIRE_AZIMUTH_STEP = 5.0
 # each mode.
 PENALTY_MODES = {"pen-solid": "solid", "pen-grey": "grey"}
 PENALTY_COLORS = {"solid": "red", "grey": "rgb(190, 190, 190)"}
+# Interaction modes that *freeze* the view: the camera is pinned and zoom is
+# disabled so a click lands exactly where the surface is drawn.  Penalization is
+# deliberately NOT here — it toggles a volume on an existing optimum (resolved
+# back to its owner even through the column wall, see :func:`_cylinder_owner`),
+# so it can stay fully navigable and show the solid, live-opacity cylinder while
+# you orbit and zoom around it.
+LOCKED_MODES = ("optima", "line")
 # Draw order, outermost first.  Two columns pinned on the same optimum would be
 # built to exactly the same wall, caps and rings, and coincident translucent
 # surfaces tear into stripes as the depth test picks a winner pixel by pixel.
@@ -196,14 +204,49 @@ PENALTY_COLORS = {"solid": "red", "grey": "rgb(190, 190, 190)"}
 PENALTY_STACK = ("solid", "grey")
 PENALTY_NEST = 4e-3
 PENALTY_NEST_LIFT = 0.35
-# Percentile the *bottom* of the colour scale lifts to when the clamp option is
-# on.  There is no matching top: the scale always runs up to the data's own
-# maximum, so the tallest optimum reads as the top colour.
-COLOR_PERCENTILE_LO = 10.0
 # Where the camera sits until the user has rotated the height map themselves.
 DESIGN_CAMERA = {"eye": {"x": 1.25, "y": 1.25, "z": 1.0},
                  "center": {"x": 0.0, "y": 0.0, "z": 0.0},
                  "up": {"x": 0.0, "y": 0.0, "z": 1.0}}
+# Client-side PNG export via the plot's camera button.  A PNG carries no
+# intrinsic DPI, so a "300 dpi" figure is bought with pixel count: the figure is
+# laid out at roughly SCREEN_DPI on screen, so rendering every dimension scaled
+# by EXPORT_DPI / SCREEN_DPI hands the browser a raster dense enough to print at
+# 300 dpi at the same physical size (950x850 -> ~2969x2656 px).
+EXPORT_DPI = 300.0
+SCREEN_DPI = 96.0
+EXPORT_SCALE = EXPORT_DPI / SCREEN_DPI
+
+
+def _colorscale_stops(name, reverse=False, n=32):
+    """A named plotly colour scale as an explicit ``[[frac, rgb], ...]`` list.
+
+    Sampled to explicit stops (rather than passed by name) so the same list
+    feeds :class:`plotly.graph_objects.Surface`, the printed-line markers *and*
+    the sub-threshold blackout in :func:`_threshold_colorscale` without any of
+    them having to re-resolve the name — and so a diverging scale can be handed
+    back *reversed*, which the bare name cannot express.
+    """
+    fr = np.linspace(0.0, 1.0, int(n))
+    cols = sample_colorscale(name, [float(f) for f in fr])
+    if reverse:
+        cols = cols[::-1]
+    return [[float(f), c] for f, c in zip(fr, cols)]
+
+
+# Colour scales offered in the UI.  "Loss (teal–brown)" is the diverging BrBG
+# ramp reversed so it reads like the reference loss landscape — deep teal at the
+# low (good) end, white through the middle, brown at the high (bad) end; Viridis
+# is the original yellow-high / blue-low objective ramp.  Each value is an
+# explicit stop list (see :func:`_colorscale_stops`).
+COLORSCALES = {
+    "Viridis": _colorscale_stops("Viridis"),
+    "Loss (teal–brown)": _colorscale_stops("BrBG", reverse=True),
+    "Terrain (Earth)": _colorscale_stops("Earth"),
+    "Blue–white–red": _colorscale_stops("RdBu", reverse=True),
+    "Cividis": _colorscale_stops("Cividis"),
+}
+DEFAULT_COLORSCALE = "Viridis"
 
 
 # ── Design-studio objective ──────────────────────────────────────────────────
@@ -212,14 +255,17 @@ class DesignEnsemble(CartesianEnsemble):
     """The unit-square objective with per-optimum peak heights.
 
     :class:`~synthetic_data.ensemble.Ensemble` puts every basin at the same raw
-    peak, ``_PEAK``, one span above the neutral level; the background's upward
-    excursions are capped a margin below it and the whole raw range is then
-    normalized by its own largest magnitude.  Here each basin instead peaks at
-    ``gain * height_i * _PEAK`` with the cap left where it was, so raising
-    ``gain`` lifts the optima *away* from the roughness underneath them — the
-    normalization divides by the taller peak, which squashes the Perlin noise
-    toward the middle of the colour scale — and ``height_i`` sets how tall each
-    individual optimum stands within that.
+    peak, ``_PEAK``, one span above the neutral level, and normalizes the whole
+    raw range by its own largest magnitude.  Here each basin instead peaks at
+    ``gain * height_i * _PEAK``, so raising ``gain`` lifts the optima higher —
+    the normalization divides by the taller peak, which squashes the Perlin
+    noise toward the middle of the colour scale — and ``height_i`` sets how tall
+    each individual optimum stands within that.
+
+    The roughness is *added* onto the optima rather than max-combined beside
+    them (see :meth:`_predict_raw`), so a placed hill carries the same Perlin
+    texture as the flats around it and blends into the landscape instead of
+    reading as a glassy smooth dome sitting on top of it.
 
     ``heights`` lines up with the *pinned* optima, which the base class prepends
     to the sampled ones, so it indexes the design studio's placed points in
@@ -257,6 +303,23 @@ class DesignEnsemble(CartesianEnsemble):
              for c, h in zip(self.peak_centers, heights)],
             axis=0,
         ).max(axis=0)
+
+    def _predict_raw(self, X: np.ndarray) -> np.ndarray:
+        """Roughness laid *over* the optima, not max-combined beside them.
+
+        The base class combines the smooth optima field with the background by
+        ``max(true, min(background, cap))``: a placed optimum's summit rises
+        above the roughness, so ``max`` keeps the smooth hill there and the
+        Perlin texture never reaches it — the optimum reads as a glassy dome on
+        an otherwise rugged landscape, which is the "why is my optimum smooth?"
+        the design studio kept hitting.  In this studio every other distractor
+        is off (see :data:`ENSEMBLE`), so the background is pure roughness;
+        *adding* it to the optima field lays that same roughness over the hills
+        and the flats alike, so a placed optimum blends into the terrain around
+        it.  The peak still towers by ``gain * height * _PEAK``, so it stays the
+        tallest point and reads as an optimum — it just wears the texture now.
+        """
+        return self._true_field(X) + self._background_field(X)
 
 
 # ── Slider helper ────────────────────────────────────────────────────────────
@@ -329,18 +392,89 @@ def build_app():
                            "(× the Optima Height above)"),
                 html.Div(id="optima-height-list"),
             ], style={"padding": "8px"}),
+            # ── Landscape (HD roughness) ──────────────────────────────────────
+            # The fixed background is Perlin roughness; turning the mesh finer
+            # and the noise deeper / more octaved is what gives the sharp,
+            # fractal, HD look of a real loss landscape.
+            html.Div(html.Label("Landscape (HD roughness)",
+                                style={"fontWeight": "bold"}),
+                     style={"padding": "12px 8px 0"}),
+            _slider("Mesh Resolution (higher = sharper / HD, slower)",
+                    "grid-n", 80, 400, 20, GRID_N, 80, lambda v: f"{v:.0f}"),
+            _slider("Roughness Amplitude (height of the noise)", "noise-amp",
+                    0, 2000, 50, ENSEMBLE["noise_amp"], 500,
+                    lambda v: f"{v:.0f}"),
+            _slider("Roughness Detail (noise octaves — fractal sharpness)",
+                    "noise-octaves", 1, 6, 1, ENSEMBLE["noise_octaves"], 1,
+                    lambda v: f"{v:.0f}"),
+            _slider("Feature Scale (noise frequency — finer = busier)",
+                    "noise-freq", 0, 40, 1, ENSEMBLE["noise_freq"], 8,
+                    lambda v: f"{v:.0f}"),
+            # ── Colour scale ──────────────────────────────────────────────────
+            html.Div([
+                html.Label("Colour Scale"),
+                dcc.Dropdown(id="colorscale",
+                             options=[{"label": k, "value": k}
+                                      for k in COLORSCALES],
+                             value=DEFAULT_COLORSCALE, clearable=False),
+            ], style={"padding": "8px"}),
+            # The two cut-offs are dialled in by hand instead of a fixed
+            # percentile: the floor and the ceiling of the colour range are each
+            # a percentile of the objective's own distribution, so exactly which
+            # span the colours spend themselves on is set with these sliders.
+            _slider("Colour Scale Floor (percentile of objective)",
+                    "color-lo-pct", 0, 50, 1, 0, 10, lambda v: f"{v:.0f}"),
+            _slider("Colour Scale Ceiling (percentile of objective)",
+                    "color-hi-pct", 50, 100, 1, 100, 10, lambda v: f"{v:.0f}"),
+            # ── Surface look ──────────────────────────────────────────────────
+            # Directional shading (relief) so peaks read from the side instead
+            # of blending into the colour ramp, plus an optional black contour
+            # grid draped over the surface to outline the terrain.
+            html.Div(html.Label("Surface look", style={"fontWeight": "bold"}),
+                     style={"padding": "12px 8px 0"}),
+            _slider("Surface Shading (relief — makes peaks pop laterally)",
+                    "surface-shading", 0.0, 1.0, 0.05, 0.6, 0.25,
+                    lambda v: f"{v:.2f}"),
+            html.Div(dcc.Checklist(
+                id="surface-toggles",
+                options=[{"label": "  Black edges on the landscape "
+                                   "(contour grid draped on the surface)",
+                          "value": "edges"}],
+                value=[], labelStyle={"display": "block"},
+                style={"paddingTop": "4px"}),
+                style={"padding": "8px"}),
+            _slider("Black Edge Spacing (smaller = denser grid)",
+                    "edge-spacing", 0.02, 0.25, 0.01, 0.05, 0.05,
+                    lambda v: f"{v:.2f}"),
             html.Div(dcc.Checklist(
                 id="design-toggles",
-                options=[{"label": "  Colour scale floored at the 10th "
-                                   "percentile (unchecked: the data's own "
-                                   "minimum; the top is the data's own maximum "
-                                   "either way)", "value": "pct"},
-                         {"label": "  Wireframe edges on penalization cylinders, "
+                options=[{"label": "  Wireframe edges on penalization cylinders, "
                                    "plus a contour where they cut the landscape",
                           "value": "cage"}],
                 value=["cage"], labelStyle={"display": "block"},
                 style={"paddingTop": "4px"}),
                 style={"padding": "8px"}),
+            # ── Saved-figure appearance ───────────────────────────────────────
+            # These ride on the *live* figure, so what is on screen is what the
+            # camera button saves.  A transparent background drops the figure
+            # onto a slide or poster cleanly; hiding the grid strips the axes,
+            # zero lines and the shaded background planes (the floor included)
+            # for a clean floating height map.
+            html.Div([
+                html.Label("Saved figure (camera icon on the plot toolbar)",
+                           style={"fontWeight": "bold"}),
+                dcc.Checklist(
+                    id="export-toggles",
+                    options=[{"label": "  Transparent background",
+                              "value": "transparent"},
+                             {"label": "  Hide grid, axes & background planes",
+                              "value": "nogrid"}],
+                    value=["transparent"], labelStyle={"display": "block"},
+                    style={"paddingTop": "4px"}),
+                html.Div("Saved as a 300 dpi PNG.",
+                         style={"fontSize": "12px", "color": "#555",
+                                "paddingTop": "2px"}),
+            ], style={"padding": "12px 8px 4px"}),
             _slider("Penalization Wireframe Thickness", "pen-wire-width",
                     0.5, 12.0, 0.5, 3.0, 2.5, lambda v: f"{v:.1f}"),
             # A radius and an opacity per colour: the two columns are
@@ -413,9 +547,12 @@ def build_app():
         prevent_initial_call=True,
     )
     def remember_camera(relayout, action, azimuth):
-        # Only while rotating: this is the orientation a placing mode then locks
-        # to, so a stray drag made *during* placing must not move the goalposts.
-        if action != "rotate":
+        # Tracked whenever the view is free to move — rotate *and* the
+        # penalization modes, which now orbit freely too — so the orientation a
+        # locked placing mode (optima / line) later pins to is always the latest
+        # one the user left.  A stray drag during a locked mode must not move the
+        # goalposts, so those are skipped.
+        if action in LOCKED_MODES:
             return no_update, no_update
         camera = (relayout or {}).get("scene.camera")
         if not camera:
@@ -438,9 +575,26 @@ def build_app():
     )
     def toggle_mode_controls(action):
         show, hide = {}, {"display": "none"}
-        # Placing freezes the view, so zoom goes with rotation.
-        cfg = {} if action == "rotate" else {"scrollZoom": False,
-                                             "doubleClick": False}
+        # The camera button downloads the figure as a 300 dpi PNG: no intrinsic
+        # DPI on a PNG, so the density is bought by rendering every dimension
+        # scaled up (see EXPORT_SCALE).  Transparency and grid come from the
+        # figure itself (paper_bgcolor / the axes), not from here.
+        cfg = {
+            "toImageButtonOptions": {
+                "format": "png",
+                "filename": "figure_maker",
+                "width": FIG_W,
+                "height": FIG_H,
+                "scale": EXPORT_SCALE,
+            },
+            "displaylogo": False,
+        }
+        # Only the locked placing modes (optima / line) freeze the view; rotate
+        # and the penalization modes keep scroll-zoom and double-click reset so
+        # you can pan, orbit and zoom around the columns while you place them.
+        if action in LOCKED_MODES:
+            cfg["scrollZoom"] = False
+            cfg["doubleClick"] = False
         # The per-colour radius and opacity sliders belong to the two
         # penalization modes; everything else here is on screen always.
         return (cfg, *((show if action in PENALTY_MODES else hide,) * 4))
@@ -465,17 +619,15 @@ def build_app():
             shape = (f"a single solid translucent {colour} cylinder spanning "
                      f"the height of the plot, at the {colour} radius and tint "
                      f"you set with the sliders below")
-            return (f"The view is locked to the orientation you left it in.  "
-                    f"Click the peak of a placed optimum to wrap it in {shape}."
-                    f"  Clicking it "
+            return (f"Drag to orbit, scroll to zoom, right-drag to pan — the "
+                    f"view stays free here.  Click the peak of a placed optimum "
+                    f"to wrap it in {shape}, shown solid so the opacity slider "
+                    f"updates it live.  Clicking it "
                     f"again in this mode clears it; the other penalization "
                     f"mode is independent, so an optimum can carry both "
-                    f"colours at once.  Anywhere on an existing "
+                    f"colours at once.  A click anywhere on an existing "
                     f"column counts as its own optimum, so a column can be "
-                    f"clicked back off without hunting for the summit inside it."
-                    f"  Columns show as wireframe cages while you are placing, "
-                    f"so you can click straight through them to the landscape "
-                    f"behind; they go solid again in Rotate / inspect.")
+                    f"clicked back off without hunting for the summit inside it.")
         return ("Drag to orbit the height map, scroll to zoom.  Switch to a "
                 "placing mode to lock the view and click features in.")
 
@@ -644,6 +796,17 @@ def build_app():
         Input("optima-gain", "value"),
         Input("optima-heights", "data"),
         Input("design-toggles", "value"),
+        Input("colorscale", "value"),
+        Input("color-lo-pct", "value"),
+        Input("color-hi-pct", "value"),
+        Input("grid-n", "value"),
+        Input("noise-amp", "value"),
+        Input("noise-octaves", "value"),
+        Input("noise-freq", "value"),
+        Input("surface-shading", "value"),
+        Input("surface-toggles", "value"),
+        Input("edge-spacing", "value"),
+        Input("export-toggles", "value"),
         Input("click-action", "value"),
         State("design-camera", "data"),
     )
@@ -652,31 +815,48 @@ def build_app():
                     line_drop_width, line_drop_opacity, bg_opacity,
                     basin_smooth, penalized, pen_r_solid, pen_a_solid,
                     pen_r_grey, pen_a_grey, pen_wire_width, wire_azimuth,
-                    optima_gain, optima_heights, design_toggles, action,
-                    camera):
+                    optima_gain, optima_heights, design_toggles, colorscale,
+                    color_lo_pct, color_hi_pct, grid_n, noise_amp,
+                    noise_octaves, noise_freq, surface_shading, surface_toggles,
+                    edge_spacing, export_toggles, action, camera):
         placed_arr = (np.asarray(placed, dtype=float).reshape(-1, 2)
                       if placed else np.empty((0, 2)))
         # Printed lines are an overlay only — they never feed the objective.
         lines = print_lines or []
+        # The roughness knobs override the fixed ENSEMBLE background so the mesh
+        # can be driven up to the sharp, fractal, HD look of a real landscape.
+        ens = {**ENSEMBLE,
+               "noise_amp": float(noise_amp),
+               "noise_octaves": int(noise_octaves),
+               "noise_freq": float(noise_freq)}
         fn = DesignEnsemble(
             dim=2,
             optima_gain=float(optima_gain),
             optima_heights=[float(h) for h in (optima_heights or [])],
             basin_smoothing=float(basin_smooth),
             pinned_optima=placed_arr if len(placed_arr) else None,
-            **ENSEMBLE,
+            **ens,
         )
         pen = penalized or []
         title = (f"Ensemble — {len(placed_arr)} placed, {len(lines)} printed, "
                  f"{len(pen)} penalized")
         toggles = design_toggles or []
-        return _design_figure(fn, GRID_N, BASIN_THRESHOLD, title,
+        exports = export_toggles or []
+        stops = COLORSCALES.get(colorscale, COLORSCALES[DEFAULT_COLORSCALE])
+        return _design_figure(fn, int(grid_n), BASIN_THRESHOLD, title,
                               placed_arr, lines, line_start, int(line_samples),
-                              float(bg_opacity), action != "rotate", camera,
+                              float(bg_opacity), action in LOCKED_MODES, camera,
                               penalized=pen,
                               penalty_radius={"solid": float(pen_r_solid),
                                               "grey": float(pen_r_grey)},
-                              percentile_colors="pct" in toggles,
+                              colorscale=stops,
+                              color_lo_pct=float(color_lo_pct),
+                              color_hi_pct=float(color_hi_pct),
+                              shading=float(surface_shading),
+                              black_edges="edges" in (surface_toggles or []),
+                              edge_spacing=float(edge_spacing),
+                              transparent="transparent" in exports,
+                              hide_grid="nogrid" in exports,
                               cylinder_edges="cage" in toggles,
                               wire_width=float(pen_wire_width),
                               solid_opacity={"solid": float(pen_a_solid),
@@ -989,22 +1169,24 @@ def _solid_cylinder_trace(center, radius, z_lo, z_hi, opacity=PENALTY_ALPHA,
     )
 
 
-def _threshold_colorscale(threshold, lo, hi, n_stops=16):
-    """Viridis with everything below ``threshold`` flattened to black.
+def _threshold_colorscale(threshold, lo, hi, base="Viridis", n_stops=16):
+    """``base`` colour scale with everything below ``threshold`` flattened to
+    black.
 
     Matches the ternary view in ``synthetic_data/plot_ensemble.py``, where
     sub-threshold compositions are blacked out; a surface has no per-point
-    colour override, so the cut is baked into the colourscale instead.
+    colour override, so the cut is baked into the colourscale instead.  ``base``
+    is the scale to cut into — a named plotly scale or an explicit stop list
+    (see :func:`_colorscale_stops`) — and is returned untouched when the cut is
+    off, which is the usual case here (``BASIN_THRESHOLD`` is 0).
     """
     if hi - lo < 1e-12 or not np.isfinite(threshold) or threshold <= lo:
-        return "Viridis"
+        return base
     if threshold >= hi:
         return [[0.0, "black"], [1.0, "black"]]
-    from plotly.colors import sample_colorscale
-
     t = float((threshold - lo) / (hi - lo))
     fracs = np.linspace(0.0, 1.0, n_stops)
-    colors = sample_colorscale("Viridis", [float(f) for f in fracs])
+    colors = sample_colorscale(base, [float(f) for f in fracs])
     # The duplicated stop at ``t`` is what makes the cut a hard edge.
     return ([[0.0, "black"], [t, "black"]]
             + [[t + (1.0 - t) * float(f), c] for f, c in zip(fracs, colors)])
@@ -1015,7 +1197,9 @@ def _threshold_colorscale(threshold, lo, hi, n_stops=16):
 def _design_figure(fn, grid_n, basin_threshold, title, placed=None, lines=None,
                    line_start=None, n_samples=25, bg_opacity=1.0, placing=False,
                    camera=None, penalized=None, penalty_radius=0.15,
-                   percentile_colors=False, cylinder_edges=True,
+                   colorscale="Viridis", color_lo_pct=0.0, color_hi_pct=100.0,
+                   shading=0.6, black_edges=False, edge_spacing=0.05,
+                   transparent=True, hide_grid=False, cylinder_edges=True,
                    wire_width=3.0, view_azimuth=45.0,
                    solid_opacity=PENALTY_ALPHA,
                    line_size=5.0, line_lift=5.0, line_outline=1.5,
@@ -1023,15 +1207,26 @@ def _design_figure(fn, grid_n, basin_threshold, title, placed=None, lines=None,
                    line_drop_width=1.5, line_drop_opacity=0.6):
     """The unit-square objective as a rotatable 3D height map.
 
-    Height *and* colour are both the objective, so the surface reads the same way
-    the ternary heatmap does (yellow high, blue low) while also standing up in 3D.
+    Height *and* colour are both the objective, so the surface stands up in 3D
+    while colour reads off ``colorscale`` (a named plotly scale or an explicit
+    stop list — see :data:`COLORSCALES`).
 
-    ``percentile_colors`` lifts the *bottom* of the colour scale to
-    :data:`COLOR_PERCENTILE_LO` instead of the objective's own minimum, so a
-    landscape whose range is set by one deep trough still shows contrast in the
-    background above it.  The top stays at the data's own maximum, so the tallest
-    optimum keeps the top colour either way.  Only the *colours* move: heights
-    are always the real objective.
+    ``color_lo_pct`` / ``color_hi_pct`` are the colour scale's floor and ceiling
+    as percentiles of the objective's own distribution, so exactly which span
+    the colours are spent on is set by hand; an inverted or collapsed pick falls
+    back to the full data range.  Only the *colours* move — heights are always
+    the real objective.
+
+    ``shading`` (0..1) drives the surface's directional lighting: 0 is flat
+    (colour only), 1 is strong relief — low ambient, high diffuse — so peaks
+    throw light and shadow and stand out when the height map is viewed from the
+    side instead of blending into the colour ramp.  ``black_edges`` drapes a
+    black contour grid over the surface at ``edge_spacing`` in x and y to outline
+    the terrain.
+
+    ``transparent`` gives the saved PNG a see-through paper background;
+    ``hide_grid`` strips the grid lines, zero lines and the shaded background
+    planes (the floor included) for a clean floating height map.
 
     ``penalty_radius`` and ``solid_opacity`` are per-colour: either a
     ``{kind: value}`` mapping or a single number standing for every colour (see
@@ -1042,25 +1237,41 @@ def _design_figure(fn, grid_n, basin_threshold, title, placed=None, lines=None,
     obj_min, obj_max = float(np.nanmin(obj)), float(np.nanmax(obj))
     span = max(obj_max - obj_min, 1e-6)
     lift = OVERLAY_LIFT * span
-    # Colour limits.  The top is always the data's own maximum — the tallest
-    # optimum should read as the top of the scale.  The bottom lifts to the
-    # percentile when the clamp is on, unless that would collapse the range
-    # (a mostly flat landscape), in which case it falls back to the data min.
-    c_lo, c_hi = obj_min, obj_max
-    if percentile_colors:
-        p_lo = float(np.nanpercentile(obj, COLOR_PERCENTILE_LO))
-        if c_hi - p_lo > 1e-9:
-            c_lo = p_lo
+    # Colour limits: the floor and ceiling are each a percentile of the
+    # objective's own values, dialled in with the two sliders, so the exact cut
+    # is set by hand.  A collapsed or inverted pick (ceiling at or below floor)
+    # falls back to the full data range rather than showing a flat colour.
+    lo_p, hi_p = float(color_lo_pct), float(color_hi_pct)
+    c_lo = float(np.nanpercentile(obj, np.clip(min(lo_p, hi_p), 0.0, 100.0)))
+    c_hi = float(np.nanpercentile(obj, np.clip(max(lo_p, hi_p), 0.0, 100.0)))
+    if c_hi - c_lo < 1e-9:
+        c_lo, c_hi = obj_min, obj_max
     # Pinned rather than auto-ranged, so "top to bottom of the plot" is a height
     # the penalization cylinders can actually be built to.  The headroom above
     # the landscape is what makes a cylinder read at all: an optimum sits on a
     # summit, so without it the column would be buried inside its own hill.
     z_lo, z_hi = obj_min - 0.04 * span, obj_max + 0.3 * span
 
+    # Directional lighting: ``shading`` fades ambient down and diffuse up, so a
+    # higher value throws sharper light and shadow across slopes and the peaks
+    # read from the side rather than washing into the colour ramp.  A little
+    # specular on top gives the summits a catch-light as it climbs.
+    s = float(np.clip(shading, 0.0, 1.0))
+    lighting = dict(ambient=0.9 - 0.6 * s, diffuse=0.3 + 0.7 * s,
+                    specular=0.04 + 0.16 * s, roughness=0.5, fresnel=0.2)
+    # Optional black contour grid draped over the surface — lines at fixed x and
+    # at fixed y, each riding the height map, so the terrain gets an inked mesh.
+    contours = None
+    if black_edges:
+        step = float(np.clip(edge_spacing, 1e-3, 1.0))
+        edge = lambda: dict(show=True, color="black", width=1.5, highlight=False,
+                            start=0.0, end=1.0, size=step)
+        contours = dict(x=edge(), y=edge())
     surface = go.Surface(
         x=axis, y=axis, z=obj.reshape(shape), name="objective",
-        colorscale=_threshold_colorscale(basin_threshold, c_lo, c_hi),
+        colorscale=_threshold_colorscale(basin_threshold, c_lo, c_hi, colorscale),
         cmin=c_lo, cmax=c_hi, opacity=float(bg_opacity), showscale=True,
+        lighting=lighting, contours=contours,
         hovertemplate=("x1=%{x:.3f}<br>x2=%{y:.3f}<br>"
                        "objective=%{z:.4f}<extra></extra>"),
         colorbar=dict(title=dict(text="Objective", side="top", font=dict(size=18)),
@@ -1185,7 +1396,7 @@ def _design_figure(fn, grid_n, basin_threshold, title, placed=None, lines=None,
             hovertemplate=("x1=%{customdata[0]:.3f}<br>x2=%{customdata[1]:.3f}<br>"
                            "objective=%{customdata[2]:.4f}<extra></extra>"),
             marker=dict(symbol="circle", size=float(line_size), color=line_obj,
-                        colorscale="Viridis", cmin=c_lo, cmax=c_hi,
+                        colorscale=colorscale, cmin=c_lo, cmax=c_hi,
                         showscale=False),
         ))
     if line_start is not None:
@@ -1199,13 +1410,20 @@ def _design_figure(fn, grid_n, basin_threshold, title, placed=None, lines=None,
                         line=dict(width=4)),
         ))
 
+    # For a clean saved figure the grid lines, zero lines and the shaded
+    # background planes are all switched off, so the height map floats on its
+    # own; otherwise the floor stays FLOOR_COLOR so the printed-line stickers
+    # punch a matching hole (see FLOOR_COLOR).
+    grid_off = dict(showgrid=False, zeroline=False, showspikes=False,
+                    showbackground=False) if hide_grid else {}
     scene = dict(
-        xaxis=dict(title=DESIGN_AXIS_LABELS[0], range=[0.0, 1.0]),
-        yaxis=dict(title=DESIGN_AXIS_LABELS[1], range=[0.0, 1.0]),
+        xaxis=dict(title=DESIGN_AXIS_LABELS[0], range=[0.0, 1.0], **grid_off),
+        yaxis=dict(title=DESIGN_AXIS_LABELS[1], range=[0.0, 1.0], **grid_off),
         # ``zaxis`` styles the xy floor plane, pinned to a known colour so the
         # hole punched in each floor sticker matches it exactly.
         zaxis=dict(title="Objective", range=[z_lo, z_hi],
-                   showbackground=True, backgroundcolor=FLOOR_COLOR),
+                   backgroundcolor=FLOOR_COLOR, showbackground=not hide_grid,
+                   **{k: v for k, v in grid_off.items() if k != "showbackground"}),
         aspectmode="manual",
         aspectratio=dict(x=1, y=1, z=DESIGN_ASPECT_Z),
         # Always orbit, even while placing.  Plotly emits a 3D click only from a
@@ -1241,6 +1459,10 @@ def _design_figure(fn, grid_n, basin_threshold, title, placed=None, lines=None,
         uirevision=f"design-{uuid4().hex}" if placing else "design",
         legend=dict(x=0.0, y=1.0), width=FIG_W, height=FIG_H, margin=dict(t=60),
         clickmode="event",
+        # Transparent paper is what makes the downloaded PNG see-through; the
+        # 3D scene has no separate background of its own once the axis planes
+        # are hidden, so this alone carries the transparency through export.
+        paper_bgcolor="rgba(0, 0, 0, 0)" if transparent else "white",
     )
     return fig
 

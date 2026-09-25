@@ -578,6 +578,22 @@ class DataHandler:
         except Exception:
             pass
 
+    def append_convergence_record(self, **record):
+        """Append one JSON record to <run_dir>/convergence_history.jsonl.
+
+        Sidecar consumed by src/core/retro.py for retroactive needle
+        declaration (all integer fields 0-based, matching the loop
+        variables). Best-effort — must never crash the optimisation loop.
+        """
+        if not self.save_enabled or self.run_dir is None:
+            return
+        try:
+            record.setdefault('ts', time.time())
+            with open(self.run_dir / 'convergence_history.jsonl', 'a', encoding='utf-8') as f:
+                f.write(json.dumps(record) + '\n')
+        except Exception:
+            pass
+
     # =========================================================================
     # State loading
     # =========================================================================
@@ -593,7 +609,8 @@ class DataHandler:
         # Load config
         config_path = self.run_dir / 'config.json'
         if config_path.exists():
-            with open(config_path) as f:
+            # utf-8-sig: tolerate a BOM from hand-edited configs (Windows editors)
+            with open(config_path, encoding='utf-8-sig') as f:
                 cfg = json.load(f)
             self.d = cfg.get('d', self.d)
             self.max_zooms = cfg.get('max_zooms', self.max_zooms)
