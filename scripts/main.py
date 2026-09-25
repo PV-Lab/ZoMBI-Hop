@@ -87,7 +87,7 @@ def start_serial(parent_shutdown: "multiprocessing.synchronize.Event"):
 
 def start_zombi(resume_uuid=None, optimizing_dims=None, checkpoint_dir=None,
                 hparams_path=None, new_run_uuid=None,
-                bounds_lo=None, bounds_hi=None, retro_needles=True):
+                bounds_lo=None, bounds_hi=None):
     try:
         time.sleep(2)
         if resume_uuid:
@@ -97,8 +97,7 @@ def start_zombi(resume_uuid=None, optimizing_dims=None, checkpoint_dir=None,
         run_zombi_main(resume_uuid=resume_uuid, optimizing_dims=optimizing_dims,
                        checkpoint_dir=checkpoint_dir, hparams_path=hparams_path,
                        new_run_uuid=new_run_uuid,
-                       bounds_lo=bounds_lo, bounds_hi=bounds_hi,
-                       retro_needles=retro_needles)
+                       bounds_lo=bounds_lo, bounds_hi=bounds_hi)
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
@@ -146,11 +145,6 @@ def main():
                         help="Caller-provided UUID for a NEW run (lets the GUI "
                              "pre-create/display the run dir immediately). Ignored "
                              "when a resume UUID is given.")
-    parser.add_argument("--no-retro-needles", action="store_true",
-                        dest="no_retro_needles",
-                        help="On resume, skip the retroactive needle pass that "
-                             "declares needles past activations would have "
-                             "produced under the current convergence criteria.")
     args = parser.parse_args()
 
     resume_uuid = args.resume_uuid
@@ -175,7 +169,6 @@ def main():
     checkpoint_dir = args.checkpoint_dir
     hparams_path = args.hparams
     new_run_uuid = args.run_uuid if resume_uuid is None else None
-    retro_needles = not args.no_retro_needles
 
     if resume_uuid is not None and resume_uuid.lower() == 'list':
         list_runs_and_exit()
@@ -267,7 +260,7 @@ def main():
     p_zombi = multiprocessing.Process(target=start_zombi,
                                       args=(resume_uuid, optimizing_dims, checkpoint_dir,
                                             hparams_path, new_run_uuid,
-                                            bounds_lo, bounds_hi, retro_needles),
+                                            bounds_lo, bounds_hi),
                                       name="ZoMBI")
 
     zombi_finished_normally = False
