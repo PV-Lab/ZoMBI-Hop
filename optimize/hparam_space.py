@@ -39,11 +39,11 @@ HPARAM_SPACE: dict[str, tuple] = {
     # Acquisition function
     "ucb_beta":                    (0.001,   3.0,   "linear"),
     # Zoom / convergence
-    # Lower bound is 2: a needle can only be declared at zoom level 2+
-    # (ZoMBIHop.min_zoom_for_needle, lowered to 1 post-6d-campaign), so max_zooms
-    # must allow reaching it. Kept in sync with evaluate._force_zoom_floors(),
-    # which derives the same floor from ZoMBIHop's own defaults.
-    "max_zooms":                   (2,      6,     "int"),
+    # Lower bound is 3: a needle can only be declared at 0-indexed zoom level 2+
+    # (ZoMBIHop.min_zoom_for_needle), so max_zooms must allow reaching it.
+    # Kept in sync with evaluate._force_zoom_floors(), which derives the same
+    # floor from ZoMBIHop's own defaults.
+    "max_zooms":                   (3,      6,     "int"),
     # Lower bound is 3 so at least min_iters_per_zoom (=3) lines can be sampled
     # per zoom level before the optimiser may advance or declare a needle.
     "max_iterations":              (3,      12,    "int"),

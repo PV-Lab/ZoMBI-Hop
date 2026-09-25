@@ -43,6 +43,7 @@ from .needles import (  # noqa: E402
     NeedleFactory,
     build_landscape,
     place_optima,
+    placement_width,
     prominence_separation,
     target_separation,
 )
@@ -61,6 +62,7 @@ __all__ = [
     "hparams_for_dim",
     "line_budget",
     "place_optima",
+    "placement_width",
     "prominence_separation",
     "target_separation",
 ]
