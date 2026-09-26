@@ -89,7 +89,7 @@ def cmd_smoke(args) -> None:
             failures.append(name)
         print(f"  {'ok  ' if ok else 'FAIL'}  {name:<10} points={m['n_points']:>4} "
               f"stop={m['stop_reason']:<7} dist={m['dist_to_needles']:.3f} "
-              f"needles={m['n_needles']:>2} regret={m['simple_regret']:.3f} "
+              f"needles={m['n_needles']:>2} "
               f"({time.time() - t0:.1f}s)")
     print(f"\n  cells written to {out}")
     if failures:

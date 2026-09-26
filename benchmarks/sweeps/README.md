@@ -7,15 +7,17 @@ A full-factorial sweep of **methods × landscapes**:
 | method | `zombi_hop`, `random`, `gp_bo`, `turbo`, `hebo` (see `benchmarks/methods`) |
 | number of needles `n` | 2, 10, 30, 50 |
 | needle sharpness (basin width) `b` | 2.2, 6, 10, 15 |
-| dimensionality `d` | 3, 4, 6, 10 |
+| dimensionality `d` | 2, 3, 5, 9 — the 3/4/6/10-component simplex in free dimensions |
 
 5 methods × 64 landscape configurations × `--n-draws` placements. Landscapes are
 **bumps-only needles on the unit cube** (`needles.py`), and every method gets the
 **byte-identical landscape and the same measurement-noise stream** for a given
 `(d, n, b, draw)`, so method-vs-method differences are paired.
 
-Every cell has the same **measurement budget: 3000 points, one point per call**,
-enforced by one shared `benchmarks.methods.Problem`. Every method is fully
+Every cell's **measurement budget is 100 × dim points, one point per call** (200 at
+2d, 300 at 3d, 500 at 5d, 900 at 9d; `--budget-per-dim` changes the multiplier and
+`--budget N` fixes one number for every dim), the same for every method at a given
+dim and enforced by one shared `benchmarks.methods.Problem`. Every method is fully
 sequential: ZoMBI-Hop measures the single candidate it proposes (`sampling="point"`,
 no LineBO lines), and the baselines run at q = 1. All start with a 48-point Sobol'
 initial design. ZoMBI-Hop's hyperparameters are used as tuned, so the ones that used
@@ -38,7 +40,7 @@ python -m benchmarks.methods install-hebo              # once per checkout
 
 # 1. Plan (writes files only; fine on the login node). Run on the cluster —
 #    the generated sbatch bakes in absolute paths.
-python -m benchmarks.sweeps plan --out benchmarks/sweeps/runs/full --n-draws 5
+python -m benchmarks.sweeps plan --out benchmarks/sweeps/runs/full --n-draws 10
 
 # 2. Submit: self-restarting workers, each cell in its own process.
 sbatch benchmarks/sweeps/runs/full/sweep.sbatch
@@ -63,7 +65,7 @@ campaign).
 --methods zombi_hop,turbo,path/to/mine.py:MyMethod   # any registered name or a ref
 --method-set turbo.n_trust_regions=5                 # one key, value parsed as JSON
 --method-config gp_bo=configs/gp_ucb.json            # a JSON object of keys
---hparams 10=optimize/hparams/10d_ensemble.json      # zombi_hop's per-dim file
+--hparams 9=optimize/hparams/10d_ensemble.json       # zombi_hop's per-dim file
 ```
 
 Configs are validated when you plan (a typo in a key stops the plan) and the
@@ -112,23 +114,7 @@ See `benchmarks/methods/README.md`. Briefly: `dist_to_needles` scores each
 method's own declared needles (ZoMBI-Hop's, or the `gp_peaks` extractor's for the
 baselines); `dist_to_needles_extracted` applies the same extractor to every
 method's samples; `frac_optima_visited` asks whether a method ever measured near
-each needle; `simple_regret` is the quantity single-optimum BO targets.
-
-`greedy_dist` scores the samples instead of the declarations: for each true optimum
-the distance to the nearest point the method measured, averaged over the optima
-(`eval_metrics.metric_greedy_dist`). Greedy, not one-to-one — two optima may share a
-sample — and with no unmatched penalty, so it ranks a method by where it looked even
-when it declared nothing useful. Against `dist_to_needles` it separates searching the
-right places from reporting them; over a budget it can only fall.
-
-Because it reads only `points.csv` and `ensemble_config.json`, `greedy_dist` can be
-recovered from a campaign that finished before the metric existed:
-`python -m benchmarks.sweeps.greedy_backfill --out runs/<campaign>` writes per-cell
-trajectories plus a heatmap and three trajectory figures matching that summary's
-`dist_to_needles` ones, and appends (never replaces) a section to its `index.md`.
-`runs/first` — the pre-2026-09 single-method simplex sweep — has been backfilled this
-way. Current campaigns need it for nothing: their cells score `greedy_dist` as they
-run.
+each needle.
 
 ## What a campaign produces
 
@@ -149,7 +135,11 @@ runs/<campaign>/
     ├── cells.csv, grid.csv, methods.csv, paired.csv
     ├── method_by_dim.png      each metric vs dim, one line per method  <- headline
     ├── <metric>_heatmap.png   rows = method, columns = dim, tile = n x b
-    └── dist_over_time.png, greedy_over_time.png, regret_over_time.png
+    ├── dist_over_time.png     panel per dim, one line per method
+    ├── dist_over_time_all.png every cell's trajectory, panel per method
+    ├── dist_over_time_by_axis.png  row per method, column per swept axis (d, n, b);
+    │                               x = fraction of budget, since budgets differ by dim
+    └── dist_over_time_grid.png     row per dim, column per n, one line per method
 ```
 
 Paired comparisons use the landscape as the unit: for each `(d, n, b, draw)`

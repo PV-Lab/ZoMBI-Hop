@@ -80,15 +80,6 @@ extractor to *every* method's samples, ZoMBI-Hop included
 (`dist_to_needles_extracted`), so there is always one comparison in which the
 methods differ only in where they sampled.
 
-Alongside it, **`greedy_dist`** scores the *samples*: for each true optimum the
-distance to the nearest point the method measured, averaged over the optima
-(`eval_metrics.metric_greedy_dist`). No declaration and no extractor enter it, the
-pairing is greedy rather than one-to-one (two optima may share a sample — a
-measurement is not a claim), and there is no unmatched penalty, so it keeps ranking
-runs that declared nothing useful. It is `frac_optima_visited`'s distance-valued
-sibling: the same per-optimum minima, averaged instead of thresholded at
-`MATCH_RADIUS`. Because samples accumulate it can only fall over a budget.
-
 `gp_peaks` (default, `extract.py`) fits a GP, climbs its posterior mean to local
 maxima, and keeps a maximum only if the model is confident it stands out from a
 shell of probes one to two fitted lengthscales away. The noise scale is floored at

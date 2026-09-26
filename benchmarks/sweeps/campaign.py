@@ -25,9 +25,11 @@ as the completion marker — plus:
   pending, so one deterministic crash cannot keep the pool resubmitting forever.
   ``reset-stale --failed`` re-opens them.
 * **A point budget, enforced identically.** Every cell measures exactly
-  ``--budget`` points (default 3000) in batches of ``--batch-size`` (1), through
-  the shared :class:`benchmarks.methods.Problem`; ``--cell-max-hours`` is only a
-  safety ceiling, and a cell stopped by it is recorded ``budget_hit: false``.
+  ``--budget-per-dim`` x dim points (default 100 x dim: 200 at 2d, 900 at 9d), or a
+  flat ``--budget`` if one is given, in batches of ``--batch-size`` (1), through the
+  shared :class:`benchmarks.methods.Problem`. Every method gets the same budget at a
+  given dim. ``--cell-max-hours`` is only a safety ceiling, and a cell stopped by it
+  is recorded ``budget_hit: false``.
 
 Queue order is draw-major, then landscape, then method: a campaign cut short has
 every configuration at draw 1, and every method on each landscape it reached.
@@ -81,7 +83,8 @@ FAILED = "FAILED"
 HEARTBEAT_EVERY_S = 60.0
 
 DEFAULT_METHODS = ("zombi_hop", "random", "gp_bo", "turbo", "hebo")
-DEFAULT_BUDGET = 3000
+#: Measured points per cell = this x dim, unless ``plan --budget`` fixes one number.
+DEFAULT_BUDGET_PER_DIM = 100
 #: One point per call for every method (POINTWISE.md). Was 24: one LineBO line.
 DEFAULT_BATCH = 1
 
@@ -114,6 +117,13 @@ def load_manifest(out_dir: str) -> dict:
             f"multi-method CUBE sweep (schema {SCHEMA_VERSION}). Its summary/ is "
             "already on disk; to re-run or re-summarise it, check out commit 285424f.")
     return manifest
+
+
+def cell_budget(manifest: dict, dim: int) -> int:
+    """Measured points a cell at ``dim`` gets. Manifests planned before per-dim
+    budgets carry only the flat ``budget``."""
+    per_dim = manifest.get("budgets")
+    return int(per_dim[str(dim)]) if per_dim else int(manifest["budget"])
 
 
 def read_tasks(out_dir: str) -> list[dict]:
@@ -268,6 +278,10 @@ def plan(args) -> str:
     method_refs = method_names(_csv(args.methods, str))   # unknown names fail here
     methods = list(method_refs)
     n_draws = max(1, int(args.n_draws))
+    if args.budget is not None:
+        budgets = {str(d): int(args.budget) for d in dims}
+    else:
+        budgets = {str(d): int(args.budget_per_dim) * d for d in dims}
 
     # Resolved up front: a bad config key, a missing hyperparameter file or an
     # uninstalled HEBO must stop the plan here, not a worker hours in.
@@ -309,7 +323,11 @@ def plan(args) -> str:
         "n_draws": n_draws,
         "n_configurations": len(dims) * len(counts) * len(widths),
         "n_tasks": len(tasks),
-        "budget": int(args.budget),
+        # Flat budget if --budget was given, else None; the per-dim numbers are in
+        # "budgets" either way (read them with cell_budget).
+        "budget": None if args.budget is None else int(args.budget),
+        "budget_per_dim": None if args.budget is not None else int(args.budget_per_dim),
+        "budgets": budgets,
         "batch_size": int(args.batch_size),
         "input_noise": float(args.input_noise),
         "output_noise_frac": float(args.output_noise_frac),
@@ -362,8 +380,15 @@ def plan(args) -> str:
     print(f"    landscapes: dims {dims} x needles {counts} x basin widths {widths} "
           f"= {manifest['n_configurations']} configuration(s) on the unit cube")
     print(f"    x {n_draws} draw(s) x {len(methods)} method(s) = {len(tasks)} cell(s)")
-    print(f"    budget: {args.budget} points per cell in batches of {args.batch_size} "
+    rule = (f"{args.budget} at every dim" if args.budget is not None
+            else f"{args.budget_per_dim} x dim")
+    print(f"    budget: {rule} = " + ", ".join(f"{n} at {d}d" for d, n in budgets.items())
+          + f" points per cell, in batches of {args.batch_size} "
           f"(wall-clock ceiling {args.cell_max_hours:g} h)")
+    small = [d for d, n in budgets.items() if n <= 48]
+    if small:
+        print(f"    WARNING: the budget at dim {', '.join(small)} does not exceed the "
+              "48-point initial design, so no method gets to choose a point there.")
     print(f"    noise: input {args.input_noise:g}, output {args.output_noise_frac:g} x |y|;"
           f" extractor {args.extractor}")
     for method in methods:
@@ -518,7 +543,7 @@ def run_one_cell(task: dict, out_dir: str, manifest: dict, target: str,
     cfg = manifest["method_configs"][task["method"]][str(task["dim"])]
 
     problem = Problem(
-        fn.predict, task["dim"], budget=int(manifest["budget"]),
+        fn.predict, task["dim"], budget=cell_budget(manifest, task["dim"]),
         batch_size=int(manifest["batch_size"]),
         input_noise=float(manifest["input_noise"]),
         output_noise_frac=float(manifest["output_noise_frac"]),

@@ -100,7 +100,8 @@ SEPARATION_MARGIN = 1.02
 #: The three landscape axes. Full-factorial: 4 x 4 x 4 = 64 configurations.
 GRID_N_NEEDLES: tuple[int, ...] = (2, 10, 30, 50)
 GRID_BASIN_WIDTH: tuple[float, ...] = (2.2, 6.0, 10.0, 15.0)
-GRID_DIM: tuple[int, ...] = (3, 4, 6, 10)
+#: Cube dims = the simplex grid (3, 4, 6, 10) in free dimensions; see hparams.py.
+GRID_DIM: tuple[int, ...] = (2, 3, 5, 9)
 
 
 # ─── Resolvability ───────────────────────────────────────────────────────────────

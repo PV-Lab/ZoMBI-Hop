@@ -14,7 +14,7 @@ sequential and like-for-like. This applies to `benchmarks/sweeps` only: the
 | `benchmarks/methods/zombihop.py` | New config `sampling` (`"line"` default, `"point"`). Point mode: the objective clips the candidate to the box and measures it alone. LineBO is not built. The initial design is `n_init_points` (48) scrambled-Sobol' points, measured one at a time, as the baselines do. Hyperparameters are passed through unchanged (below). Line mode now refuses `batch_size < 2`, since a one-point "line" is just its left endpoint. |
 | `benchmarks/sweeps/configs.py` | Forces `zombi_hop.sampling = "point"` unless overridden. Records `resolved_hparams` (the values actually run) per dimension in the manifest. |
 | `benchmarks/sweeps/campaign.py` | `DEFAULT_BATCH` 24 → **1**. `plan` warns if zombi_hop is in point mode while `--batch-size` is not 1. |
-| `benchmarks/sweeps/__main__.py` | `--trace-every` default 10 → **240**. `describe` prints zombi_hop's sampling mode and resolved values. |
+| `benchmarks/sweeps/__main__.py` | `--trace-every` default 10 → **240** (later **20**, when budgets became 100 × dim). `describe` prints zombi_hop's sampling mode and resolved values. |
 | `benchmarks/sweeps/README.md` | Budget paragraph updated. |
 
 `src/core/zombihop.py` is **unchanged**. Its loop already accepts any number of

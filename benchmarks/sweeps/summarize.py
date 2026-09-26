@@ -15,8 +15,11 @@ landscapes", so the summary is organised around the METHOD:
     ├── method_by_dim.png          the headline: each metric vs dim, one line per method
     ├── <metric>_heatmap.png       rows = method, columns = dim, tile = n x b
     ├── dist_over_time.png         dist_to_needles vs measured points, panel per dim
-    ├── greedy_over_time.png       greedy_dist vs measured points, panel per dim
-    └── regret_over_time.png       simple regret vs measured points, panel per dim
+    ├── dist_over_time_all.png     every cell's trajectory, panel per method
+    ├── dist_over_time_by_axis.png row per method, column per swept axis (d, n, b)
+    ├── dist_over_time_grid.png    row per dim, column per n, one line per method
+    └── sampling_<cell>.png        2-D landscapes only: the landscape (draw 1), one
+                                   panel per method with its samples on it
 
 Metrics (all from each cell's ``metrics.json``; see ``benchmarks/methods/runner.py``)
 ------------------------------------------------------------------------------------
@@ -26,17 +29,8 @@ Metrics (all from each cell's ``metrics.json``; see ``benchmarks/methods/runner.
     dist_to_needles_extracted  the SAME extractor on every method's samples — the
                                comparison in which methods differ only in where they
                                sampled. Lower is better.
-    greedy_dist                the sample-side distance: for each true optimum the
-                               distance to the nearest point the method MEASURED,
-                               averaged over the optima. No declarations and no
-                               extractor enter it, so it separates "searched the right
-                               places" from "reported them correctly", which the two
-                               dist_to_needles columns cannot do on their own. Lower
-                               is better.
     frac_optima_visited        true optima with a sample within the match radius:
                                did the method ever measure there. Higher is better.
-    simple_regret              1 - best noiseless value sampled: what single-optimum
-                               BO optimises for. Lower is better.
 
 Paired comparisons use the landscape as the unit: for every ``(dim, n, b, draw)`` on
 which both a method and the reference finished, the difference in the metric, and
@@ -59,7 +53,8 @@ from ._paths import ensure_paths
 
 ensure_paths()
 
-from .campaign import CELL_FILE, load_manifest, read_tasks, task_dir  # noqa: E402
+from .campaign import (CELL_FILE, cell_budget, load_manifest, read_tasks,  # noqa: E402
+                       task_dir)
 
 DEFAULT_CI = 0.95
 DEFAULT_N_BOOT = 2000
@@ -69,9 +64,7 @@ REFERENCE_METHOD = "zombi_hop"
 METRICS: dict[str, tuple[str, bool]] = {
     "dist_to_needles": ("dist_to_needles (own needles)", True),
     "dist_to_needles_extracted": ("dist_to_needles (common extractor)", True),
-    "greedy_dist": ("greedy dist (optima -> nearest sample)", True),
     "frac_optima_visited": ("fraction of optima visited", False),
-    "simple_regret": ("simple regret", True),
 }
 #: Extra columns carried into cells.csv but not plotted.
 EXTRA = ("n_needles", "n_needles_extracted", "frac_optima_found",
@@ -324,8 +317,11 @@ def _heatmaps(agg: list[dict], metric: str, methods: list[str], path: str) -> No
     plt.close(fig)
 
 
-def collect_curves(out_dir: str, column: str) -> list[dict]:
-    """``column`` vs measured points for every finished cell (NaN rows dropped)."""
+def collect_curves(out_dir: str, column: str, manifest: dict) -> list[dict]:
+    """``column`` vs measured points for every finished cell (NaN rows dropped).
+
+    ``f`` is the same x as a fraction of the cell's budget, for figures that pool
+    dimensions (budgets differ by dim)."""
     import pandas as pd
 
     curves = []
@@ -343,10 +339,36 @@ def collect_curves(out_dir: str, column: str) -> list[dict]:
         df = df[["n_points", column]].dropna()
         if len(df) < 2:
             continue
+        x = df["n_points"].to_numpy(float)
         curves.append({"method": task["method"], "dim": task["dim"],
-                       "x": df["n_points"].to_numpy(float),
+                       "n_needles_true": task["n_needles"],
+                       "basin_width": task["basin_width"], "draw": task["draw"],
+                       "x": x, "f": x / cell_budget(manifest, task["dim"]),
                        "y": df[column].to_numpy(float)})
     return curves
+
+
+def _pool(group: list[dict], xkey: str = "x"):
+    """``(xs, mean, q25, q75)`` over a group of curves, or None.
+
+    The common grid is the x values every curve reaches, so a short curve is never
+    extended with an invented flat tail. Step interpolation: a metric holds its last
+    measured value (extractor-scored curves only have a point every trace_every)."""
+    x_max = min(c[xkey][-1] for c in group)
+    xs = np.unique(np.concatenate([c[xkey] for c in group]))
+    xs = xs[xs <= x_max]
+    if len(xs) < 2:
+        return None
+    Y = np.vstack([c["y"][np.clip(np.searchsorted(c[xkey], xs, side="right") - 1,
+                                  0, len(c["y"]) - 1)] for c in group])
+    return xs, Y.mean(axis=0), np.quantile(Y, 0.25, axis=0), np.quantile(Y, 0.75, axis=0)
+
+
+def _level_colors(n: int) -> list[str]:
+    """``n`` ordered levels (dim, n, b) -> steps of the sequential ramp, light to dark.
+    The two palest steps are skipped: a 2px line in them vanishes on white."""
+    ramp = SEQUENTIAL[2:]
+    return [ramp[i] for i in np.linspace(0, len(ramp) - 1, max(n, 1)).round().astype(int)]
 
 
 def _curves_by_dim(curves: list[dict], methods: list[str], ylabel: str,
@@ -362,21 +384,12 @@ def _curves_by_dim(curves: list[dict], methods: list[str], ylabel: str,
     for ax, d in zip(axes[0], dims):
         for m in methods:
             group = [c for c in curves if c["dim"] == d and c["method"] == m]
-            if not group:
+            pooled = _pool(group) if group else None
+            if pooled is None:
                 continue
-            # Common grid = the points every curve in the group reaches, so a short
-            # curve is never extended with an invented flat tail.
-            x_max = min(c["x"][-1] for c in group)
-            xs = np.unique(np.concatenate([c["x"] for c in group]))
-            xs = xs[xs <= x_max]
-            if len(xs) < 2:
-                continue
-            # Step interpolation: a metric holds its last measured value.
-            Y = np.vstack([c["y"][np.clip(np.searchsorted(c["x"], xs, side="right") - 1,
-                                          0, len(c["y"]) - 1)] for c in group])
-            ax.fill_between(xs, np.quantile(Y, 0.25, axis=0), np.quantile(Y, 0.75, axis=0),
-                            color=colors[m], alpha=0.14, lw=0)
-            ax.plot(xs, Y.mean(axis=0), color=colors[m], lw=2, label=f"{m} ({len(group)})")
+            xs, mu, lo, hi = pooled
+            ax.fill_between(xs, lo, hi, color=colors[m], alpha=0.14, lw=0)
+            ax.plot(xs, mu, color=colors[m], lw=2, label=f"{m} ({len(group)})")
         ax.set_title(f"dim {d}", fontsize=10)
         ax.set_xlabel("measured points")
         _style(ax)
@@ -387,6 +400,215 @@ def _curves_by_dim(curves: list[dict], methods: list[str], ylabel: str,
     fig.tight_layout()
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def _traj_all(curves: list[dict], methods: list[str], path: str) -> None:
+    """Panel per method: every cell's trajectory, faint and coloured by dim, with the
+    per-dim mean drawn bold over the top. Shows the spread the means are made of —
+    where a bimodal slice or a single divergent cell would live."""
+    plt = _plt()
+    methods = [m for m in methods if any(c["method"] == m for c in curves)]
+    dims = sorted({c["dim"] for c in curves})
+    if not (methods and dims):
+        return
+    colours = dict(zip(dims, _level_colors(len(dims))))
+    fig, axes = plt.subplots(1, len(methods), figsize=(3.6 * len(methods) + 0.4, 3.8),
+                             sharey=True, squeeze=False)
+    for ax, m in zip(axes[0], methods):
+        mine = [c for c in curves if c["method"] == m]
+        for c in mine:
+            ax.plot(c["x"], c["y"], color=colours[c["dim"]], lw=0.6, alpha=0.25, zorder=1)
+        for d in dims:
+            group = [c for c in mine if c["dim"] == d]
+            pooled = _pool(group) if group else None
+            if pooled is None:
+                continue
+            xs, mu, _, _ = pooled
+            # A white underlay keeps each mean readable where it crosses the others.
+            ax.plot(xs, mu, color="white", lw=4.0, zorder=2)
+            ax.plot(xs, mu, color=colours[d], lw=2.0, zorder=3,
+                    label=f"dim {d} ({len(group)})")
+        ax.set_title(f"{m}  ({len(mine)} cells)", fontsize=10)
+        ax.set_xlabel("measured points")
+        _style(ax)
+    axes[0][0].set_ylabel("dist_to_needles (lower is better)")
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    fig.legend(handles, [lb.split(" (")[0] for lb in labels], loc="upper center",
+               ncol=len(dims), frameon=False, bbox_to_anchor=(0.5, 1.05),
+               title="bold = mean per dimension")
+    fig.suptitle("Every cell's dist_to_needles trajectory — one faint line per cell",
+                 y=1.15, fontsize=10.5)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _traj_by_axis(curves: list[dict], methods: list[str], path: str) -> None:
+    """Row per method, column per swept axis: one curve per level of that axis with
+    the other two pooled. The main-effects view — does raising d, n or b change the
+    shape of the search, or only where it ends up. Budgets differ by dim, so x is the
+    fraction of the cell's budget spent."""
+    plt = _plt()
+    methods = [m for m in methods if any(c["method"] == m for c in curves)]
+    if not methods:
+        return
+    specs = [("dim", "dimension d"), ("n_needles_true", "needles n"),
+             ("basin_width", "sharpness b")]
+    fig, axes = plt.subplots(len(methods), 3, figsize=(12.0, 2.7 * len(methods) + 0.8),
+                             sharex=True, sharey=True, squeeze=False)
+    for i, m in enumerate(methods):
+        mine = [c for c in curves if c["method"] == m]
+        for j, (key, label) in enumerate(specs):
+            ax = axes[i][j]
+            levels = sorted({c[key] for c in curves})
+            for colour, lv in zip(_level_colors(len(levels)), levels):
+                group = [c for c in mine if c[key] == lv]
+                pooled = _pool(group, "f") if group else None
+                if pooled is None:
+                    continue
+                xs, mu, lo, hi = pooled
+                ax.fill_between(xs, lo, hi, color=colour, alpha=0.12, lw=0)
+                ax.plot(xs, mu, color=colour, lw=2, label=f"{lv:g}")
+            _style(ax)
+            if i == 0:
+                # One legend per column: each column's levels mean something different.
+                ax.legend(title=label, fontsize=8, title_fontsize=8.5, frameon=False,
+                          ncol=len(levels), loc="lower center",
+                          bbox_to_anchor=(0.5, 1.02))
+            if j == 0:
+                ax.set_ylabel(f"{m}\ndist_to_needles", fontsize=9)
+            if i == len(methods) - 1:
+                ax.set_xlabel("fraction of budget spent")
+    fig.suptitle("dist_to_needles over the budget, by axis — mean over every cell in "
+                 "the slice, band is the IQR (lower is better)", fontsize=10.5)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _traj_grid(curves: list[dict], methods: list[str], manifest: dict,
+               path: str) -> None:
+    """Row per dim, column per needle count, one line per method (mean over
+    sharpness and draws). The by-axis view marginalises, which hides interactions;
+    this keeps dim x n and compares methods inside each panel."""
+    plt = _plt()
+    colors = _method_colors(methods)
+    dims = sorted({c["dim"] for c in curves})
+    counts = sorted({c["n_needles_true"] for c in curves})
+    if not (dims and counts):
+        return
+    fig, axes = plt.subplots(len(dims), len(counts),
+                             figsize=(3.0 * len(counts) + 0.6, 2.5 * len(dims) + 0.8),
+                             sharex="row", sharey=True, squeeze=False)
+    for i, d in enumerate(dims):
+        for j, n in enumerate(counts):
+            ax = axes[i][j]
+            for m in methods:
+                group = [c for c in curves if c["method"] == m and c["dim"] == d
+                         and c["n_needles_true"] == n]
+                pooled = _pool(group) if group else None
+                if pooled is None:
+                    continue
+                xs, mu, _, _ = pooled
+                ax.plot(xs, mu, color=colors[m], lw=2, label=m)
+            _style(ax)
+            if i == 0:
+                ax.set_title(f"n = {n}", fontsize=10)
+            if j == 0:
+                ax.set_ylabel(f"dim {d}", fontsize=10)
+            if i == len(dims) - 1:
+                ax.set_xlabel("measured points", fontsize=9)
+    handles, labels = [], []
+    for row in axes:
+        for ax in row:
+            for h, lb in zip(*ax.get_legend_handles_labels()):
+                if lb not in labels:
+                    handles.append(h)
+                    labels.append(lb)
+    order = [labels.index(m) for m in methods if m in labels]
+    fig.legend([handles[k] for k in order], [labels[k] for k in order],
+               loc="upper center", ncol=len(order), frameon=False,
+               bbox_to_anchor=(0.5, 1.0))
+    fig.suptitle(f"dist_to_needles over the budget — mean over sharpness and "
+                 f"{manifest.get('n_draws', '?')} draw(s) per line (lower is better)",
+                 fontsize=10.5, y=1.03)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+#: Sampling maps are drawn only for landscapes a plane can show exactly.
+SAMPLING_DIM = 2
+SAMPLING_GRID_N = 201
+
+
+def _sampling_maps(out_dir: str, methods: list[str], sdir: str) -> list[str]:
+    """Where each method sampled, one figure per 2-D landscape configuration.
+
+    Draw 1 only (any draw would do; every method on a draw sees the same landscape).
+    Each panel is the true noiseless landscape with one method's samples on it. A
+    sample is filled with the colour the landscape has AT that sample (its noiseless
+    ``f`` on the same scale), so it reads as a see-through ring on the map: a ring
+    darker than its surroundings sits on a peak. Returns the files written."""
+    import pandas as pd
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
+
+    from synthetic_data.ensemble import Ensemble
+
+    plt = _plt()
+    tasks = [t for t in read_tasks(out_dir)
+             if int(t["dim"]) == SAMPLING_DIM and int(t["draw"]) == 1]
+    written = []
+    for name in sorted({t["name"] for t in tasks}):
+        cells = {}
+        for t in tasks:
+            target = task_dir(out_dir, t)
+            if (t["name"] == name and os.path.isfile(os.path.join(target, CELL_FILE))
+                    and os.path.isfile(os.path.join(target, "points.csv"))):
+                cells[t["method"]] = target
+        shown = [m for m in methods if m in cells]
+        if not shown:
+            continue
+        with open(os.path.join(cells[shown[0]], "ensemble_config.json")) as f:
+            fn = Ensemble(**json.load(f))
+        g = np.linspace(0.0, 1.0, SAMPLING_GRID_N)
+        gx, gy = np.meshgrid(g, g)
+        Z = np.asarray(fn.predict(np.column_stack([gx.ravel(), gy.ravel()])),
+                       float).reshape(gx.shape)
+        pts = {m: pd.read_csv(os.path.join(cells[m], "points.csv")) for m in shown}
+        f_all = np.concatenate([p["f"].to_numpy(float) for p in pts.values()])
+        norm = Normalize(vmin=min(Z.min(), f_all.min()), vmax=max(Z.max(), f_all.max()))
+        cmap = LinearSegmentedColormap.from_list("seq", SEQUENTIAL)
+
+        fig, axes = plt.subplots(1, len(shown), figsize=(3.3 * len(shown) + 0.9, 3.6),
+                                 squeeze=False)
+        im = None
+        for ax, m in zip(axes[0], shown):
+            im = ax.pcolormesh(g, g, Z, cmap=cmap, norm=norm, shading="nearest",
+                               rasterized=True)
+            p = pts[m]
+            ax.scatter(p["x0"], p["x1"], c=cmap(norm(p["f"].to_numpy(float))), s=16,
+                       edgecolors=INK, linewidths=0.5, zorder=3)
+            ax.set_title(f"{m}  ({len(p)} points)", fontsize=10)
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.set_aspect("equal")
+            ax.set_xlabel("x0")
+            ax.set_yticks([0, 0.5, 1])
+            ax.set_xticks([0, 0.5, 1])
+        axes[0][0].set_ylabel("x1")
+        fig.colorbar(im, ax=axes, fraction=0.02, pad=0.02,
+                     label="objective (noiseless)")
+        t0 = next(t for t in tasks if t["name"] == name)
+        fig.suptitle(f"Where each method sampled — dim {SAMPLING_DIM}, "
+                     f"n = {t0['n_needles']}, b = {float(t0['basin_width']):g}, draw 1. "
+                     "Each point is filled with the landscape's colour at that point.",
+                     fontsize=10.5)
+        path = os.path.join(sdir, f"sampling_{name}.png")
+        fig.savefig(path, dpi=140, bbox_inches="tight")
+        plt.close(fig)
+        written.append(os.path.basename(path))
+    return written
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────────
@@ -431,20 +653,19 @@ def summarize(out_dir: str, *, ci: float = DEFAULT_CI, n_boot: int = DEFAULT_N_B
     _method_by_dim(agg_md, methods, os.path.join(sdir, "method_by_dim.png"), ci)
     for metric in METRICS:
         _heatmaps(agg, metric, methods, os.path.join(sdir, f"{metric}_heatmap.png"))
-    _curves_by_dim(collect_curves(out_dir, "dist_to_needles"), methods,
-                   "dist_to_needles (lower is better)",
+    curves = collect_curves(out_dir, "dist_to_needles", manifest)
+    _curves_by_dim(curves, methods, "dist_to_needles (lower is better)",
                    os.path.join(sdir, "dist_over_time.png"),
                    "dist_to_needles over the budget")
-    _curves_by_dim(collect_curves(out_dir, "greedy_dist"), methods,
-                   "greedy dist (lower is better)",
-                   os.path.join(sdir, "greedy_over_time.png"),
-                   "greedy_dist over the budget")
-    _curves_by_dim(collect_curves(out_dir, "simple_regret"), methods,
-                   "simple regret (lower is better)",
-                   os.path.join(sdir, "regret_over_time.png"),
-                   "Simple regret over the budget")
+    _traj_all(curves, methods, os.path.join(sdir, "dist_over_time_all.png"))
+    _traj_by_axis(curves, methods, os.path.join(sdir, "dist_over_time_by_axis.png"))
+    _traj_grid(curves, methods, manifest, os.path.join(sdir, "dist_over_time_grid.png"))
+    sampling = _sampling_maps(out_dir, methods, sdir)
 
     n_expected = manifest["n_tasks"]
+    dims_all = sorted({int(d) for d in manifest["grid"]["dims"]})
+    budget_text = (", ".join(f"{cell_budget(manifest, d)} at {d}d" for d in dims_all)
+                   if manifest.get("budgets") else str(manifest["budget"]))
     short = [r for r in rows if r.get("budget_hit") is False]
     lines = [
         "# Method sweep — ZoMBI-Hop vs. black-box baselines on needle landscapes",
@@ -453,8 +674,9 @@ def summarize(out_dir: str, *, ci: float = DEFAULT_CI, n_boot: int = DEFAULT_N_B
         f"{manifest['n_configurations']} landscape configuration(s) x "
         f"{manifest['n_draws']} draw(s).",
         "",
-        f"Budget: **{manifest['budget']} measured points per cell** in batches of "
-        f"{manifest['batch_size']}, identical for every method and dimension. Noise: "
+        f"Budget: **{budget_text} measured points per cell** in batches of "
+        f"{manifest['batch_size']}, identical for every method at a given dimension. "
+        f"Noise: "
         f"input {manifest['input_noise']:g}, output {manifest['output_noise_frac']:g} x |y|. "
         "Landscape: bumps-only `CartesianEnsemble` on the unit cube — *n* negated-Ackley "
         "needles of sharpness *b* peaking at 1.0 on a plain at 0.75 "
@@ -466,34 +688,24 @@ def summarize(out_dir: str, *, ci: float = DEFAULT_CI, n_boot: int = DEFAULT_N_B
         "`dist_to_needles_extracted` applies that same extractor to every method "
         "(`benchmarks/methods/extract.py`).",
         "",
-        "`greedy_dist` needs neither: for each true optimum it is the distance to the "
-        "nearest point the method actually MEASURED, averaged over the optima "
-        "(`eval_metrics.metric_greedy_dist`). The pairing is greedy, not one-to-one — "
-        "two optima may share a sample, because a measurement is not a claim — and "
-        "there is no unmatched penalty, so a method that declared nothing useful is "
-        "still ranked by where it looked. Read against `dist_to_needles` it separates "
-        "*searching* the right places from *reporting* them.",
-        "",
         "## Headline (all landscapes)",
         "",
-        "| method | cells | dist_to_needles | dist (common extractor) | greedy dist "
-        "| optima visited | simple regret |",
-        "|---|---|---|---|---|---|---|",
+        "| method | cells | dist_to_needles | dist (common extractor) | optima visited |",
+        "|---|---|---|---|---|",
     ]
     for r in sorted(agg_m, key=lambda r: methods.index(r["method"])):
         lines.append(f"| {r['method']} | {r['n_cells']} | {_fmt(r, 'dist_to_needles')} | "
                      f"{_fmt(r, 'dist_to_needles_extracted')} | "
-                     f"{_fmt(r, 'greedy_dist')} | "
-                     f"{_fmt(r, 'frac_optima_visited')} | {_fmt(r, 'simple_regret')} |")
+                     f"{_fmt(r, 'frac_optima_visited')} |")
     lines += ["", f"Means with {int(ci * 100)}% bootstrap intervals over cells. Lower "
               "is better except *optima visited*.", "",
               f"## Paired against `{ref}` (all landscapes)", "",
               "Difference = method − reference on the same landscape (negative is "
-              "better for the distances and regret). Win rate = share of landscapes "
+              "better for the distances). Win rate = share of landscapes "
               "where the method did strictly better.", "",
               "| method | pairs | Δ dist_to_needles | win rate | Δ dist (common extractor) "
-              "| win rate | Δ greedy dist | win rate | Δ simple regret | win rate |",
-              "|---|---|---|---|---|---|---|---|---|---|"]
+              "| win rate |",
+              "|---|---|---|---|---|---|"]
     for r in pair:
         if r["dim"] != "all":
             continue
@@ -501,9 +713,7 @@ def summarize(out_dir: str, *, ci: float = DEFAULT_CI, n_boot: int = DEFAULT_N_B
             f"| {r['method']} | {r['dist_to_needles_diff_n']} | "
             f"{_fmt(r, 'dist_to_needles_diff')} | {r['dist_to_needles_win_rate']} | "
             f"{_fmt(r, 'dist_to_needles_extracted_diff')} | "
-            f"{r['dist_to_needles_extracted_win_rate']} | "
-            f"{_fmt(r, 'greedy_dist_diff')} | {r['greedy_dist_win_rate']} | "
-            f"{_fmt(r, 'simple_regret_diff')} | {r['simple_regret_win_rate']} |")
+            f"{r['dist_to_needles_extracted_win_rate']} |")
     lines += ["", "Per-dimension pairs are in `paired.csv`.", "",
               "## Configurations", "", "| method | dim | source |", "|---|---|---|"]
     for method in methods:
@@ -522,13 +732,19 @@ def summarize(out_dir: str, *, ci: float = DEFAULT_CI, n_boot: int = DEFAULT_N_B
         *[f"![{m}]({m}_heatmap.png)" for m in METRICS],
         "",
         "![dist over time](dist_over_time.png)",
-        "![greedy dist over time](greedy_over_time.png)",
-        "![regret over time](regret_over_time.png)",
+        "![dist over time by axis](dist_over_time_by_axis.png)",
+        "![dist over time faceted](dist_over_time_grid.png)",
+        "![all trajectories](dist_over_time_all.png)",
         "",
-        "`greedy_dist` can only fall — samples accumulate, so each optimum's nearest "
-        "one never gets further away. A flat tail there means the search stopped "
-        "reaching new ground, not that it stopped declaring well.",
+        "The by-axis figure pools dimensions with different budgets, so its x axis is "
+        "the fraction of the cell's budget spent; the others are in measured points.",
         "",
+        "## Where each method sampled",
+        "",
+        *([f"Draw 1 of every {SAMPLING_DIM}-D landscape: the true landscape, one panel "
+           "per method, each sample filled with the landscape's colour at that point.",
+           "", *[f"![{f}]({f})" for f in sampling], ""] if sampling else
+          [f"Drawn only for {SAMPLING_DIM}-D landscapes; this campaign has none.", ""]),
         f"The over-time curves for extractor-scored methods have a point every "
         f"{manifest['trace_every']} batches (each is a GP fit); ZoMBI-Hop's own "
         "needles are traced every batch.",

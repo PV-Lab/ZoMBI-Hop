@@ -6,13 +6,13 @@ full-factorial grid of needle landscapes on the unit cube.
                         ``benchmarks.methods``, or ``module:Class``)
     number of needles   2, 10, 30, 50
     basin sharpness b   2.2, 6, 10, 15
-    dimension           3, 4, 6, 10
+    dimension           2, 3, 5, 9  (the 3/4/6/10-simplex in free dimensions)
 
 on a bumps-only ``CartesianEnsemble`` — negated-Ackley optima on a flat plain in
 ``[0, 1]^dim``, every other ``Ensemble`` feature off — so a difference between two
 cells is attributable to the swept quantities. Every method gets the identical
 landscape and noise stream for a given cell, and the same **measurement budget**
-(3000 points in batches of 24), enforced by one shared ``Problem``.
+(100 x dim points by default, one per call), enforced by one shared ``Problem``.
 
 See ``benchmarks/sweeps/README.md`` for the workflow, ``benchmarks/methods`` for
 the optimiser interface, and ``needles.py`` for what "a resolvable needle" means.
@@ -26,8 +26,9 @@ ensure_paths()
 
 from .campaign import (  # noqa: E402
     DEFAULT_BATCH,
-    DEFAULT_BUDGET,
+    DEFAULT_BUDGET_PER_DIM,
     DEFAULT_METHODS,
+    cell_budget,
     cell_dir,
     load_manifest,
     read_tasks,
@@ -47,13 +48,14 @@ from .needles import (  # noqa: E402
 
 __all__ = [
     "DEFAULT_BATCH",
-    "DEFAULT_BUDGET",
+    "DEFAULT_BUDGET_PER_DIM",
     "DEFAULT_METHODS",
     "GRID_BASIN_WIDTH",
     "GRID_DIM",
     "GRID_N_NEEDLES",
     "HPARAM_MAP",
     "build_landscape",
+    "cell_budget",
     "cell_dir",
     "ensure_paths",
     "hparams_for_dim",

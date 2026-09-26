@@ -32,7 +32,7 @@ from benchmarks.methods.base import DEFAULT_OUTPUT_NOISE_FRAC  # noqa: E402
 from . import needles as nd  # noqa: E402
 from .campaign import (  # noqa: E402
     DEFAULT_BATCH,
-    DEFAULT_BUDGET,
+    DEFAULT_BUDGET_PER_DIM,
     DEFAULT_METHODS,
     cell_command,
     plan,
@@ -147,11 +147,14 @@ def main() -> None:
     _add_out(p)
     _add_grid_args(p)
     _add_config_args(p)
-    p.add_argument("--n-draws", type=int, default=5,
+    p.add_argument("--n-draws", type=int, default=10,
                    help="independent optima placements per landscape configuration; "
                         "every method runs on each")
-    p.add_argument("--budget", type=int, default=DEFAULT_BUDGET,
-                   help="measured points per cell, initial design included")
+    p.add_argument("--budget-per-dim", type=int, default=DEFAULT_BUDGET_PER_DIM,
+                   help="measured points per cell = this x dim, initial design "
+                        "included (100 -> 200 points at 2d, 900 at 9d)")
+    p.add_argument("--budget", type=int, default=None,
+                   help="one flat budget for every dim instead of --budget-per-dim")
     p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH,
                    help="points per call for every method (the q of the batch "
                         "baselines). 1 = fully sequential, which zombi_hop's point "
@@ -166,10 +169,11 @@ def main() -> None:
                         "(and the controlled *_extracted metrics for all methods)")
     p.add_argument("--extractor-arg", action="append", metavar="KEY=VALUE",
                    default=None, help="extractor setting; repeatable")
-    p.add_argument("--trace-every", type=int, default=240,
+    p.add_argument("--trace-every", type=int, default=20,
                    help="run the extractor every this many batches for the "
                         "trajectories (0 = final only). Each run is a GP fit. At "
-                        "batch size 1 a batch is a point: 240 is the old 10 x 24")
+                        "batch size 1 a batch is a point: 20 gives 10 checkpoints "
+                        "at 2d and 45 at 9d under the default 100 x dim budget")
     p.add_argument("--cell-max-hours", type=float, default=6.0,
                    help="wall-clock ceiling per cell. NOT the budget — a safety "
                         "valve; a cell stopped by it is flagged budget_hit=false")
