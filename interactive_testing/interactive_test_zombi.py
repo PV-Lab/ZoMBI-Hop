@@ -40,6 +40,8 @@ Workflow
    simplex, the requested line is pushed through the physics print model; on the
    square it is sampled as-is.  Multiplicative output noise
    (OUTPUT_NOISE_FRAC × |y|) is added at every sample, matched to data/2nd_real_run.db.
+   With ``--pointwise`` each call instead measures the single proposed point
+   (no LineBO, no print model), as ``benchmarks/sweeps`` does.
 5. After every objective call, save a two-panel figure (ternary or square, per
    the domain) to ``interactive_testing/plots/`` and display it (non-blocking;
    PNGs are still saved but not displayed under ``--background``):
@@ -53,6 +55,7 @@ Workflow
                • dotted cornflower-blue line for LineBO's cache line,
                • thin dim-grey lines for every candidate line sampled this step
                  (only with ``--show-sampling``),
+               • orange ✕ for the point measured this step (``--pointwise``),
                • blue ★ for confirmed reference extrema.
 
 Usage
@@ -95,6 +98,17 @@ Flags
       Overlay a thin, semi-transparent line for every candidate line the
       acquisition function was integrated over at each step.
         python interactive_testing/interactive_test_zombi.py --show-sampling
+
+  --pointwise
+      Point-wise sampling, the ``benchmarks/sweeps`` regime (see
+      ``benchmarks/sweeps/POINTWISE.md``): every objective call measures ONE
+      point, the candidate ZoMBI-Hop proposes (projected into the domain; on the
+      simplex the print model is skipped). The initial design is 48 scrambled-
+      Sobol' points instead of 2 random lines, and the call-counted
+      hyperparameters (``max_iterations``, ``min_iters_per_zoom``,
+      ``max_lines_per_activation``) are multiplied by 24 so each zoom and
+      activation keeps its point budget. ``--show-sampling`` is ignored.
+        python interactive_testing/interactive_test_zombi.py --domain cartesian --pointwise
 
   --background
       Run headless on the Agg backend: no plot window ever pops up or steals
@@ -149,6 +163,8 @@ from src.utils.simplex import Ellipsoid, composition_to_ilr, ilr_to_composition
 from synthetic_data.ackley import Ackley
 from synthetic_data.ensemble import Ensemble, random_ensemble_config
 from optimize.composition_prediction import physics_simulate_line
+from benchmarks.methods.base import sobol_design
+from benchmarks.methods.zombihop import CALL_COUNTED, _zombihop_defaults
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 COMPOSITION_COLS = ["FAPbI3", "MAPbI3", "MAPbBr3"]
@@ -167,6 +183,9 @@ NUM_EXPERIMENTS = 24     # points sampled per suggested line (mirrors run_zombi_
 NUM_LINES = 10           # LineBO candidate lines per iteration
 TERNARY_GRID_N = 120     # ternary grid resolution for reference heatmap
 N_INIT_LINES = 2         # random lines to build the initial GP dataset
+# --pointwise (benchmarks/sweeps' regime, see benchmarks/sweeps/POINTWISE.md):
+N_INIT_POINTS = N_INIT_LINES * NUM_EXPERIMENTS   # Sobol' points in the initial design (48)
+LINE_EQUIVALENT = NUM_EXPERIMENTS                # CALL_COUNTED hparams are scaled by this
 
 SAVE_PLOTS = True        # save per-iteration PNG to interactive_testing/plots/
 
@@ -663,6 +682,39 @@ def make_linebo_wrapper(
     return wrapper
 
 
+def make_point_wrapper(
+    rf,
+    device: torch.device,
+    dtype: torch.dtype,
+    plot_state: dict,
+    *,
+    maximize: bool,
+    zdomain,
+):
+    """
+    Point-mode counterpart of :func:`make_linebo_wrapper` (``--pointwise``)::
+
+        wrapper(x_tell, bounds, acq_fn) → (x_requested, x_actual, y)
+
+    Measures exactly the candidate ZoMBI-Hop proposed, projected into the domain,
+    as ``benchmarks/methods/zombihop.py`` does with ``sampling="point"``. LineBO is
+    not used. The physics print model is a model of a printed *line*, so on the
+    simplex the point is measured as requested (``x_actual == x_requested``).
+    Output noise is the same multiplicative OUTPUT_NOISE_FRAC × |y|.
+    """
+
+    def wrapper(x_tell, bounds: torch.Tensor, acquisition_function):
+        x = zdomain.project(x_tell.detach().to(device=device, dtype=dtype).reshape(1, -1))
+        plot_state["point"] = x[0].cpu().numpy()
+        raw = torch.tensor(rf.predict(x.cpu().numpy()).ravel(), dtype=dtype, device=device)
+        y = raw if maximize else -raw
+        y = y + torch.randn_like(y) * (OUTPUT_NOISE_FRAC * y.abs())
+        print(f"  [point] measured {np.round(plot_state['point'], 4)}  y={y.item():.4f}", flush=True)
+        return x, x.clone(), y
+
+    return wrapper
+
+
 def _gp_landscape_vals(gp_handler, grid_pts, maximize: bool):
     """GP posterior mean over the ternary grid (display orientation), or None.
 
@@ -754,6 +806,7 @@ def make_plotting_wrapper(
             trust_ellipsoid=_clone(curr_bounds),
             line_0=plot_state.get("line_0"),
             line_1=plot_state.get("line_1"),
+            point=plot_state.get("point"),
             sampling_lines=plot_state.get("sampling_lines") if show_sampling else None,
             iteration_num=plot_state["iter"],
             save_dir=save_dir,
@@ -950,6 +1003,7 @@ def _plot_iteration(
     gp_grid_vals: np.ndarray | None = None,
     domain: str = "simplex",
     landscape_name: str = "RF",
+    point: np.ndarray | None = None,
 ) -> plt.Figure:
     """
     Generate the two-panel figure for one iteration and optionally save it —
@@ -972,6 +1026,7 @@ def _plot_iteration(
     sampling_lines      : list of (left_np, right_np) for every candidate line the
                           acquisition was integrated over this step, or None to skip
                           the thin sampling overlay (``--show-sampling``).
+    point               : (d,) point measured this step (``--pointwise``), or None.
     """
     fig, (ax_ref, ax_exp) = plt.subplots(1, 2, figsize=(16, 6.8))
     fig.suptitle(
@@ -1077,6 +1132,17 @@ def _plot_iteration(
         )
         legend_handles.append(h1)
 
+    # Point measured this step (--pointwise)
+    if point is not None:
+        pxy = to_xy(np.asarray(point).reshape(1, -1), domain)
+        h_pt = ax_exp.scatter(
+            pxy[:, 0], pxy[:, 1],
+            marker="X", s=160, c="orange",
+            zorder=10, edgecolors="black", linewidths=1.0,
+            label="Measured point",
+        )
+        legend_handles.append(h_pt)
+
     # Reference extrema on the exploration panel too (blue stars)
     if true_minima:
         mc = np.array([m[0] for m in true_minima])
@@ -1116,6 +1182,8 @@ def _plot_iteration(
         summary_lines.append(f"Line0: {_fmt(line_0[0])} → {_fmt(line_0[1])}")
     if line_1 is not None:
         summary_lines.append(f"Line1: {_fmt(line_1[0])} → {_fmt(line_1[1])}")
+    if point is not None:
+        summary_lines.append(f"Point: {_fmt(point)}")
     if summary_lines:
         ax_exp.text(
             0.01, 0.99, "\n".join(summary_lines),
@@ -1219,6 +1287,51 @@ def generate_init_data(
     )
 
 
+def generate_init_points(
+    rf,
+    n_points: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    maximize: bool,
+    domain: str = "simplex",
+    seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Point-mode initial design (``--pointwise``): ``n_points`` scrambled-Sobol'
+    points, as ``benchmarks/methods`` gives every method. On the square they are
+    Sobol' points in [0, 1]^2; on the simplex a (d-1)-dim Sobol' design is mapped
+    uniformly onto the simplex by the sorted-spacings construction. Measured as
+    requested, so ``X_init_actual == X_init_expected``.
+    """
+    dim = DOMAIN_DIMS[domain]
+    if domain == "simplex":
+        u = np.sort(sobol_design(n_points, dim - 1, seed), axis=1)
+        pts = np.diff(np.hstack([np.zeros((n_points, 1)), u, np.ones((n_points, 1))]), axis=1)
+    else:
+        pts = sobol_design(n_points, dim, seed)
+    raw = torch.tensor(rf.predict(pts).ravel(), dtype=dtype, device=device)
+    y = raw + torch.randn_like(raw) * (OUTPUT_NOISE_FRAC * raw.abs())
+    y_zombi = y if maximize else -y
+    X = torch.as_tensor(pts, dtype=dtype, device=device)
+    return X, X.clone(), y_zombi.reshape(-1, 1)
+
+
+def scale_call_counted(zparams: dict, k: int) -> dict:
+    """Point-mode hparams: the keys in ``CALL_COUNTED`` (budgets counted in objective
+    calls, tuned when a call was a ``k``-point line) are multiplied by ``k``, so the
+    per-zoom and per-activation *point* budgets stay as tuned — the same rule as
+    ``ZoMBIHopMethod.resolved_hparams`` (see benchmarks/sweeps/POINTWISE.md). Keys
+    absent from ``zparams`` are scaled from the ``ZoMBIHop`` constructor defaults."""
+    out = dict(zparams)
+    missing = [key for key in CALL_COUNTED if key not in out]
+    base = {**(_zombihop_defaults(missing) if missing else {}),
+            **{key: out[key] for key in CALL_COUNTED if key in out}}
+    for key in CALL_COUNTED:
+        out[key] = int(base[key]) * k
+    return out
+
+
 # ── Hyperparameter loading ────────────────────────────────────────────────────
 
 def load_hparams(path: str) -> dict:
@@ -1298,6 +1411,7 @@ def main(
     domain: str | None = None,
     seed: int = 0,
     index: int = 0,
+    pointwise: bool = False,
 ) -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(script_dir, "campaign1a.csv")
@@ -1328,7 +1442,11 @@ def main(
     print(f"Domain : {domain}  (d={dim}, {zdomain!r})")
     print(f"Device : {DEVICE}")
     print(f"Noise  : input ILR std={NOISE_LEVEL_ILR}  |  output frac={OUTPUT_NOISE_FRAC} (× |y|)")
+    print(f"Sampling: {'point (one point per call)' if pointwise else f'line (LineBO, {NUM_EXPERIMENTS} pts per call)'}")
     print("=" * 70)
+    if pointwise and show_sampling:
+        print("  --show-sampling draws LineBO candidate lines; ignored with --pointwise.")
+        show_sampling = False
 
     # ── Step 1: build the objective surrogate ─────────────────────────────────
     # ``rf`` is any object exposing a scikit-learn-style ``predict((N, d)) → (N,)``
@@ -1401,18 +1519,28 @@ def main(
     zparams = dict(ZOMBI_PARAMS)
     if hparams_path is not None:
         zparams.update(load_hparams(hparams_path))
+    if pointwise:
+        zparams = scale_call_counted(zparams, LINE_EQUIVALENT)
+        print(f"    Point mode: call-counted hparams × {LINE_EQUIVALENT}: "
+              + ", ".join(f"{k}={zparams[k]}" for k in CALL_COUNTED))
 
-    plot_state: dict = {"line_0": None, "line_1": None, "fig": None, "iter": 0}
+    plot_state: dict = {"line_0": None, "line_1": None, "point": None, "fig": None, "iter": 0}
     dh_ref: list = [None]   # filled with optimizer.data_handler after construction
     gp_ref: list = [None]   # filled with optimizer.gp_handler after construction
     plot_queue: queue.Queue = queue.Queue()
 
-    print("    Building sim objective …")
-    sim_obj = make_sim_objective(rf, DEVICE, DTYPE, maximize=maximize, domain=domain)
-    print("    Building LineBO wrapper …")
-    inner_wrap = make_linebo_wrapper(
-        sim_obj, dim, NUM_LINES, DEVICE, DTYPE, plot_state, zdomain=zdomain,
-    )
+    if pointwise:
+        print("    Building point wrapper …")
+        inner_wrap = make_point_wrapper(
+            rf, DEVICE, DTYPE, plot_state, maximize=maximize, zdomain=zdomain,
+        )
+    else:
+        print("    Building sim objective …")
+        sim_obj = make_sim_objective(rf, DEVICE, DTYPE, maximize=maximize, domain=domain)
+        print("    Building LineBO wrapper …")
+        inner_wrap = make_linebo_wrapper(
+            sim_obj, dim, NUM_LINES, DEVICE, DTYPE, plot_state, zdomain=zdomain,
+        )
     print("    Building plotting wrapper …")
     full_wrap = make_plotting_wrapper(
         inner_wrap, dh_ref, plot_state,
@@ -1426,10 +1554,16 @@ def main(
         landscape_name=landscape_name,
     )
 
-    print(f"    Generating initial data ({N_INIT_LINES} lines × {NUM_EXPERIMENTS} pts) …")
-    X_init_a, X_init_e, Y_init = generate_init_data(
-        rf, N_INIT_LINES, DEVICE, DTYPE, maximize=maximize, domain=domain,
-    )
+    if pointwise:
+        print(f"    Generating initial data ({N_INIT_POINTS} Sobol' points) …")
+        X_init_a, X_init_e, Y_init = generate_init_points(
+            rf, N_INIT_POINTS, DEVICE, DTYPE, maximize=maximize, domain=domain, seed=seed,
+        )
+    else:
+        print(f"    Generating initial data ({N_INIT_LINES} lines × {NUM_EXPERIMENTS} pts) …")
+        X_init_a, X_init_e, Y_init = generate_init_data(
+            rf, N_INIT_LINES, DEVICE, DTYPE, maximize=maximize, domain=domain,
+        )
     print(f"    {X_init_a.shape[0]} initial points generated.")
     y_rng_lbl = "ZoMBI-internal Y" if maximize else "ZoMBI-internal Y (negated RF)"
     print(f"    Y_init range ({y_rng_lbl}): [{Y_init.min().item():.4f}, {Y_init.max().item():.4f}]")
@@ -1632,6 +1766,15 @@ if __name__ == "__main__":
              "during the run, and per-iteration PNGs are still saved to "
              "interactive_testing/plots/. Skips the interactive extrema picker.",
     )
+    parser.add_argument(
+        "--pointwise",
+        action="store_true",
+        help="Measure ONE point per objective call (the candidate ZoMBI-Hop "
+             f"proposes) instead of a LineBO line, with a {N_INIT_POINTS}-point "
+             "Sobol' initial design and the call-counted hyperparameters scaled "
+             f"x{LINE_EQUIVALENT} — the benchmarks/sweeps regime "
+             "(see benchmarks/sweeps/POINTWISE.md).",
+    )
     args = parser.parse_args()
     main(
         hparams_path=args.hparams,
@@ -1642,4 +1785,5 @@ if __name__ == "__main__":
         domain=args.domain,
         seed=args.seed,
         index=args.index,
+        pointwise=args.pointwise,
     )
