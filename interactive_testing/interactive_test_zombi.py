@@ -104,10 +104,10 @@ Flags
       ``benchmarks/sweeps/POINTWISE.md``): every objective call measures ONE
       point, the candidate ZoMBI-Hop proposes (projected into the domain; on the
       simplex the print model is skipped). The initial design is 48 scrambled-
-      Sobol' points instead of 2 random lines, and the call-counted
-      hyperparameters (``max_iterations``, ``min_iters_per_zoom``,
-      ``max_lines_per_activation``) are multiplied by 24 so each zoom and
-      activation keeps its point budget. ``--show-sampling`` is ignored.
+      Sobol' points instead of 2 random lines. Hyperparameters are used as
+      given, so the ones that count objective calls (``max_iterations``,
+      ``min_iters_per_zoom``, ``max_lines_per_activation``) count single points
+      instead of lines. ``--show-sampling`` is ignored.
         python interactive_testing/interactive_test_zombi.py --domain cartesian --pointwise
 
   --background
@@ -164,7 +164,6 @@ from synthetic_data.ackley import Ackley
 from synthetic_data.ensemble import Ensemble, random_ensemble_config
 from optimize.composition_prediction import physics_simulate_line
 from benchmarks.methods.base import sobol_design
-from benchmarks.methods.zombihop import CALL_COUNTED, _zombihop_defaults
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 COMPOSITION_COLS = ["FAPbI3", "MAPbI3", "MAPbBr3"]
@@ -185,7 +184,6 @@ TERNARY_GRID_N = 120     # ternary grid resolution for reference heatmap
 N_INIT_LINES = 2         # random lines to build the initial GP dataset
 # --pointwise (benchmarks/sweeps' regime, see benchmarks/sweeps/POINTWISE.md):
 N_INIT_POINTS = N_INIT_LINES * NUM_EXPERIMENTS   # Sobol' points in the initial design (48)
-LINE_EQUIVALENT = NUM_EXPERIMENTS                # CALL_COUNTED hparams are scaled by this
 
 SAVE_PLOTS = True        # save per-iteration PNG to interactive_testing/plots/
 
@@ -1317,21 +1315,6 @@ def generate_init_points(
     return X, X.clone(), y_zombi.reshape(-1, 1)
 
 
-def scale_call_counted(zparams: dict, k: int) -> dict:
-    """Point-mode hparams: the keys in ``CALL_COUNTED`` (budgets counted in objective
-    calls, tuned when a call was a ``k``-point line) are multiplied by ``k``, so the
-    per-zoom and per-activation *point* budgets stay as tuned — the same rule as
-    ``ZoMBIHopMethod.resolved_hparams`` (see benchmarks/sweeps/POINTWISE.md). Keys
-    absent from ``zparams`` are scaled from the ``ZoMBIHop`` constructor defaults."""
-    out = dict(zparams)
-    missing = [key for key in CALL_COUNTED if key not in out]
-    base = {**(_zombihop_defaults(missing) if missing else {}),
-            **{key: out[key] for key in CALL_COUNTED if key in out}}
-    for key in CALL_COUNTED:
-        out[key] = int(base[key]) * k
-    return out
-
-
 # ── Hyperparameter loading ────────────────────────────────────────────────────
 
 def load_hparams(path: str) -> dict:
@@ -1519,10 +1502,6 @@ def main(
     zparams = dict(ZOMBI_PARAMS)
     if hparams_path is not None:
         zparams.update(load_hparams(hparams_path))
-    if pointwise:
-        zparams = scale_call_counted(zparams, LINE_EQUIVALENT)
-        print(f"    Point mode: call-counted hparams × {LINE_EQUIVALENT}: "
-              + ", ".join(f"{k}={zparams[k]}" for k in CALL_COUNTED))
 
     plot_state: dict = {"line_0": None, "line_1": None, "point": None, "fig": None, "iter": 0}
     dh_ref: list = [None]   # filled with optimizer.data_handler after construction
@@ -1771,9 +1750,9 @@ if __name__ == "__main__":
         action="store_true",
         help="Measure ONE point per objective call (the candidate ZoMBI-Hop "
              f"proposes) instead of a LineBO line, with a {N_INIT_POINTS}-point "
-             "Sobol' initial design and the call-counted hyperparameters scaled "
-             f"x{LINE_EQUIVALENT} — the benchmarks/sweeps regime "
-             "(see benchmarks/sweeps/POINTWISE.md).",
+             "Sobol' initial design — the benchmarks/sweeps regime (see "
+             "benchmarks/sweeps/POINTWISE.md). Hyperparameters are used as given, "
+             "so max_iterations etc. count points instead of lines.",
     )
     args = parser.parse_args()
     main(

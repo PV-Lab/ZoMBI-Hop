@@ -18,8 +18,8 @@ Every cell has the same **measurement budget: 3000 points, one point per call**,
 enforced by one shared `benchmarks.methods.Problem`. Every method is fully
 sequential: ZoMBI-Hop measures the single candidate it proposes (`sampling="point"`,
 no LineBO lines), and the baselines run at q = 1. All start with a 48-point Sobol'
-initial design. ZoMBI-Hop's hyperparameters counted in lines are converted to points;
-[`POINTWISE.md`](POINTWISE.md) lists every change and why. A wall-clock budget would hand fast methods and low
+initial design. ZoMBI-Hop's hyperparameters are used as tuned, so the ones that used
+to count lines now count points; [`POINTWISE.md`](POINTWISE.md) lists every change and why. A wall-clock budget would hand fast methods and low
 dimensions more experiments, so the budget is points, the quantity that costs money
 on real hardware. `--cell-max-hours` is only a safety ceiling.
 

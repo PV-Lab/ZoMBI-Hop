@@ -26,11 +26,10 @@ Point mode (``sampling="point"``, what ``benchmarks/sweeps`` runs)
 --------------------------------------------------------------------
 Every objective call measures ONE point, the candidate ZoMBI-Hop proposed (clipped to
 the box). LineBO is not used. The initial design is ``n_init_points`` scrambled-Sobol'
-points, measured one at a time like the baselines' designs. Hyperparameters that
-count objective calls (:data:`CALL_COUNTED`) were tuned when a call was a
-``line_equivalent``-point line, so ``resolved_hparams`` multiplies them by
-``line_equivalent``. That keeps the per-zoom and per-activation *point* budgets the
-tuned configs had. See ``benchmarks/sweeps/POINTWISE.md`` for why.
+points, measured one at a time like the baselines' designs. Hyperparameters are
+used as given: the ones that count objective calls (``max_iterations``,
+``min_iters_per_zoom``, ``max_lines_per_activation``) now count single points, not
+lines. See ``benchmarks/sweeps/POINTWISE.md``.
 
 Config
 ------
@@ -45,8 +44,6 @@ sampling            "line" (default) or "point" (see above)
 n_init_lines        random chords measured before the optimiser starts (line mode)
 n_init_points       Sobol' points measured before the optimiser starts (point mode;
                     default 48, the baselines' ``n_init``)
-line_equivalent     points per line the hyperparameters were tuned with (24); point
-                    mode scales :data:`CALL_COUNTED` by it
 linebo_num_lines   candidate chords LineBO ranks per call (run_mobo: 10)
 linebo_points_per_line
                     points per candidate chord LineBO scores the acquisition on
@@ -75,28 +72,6 @@ ensure_paths()
 ZOMBI_FIXED = {"max_gp_points": 3000, "acquisition_type": "ucb",
                "input_noise": 0.128, "verbose": False}
 
-#: ZoMBI-Hop hyperparameters denominated in objective calls, which point mode
-#: rescales by ``line_equivalent``. Counts of zooms, repeats, points and consecutive
-#: convergence checks are not in here and are left as they are.
-CALL_COUNTED = ("max_iterations", "min_iters_per_zoom", "max_lines_per_activation")
-
-
-def _zombihop_defaults(keys) -> dict:
-    """``ZoMBIHop.__init__`` defaults for ``keys``, read without keeping the import's
-    side effect (importing it switches torch's global default device and dtype)."""
-    import inspect
-
-    import torch
-
-    prev_dtype, prev_device = torch.get_default_dtype(), torch.get_default_device()
-    try:
-        from src.core.zombihop import ZoMBIHop
-    finally:
-        torch.set_default_dtype(prev_dtype)
-        torch.set_default_device(prev_device)
-    params = inspect.signature(ZoMBIHop.__init__).parameters
-    return {k: params[k].default for k in keys}
-
 
 def _box_chord(x0: np.ndarray, direction: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Endpoints of the line ``x0 + t*direction`` clipped to the unit box."""
@@ -121,7 +96,6 @@ class ZoMBIHopMethod(Method):
         "sampling": "line",
         "n_init_lines": 2,
         "n_init_points": 48,
-        "line_equivalent": 24,
         "linebo_num_lines": 10,
         "linebo_points_per_line": 100,
         "never_terminate": True,
@@ -145,13 +119,6 @@ class ZoMBIHopMethod(Method):
         # run_single_trial's rule: the top-m ellipsoid fit needs at least d+1 points.
         if dim > 3 and (hp.get("top_m_points") is None or hp["top_m_points"] < dim + 1):
             hp["top_m_points"] = max(dim + 1, 4)
-        if self.config["sampling"] == "point":
-            k = int(self.config["line_equivalent"])
-            missing = [key for key in CALL_COUNTED if key not in hp]
-            base = {**(_zombihop_defaults(missing) if missing else {}),
-                    **{key: hp[key] for key in CALL_COUNTED if key in hp}}
-            for key in CALL_COUNTED:
-                hp[key] = int(base[key]) * k
         return hp
 
     # ── run ──

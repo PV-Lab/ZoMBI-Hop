@@ -8,7 +8,7 @@ plan time and frozen into the manifest.
   :mod:`benchmarks.sweeps.hparams` (overridable with ``--hparams DIM=path``), and
   ``sampling="point"``: in a sweep every method measures one point per call (see
   ``POINTWISE.md``). The manifest also records ``resolved_hparams``, the values it
-  actually runs after point mode rescales its call-counted keys.
+  actually runs (the hparams file plus the ``top_m_points`` floor).
 * Every other method gets its class ``defaults``, the same at every dimension.
 
 Either can be overridden for the whole campaign:
