@@ -83,6 +83,14 @@ instead of the simplex — every knob keeps its meaning, only the domain changes
 At ``dim=2`` it gives a square landscape that draws as an ordinary height map
 (the simplex cannot: a 2-simplex is just a line segment).
 
+The domain is also selectable as a *mode* on ``Ensemble`` itself:
+``Ensemble(dim=3, domain="cube", ...)`` returns a ``CartesianEnsemble``, and
+``random_ensemble_config(dim, domain="cube")`` emits a config carrying
+``"domain": "cube"`` so ``Ensemble(**config)`` recreates the hypercube landscape
+through every existing call site.  ``domain="simplex"`` (the default) is the
+original behaviour, and simplex configs carry no ``"domain"`` key so previously
+saved configs stay byte-identical.
+
 Example
 -------
     from synthetic_data.ensemble import Ensemble
@@ -139,11 +147,20 @@ _SEED_CLUSTERS = 808
 # region preference.  ``"faces"`` only differs from ``"edges"`` for dim >= 4.
 REGION_MODES = ("corners", "edges", "faces", "middle")
 
+# Input domains: the probability simplex (the default) or the unit hypercube
+# ``[0, 1]^dim`` (:class:`CartesianEnsemble`).
+DOMAINS = ("simplex", "cube")
 
-def region_modes(dim: int) -> tuple[str, ...]:
-    """Region targets meaningful at simplex ``dim`` (drops ``"faces"`` for dim 3,
-    where a facet coincides with an edge)."""
-    if dim <= 3:
+
+def region_modes(dim: int, domain: str = "simplex") -> tuple[str, ...]:
+    """Region targets meaningful at ``dim`` on ``domain``.
+
+    Drops ``"faces"`` wherever a facet coincides with an edge: the simplex at
+    dim <= 3 (a triangle's facets are its edges) and the cube at dim <= 2 (a
+    square's facets are its edges).
+    """
+    max_degenerate = 2 if domain == "cube" else 3
+    if dim <= max_degenerate:
         return tuple(m for m in REGION_MODES if m != "faces")
     return REGION_MODES
 
@@ -211,6 +228,7 @@ def random_ensemble_config(
     seed: int = 0,
     optima_margin: float = 0.2,
     input_noise: float = _DEFAULT_INPUT_NOISE,
+    domain: str = "simplex",
 ) -> dict:
     """Draw the ``index``-th :class:`Ensemble` configuration from a Sobol' sweep.
 
@@ -233,11 +251,16 @@ def random_ensemble_config(
         sequence itself; accepted for API symmetry / future LHS batching).
     seed : selects the Sobol' scramble *and* the per-landscape feature placement
         seed; same ``(seed, index)`` -> identical landscape.
+    domain : ``"simplex"`` (default) or ``"cube"``.  A cube config additionally
+        carries ``"domain": "cube"``; the knob draws are otherwise identical, so
+        the same ``(seed, index)`` gives the same settings on either domain.
     """
     dim = int(dim)
+    if domain not in DOMAINS:
+        raise ValueError(f"domain must be one of {DOMAINS} (got {domain!r}).")
     opt_lo, opt_hi = optima_count_range(dim)
     bw_lo, bw_hi = basin_width_range(dim)
-    regions = region_modes(dim)
+    regions = region_modes(dim, domain)
     layout_opts = ("scatter",) + regions
 
     # One Sobol' coordinate per knob, consumed in order.
@@ -270,7 +293,7 @@ def random_ensemble_config(
     # Per-landscape placement seed, deterministic in (seed, index).
     feature_seed = (int(seed) * 100_003 + int(index)) % 1_000_000
 
-    return {
+    cfg = {
         "dim": dim,
         # true optima
         "n_optima": i_range(opt_lo, opt_hi),
@@ -311,6 +334,9 @@ def random_ensemble_config(
         # global
         "seed": int(feature_seed),
     }
+    if domain != "simplex":
+        cfg["domain"] = domain
+    return cfg
 
 
 # ── Geometry helpers ─────────────────────────────────────────────────────────
@@ -454,6 +480,9 @@ class Ensemble:
     neg_frac : float
         Fraction of signed-feature instances that *subtract* mass instead of
         adding it (in ``[0, 1]``; ~0.5 keeps the surface centred).
+    domain : str
+        ``"simplex"`` (default) or ``"cube"``.  ``Ensemble(domain="cube", ...)``
+        constructs a :class:`CartesianEnsemble` (same knobs on ``[0, 1]^dim``).
     input_noise : float
         Minimum separation (composition L2) below which two optima are treated
         as the same peak.  Optima are tagged as *true* optima greedily in
@@ -464,6 +493,16 @@ class Ensemble:
         basin is a true optimum).  Defaults to :data:`_DEFAULT_INPUT_NOISE`.
     seed : single master seed driving every random placement and sign.
     """
+
+    domain = "simplex"
+
+    def __new__(cls, *args, domain: str | None = None, **kwargs):
+        # ``domain`` is a mode switch: asking the base class for a cube hands
+        # back the hypercube subclass, so ``Ensemble(**config)`` works for
+        # configs from ``random_ensemble_config(..., domain="cube")``.
+        if cls is Ensemble and domain == "cube":
+            cls = CartesianEnsemble
+        return super().__new__(cls)
 
     def __init__(
         self,
@@ -507,9 +546,15 @@ class Ensemble:
         neg_frac: float = 0.5,
         # optima paring
         input_noise: float = _DEFAULT_INPUT_NOISE,
+        # input domain (dispatched in ``__new__``)
+        domain: str | None = None,
         # global
         seed: int = 0,
     ) -> None:
+        if domain is not None and domain != type(self).domain:
+            raise ValueError(
+                f"domain must be one of {DOMAINS} and match the class "
+                f"({type(self).__name__} is {type(self).domain!r}; got {domain!r}).")
         if dim < 2:
             raise ValueError(f"dim must be >= 2 (got {dim}).")
         self.dim = dim
@@ -897,7 +942,11 @@ class CartesianEnsemble(Ensemble):
     The region modes keep their names against the box's own geometry:
     ``"corners"`` are its ``2**dim`` vertices, ``"edges"`` its edges, ``"faces"``
     its facets (the whole boundary), and ``"middle"`` its centre.
+
+    Also reachable as ``Ensemble(domain="cube", ...)``.
     """
+
+    domain = "cube"
 
     @property
     def _centroid(self) -> np.ndarray:

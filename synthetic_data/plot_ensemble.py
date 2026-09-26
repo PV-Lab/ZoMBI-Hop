@@ -1,11 +1,20 @@
 """Interactive viewer for the layered :class:`~synthetic_data.ensemble.Ensemble`
 objective.
 
-A single Dash app shows **one plot at a time**, chosen by the **view** dropdown:
+A single Dash app shows **one plot at a time**, chosen by the **domain** and
+**view** dropdowns:
 
-  * **3D (ternary heatmap)** — the 3-simplex drawn as a ternary heatmap.
-  * **4D (tetrahedron point cloud)** — the 4-simplex as a point cloud, objective
-    mapped to colour.
+  * **Simplex** domain (the probability simplex, :class:`Ensemble`):
+      - **3D (ternary heatmap)** — the 3-simplex drawn as a ternary heatmap.
+      - **4D (tetrahedron point cloud)** — the 4-simplex as a point cloud,
+        objective mapped to colour.
+  * **Hypercube** domain (``[0, 1]^dim``, ``Ensemble(domain="cube")``):
+      - **2D (square heatmap)** — the unit square as an ordinary heatmap.
+      - **3D (cube point cloud)** — the unit cube as a point cloud.
+
+The two views of each domain share the same on-screen dimensionality (a flat
+2D plot / a 3D point cloud), so each view keeps its resolution slider when the
+domain is switched.
 
 Hand-building a landscape on the unit square — placing optima, penalization
 volumes and printed lines by clicking — lives in its own app,
@@ -32,6 +41,7 @@ import argparse
 import os
 import random
 import sys
+from math import comb
 from pathlib import Path
 
 import numpy as np
@@ -204,12 +214,17 @@ def build_app():
 
     controls = html.Div([
         html.Div([
+            html.Label("Domain"),
+            dcc.Dropdown(id="domain-select", clearable=False,
+                         options=[{"label": "Simplex (compositions)",
+                                   "value": "simplex"},
+                                  {"label": "Hypercube [0, 1]^d", "value": "cube"}],
+                         value="simplex"),
+        ], style={"padding": "8px"}),
+        html.Div([
             html.Label("View"),
             dcc.Dropdown(id="dim-select", clearable=False,
-                         options=[{"label": "3D (ternary heatmap)", "value": "3d"},
-                                  {"label": "4D (tetrahedron point cloud)",
-                                   "value": "4d"}],
-                         value="3d"),
+                         options=_view_options("simplex"), value="3d"),
         ], style={"padding": "8px"}),
 
         html.Div([
@@ -227,6 +242,15 @@ def build_app():
         controls,
         dcc.Graph(id="cloud-plot", style={"height": f"{FIG_H}px"}),
     ])
+
+    @callback(
+        Output("dim-select", "options"),
+        Input("domain-select", "value"),
+    )
+    def relabel_views(domain):
+        # View values stay "3d"/"4d" (flat plot / 3D cloud); only the labels
+        # change, so the selected view survives a domain switch.
+        return _view_options(domain)
 
     @callback(
         Output("grid-3d-wrap", "style"),
@@ -272,15 +296,17 @@ def build_app():
         Output("tog-edge", "value"),
         Input("randomize-btn", "n_clicks"),
         State("dim-select", "value"),
+        State("domain-select", "value"),
         prevent_initial_call=True,
     )
-    def randomize(_n_clicks, dim_sel):
+    def randomize(_n_clicks, dim_sel, domain):
         # Draw exactly what optimize/run_mobo.py and optimize/evaluate.py generate
         # per run, so the viewer's "Randomize" matches the benchmark landscapes.
         # A random Sobol' index + scramble seed gives a fresh landscape per click.
-        cfg = random_ensemble_config(_dim_of(dim_sel),
+        cfg = random_ensemble_config(_dim_of(dim_sel, domain),
                                      index=random.randrange(1 << 20),
-                                     seed=random.randrange(1 << 16))
+                                     seed=random.randrange(1 << 16),
+                                     domain=domain)
         on = lambda v: ["on"] if v else []  # noqa: E731
         return (
             cfg["n_optima"],                             # n-optima
@@ -317,6 +343,7 @@ def build_app():
 
     @callback(
         Output("cloud-plot", "figure"),
+        Input("domain-select", "value"),
         Input("dim-select", "value"),
         Input("n-optima", "value"),
         Input("basin-width", "value"),
@@ -354,7 +381,7 @@ def build_app():
         Input("grid-res-4d", "value"),
         Input("basin-threshold", "value"),
     )
-    def update_plot(dim_sel, n_optima, basin_width, optima_margin,
+    def update_plot(domain, dim_sel, n_optima, basin_width, optima_margin,
                     optima_layout, n_clusters, cluster_conc, cluster_spread,
                     tog_weak, n_weak, weak_width, weak_amp,
                     tog_ridges, n_ridges, ridge_width, ridge_amp, ridge_length,
@@ -363,10 +390,11 @@ def build_app():
                     tog_plateaus, n_plateaus, plateau_radius, plateau_amp,
                     tog_edge, edge_region, edge_amp, edge_reach, neg_frac,
                     seed, grid_res_3d, grid_res_4d, basin_threshold):
-        dim = _dim_of(dim_sel)
+        dim = _dim_of(dim_sel, domain)
         on = lambda t: bool(t)  # noqa: E731
         fn = Ensemble(
             dim=dim,
+            domain=domain,
             n_optima=int(n_optima),
             basin_width=float(basin_width),
             optima_margin=float(optima_margin),
@@ -396,7 +424,13 @@ def build_app():
         )
         peaks = np.asarray(fn.centers)
         title = (f"Ensemble — {len(peaks)} optima, margin={optima_margin:g} "
-                 f"(dim {dim}, seed {seed})")
+                 f"({domain} dim {dim}, seed {seed})")
+        if domain == "cube":
+            if dim_sel == "4d":
+                return _cube_cloud_figure(fn, peaks, int(grid_res_4d),
+                                          basin_threshold, title)
+            return _square_figure(fn, peaks, int(grid_res_3d), basin_threshold,
+                                  title)
         if dim == 3:
             return _ternary_figure(fn, peaks, int(grid_res_3d), basin_threshold,
                                    title)
@@ -405,9 +439,21 @@ def build_app():
     return app
 
 
-def _dim_of(dim_sel):
-    """Input dimensionality behind each view."""
-    return 4 if dim_sel == "4d" else 3
+def _view_options(domain):
+    """View dropdown entries for ``domain`` ("3d" = flat plot, "4d" = 3D cloud)."""
+    if domain == "cube":
+        return [{"label": "2D (square heatmap)", "value": "3d"},
+                {"label": "3D (cube point cloud)", "value": "4d"}]
+    return [{"label": "3D (ternary heatmap)", "value": "3d"},
+            {"label": "4D (tetrahedron point cloud)", "value": "4d"}]
+
+
+def _dim_of(dim_sel, domain="simplex"):
+    """Input dimensionality behind each view.  The simplex needs one more
+    component than the picture has axes (the components sum to 1); the cube
+    does not."""
+    base = 4 if dim_sel == "4d" else 3
+    return base - 1 if domain == "cube" else base
 
 
 # ── Figure builders ──────────────────────────────────────────────────────────
@@ -498,6 +544,107 @@ def _point_cloud_figure(fn, peaks, grid_n, basin_threshold, title):
         title=title,
         scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False),
                    zaxis=dict(visible=False), aspectmode="data"),
+        legend=dict(x=0.0, y=1.0), width=FIG_W, height=FIG_H,
+    )
+    return fig
+
+
+def _square_figure(fn, peaks, grid_n, basin_threshold, title):
+    """The 2D unit square as a heatmap; cells below the basin threshold are
+    left empty over a black plot background, matching the ternary view."""
+    ax = np.linspace(0.0, 1.0, grid_n + 1)
+    gx, gy = np.meshgrid(ax, ax)
+    obj = fn.predict(np.column_stack([gx.ravel(), gy.ravel()]))
+    obj_min, obj_max = float(obj.min()), float(obj.max())
+    z = np.where(basin_mask(obj, basin_threshold), obj, np.nan).reshape(gx.shape)
+
+    traces = [go.Heatmap(
+        x=ax, y=ax, z=z, colorscale="Viridis", zmin=obj_min, zmax=obj_max,
+        name="objective", hovertemplate="x1=%{x:.2f}<br>x2=%{y:.2f}<br>"
+                                        "obj=%{z:.3f}<extra></extra>",
+        colorbar=dict(title=dict(text="Objective", side="top", font=dict(size=20)),
+                      tickfont=dict(size=18), len=0.8, x=1.02),
+    )]
+    if len(peaks):
+        traces.append(go.Scatter(
+            x=peaks[:, 0], y=peaks[:, 1], mode="markers", name="known peak",
+            visible="legendonly",
+            marker=dict(symbol="star", color="red", size=14,
+                        line=dict(color="white", width=1)),
+        ))
+
+    fig = go.Figure(data=traces)
+    axis_title_font = dict(size=22)
+    axis_tick_font = dict(size=18)
+    fig.update_layout(
+        title=title, plot_bgcolor="black",
+        xaxis=dict(title=dict(text="x1", font=axis_title_font),
+                   tickfont=axis_tick_font, range=[0, 1], constrain="domain",
+                   showgrid=False, zeroline=False),
+        yaxis=dict(title=dict(text="x2", font=axis_title_font),
+                   tickfont=axis_tick_font, range=[0, 1], scaleanchor="x",
+                   constrain="domain", showgrid=False, zeroline=False),
+        legend=dict(x=1.15, y=1.0), width=FIG_W, height=FIG_H, margin=dict(t=60),
+    )
+    return fig
+
+
+# Unit-cube wireframe: the 12 edges join corners differing in exactly one axis.
+_CUBE_CORNERS = np.array([[i, j, k] for i in (0, 1) for j in (0, 1) for k in (0, 1)],
+                         dtype=float)
+
+
+def _cube_edges_trace():
+    xs, ys, zs = [], [], []
+    for a in range(8):
+        for b in range(a + 1, 8):
+            if np.abs(_CUBE_CORNERS[a] - _CUBE_CORNERS[b]).sum() == 1:
+                for coord, out in zip(range(3), (xs, ys, zs)):
+                    out += [_CUBE_CORNERS[a, coord], _CUBE_CORNERS[b, coord], None]
+    return go.Scatter3d(
+        x=xs, y=ys, z=zs, mode="lines", name="cube edges",
+        line=dict(color="rgba(60,60,60,0.6)", width=3), hoverinfo="skip",
+    )
+
+
+def _cube_cloud_figure(fn, peaks, grid_n, basin_threshold, title):
+    """The 3D unit cube as a point cloud.  ``grid_n`` is the same slider as the
+    tetrahedron view; the cube lattice is sized to hold about as many points as
+    that tetrahedron lattice would, so the browser load is comparable."""
+    n_side = max(2, int(round(comb(grid_n + 3, 3) ** (1.0 / 3.0))))
+    ax = np.linspace(0.0, 1.0, n_side)
+    comp = np.stack(np.meshgrid(ax, ax, ax, indexing="ij"), axis=-1).reshape(-1, 3)
+    obj = fn.predict(comp)
+    obj_min, obj_max = float(obj.min()), float(obj.max())
+
+    above = basin_mask(obj, basin_threshold)
+    comp_v, obj_v = comp[above], obj[above]
+    hover = [f"x=[{a:.2f}, {b:.2f}, {c:.2f}]<br>obj={v:.2f}"
+             for (a, b, c), v in zip(comp_v, obj_v)]
+
+    cloud = go.Scatter3d(
+        x=comp_v[:, 0], y=comp_v[:, 1], z=comp_v[:, 2], mode="markers",
+        name="objective", text=hover, hoverinfo="text",
+        marker=dict(color=obj_v, colorscale="Viridis", cmin=obj_min, cmax=obj_max,
+                    size=MARKER_SIZE, opacity=MARKER_OPACITY, showscale=True,
+                    colorbar=dict(title="Objective")),
+    )
+    data = [cloud, _cube_edges_trace()]
+    if len(peaks):
+        data.append(go.Scatter3d(
+            x=peaks[:, 0], y=peaks[:, 1], z=peaks[:, 2], mode="markers",
+            name="known peak", visible="legendonly",
+            marker=dict(symbol="diamond", color="red", size=6,
+                        line=dict(color="white", width=1)),
+            hoverinfo="name",
+        ))
+
+    fig = go.Figure(data=data)
+    fig.update_layout(
+        title=title,
+        scene=dict(xaxis=dict(title="x1", range=[0, 1]),
+                   yaxis=dict(title="x2", range=[0, 1]),
+                   zaxis=dict(title="x3", range=[0, 1]), aspectmode="cube"),
         legend=dict(x=0.0, y=1.0), width=FIG_W, height=FIG_H,
     )
     return fig
