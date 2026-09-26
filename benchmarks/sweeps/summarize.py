@@ -15,6 +15,7 @@ landscapes", so the summary is organised around the METHOD:
     ├── method_by_dim.png          the headline: each metric vs dim, one line per method
     ├── <metric>_heatmap.png       rows = method, columns = dim, tile = n x b
     ├── dist_over_time.png         dist_to_needles vs measured points, panel per dim
+    ├── greedy_over_time.png       greedy_dist vs measured points, panel per dim
     └── regret_over_time.png       simple regret vs measured points, panel per dim
 
 Metrics (all from each cell's ``metrics.json``; see ``benchmarks/methods/runner.py``)
@@ -25,6 +26,13 @@ Metrics (all from each cell's ``metrics.json``; see ``benchmarks/methods/runner.
     dist_to_needles_extracted  the SAME extractor on every method's samples — the
                                comparison in which methods differ only in where they
                                sampled. Lower is better.
+    greedy_dist                the sample-side distance: for each true optimum the
+                               distance to the nearest point the method MEASURED,
+                               averaged over the optima. No declarations and no
+                               extractor enter it, so it separates "searched the right
+                               places" from "reported them correctly", which the two
+                               dist_to_needles columns cannot do on their own. Lower
+                               is better.
     frac_optima_visited        true optima with a sample within the match radius:
                                did the method ever measure there. Higher is better.
     simple_regret              1 - best noiseless value sampled: what single-optimum
@@ -61,6 +69,7 @@ REFERENCE_METHOD = "zombi_hop"
 METRICS: dict[str, tuple[str, bool]] = {
     "dist_to_needles": ("dist_to_needles (own needles)", True),
     "dist_to_needles_extracted": ("dist_to_needles (common extractor)", True),
+    "greedy_dist": ("greedy dist (optima -> nearest sample)", True),
     "frac_optima_visited": ("fraction of optima visited", False),
     "simple_regret": ("simple regret", True),
 }
@@ -426,6 +435,10 @@ def summarize(out_dir: str, *, ci: float = DEFAULT_CI, n_boot: int = DEFAULT_N_B
                    "dist_to_needles (lower is better)",
                    os.path.join(sdir, "dist_over_time.png"),
                    "dist_to_needles over the budget")
+    _curves_by_dim(collect_curves(out_dir, "greedy_dist"), methods,
+                   "greedy dist (lower is better)",
+                   os.path.join(sdir, "greedy_over_time.png"),
+                   "greedy_dist over the budget")
     _curves_by_dim(collect_curves(out_dir, "simple_regret"), methods,
                    "simple regret (lower is better)",
                    os.path.join(sdir, "regret_over_time.png"),
@@ -453,15 +466,24 @@ def summarize(out_dir: str, *, ci: float = DEFAULT_CI, n_boot: int = DEFAULT_N_B
         "`dist_to_needles_extracted` applies that same extractor to every method "
         "(`benchmarks/methods/extract.py`).",
         "",
+        "`greedy_dist` needs neither: for each true optimum it is the distance to the "
+        "nearest point the method actually MEASURED, averaged over the optima "
+        "(`eval_metrics.metric_greedy_dist`). The pairing is greedy, not one-to-one — "
+        "two optima may share a sample, because a measurement is not a claim — and "
+        "there is no unmatched penalty, so a method that declared nothing useful is "
+        "still ranked by where it looked. Read against `dist_to_needles` it separates "
+        "*searching* the right places from *reporting* them.",
+        "",
         "## Headline (all landscapes)",
         "",
-        "| method | cells | dist_to_needles | dist (common extractor) | optima visited "
-        "| simple regret |",
-        "|---|---|---|---|---|---|",
+        "| method | cells | dist_to_needles | dist (common extractor) | greedy dist "
+        "| optima visited | simple regret |",
+        "|---|---|---|---|---|---|---|",
     ]
     for r in sorted(agg_m, key=lambda r: methods.index(r["method"])):
         lines.append(f"| {r['method']} | {r['n_cells']} | {_fmt(r, 'dist_to_needles')} | "
                      f"{_fmt(r, 'dist_to_needles_extracted')} | "
+                     f"{_fmt(r, 'greedy_dist')} | "
                      f"{_fmt(r, 'frac_optima_visited')} | {_fmt(r, 'simple_regret')} |")
     lines += ["", f"Means with {int(ci * 100)}% bootstrap intervals over cells. Lower "
               "is better except *optima visited*.", "",
@@ -470,8 +492,8 @@ def summarize(out_dir: str, *, ci: float = DEFAULT_CI, n_boot: int = DEFAULT_N_B
               "better for the distances and regret). Win rate = share of landscapes "
               "where the method did strictly better.", "",
               "| method | pairs | Δ dist_to_needles | win rate | Δ dist (common extractor) "
-              "| win rate | Δ simple regret | win rate |",
-              "|---|---|---|---|---|---|---|---|"]
+              "| win rate | Δ greedy dist | win rate | Δ simple regret | win rate |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
     for r in pair:
         if r["dim"] != "all":
             continue
@@ -480,6 +502,7 @@ def summarize(out_dir: str, *, ci: float = DEFAULT_CI, n_boot: int = DEFAULT_N_B
             f"{_fmt(r, 'dist_to_needles_diff')} | {r['dist_to_needles_win_rate']} | "
             f"{_fmt(r, 'dist_to_needles_extracted_diff')} | "
             f"{r['dist_to_needles_extracted_win_rate']} | "
+            f"{_fmt(r, 'greedy_dist_diff')} | {r['greedy_dist_win_rate']} | "
             f"{_fmt(r, 'simple_regret_diff')} | {r['simple_regret_win_rate']} |")
     lines += ["", "Per-dimension pairs are in `paired.csv`.", "",
               "## Configurations", "", "| method | dim | source |", "|---|---|---|"]
@@ -499,7 +522,12 @@ def summarize(out_dir: str, *, ci: float = DEFAULT_CI, n_boot: int = DEFAULT_N_B
         *[f"![{m}]({m}_heatmap.png)" for m in METRICS],
         "",
         "![dist over time](dist_over_time.png)",
+        "![greedy dist over time](greedy_over_time.png)",
         "![regret over time](regret_over_time.png)",
+        "",
+        "`greedy_dist` can only fall — samples accumulate, so each optimum's nearest "
+        "one never gets further away. A flat tail there means the search stopped "
+        "reaching new ground, not that it stopped declaring well.",
         "",
         f"The over-time curves for extractor-scored methods have a point every "
         f"{manifest['trace_every']} batches (each is a GP fit); ZoMBI-Hop's own "

@@ -5,7 +5,10 @@ The configuration every (method, dimension) of a campaign runs, resolved once at
 plan time and frozen into the manifest.
 
 * ``zombi_hop`` gets ``{"hparams": <file>}`` per dimension from
-  :mod:`benchmarks.sweeps.hparams` (overridable with ``--hparams DIM=path``).
+  :mod:`benchmarks.sweeps.hparams` (overridable with ``--hparams DIM=path``), and
+  ``sampling="point"``: in a sweep every method measures one point per call (see
+  ``POINTWISE.md``). The manifest also records ``resolved_hparams``, the values it
+  actually runs after point mode rescales its call-counted keys.
 * Every other method gets its class ``defaults``, the same at every dimension.
 
 Either can be overridden for the whole campaign:
@@ -111,6 +114,8 @@ def resolve_method_configs(refs: list[str], dims: list[int], *,
         per_dim = {}
         for dim in sorted(set(int(d) for d in dims)):
             override = dict(overrides.get(name, {}))
+            if name == ZOMBI:
+                override.setdefault("sampling", "point")
             if name == ZOMBI and "hparams" not in override:
                 rec = hparams_for_dim(dim, zombi_hparam_files)
                 override["hparams"] = rec["hparams"]
@@ -120,8 +125,10 @@ def resolve_method_configs(refs: list[str], dims: list[int], *,
                 source = "defaults" + (" + overrides" if override else "")
                 stand_in = False
             # Validates the keys (unknown -> TypeError) and yields the merged config.
-            config = cls(override).config
-            per_dim[str(dim)] = {"config": config, "source": source,
+            method = cls(override)
+            per_dim[str(dim)] = {"config": method.config, "source": source,
                                  "is_stand_in": bool(stand_in)}
+            if name == ZOMBI:
+                per_dim[str(dim)]["resolved_hparams"] = method.resolved_hparams(dim)
         out[name] = per_dim
     return out

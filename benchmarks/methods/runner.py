@@ -32,6 +32,12 @@ unmatched members charged ``UNMATCHED_PENALTY``). Alongside it:
     needle_precision      needles within MATCH_RADIUS of a true optimum
     frac_optima_visited   true optima with a SAMPLE within MATCH_RADIUS — whether
                           the method ever measured there, needles aside
+    greedy_dist           mean distance from each true optimum to the nearest SAMPLE
+                          (eval_metrics.metric_greedy_dist): the same per-optimum
+                          minima frac_optima_visited thresholds, averaged instead of
+                          counted, so it still ranks runs that found nothing inside
+                          the radius. Declaration-free, so no extractor stands in the
+                          middle of it, and monotone non-increasing over a budget
     best_f, simple_regret best noiseless value sampled, and the gap to the global
                           maximum: the quantity single-optimum BO is designed for
     median_nn_spacing     eval_metrics.metric_median_nn_spacing of the samples
@@ -66,6 +72,7 @@ from eval_metrics import (  # noqa: E402
     MATCH_RADIUS,
     UNMATCHED_PENALTY,
     metric_dist_to_needles,
+    metric_greedy_dist,
     metric_median_nn_spacing,
 )
 
@@ -108,7 +115,14 @@ def score_needles(needles: np.ndarray, truth: GroundTruth) -> dict:
 
 
 class _VisitTracker:
-    """Running min distance from each true optimum to the samples, batch by batch."""
+    """Running min distance from each true optimum to the samples, batch by batch.
+
+    Both sample-side metrics read off this one running vector: the fraction of optima
+    inside ``MATCH_RADIUS`` and the mean of the minima (``greedy_dist``). Keeping it
+    incremental is what makes the trajectory free — the alternative, re-running
+    :func:`~eval_metrics.metric_greedy_dist` on the whole prefix at every batch, is
+    the same number for O(n_batches) times the work.
+    """
 
     def __init__(self, optima: np.ndarray) -> None:
         self.optima = optima
@@ -118,6 +132,13 @@ class _VisitTracker:
         if len(X) and len(self.optima):
             self.dmin = np.minimum(self.dmin, _nearest(self.optima, X))
         return float((self.dmin <= MATCH_RADIUS).mean()) if len(self.optima) else 0.0
+
+    @property
+    def greedy_dist(self) -> float | None:
+        """Mean nearest-sample distance so far; None before any sample has landed."""
+        if not len(self.optima):
+            return 0.0
+        return float(self.dmin.mean()) if np.isfinite(self.dmin).all() else None
 
 
 # ─── Seeding / IO ────────────────────────────────────────────────────────────────
@@ -280,9 +301,11 @@ def run_method(method: Method, problem: Problem, truth: GroundTruth, trial_dir: 
         n = int(ends[k - 1])
         frac_visited = visits.add(X[lo:n])
         best_f = max(best_f, float(F[lo:n].max()))
+        greedy = visits.greedy_dist
         row = {"batch": k, "n_points": n, "best_f": round(best_f, 6),
                "simple_regret": round(truth.peak_value - best_f, 6),
-               "frac_optima_visited": round(frac_visited, 6)}
+               "frac_optima_visited": round(frac_visited, 6),
+               "greedy_dist": None if greedy is None else round(greedy, 6)}
         native = None
         if method.declares_needles:
             # The snapshot taken before batch k+1 is the state after batch k.
@@ -337,6 +360,10 @@ def run_method(method: Method, problem: Problem, truth: GroundTruth, trial_dir: 
         **final,
         **{f"{k}_extracted": v for k, v in final_ex.items()},
         "frac_optima_visited": rows[-1]["frac_optima_visited"] if rows else 0.0,
+        # Recomputed from every sample rather than taken off the last row: one
+        # definition, and it is the same number (the tracker's minima are running).
+        "greedy_dist": (round(metric_greedy_dist(X, list(truth.optima)), 6)
+                        if len(X) else None),
         "best_f": rows[-1]["best_f"] if rows else None,
         "simple_regret": rows[-1]["simple_regret"] if rows else None,
         "median_nn_spacing": (round(metric_median_nn_spacing(X), 8) if len(X) > 1 else None),
@@ -356,7 +383,8 @@ def run_method(method: Method, problem: Problem, truth: GroundTruth, trial_dir: 
     if verbose:
         print(f"  [run] {method.name} done — dist={metrics['dist_to_needles']:.4f} "
               f"(extracted {metrics['dist_to_needles_extracted']:.4f})  "
-              f"needles={metrics['n_needles']}  regret={metrics['simple_regret']}  "
+              f"needles={metrics['n_needles']}  greedy={metrics['greedy_dist']}  "
+              f"regret={metrics['simple_regret']}  "
               f"points={metrics['n_points']}/{problem.budget}  stop={stop}  "
               f"({runtime:.1f}s run, {metrics['scoring_s']:.1f}s scoring)", flush=True)
     return metrics

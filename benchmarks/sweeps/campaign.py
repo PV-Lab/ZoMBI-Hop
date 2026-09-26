@@ -25,7 +25,7 @@ as the completion marker — plus:
   pending, so one deterministic crash cannot keep the pool resubmitting forever.
   ``reset-stale --failed`` re-opens them.
 * **A point budget, enforced identically.** Every cell measures exactly
-  ``--budget`` points (default 3000) in batches of ``--batch-size`` (24), through
+  ``--budget`` points (default 3000) in batches of ``--batch-size`` (1), through
   the shared :class:`benchmarks.methods.Problem`; ``--cell-max-hours`` is only a
   safety ceiling, and a cell stopped by it is recorded ``budget_hit: false``.
 
@@ -82,7 +82,8 @@ HEARTBEAT_EVERY_S = 60.0
 
 DEFAULT_METHODS = ("zombi_hop", "random", "gp_bo", "turbo", "hebo")
 DEFAULT_BUDGET = 3000
-DEFAULT_BATCH = 24
+#: One point per call for every method (POINTWISE.md). Was 24: one LineBO line.
+DEFAULT_BATCH = 1
 
 
 # ─── Layout ──────────────────────────────────────────────────────────────────────
@@ -371,6 +372,10 @@ def plan(args) -> str:
                 flag = "  [STAND-IN]" if rec["is_stand_in"] else ""
                 where = f"dim {dim:>2}" if method == "zombi_hop" else "all dims"
                 print(f"    {method:<10} {where}: {rec['source']}{flag}")
+    zombi_cfg = next(iter(configs.get("zombi_hop", {}).values()), {}).get("config", {})
+    if zombi_cfg.get("sampling") == "point" and int(args.batch_size) != 1:
+        print(f"    WARNING: zombi_hop measures 1 point per call but the baselines get "
+              f"batches of {args.batch_size}; the comparison is not like-for-like.")
     tight = [r for r in feasibility if not r["feasible"]]
     if tight:
         print(f"    NOTE: {len(tight)} configuration(s) above the packing bound; "

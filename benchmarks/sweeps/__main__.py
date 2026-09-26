@@ -124,6 +124,12 @@ def describe(args) -> None:
             if method == "zombi_hop":
                 flag = "  [STAND-IN]" if rec["is_stand_in"] else ""
                 print(f"  {method:<10} dim {dim:>2}: {rec['source']}{flag}")
+                rh = rec.get("resolved_hparams", {})
+                keys = ("max_zooms", "max_iterations", "min_iters_per_zoom",
+                        "max_lines_per_activation", "n_consecutive_converged",
+                        "top_m_points")
+                print(f"  {'':<10}         sampling={rec['config'].get('sampling')}  "
+                      + "  ".join(f"{k}={rh[k]}" for k in keys if k in rh))
             elif dim == str(dims[0]):
                 shown = {k: v for k, v in rec["config"].items()}
                 print(f"  {method:<10} all dims: {rec['source']}  {shown}")
@@ -147,8 +153,9 @@ def main() -> None:
     p.add_argument("--budget", type=int, default=DEFAULT_BUDGET,
                    help="measured points per cell, initial design included")
     p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH,
-                   help="points per batch: ZoMBI-Hop's points per line and the q of "
-                        "the batch baselines")
+                   help="points per call for every method (the q of the batch "
+                        "baselines). 1 = fully sequential, which zombi_hop's point "
+                        "mode assumes; see POINTWISE.md")
     p.add_argument("--input-noise", type=float, default=0.0,
                    help="sd of Gaussian actuation noise added to every requested "
                         "coordinate (0 = the optimiser gets the point it asked for)")
@@ -159,9 +166,10 @@ def main() -> None:
                         "(and the controlled *_extracted metrics for all methods)")
     p.add_argument("--extractor-arg", action="append", metavar="KEY=VALUE",
                    default=None, help="extractor setting; repeatable")
-    p.add_argument("--trace-every", type=int, default=10,
+    p.add_argument("--trace-every", type=int, default=240,
                    help="run the extractor every this many batches for the "
-                        "trajectories (0 = final only). Each run is a GP fit")
+                        "trajectories (0 = final only). Each run is a GP fit. At "
+                        "batch size 1 a batch is a point: 240 is the old 10 x 24")
     p.add_argument("--cell-max-hours", type=float, default=6.0,
                    help="wall-clock ceiling per cell. NOT the budget — a safety "
                         "valve; a cell stopped by it is flagged budget_hit=false")

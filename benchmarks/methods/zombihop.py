@@ -22,6 +22,16 @@ candidate chords through the acquisition maximiser, and the best is measured at
 baseline gets). The initial design is ``n_init_lines`` random chords through the
 box (2 x 24 = 48 points, the baselines' ``n_init``). Both count against the budget.
 
+Point mode (``sampling="point"``, what ``benchmarks/sweeps`` runs)
+--------------------------------------------------------------------
+Every objective call measures ONE point, the candidate ZoMBI-Hop proposed (clipped to
+the box). LineBO is not used. The initial design is ``n_init_points`` scrambled-Sobol'
+points, measured one at a time like the baselines' designs. Hyperparameters that
+count objective calls (:data:`CALL_COUNTED`) were tuned when a call was a
+``line_equivalent``-point line, so ``resolved_hparams`` multiplies them by
+``line_equivalent``. That keeps the per-zoom and per-activation *point* budgets the
+tuned configs had. See ``benchmarks/sweeps/POINTWISE.md`` for why.
+
 Config
 ------
 hparams             ZoMBI-Hop hyperparameters (a dict, as in the ``optimize/hparams``
@@ -31,8 +41,13 @@ fixed               the infrastructure constants ``run_mobo.ZOMBI_FIXED`` pins
                     (GP cap, UCB, the measured input noise 0.128 as ZoMBI's length
                     scale, quiet logging). A key in both ``hparams`` and ``fixed`` is
                     dropped from ``hparams``, as ``benchmarks/ablations`` does.
-n_init_lines        random chords measured before the optimiser starts
-linebo_num_lines    candidate chords LineBO ranks per call (run_mobo: 10)
+sampling            "line" (default) or "point" (see above)
+n_init_lines        random chords measured before the optimiser starts (line mode)
+n_init_points       Sobol' points measured before the optimiser starts (point mode;
+                    default 48, the baselines' ``n_init``)
+line_equivalent     points per line the hyperparameters were tuned with (24); point
+                    mode scales :data:`CALL_COUNTED` by it
+linebo_num_lines   candidate chords LineBO ranks per call (run_mobo: 10)
 linebo_points_per_line
                     points per candidate chord LineBO scores the acquisition on
                     (run_mobo: 100) — scoring only, not measurement
@@ -51,7 +66,7 @@ import math
 import numpy as np
 
 from ._paths import ensure_paths
-from .base import Method, Problem
+from .base import Method, Problem, sobol_design
 from .registry import register
 
 ensure_paths()
@@ -59,6 +74,28 @@ ensure_paths()
 #: ``run_mobo.ZOMBI_FIXED``, restated so this module does not import run_mobo.
 ZOMBI_FIXED = {"max_gp_points": 3000, "acquisition_type": "ucb",
                "input_noise": 0.128, "verbose": False}
+
+#: ZoMBI-Hop hyperparameters denominated in objective calls, which point mode
+#: rescales by ``line_equivalent``. Counts of zooms, repeats, points and consecutive
+#: convergence checks are not in here and are left as they are.
+CALL_COUNTED = ("max_iterations", "min_iters_per_zoom", "max_lines_per_activation")
+
+
+def _zombihop_defaults(keys) -> dict:
+    """``ZoMBIHop.__init__`` defaults for ``keys``, read without keeping the import's
+    side effect (importing it switches torch's global default device and dtype)."""
+    import inspect
+
+    import torch
+
+    prev_dtype, prev_device = torch.get_default_dtype(), torch.get_default_device()
+    try:
+        from src.core.zombihop import ZoMBIHop
+    finally:
+        torch.set_default_dtype(prev_dtype)
+        torch.set_default_device(prev_device)
+    params = inspect.signature(ZoMBIHop.__init__).parameters
+    return {k: params[k].default for k in keys}
 
 
 def _box_chord(x0: np.ndarray, direction: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -76,12 +113,15 @@ def _box_chord(x0: np.ndarray, direction: np.ndarray) -> tuple[np.ndarray, np.nd
 @register
 class ZoMBIHopMethod(Method):
     name = "zombi_hop"
-    description = "ZoMBI-Hop (this repo), LineBO lines on BoxDomain()"
+    description = "ZoMBI-Hop (this repo) on BoxDomain(): LineBO lines, or single points"
     declares_needles = True
     defaults = {
         "hparams": None,
         "fixed": dict(ZOMBI_FIXED),
+        "sampling": "line",
         "n_init_lines": 2,
+        "n_init_points": 48,
+        "line_equivalent": 24,
         "linebo_num_lines": 10,
         "linebo_points_per_line": 100,
         "never_terminate": True,
@@ -105,6 +145,13 @@ class ZoMBIHopMethod(Method):
         # run_single_trial's rule: the top-m ellipsoid fit needs at least d+1 points.
         if dim > 3 and (hp.get("top_m_points") is None or hp["top_m_points"] < dim + 1):
             hp["top_m_points"] = max(dim + 1, 4)
+        if self.config["sampling"] == "point":
+            k = int(self.config["line_equivalent"])
+            missing = [key for key in CALL_COUNTED if key not in hp]
+            base = {**(_zombihop_defaults(missing) if missing else {}),
+                    **{key: hp[key] for key in CALL_COUNTED if key in hp}}
+            for key in CALL_COUNTED:
+                hp[key] = int(base[key]) * k
         return hp
 
     # ── run ──
@@ -136,20 +183,36 @@ class ZoMBIHopMethod(Method):
         dt = torch.float64
         B = problem.batch_size
         domain = BoxDomain(boundary_repulsion=bool(self.config["boundary_repulsion"]))
+        pointwise = self.config["sampling"] == "point"
+        if self.config["sampling"] not in ("line", "point"):
+            raise ValueError(f"zombi_hop: unknown sampling {self.config['sampling']!r}")
+        if not pointwise and B < 2:
+            raise ValueError(f"zombi_hop: a line needs batch_size >= 2 (got {B}); "
+                             "use sampling='point' for one point per call")
         t_line = np.linspace(0.0, 1.0, B)
 
-        def measure_line(left: np.ndarray, right: np.ndarray, **tags):
-            X_req = left[None, :] + t_line[:, None] * (right - left)[None, :]
+        def measure(X_req: np.ndarray, **tags):
             X_act, Y = problem.evaluate(X_req, **tags)
             return X_req[: len(Y)], X_act, Y
 
-        # Initial design: random chords through the box.
+        def measure_line(left: np.ndarray, right: np.ndarray, **tags):
+            return measure(left[None, :] + t_line[:, None] * (right - left)[None, :], **tags)
+
+        # Initial design: Sobol' points one at a time (point mode), or random chords
+        # through the box (line mode).
         xa, xe, ys = [], [], []
-        for _ in range(int(self.config["n_init_lines"])):
-            x0 = self.rng.random(d)
-            v = self.rng.normal(size=d)
-            left, right = _box_chord(x0, v / np.linalg.norm(v))
-            X_req, X_act, Y = measure_line(left, right, activation=-1, zoom=-1)
+        if pointwise:
+            init = sobol_design(int(self.config["n_init_points"]), d, self.seed)
+            inits = [(lambda x=x: measure(x[None, :], activation=-1, zoom=-1)) for x in init]
+        else:
+            inits = []
+            for _ in range(int(self.config["n_init_lines"])):
+                x0 = self.rng.random(d)
+                v = self.rng.normal(size=d)
+                left, right = _box_chord(x0, v / np.linalg.norm(v))
+                inits.append(lambda l=left, r=right: measure_line(l, r, activation=-1, zoom=-1))
+        for step in inits:
+            X_req, X_act, Y = step()
             xe.append(X_req)
             xa.append(X_act)
             ys.append(Y)
@@ -157,17 +220,21 @@ class ZoMBIHopMethod(Method):
         def T(a):
             return torch.as_tensor(np.asarray(a, dtype=float), dtype=dt, device=dev)
 
-        linebo = LineBO(None, d, num_points_per_line=int(self.config["linebo_points_per_line"]),
-                        num_lines=int(self.config["linebo_num_lines"]),
-                        device=str(dev), domain=domain)
+        linebo = None if pointwise else LineBO(
+            None, d, num_points_per_line=int(self.config["linebo_points_per_line"]),
+            num_lines=int(self.config["linebo_num_lines"]), device=str(dev), domain=domain)
 
         def objective(x_tell, bounds, acq_fn):
-            x_left, x_right = linebo.ranked_line_endpoints(x_tell, bounds, acq_fn)
             dh = self.optimizer.data_handler if self.optimizer is not None else None
             tags = ({"activation": int(dh.current_activation), "zoom": int(dh.current_zoom)}
                     if dh is not None else {})
-            X_req, X_act, Y = measure_line(x_left[0].detach().cpu().numpy(),
-                                           x_right[0].detach().cpu().numpy(), **tags)
+            if pointwise:
+                x = np.clip(x_tell.detach().cpu().numpy().astype(float), 0.0, 1.0)
+                X_req, X_act, Y = measure(x[None, :], **tags)
+            else:
+                x_left, x_right = linebo.ranked_line_endpoints(x_tell, bounds, acq_fn)
+                X_req, X_act, Y = measure_line(x_left[0].detach().cpu().numpy(),
+                                               x_right[0].detach().cpu().numpy(), **tags)
             return T(X_req), T(X_act), T(Y)
 
         self.optimizer = ZoMBIHop(
