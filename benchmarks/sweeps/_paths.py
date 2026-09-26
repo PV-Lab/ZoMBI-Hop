@@ -1,19 +1,18 @@
 """
 benchmarks/sweeps/_paths.py
 ===========================
-sys.path bootstrap, delegated to the ablations package.
+sys.path bootstrap, delegated to ``benchmarks.methods._paths`` (repo root and
+``optimize/`` on the path, headless matplotlib, UTF-8 stdio).
 
-This sweep drives the same shared code (``optimize/run_mobo.py`` imported as a
-TOP-LEVEL module, ``src.*``, ``synthetic_data.*``) and hits the same two Windows
-hazards — a matplotlib backend chosen at ``run_mobo`` import time, and cp1252
-stdio blowing up on the non-ASCII log lines inside the needle-declaration path.
-``benchmarks.ablations._paths`` already solves all of that and is idempotent, so
-re-solving it here would only be a second copy to keep in sync.
+Not ``benchmarks.ablations._paths`` any more: importing anything under
+``benchmarks.ablations`` imports ``run_mobo`` and, through it, ZoMBI-Hop's
+global-torch-default side effect, which a process running the BoTorch baselines
+must not inherit. See ``benchmarks/methods/_paths.py``.
 """
 
 from __future__ import annotations
 
-from benchmarks.ablations._paths import (  # noqa: F401
+from benchmarks.methods._paths import (  # noqa: F401
     OPTIMIZE_DIR,
     REPO_ROOT,
     ensure_paths,

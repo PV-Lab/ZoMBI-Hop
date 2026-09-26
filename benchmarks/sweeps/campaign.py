@@ -1,41 +1,36 @@
 """
 benchmarks/sweeps/campaign.py
 =============================
-Planning and draining the landscape sweep.
+Planning and draining a method x landscape sweep.
 
-A campaign is the full-factorial grid ``n_needles x basin_width x dim`` (4 x 4 x 4
-= 64 landscape configurations) times ``--n-draws`` independent placements of the
-optima, written to a queue and drained by a pool of persistent workers. It is built
-on the same primitives as ``benchmarks/ablations`` and ``optimize/showdown.py`` —
-one atomic ``mkdir`` per claim, a per-cell artifact that doubles as the completion
-marker — with three differences the sweep needs:
+A campaign is ``methods x dims x n_needles x basin_widths x draws``: every method
+runs on every landscape, and for a given ``(dim, n, b, draw)`` every method gets the
+byte-identical landscape and the same measurement-noise seed, so method-vs-method
+differences are paired. Cells go into a queue drained by a pool of persistent,
+self-restarting SLURM workers, on the same primitives as ``benchmarks/ablations``
+and ``optimize/showdown.py`` — one atomic ``mkdir`` per claim, a per-cell artifact
+as the completion marker — plus:
 
-* **The grid varies the dimension**, so ``dim`` lives in the queue row rather than
-  the manifest, and the landscape factory and the hyperparameters are resolved per
-  cell instead of once per campaign.
-* **The budget is measured in lines, not wall-clock** (see
-  :mod:`benchmarks.sweeps.budget`), so every cell gets the same 3000 experiments
-  whatever the dimension does to the cost of an iteration.
-* **It heals itself across restarts.** A worker heartbeats its claim; a claim that
-  has stopped beating for ``--reclaim-after-min`` is released automatically by the
-  next worker that walks past it. That is what lets the generated sbatch resubmit
-  itself indefinitely without anyone running ``reset-stale`` between submissions —
-  the requirement that a campaign of this length runs unattended.
+* **Heartbeated claims.** A worker touches its claim once a minute; a claim silent
+  for ``--reclaim-after-min`` is released by the next worker that walks past it, so
+  the pool survives node failures without anyone running ``reset-stale``.
+* **One process per cell.** A worker runs each cell as
+  ``python -m benchmarks.sweeps cell ...`` in a child process, under a hard timeout.
+  Importing ZoMBI-Hop switches torch's global default device and dtype, HEBO puts a
+  vendored directory on ``sys.path``, and a GP that exhausts GPU memory can take the
+  process down: none of that may leak into the next method's cell. Process startup
+  costs seconds against a cell of minutes to hours.
+* **Bounded retries.** A cell whose child fails ``--max-attempts`` times is marked
+  FAILED (its claim holds a ``FAILED`` file) and is no longer retried or counted as
+  pending, so one deterministic crash cannot keep the pool resubmitting forever.
+  ``reset-stale --failed`` re-opens them.
+* **A point budget, enforced identically.** Every cell measures exactly
+  ``--budget`` points (default 3000) in batches of ``--batch-size`` (24), through
+  the shared :class:`benchmarks.methods.Problem`; ``--cell-max-hours`` is only a
+  safety ceiling, and a cell stopped by it is recorded ``budget_hit: false``.
 
-Draw-major order
-----------------
-Tasks are ordered ``(draw, dim, n_needles, basin_width)``, so a campaign cut short
-has every one of the 64 grid configurations at draw 1 rather than all five draws of
-the first few configurations and nothing for the rest. A partial sweep is then
-still a complete picture of the grid, just a noisier one.
-
-Usage
------
-  python -m benchmarks.sweeps plan --out benchmarks/sweeps/runs/first --n-draws 5
-  sbatch benchmarks/sweeps/runs/first/sweep.sbatch
-
-  python -m benchmarks.sweeps status    --out benchmarks/sweeps/runs/first
-  python -m benchmarks.sweeps summarize --out benchmarks/sweeps/runs/first
+Queue order is draw-major, then landscape, then method: a campaign cut short has
+every configuration at draw 1, and every method on each landscape it reached.
 """
 
 from __future__ import annotations
@@ -45,6 +40,8 @@ import itertools
 import json
 import os
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -53,15 +50,24 @@ from ._paths import REPO_ROOT, ensure_paths
 
 ensure_paths()
 
-from benchmarks.ablations.runner import (  # noqa: E402
-    is_complete as _run_complete,
-    run_ablation_trial,
+from benchmarks.methods import make_extractor, make_method  # noqa: E402
+from benchmarks.methods.base import Problem  # noqa: E402
+from benchmarks.methods.runner import (  # noqa: E402
+    GroundTruth,
+    atomic_write_json,
+    run_method,
 )
+from benchmarks.methods.runner import is_complete as _run_complete  # noqa: E402
 
 from . import needles as nd  # noqa: E402
-from .budget import BudgetState, line_budget  # noqa: E402
-from .hparams import parse_hparam_overrides, resolve_all  # noqa: E402
+from .configs import (  # noqa: E402
+    method_names,
+    parse_method_overrides,
+    resolve_method_configs,
+)
+from .hparams import parse_hparam_overrides  # noqa: E402
 
+SCHEMA_VERSION = 2
 MANIFEST = "manifest.json"
 QUEUE = "tasks.tsv"
 CLAIMS = "claims"
@@ -69,20 +75,29 @@ RUNS = "runs"
 LOGS = "logs"
 CELL_FILE = "sweep_cell.json"
 HEARTBEAT = "heartbeat"
+FAILED = "FAILED"
 
 #: How often a running worker touches its claim's heartbeat file.
 HEARTBEAT_EVERY_S = 60.0
+
+DEFAULT_METHODS = ("zombi_hop", "random", "gp_bo", "turbo", "hebo")
+DEFAULT_BUDGET = 3000
+DEFAULT_BATCH = 24
 
 
 # ─── Layout ──────────────────────────────────────────────────────────────────────
 
 def cell_name(dim: int, n_needles: int, basin_width: float) -> str:
-    """Directory-safe name for one grid configuration."""
+    """Directory-safe name for one landscape configuration."""
     return f"d{int(dim):02d}_n{int(n_needles):02d}_b{float(basin_width):g}"
 
 
-def cell_dir(out_dir: str, name: str, draw: int) -> str:
-    return os.path.join(out_dir, RUNS, name, f"draw{int(draw):03d}")
+def cell_dir(out_dir: str, method: str, name: str, draw: int) -> str:
+    return os.path.join(out_dir, RUNS, method, name, f"draw{int(draw):03d}")
+
+
+def task_dir(out_dir: str, task: dict) -> str:
+    return cell_dir(out_dir, task["method"], task["name"], task["draw"])
 
 
 def load_manifest(out_dir: str) -> dict:
@@ -90,7 +105,14 @@ def load_manifest(out_dir: str) -> dict:
     if not os.path.isfile(path):
         raise SystemExit(f"no {MANIFEST} in {out_dir} — run `plan` first")
     with open(path) as f:
-        return json.load(f)
+        manifest = json.load(f)
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        raise SystemExit(
+            f"{out_dir} was planned by the pre-2026-09 single-method SIMPLEX sweep "
+            f"(schema {manifest.get('schema_version', 1)}); this code runs the "
+            f"multi-method CUBE sweep (schema {SCHEMA_VERSION}). Its summary/ is "
+            "already on disk; to re-run or re-summarise it, check out commit 285424f.")
+    return manifest
 
 
 def read_tasks(out_dir: str) -> list[dict]:
@@ -103,22 +125,41 @@ def read_tasks(out_dir: str) -> list[dict]:
         for line in f:
             if not line.strip():
                 continue
-            tid, name, dim, n, b, draw = line.rstrip("\n").split("\t")
-            out.append({"tid": tid, "name": name, "dim": int(dim),
-                        "n_needles": int(n), "basin_width": float(b),
-                        "draw": int(draw)})
+            tid, method, name, dim, n, b, draw = line.rstrip("\n").split("\t")
+            out.append({"tid": tid, "method": method, "name": name, "dim": int(dim),
+                        "n_needles": int(n), "basin_width": float(b), "draw": int(draw)})
     return out
 
 
 def is_complete(target: str) -> bool:
-    """A cell is done when it has BOTH the run's metrics and this sweep's record.
+    """Done = the runner's ``metrics.json`` AND this sweep's ``sweep_cell.json``.
 
-    ``metrics.json`` is written by the shared runner and proves the optimiser
-    finished; :data:`CELL_FILE` is written after it and proves the budget and
-    landscape bookkeeping landed too. Requiring both means a cell interrupted
-    between the two is re-run rather than counted with half its record.
+    The sweep record is written after the metrics, so a cell interrupted between
+    the two is re-run rather than counted with half its record.
     """
     return _run_complete(target) and os.path.isfile(os.path.join(target, CELL_FILE))
+
+
+# ─── Seeds ───────────────────────────────────────────────────────────────────────
+
+def cell_seed(seed_base: int, task: dict) -> int:
+    """Seed for a cell's measurement noise and the method's own RNG.
+
+    Excludes the method on purpose: every method on a landscape draws from the same
+    noise stream (common random numbers), so a paired difference between two
+    methods is not inflated by one of them drawing kinder noise.
+    """
+    h = (int(seed_base) * 7_919
+         ^ int(task["dim"]) * 104_729
+         ^ int(task["n_needles"]) * 1_299_709
+         ^ int(round(float(task["basin_width"]) * 10)) * 15_485_863
+         ^ int(task["draw"]) * 2_654_435_761)
+    return int(abs(h) % (2 ** 31 - 1))
+
+
+def landscape_seed(seed_base: int, task: dict) -> int:
+    return nd.placement_seed(seed_base, task["dim"], task["n_needles"],
+                             task["basin_width"], task["draw"])
 
 
 # ─── Plan ────────────────────────────────────────────────────────────────────────
@@ -129,37 +170,34 @@ SBATCH_TEMPLATE = """#!/bin/bash
 #SBATCH --error={out_dir}/logs/%x_%A_%a.err
 #SBATCH --time={walltime}
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=64G
-#SBATCH --partition=sched_mit_sloan_gpu_r8
-#SBATCH --gres=gpu:1
-#SBATCH --array=0-{last_worker}
+#SBATCH --cpus-per-task={cpus}
+#SBATCH --mem={mem}
+#SBATCH --partition={partition}
+{gres_line}#SBATCH --array=0-{last_worker}
 #SBATCH --signal=B:USR1@300
 
-# SELF-RESTARTING PERSISTENT WORKER POOL -- {n_workers} workers, {n_tasks} cells.
+# SELF-RESTARTING PERSISTENT WORKER POOL -- {n_workers} workers, {n_tasks} cells
+# ({methods}).
 #
 # Each array element is one long-lived worker that claims cell after cell off
-# tasks.tsv until the queue drains, so a finished cell hands its GPU to the next
-# one inside the same allocation instead of going back to the scheduler.
+# tasks.tsv until the queue drains; each cell runs in its own child process.
 #
-# The pool RESTARTS ITSELF, which is what lets a multi-day campaign run unattended:
-#
-#   * The worker stops claiming with less than one cell's budget of wall-time left
-#     and exits cleanly; the tail of this script then resubmits THIS array index if
-#     the queue still has work. A clean exit with an empty queue submits nothing,
-#     so the chain ends on its own when the campaign finishes.
-#   * If wall-time arrives anyway (a cell overran its estimate), SLURM sends USR1
-#     300 s early and the trap below resubmits and exits before the kill.
-#   * Claims are HEARTBEATED. A worker killed outright -- node failure, OOM, a
-#     SIGKILL past the grace period -- leaves a claim whose heartbeat stops, and the
-#     next worker to walk past it releases it automatically after
-#     {reclaim_after_min:g} minutes. Nothing has to be reset by hand between
-#     submissions.
+# The pool RESTARTS ITSELF:
+#   * A worker stops claiming with less than one cell's ceiling of wall-time left
+#     and exits cleanly; the tail of this script resubmits THIS array index if the
+#     queue still has work, and submits nothing once it does not.
+#   * If wall-time arrives anyway, SLURM sends USR1 300 s early and the trap below
+#     resubmits and exits before the kill.
+#   * Claims are HEARTBEATED; a claim silent for {reclaim_after_min:g} minutes is
+#     released by the next worker. A cell that fails {max_attempts} times is marked
+#     FAILED and left alone (`status` lists it; `reset-stale --failed` retries).
 #
 # Stop the chain with `scancel`. To drain it by hand instead:
-#     python -m benchmarks.sweeps run --out {out_dir} --device cuda
+#     python -m benchmarks.sweeps run --out {out_dir}
 
 cd {repo}
+export OMP_NUM_THREADS={cpus}
+export MKL_NUM_THREADS={cpus}
 
 RESUBMITTED=0
 resubmit_if_work_remains() {{
@@ -189,140 +227,173 @@ uv run python -m benchmarks.sweeps run \\
     --worker "$SLURM_ARRAY_TASK_ID" \\
     --n-workers {n_workers} \\
     --worker-hours {worker_hours} \\
-    --reclaim-after-min {reclaim_after_min} \\
-    --device cuda < /dev/null &
+    --reclaim-after-min {reclaim_after_min}{device_flag} < /dev/null &
 wait $!
 rc=$?
 
-# Reached only on a clean exit (the USR1 trap exits before this). A crashed worker
-# resubmits too: the cell it died on keeps its claim only until the heartbeat goes
-# stale, and one bad cell should not end a campaign of {n_tasks}.
 echo "[$(date)] worker $SLURM_ARRAY_TASK_ID exited rc=$rc"
 resubmit_if_work_remains
 """
 
 
+def _csv(raw: str, cast):
+    return [cast(v) for v in raw.split(",") if v.strip()]
+
+
+def _parse_kv(pairs: list[str] | None) -> dict:
+    out = {}
+    for raw in pairs or []:
+        k, sep, v = raw.partition("=")
+        if not sep:
+            raise ValueError(f"{raw!r} is not key=value")
+        try:
+            out[k.strip()] = json.loads(v)
+        except json.JSONDecodeError:
+            out[k.strip()] = v
+    return out
+
+
 def plan(args) -> str:
     """Write the manifest, the queue and the self-restarting SLURM array script."""
     out_dir = os.path.abspath(args.out)
-    dims = [int(v) for v in args.dims.split(",") if v.strip()]
-    counts = [int(v) for v in args.n_needles.split(",") if v.strip()]
-    widths = [float(v) for v in args.basin_widths.split(",") if v.strip()]
+    if os.path.isfile(os.path.join(out_dir, QUEUE)) and not args.force:
+        raise SystemExit(
+            f"{out_dir} already holds a planned campaign. Re-planning rewrites the "
+            "queue under any claims and finished cells it has; plan into a new "
+            "directory, or pass --force if that is really what you want.")
+    dims = _csv(args.dims, int)
+    counts = _csv(args.n_needles, int)
+    widths = _csv(args.basin_widths, float)
+    method_refs = method_names(_csv(args.methods, str))   # unknown names fail here
+    methods = list(method_refs)
     n_draws = max(1, int(args.n_draws))
 
-    # Resolved first: a missing or unreadable hyperparameter file must stop the plan
-    # here, not on a worker three hours in.
-    hp_map = resolve_all(dims, parse_hparam_overrides(args.hparams))
+    # Resolved up front: a bad config key, a missing hyperparameter file or an
+    # uninstalled HEBO must stop the plan here, not a worker hours in.
+    configs = resolve_method_configs(
+        list(method_refs.values()), dims,
+        zombi_hparam_files=parse_hparam_overrides(args.hparams),
+        overrides=parse_method_overrides(args.method_config, args.method_set))
+    if "hebo" in methods:
+        from benchmarks.methods.hebo_method import _import_hebo
+
+        _import_hebo()
+    extractor_kwargs = _parse_kv(args.extractor_arg)
+    extractor_cfg = make_extractor(args.extractor, noise_frac=float(args.output_noise_frac),
+                                   **extractor_kwargs).config()
 
     for sub in (RUNS, LOGS, CLAIMS):
         os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
 
-    # Draw-major: the whole grid at draw 1 before any of draw 2 (see the docstring).
     tasks = []
     for draw in range(1, n_draws + 1):
         for dim, n, b in itertools.product(dims, counts, widths):
-            tasks.append({"tid": f"{len(tasks):05d}", "name": cell_name(dim, n, b),
-                          "dim": dim, "n_needles": n, "basin_width": b, "draw": draw})
+            for method in methods:
+                tasks.append({"tid": f"{len(tasks):06d}", "method": method,
+                              "name": cell_name(dim, n, b), "dim": dim,
+                              "n_needles": n, "basin_width": b, "draw": draw})
     with open(os.path.join(out_dir, QUEUE), "w") as f:
         for t in tasks:
-            f.write(f"{t['tid']}\t{t['name']}\t{t['dim']}\t{t['n_needles']}\t"
-                    f"{t['basin_width']:g}\t{t['draw']}\n")
+            f.write(f"{t['tid']}\t{t['method']}\t{t['name']}\t{t['dim']}\t"
+                    f"{t['n_needles']}\t{t['basin_width']:g}\t{t['draw']}\n")
 
     feasibility = nd.plan_feasibility(dims, counts, widths)
     manifest = {
+        "schema_version": SCHEMA_VERSION,
         "generated": datetime.datetime.now().isoformat(timespec="seconds"),
+        "domain": nd.DOMAIN,
+        "methods": methods,
+        "method_refs": method_refs,
         "grid": {"dims": dims, "n_needles": counts, "basin_widths": widths},
         "n_draws": n_draws,
         "n_configurations": len(dims) * len(counts) * len(widths),
         "n_tasks": len(tasks),
-        "n_lines": int(args.n_lines),
-        "points_per_line": int(_points_per_line()),
-        "points_budget": int(args.n_lines) * int(_points_per_line()),
+        "budget": int(args.budget),
+        "batch_size": int(args.batch_size),
+        "input_noise": float(args.input_noise),
+        "output_noise_frac": float(args.output_noise_frac),
+        "extractor": {"name": args.extractor, "kwargs": extractor_kwargs,
+                      "resolved": extractor_cfg},
+        "trace_every": int(args.trace_every),
         "cell_max_hours": float(args.cell_max_hours),
         "seed_base": int(args.seed_base),
-        "hparams": hp_map,
+        "method_configs": configs,
         "landscape": {
-            "kind": "needles",
-            "description": ("bumps-only Ensemble: n negated-Ackley optima of "
-                            "sharpness b on a flat plain, every other feature off"),
+            "kind": "needles", "domain": nd.DOMAIN,
+            "description": ("bumps-only CartesianEnsemble on [0,1]^dim: n negated-"
+                            "Ackley optima of sharpness b on a flat plain, every "
+                            "other feature off"),
             "sigma_x": float(nd.SIGMA_X),
             "sigma_y_at_peak": round(float(nd.sigma_y_at_peak()), 6),
             "plain_y": nd.PLAIN_Y, "peak_y": nd.PEAK_Y,
         },
         "feasibility": feasibility,
         "reclaim_after_min": float(args.reclaim_after_min),
+        "max_attempts": int(args.max_attempts),
     }
-    with open(os.path.join(out_dir, MANIFEST), "w") as f:
-        json.dump(manifest, f, indent=2, default=str)
+    atomic_write_json(os.path.join(out_dir, MANIFEST), manifest)
 
     n_workers = max(1, int(args.n_workers))
-    worker_hours = float(args.worker_hours)
     sbatch = SBATCH_TEMPLATE.format(
-        job_name=args.job_name or "zh_sweep",
+        job_name=args.job_name or "zh_bench",
         out_dir=out_dir, repo=REPO_ROOT,
         walltime=f"{max(1, int(round(args.walltime_hours)))}:00:00",
+        cpus=int(args.cpus_per_task), mem=args.mem, partition=args.partition,
+        gres_line=(f"#SBATCH --gres={args.gres}\n" if args.gres else ""),
+        device_flag=(" \\\n    --device cuda" if args.gres else ""),
         last_worker=n_workers - 1, n_workers=n_workers, n_tasks=len(tasks),
-        worker_hours=worker_hours,
+        methods=", ".join(methods), worker_hours=float(args.worker_hours),
         reclaim_after_min=float(args.reclaim_after_min),
+        max_attempts=int(args.max_attempts),
     )
     sbatch_path = os.path.join(out_dir, "sweep.sbatch")
-    # Explicit UTF-8 and an ASCII-only template: `plan` may be run from a Windows
-    # checkout, where the default encoding is cp1252 and any non-ASCII in the
-    # script would be written as mojibake for bash to choke on.
-    # LF line endings explicitly: a CRLF sbatch written from a Windows checkout is
-    # rejected by bash on the cluster ("\r: command not found").
+    # UTF-8, ASCII-only template, LF endings: a plan written from a Windows checkout
+    # must still be a script bash on the cluster will run.
     with open(sbatch_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(sbatch)
     try:
         os.chmod(sbatch_path, 0o755)
     except OSError:
-        pass  # Windows: the mode bit is meaningless and chmod may refuse
+        pass
 
     print(f"\n  plan -> {out_dir}")
-    print(f"    grid: dims {dims} x needles {counts} x basin widths {widths} "
-          f"= {manifest['n_configurations']} configuration(s)")
-    print(f"    x {n_draws} draw(s) = {len(tasks)} cell(s)")
-    print(f"    budget: {args.n_lines} lines x {_points_per_line()} points "
-          f"= {manifest['points_budget']} measured compositions per cell "
+    print(f"    methods: {', '.join(methods)}")
+    print(f"    landscapes: dims {dims} x needles {counts} x basin widths {widths} "
+          f"= {manifest['n_configurations']} configuration(s) on the unit cube")
+    print(f"    x {n_draws} draw(s) x {len(methods)} method(s) = {len(tasks)} cell(s)")
+    print(f"    budget: {args.budget} points per cell in batches of {args.batch_size} "
           f"(wall-clock ceiling {args.cell_max_hours:g} h)")
-    for dim in dims:
-        rec = hp_map[dim]
-        flag = "  [STAND-IN]" if rec["is_stand_in"] else ""
-        print(f"    dim {dim:>2}: {rec['path']}{flag}")
+    print(f"    noise: input {args.input_noise:g}, output {args.output_noise_frac:g} x |y|;"
+          f" extractor {args.extractor}")
+    for method in methods:
+        for dim, rec in configs[method].items():
+            if method == "zombi_hop" or dim == str(dims[0]):
+                flag = "  [STAND-IN]" if rec["is_stand_in"] else ""
+                where = f"dim {dim:>2}" if method == "zombi_hop" else "all dims"
+                print(f"    {method:<10} {where}: {rec['source']}{flag}")
     tight = [r for r in feasibility if not r["feasible"]]
     if tight:
-        print(f"    NOTE: {len(tight)} cell(s) sit above the optimistic packing "
-              "bound; placement falls back to the input-noise floor and records it:")
-        for r in tight:
-            print(f"           dim {r['dim']} / n {r['n_needles']} / b "
-                  f"{r['basin_width']:g}: wants s>={r['separation_target']:.4f}, "
-                  f"~{r['capacity_estimate']:g} fit")
-    print(f"    queue -> {os.path.join(out_dir, QUEUE)}")
-    print(f"    {n_workers} self-restarting worker(s) @ {args.walltime_hours:g} h")
+        print(f"    NOTE: {len(tight)} configuration(s) above the packing bound; "
+              "placement falls back to the input-noise floor and records it.")
+    print(f"    {n_workers} self-restarting worker(s) @ {args.walltime_hours:g} h on "
+          f"{args.partition}" + (f" ({args.gres})" if args.gres else ""))
     print(f"    submit:      sbatch {sbatch_path}")
     print(f"    drain here:  python -m benchmarks.sweeps run --out {out_dir}")
     return out_dir
 
 
-def _points_per_line() -> int:
-    import run_mobo as rm
-
-    return int(rm.NUM_EXPERIMENTS)
-
-
-# ─── Claims: atomic, heartbeated, self-releasing ─────────────────────────────────
+# ─── Claims: atomic, heartbeated, self-releasing, bounded retries ────────────────
 
 def _claim_path(out_dir: str, tid: str) -> str:
     return os.path.join(out_dir, CLAIMS, tid)
 
 
-def _claim_age_s(claim: str) -> float:
-    """Seconds since this claim last showed a sign of life.
+def _is_failed(claim: str) -> bool:
+    return os.path.isfile(os.path.join(claim, FAILED))
 
-    The heartbeat file if there is one, else the claim directory's own mtime — a
-    claim made microseconds ago has not written its first beat yet, and treating
-    that as infinitely stale would let a second worker steal a cell that is fine.
-    """
+
+def _claim_age_s(claim: str) -> float:
+    """Seconds since the claim last showed a sign of life (heartbeat, else mkdir)."""
     for candidate in (os.path.join(claim, HEARTBEAT), claim):
         try:
             return max(0.0, time.time() - os.path.getmtime(candidate))
@@ -331,40 +402,63 @@ def _claim_age_s(claim: str) -> float:
     return 0.0
 
 
-def _release_stale(out_dir: str, tasks: list[dict], max_age_s: float) -> int:
-    """Release claims that have stopped beating and produced no result.
+def _attempts_log(out_dir: str, tid: str) -> str:
+    """Failure count, kept OUTSIDE the claim so releasing a stale claim keeps it."""
+    return os.path.join(out_dir, LOGS, f"attempts_{tid}")
 
-    This is what makes the campaign survive restarts unattended. It is safe to run
-    while other workers are live *because* it keys on the heartbeat: a running
-    worker touches its claim once a minute (:data:`HEARTBEAT_EVERY_S`), so a claim
-    silent for tens of minutes is not one somebody is working on. Two workers
-    racing to release the same claim is harmless — the ``mkdir`` that follows is
-    still atomic and exactly one of them ends up owning the cell.
+
+def _count_attempts(out_dir: str, tid: str) -> int:
+    try:
+        with open(_attempts_log(out_dir, tid)) as f:
+            return int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def _record_failure(out_dir: str, tid: str, claim: str, max_attempts: int) -> bool:
+    """Bump the failure count; mark the claim FAILED at the limit. True if marked."""
+    n = _count_attempts(out_dir, tid) + 1
+    with open(_attempts_log(out_dir, tid), "w") as f:
+        f.write(f"{n}\n")
+    if n >= int(max_attempts):
+        with open(os.path.join(claim, FAILED), "w") as f:
+            f.write(f"{n} failed attempt(s); last {datetime.datetime.now().isoformat()}\n")
+        return True
+    return False
+
+
+def _release_stale(out_dir: str, tasks: list[dict], max_age_s: float,
+                   include_failed: bool = False) -> int:
+    """Release claims that stopped beating and produced no result.
+
+    Safe while other workers are live because it keys on the heartbeat. FAILED
+    claims are kept (that is what stops the retries) unless ``include_failed``.
     """
     n = 0
     for t in tasks:
         claim = _claim_path(out_dir, t["tid"])
-        if not os.path.isdir(claim):
+        if not os.path.isdir(claim) or is_complete(task_dir(out_dir, t)):
             continue
-        if is_complete(cell_dir(out_dir, t["name"], t["draw"])):
+        failed = _is_failed(claim)
+        if failed and not include_failed:
             continue
-        if _claim_age_s(claim) < max_age_s:
+        if not failed and _claim_age_s(claim) < max_age_s:
             continue
         try:
             shutil.rmtree(claim)
+            if failed:
+                try:
+                    os.remove(_attempts_log(out_dir, t["tid"]))
+                except OSError:
+                    pass
             n += 1
         except OSError:
-            pass  # another worker got there first
+            pass
     return n
 
 
 class _Heartbeat:
-    """Touch a claim's heartbeat file on a daemon thread while a cell runs.
-
-    A cell can take an hour inside one blocking call, so the beat cannot be driven
-    from the run loop. The thread is a daemon and the flag is checked every second,
-    so it never holds up interpreter shutdown or the next cell.
-    """
+    """Touch a claim's heartbeat file on a daemon thread while its cell runs."""
 
     def __init__(self, claim: str) -> None:
         self._path = os.path.join(claim, HEARTBEAT)
@@ -387,109 +481,103 @@ class _Heartbeat:
             with open(self._path, "w") as f:
                 f.write(f"{time.time():.0f}\n")
         except OSError:
-            pass  # a filesystem hiccup must not take the cell down
+            pass
 
     def _loop(self) -> None:
         while not self._stop.wait(HEARTBEAT_EVERY_S):
             self._beat()
 
 
+# ─── One cell (runs in the child process) ────────────────────────────────────────
+
+def _default_device() -> str:
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
+
+
+def run_one_cell(task: dict, out_dir: str, manifest: dict, target: str,
+                 device: str | None = None, verbose: bool = True) -> dict:
+    """Build the landscape, run the method on it, write the cell and its record."""
+    device = device or _default_device()
+    seed_base = int(manifest.get("seed_base", 0))
+    built = nd.build_landscape(task["dim"], task["n_needles"], task["basin_width"],
+                               landscape_seed(seed_base, task))
+    fn = built["fn"]
+    truth = GroundTruth(optima=built["centers"],
+                        peak_value=float(fn.predict(built["centers"]).max()))
+    seed = cell_seed(seed_base, task)
+    cfg = manifest["method_configs"][task["method"]][str(task["dim"])]
+
+    problem = Problem(
+        fn.predict, task["dim"], budget=int(manifest["budget"]),
+        batch_size=int(manifest["batch_size"]),
+        input_noise=float(manifest["input_noise"]),
+        output_noise_frac=float(manifest["output_noise_frac"]),
+        seed=seed, deadline=time.time() + float(manifest["cell_max_hours"]) * 3600.0)
+    ref = manifest.get("method_refs", {}).get(task["method"], task["method"])
+    method = make_method(ref, cfg["config"], seed=seed, device=device)
+    extractor = make_extractor(manifest["extractor"]["name"], device=device, seed=seed,
+                               noise_frac=float(manifest["output_noise_frac"]),
+                               **manifest["extractor"]["kwargs"])
+
+    os.makedirs(target, exist_ok=True)
+    with open(os.path.join(target, "ensemble_config.json"), "w") as f:
+        json.dump(built["config"], f, indent=2)
+    t0 = time.time()
+    metrics = run_method(method, problem, truth, target, extractor=extractor,
+                         trace_every=int(manifest["trace_every"]),
+                         extra_record={"task": task, "config_source": cfg["source"]},
+                         verbose=verbose)
+    record = {
+        "tid": task["tid"], "method": task["method"], "cell": task["name"],
+        "draw": task["draw"], "dim": task["dim"], "n_needles": task["n_needles"],
+        "basin_width": task["basin_width"],
+        "config_source": cfg["source"], "config_is_stand_in": cfg["is_stand_in"],
+        "landscape": built["record"],
+        "metrics": metrics,
+        "device": device,
+        "wall_s": round(time.time() - t0, 3),
+    }
+    atomic_write_json(os.path.join(target, CELL_FILE), record)
+    return record
+
+
+def cell_command(args) -> None:
+    """``python -m benchmarks.sweeps cell --out DIR --tid T``: one cell, in-process."""
+    out_dir = os.path.abspath(args.out)
+    manifest = load_manifest(out_dir)
+    task = next((t for t in read_tasks(out_dir) if t["tid"] == args.tid), None)
+    if task is None:
+        raise SystemExit(f"no task {args.tid!r} in {out_dir}/{QUEUE}")
+    run_one_cell(task, out_dir, manifest, task_dir(out_dir, task), args.device)
+
+
 # ─── Run (drain the queue) ───────────────────────────────────────────────────────
 
 def _rotated(tasks: list, worker: int, n_workers: int) -> list:
-    """Worker *k* starts ``k/n_workers`` of the way down the queue and wraps.
-
-    Read top-down in lockstep every worker would race for the same first cell and
-    lose ``n_workers-1`` claim races before finding work, and the pool would grind
-    through one region of the grid at a time. Rotating starts each worker in a
-    different part of the grid.
-    """
+    """Worker *k* starts ``k/n_workers`` of the way down the queue and wraps, so the
+    pool does not race for the same first cell or grind through one region."""
     if n_workers <= 1 or not tasks:
         return list(tasks)
     offset = (worker * len(tasks)) // n_workers
     return tasks[offset:] + tasks[:offset]
 
 
-def run_one_cell(task: dict, out_dir: str, manifest: dict, target: str,
-                 device: str | None, verbose: bool = True) -> dict:
-    """Run a single grid cell under the line budget, and write its sweep record.
-
-    Routes through ``benchmarks.ablations.runner.run_ablation_trial`` on the
-    unmodified baseline arm, so the cell gets the same artifact set as a MOBO trial
-    or an ablation cell (points.csv, needles.csv, metrics_over_time.csv, the plots,
-    the CoNet renders, ``metrics.json``) and drops into the existing tooling
-    unchanged. This function adds only what the ablations harness has no concept
-    of: the line budget wrapped around the call, and the landscape/budget record
-    written after it.
-    """
-    factory = nd.NeedleFactory(
-        dim=task["dim"], n_needles=task["n_needles"],
-        basin_width=task["basin_width"], seed=int(manifest.get("seed_base", 0)),
-        time_limit_hours=float(manifest["cell_max_hours"]),
-    )
-    hparams = manifest["hparams"][str(task["dim"])]["hparams"]
-
-    # The landscape is built once here so its verified record (exact optima count,
-    # measured prominence, achieved separation) can be written even though
-    # ``run_ablation_trial`` builds its own copy from the same seed. Both calls go
-    # through ``place_optima`` with the same seed, so they are the same landscape;
-    # this one exists to be *checked*, and build_landscape raises if the count is
-    # ever not exactly n.
-    seed = factory.placement_seed(task["draw"])
-    built = nd.build_landscape(task["dim"], task["n_needles"],
-                               task["basin_width"], seed)
-
-    state = BudgetState(n_lines=int(manifest["n_lines"]),
-                        n_init_lines=_n_init_lines(),
-                        points_per_line=_points_per_line())
-    t0 = time.time()
-    with line_budget(state=state):
-        metrics = run_ablation_trial(
-            arm="zombi_hop", factory=factory,
-            landscape_index=task["draw"], repeat=1,
-            trial_dir=target, base_hparams=hparams, device=device,
-            # Distinct per grid configuration, so two cells at the same draw index
-            # do not start from correlated initial designs.
-            seed_base=_cell_seed_base(task, int(manifest.get("seed_base", 0))),
-            verbose=verbose,
-        )
-
-    record = {
-        "tid": task["tid"], "cell": task["name"], "draw": task["draw"],
-        "dim": task["dim"], "n_needles": task["n_needles"],
-        "basin_width": task["basin_width"],
-        "hparams_source": manifest["hparams"][str(task["dim"])]["path"],
-        "hparams_is_stand_in": manifest["hparams"][str(task["dim"])]["is_stand_in"],
-        "landscape": built["record"],
-        "budget": state.to_dict(),
-        "metrics": metrics,
-        "wall_s": round(time.time() - t0, 3),
-    }
-    with open(os.path.join(target, CELL_FILE), "w") as f:
-        json.dump(record, f, indent=2, default=str)
-    if verbose:
-        b = state.to_dict()
-        print(f"  [cell] {task['name']} draw {task['draw']}: "
-              f"dist={metrics['dist_to_needles']:.4f} "
-              f"needles={metrics['n_needles']}/{task['n_needles']} "
-              f"points={metrics['n_points']}/{b['points_budget']} "
-              f"budget_hit={b['budget_hit']}", flush=True)
-    return record
-
-
-def _n_init_lines() -> int:
-    import run_mobo as rm
-
-    return int(rm.N_INIT_LINES)
-
-
-def _cell_seed_base(task: dict, base: int) -> int:
-    """Seed offset unique to a grid configuration (the draw is mixed in downstream)."""
-    h = (int(base) * 1_000_003
-         ^ int(task["dim"]) * 2_654_435_761
-         ^ int(task["n_needles"]) * 40_503
-         ^ int(round(float(task["basin_width"]) * 10)) * 97_499)
-    return int(abs(h) % (2 ** 31 - 1))
+def _spawn_cell(out_dir: str, task: dict, device: str | None, timeout_s: float) -> int:
+    cmd = [sys.executable, "-m", "benchmarks.sweeps", "cell", "--out", out_dir,
+           "--tid", task["tid"]]
+    if device:
+        cmd += ["--device", device]
+    try:
+        return subprocess.run(cmd, cwd=REPO_ROOT, timeout=timeout_s).returncode
+    except subprocess.TimeoutExpired:
+        print(f"  [cell {task['tid']}] killed after {timeout_s / 3600:.2f} h "
+              "(hard timeout)", flush=True)
+        return -9
 
 
 def run(args) -> None:
@@ -500,10 +588,9 @@ def run(args) -> None:
     os.makedirs(os.path.join(out_dir, CLAIMS), exist_ok=True)
 
     reclaim_after_s = float(args.reclaim_after_min) * 60.0
-    # A cell's worst case is the wall-clock ceiling plus artifact rendering (the
-    # CoNet UMAP renders are the slow tail; run_mobo caps each at 0.5 h). A worker
-    # stops claiming when less than this is left, so it exits cleanly instead of
-    # being killed mid-cell.
+    max_attempts = int(manifest.get("max_attempts", 3))
+    # A cell's worst case: the in-cell wall-clock ceiling, then scoring (the
+    # extractor's GP fits) and process start-up. The child is killed past this.
     per_cell_h = float(manifest["cell_max_hours"]) + float(args.cell_margin_hours)
     deadline = (time.time() + float(args.worker_hours) * 3600.0
                 if args.worker_hours and args.worker_hours > 0 else None)
@@ -513,26 +600,24 @@ def run(args) -> None:
     print(f"  [worker {args.worker}] {len(queue)} cell(s) in view; "
           + ("no wall-time limit" if deadline is None
              else f"{args.worker_hours:g} h wall-time, stops claiming with "
-                  f"{per_cell_h:.2f} h left"))
+                  f"{per_cell_h:.2f} h left"), flush=True)
 
     while True:
         pass_no += 1
-        # Release abandoned claims before every pass, so a worker restarted after a
-        # node failure picks up the cells that died with it without anyone running
-        # reset-stale first. See _release_stale on why this is safe while live.
         released = _release_stale(out_dir, tasks, reclaim_after_s)
         if released:
             print(f"  [worker {args.worker}] released {released} claim(s) with no "
-                  f"heartbeat for {args.reclaim_after_min:g} min")
+                  f"heartbeat for {args.reclaim_after_min:g} min", flush=True)
 
         claimed_this_pass = 0
         for task in queue:
-            target = cell_dir(out_dir, task["name"], task["draw"])
+            target = task_dir(out_dir, task)
             if is_complete(target):
                 continue
             if deadline is not None and time.time() + per_cell_h * 3600.0 > deadline:
                 print(f"  [worker {args.worker}] out of wall-time for another cell "
-                      f"(ran {n_ran}) — exiting cleanly so the job can resubmit")
+                      f"(ran {n_ran}) — exiting cleanly so the job can resubmit",
+                      flush=True)
                 return
             claim = _claim_path(out_dir, task["tid"])
             try:
@@ -542,119 +627,109 @@ def run(args) -> None:
             claimed_this_pass += 1
 
             if args.dry_run:
-                print(f"  [dry-run] {task['tid']}: {task['name']} draw {task['draw']}")
+                print(f"  [dry-run] {task['tid']}: {task['method']} {task['name']} "
+                      f"draw {task['draw']}")
                 shutil.rmtree(claim, ignore_errors=True)
                 continue
 
-            try:
-                with _Heartbeat(claim):
-                    run_one_cell(task, out_dir, manifest, target, args.device)
+            print(f"  [worker {args.worker}] cell {task['tid']}: {task['method']} "
+                  f"{task['name']} draw {task['draw']}", flush=True)
+            with _Heartbeat(claim):
+                rc = _spawn_cell(out_dir, task, args.device, per_cell_h * 3600.0)
+            if rc == 0 and is_complete(target):
                 n_ran += 1
-            except Exception:
-                n_failed += 1
-                print(f"  [worker {args.worker}] cell {task['tid']} "
-                      f"({task['name']} draw {task['draw']}) FAILED", flush=True)
+                continue
+            n_failed += 1
+            gave_up = _record_failure(out_dir, task["tid"], claim, max_attempts)
+            msg = (f"  [worker {args.worker}] cell {task['tid']} ({task['method']} "
+                   f"{task['name']} draw {task['draw']}) FAILED rc={rc}"
+                   + (f" — {max_attempts} attempts, marked FAILED" if gave_up
+                      else " — will be retried once its claim goes stale"))
+            print(msg, flush=True)
+            try:
+                with open(os.path.join(out_dir, LOGS, f"fail_{task['tid']}.log"), "a") as f:
+                    f.write(f"=== {datetime.datetime.now().isoformat()} rc={rc} ===\n"
+                            f"see {os.path.join(target, 'error.log')} and the worker log\n")
+            except OSError:
                 traceback.print_exc()
-                log = os.path.join(out_dir, LOGS, f"fail_{task['tid']}.log")
-                try:
-                    with open(log, "a") as f:
-                        f.write(f"\n=== {datetime.datetime.now().isoformat()} ===\n")
-                        traceback.print_exc(file=f)
-                except OSError:
-                    pass
-                # The claim is left in place but stops beating, so it is retried
-                # after reclaim_after_min rather than immediately — a cell that
-                # fails deterministically must not spin the pool.
 
         if claimed_this_pass == 0:
             break
         print(f"  [worker {args.worker}] pass {pass_no} claimed "
-              f"{claimed_this_pass} cell(s); rescanning")
+              f"{claimed_this_pass} cell(s); rescanning", flush=True)
 
     print(f"  [worker {args.worker}] done — ran {n_ran} cell(s), {n_failed} failed, "
-          f"{pass_no} pass(es)")
+          f"{pass_no} pass(es)", flush=True)
 
 
 # ─── Status / reset ──────────────────────────────────────────────────────────────
 
-def _counts(out_dir: str, tasks: list[dict], reclaim_after_s: float):
-    done = running = stale = pending = 0
-    for t in tasks:
-        if is_complete(cell_dir(out_dir, t["name"], t["draw"])):
-            done += 1
-            continue
-        claim = _claim_path(out_dir, t["tid"])
-        if os.path.isdir(claim):
-            if _claim_age_s(claim) >= reclaim_after_s:
-                stale += 1
-            else:
-                running += 1
-        else:
-            pending += 1
-    return done, running, stale, pending
+def _state(out_dir: str, task: dict, reclaim_after_s: float) -> str:
+    if is_complete(task_dir(out_dir, task)):
+        return "done"
+    claim = _claim_path(out_dir, task["tid"])
+    if not os.path.isdir(claim):
+        return "pending"
+    if _is_failed(claim):
+        return "failed"
+    return "stale" if _claim_age_s(claim) >= reclaim_after_s else "running"
+
+
+STATES = ("done", "running", "stale", "pending", "failed")
 
 
 def status(args) -> None:
-    """Progress by dimension, plus the count the sbatch chain reads to decide."""
+    """Progress by method and dimension, plus the count the sbatch chain reads."""
     out_dir = os.path.abspath(args.out)
     manifest = load_manifest(out_dir)
     tasks = read_tasks(out_dir)
     reclaim_after_s = float(manifest.get("reclaim_after_min", 30.0)) * 60.0
+    states = [(t, _state(out_dir, t, reclaim_after_s)) for t in tasks]
 
     if args.pending_count:
-        # Machine-readable, and the last line of stdout: the generated sbatch
-        # parses this to decide whether to resubmit itself. A stale claim counts as
-        # outstanding work, because it will be released and re-run.
-        _, _, stale, pending = _counts(out_dir, tasks, reclaim_after_s)
-        print(stale + pending)
+        # Machine-readable, last line of stdout: the sbatch resubmits while > 0. A
+        # stale claim is outstanding work (it will be released); FAILED is not.
+        print(sum(1 for _, s in states if s in ("pending", "stale")))
         return
 
-    by_dim: dict[int, list[int]] = {}
-    for t in tasks:
-        row = by_dim.setdefault(t["dim"], [0, 0, 0, 0])
-        if is_complete(cell_dir(out_dir, t["name"], t["draw"])):
-            row[0] += 1
-            continue
-        claim = _claim_path(out_dir, t["tid"])
-        if os.path.isdir(claim):
-            row[2 if _claim_age_s(claim) >= reclaim_after_s else 1] += 1
-        else:
-            row[3] += 1
-
+    table: dict[tuple[str, int], dict[str, int]] = {}
+    for t, s in states:
+        row = table.setdefault((t["method"], t["dim"]), dict.fromkeys(STATES, 0))
+        row[s] += 1
     print(f"  {os.path.basename(out_dir)}: {len(tasks)} cell(s)")
-    print(f"    {'dim':<8} {'done':>6} {'running':>8} {'stale':>7} {'pending':>8}")
-    total = [0, 0, 0, 0]
-    for dim in sorted(by_dim):
-        r = by_dim[dim]
-        total = [a + b for a, b in zip(total, r)]
-        print(f"    dim {dim:<4} {r[0]:>6} {r[1]:>8} {r[2]:>7} {r[3]:>8}")
-    print(f"    {'TOTAL':<8} {total[0]:>6} {total[1]:>8} {total[2]:>7} {total[3]:>8}")
-    if total[2]:
-        print(f"    ({total[2]} stale claim(s) will be released automatically by the "
-              "next worker)")
+    print(f"    {'method':<13} {'dim':>4} " + " ".join(f"{s:>8}" for s in STATES))
+    total = dict.fromkeys(STATES, 0)
+    for (method, dim) in sorted(table):
+        row = table[(method, dim)]
+        for s in STATES:
+            total[s] += row[s]
+        print(f"    {method:<13} {dim:>4} " + " ".join(f"{row[s]:>8}" for s in STATES))
+    print(f"    {'TOTAL':<13} {'':>4} " + " ".join(f"{total[s]:>8}" for s in STATES))
+    if total["stale"]:
+        print(f"    ({total['stale']} stale claim(s) will be released by the next worker)")
+    if total["failed"]:
+        print(f"    {total['failed']} cell(s) FAILED {manifest.get('max_attempts', 3)} "
+              "times and are no longer retried — see logs/fail_*.log and each cell's "
+              "error.log; `reset-stale --failed` re-opens them:")
+        for t, s in states:
+            if s == "failed":
+                print(f"      {t['tid']}  {t['method']:<10} {t['name']} draw {t['draw']}")
 
 
 def reset_stale(args) -> None:
-    """Release stale claims now, rather than waiting for a worker to do it.
-
-    Rarely needed — workers release stale claims at the top of every pass, which is
-    the whole point of the heartbeat. Kept for the case where you have shortened
-    the campaign's patience and want the queue re-opened immediately, and for
-    ``--all``, which releases every unfinished claim regardless of heartbeat and is
-    therefore only safe when no workers are live.
-    """
+    """Release stale claims now (``--all``: every unfinished claim; ``--failed``:
+    also re-open cells marked FAILED). Workers release stale claims on their own."""
     out_dir = os.path.abspath(args.out)
     manifest = load_manifest(out_dir)
     tasks = read_tasks(out_dir)
     max_age = 0.0 if args.all else float(
-        args.reclaim_after_min
-        if args.reclaim_after_min is not None
+        args.reclaim_after_min if args.reclaim_after_min is not None
         else manifest.get("reclaim_after_min", 30.0)) * 60.0
     if args.all:
-        print("  --all: releasing every unfinished claim, heartbeat or not. This is "
-              "only safe with no workers running.")
-    n = _release_stale(out_dir, tasks, max_age)
-    done, running, stale, pending = _counts(
-        out_dir, tasks, float(manifest.get("reclaim_after_min", 30.0)) * 60.0)
-    print(f"  released {n} claim(s); {done} done, {running} running, "
-          f"{stale} stale, {pending} pending")
+        print("  --all: releasing every unfinished claim, heartbeat or not. Only safe "
+              "with no workers running.")
+    n = _release_stale(out_dir, tasks, max_age, include_failed=args.failed)
+    counts = dict.fromkeys(STATES, 0)
+    for t in tasks:
+        counts[_state(out_dir, t, float(manifest.get("reclaim_after_min", 30.0)) * 60.0)] += 1
+    print(f"  released {n} claim(s); " + ", ".join(f"{counts[s]} {s}" for s in STATES))

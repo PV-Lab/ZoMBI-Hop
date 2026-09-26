@@ -22,12 +22,20 @@ def _ensure_project_on_path():
         sys.path.append(str(zombi_replace_root))
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _require_cuda(torch):
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "cpu: test runs on CPU by design and is exempt from the CUDA requirement")
+
+
+@pytest.fixture(autouse=True)
+def _require_cuda(torch, request):
     """
     This project is intended to run on CUDA. Fail fast in tests if CUDA
-    is not available, rather than silently running on CPU.
+    is not available, rather than silently running on CPU. Tests marked
+    ``cpu`` (e.g. bit-exact golden runs, which CUDA cannot reproduce) are exempt.
     """
+    if request.node.get_closest_marker("cpu") is not None:
+        return
     if not torch.cuda.is_available():
         pytest.fail("CUDA is required for this test suite (torch.cuda.is_available() is False).")
 

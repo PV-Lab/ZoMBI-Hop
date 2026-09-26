@@ -1,15 +1,25 @@
 """
 benchmarks/sweeps/hparams.py
 ============================
-Which ZoMBI-Hop configuration each dimension of the sweep runs.
+Which ZoMBI-Hop configuration each dimension of the sweep runs. (The other methods
+take their configuration from their own ``defaults`` plus any ``--method-config`` /
+``--method-set`` overrides — see :mod:`benchmarks.sweeps.configs`.)
 
-The sweep asks how robust the optimiser is to the *landscape*, so within a
-dimension the configuration is held fixed — a difference between two grid cells at
-the same dim is then attributable to the needle count and the basin width and
-nothing else. Across dimensions the configuration changes, because a single config
-would hand one dimension its own tuning and the rest somebody else's; the price is
-that dim-to-dim comparisons vary the optimiser as well as the landscape, and the
-summary says so.
+Within a dimension the configuration is held fixed, so a difference between two
+cells at the same dim is attributable to the landscape and nothing else. Across
+dimensions it changes, because one config would hand one dimension its own tuning
+and the rest somebody else's; dim-to-dim comparisons of ZoMBI-Hop therefore vary
+its hyperparameters as well as the landscape, and the summary says so.
+
+Tuned on the simplex, run on the cube
+-------------------------------------
+Every file below was tuned by MOBO on the *simplex* ensemble landscapes; the sweep
+now runs on the unit cube. ZoMBI-Hop's length-scale hyperparameters are
+dimensionless fractions of a unit-extent domain on both (``BoxDomain`` defaults to
+the unit cube for exactly this reason — see ``src/utils/domain.py``), so they carry
+over, but they are a transfer, not a cube-tuned optimum. The baselines run their
+published defaults with no tuning at all, so neither side of the comparison was
+tuned on these landscapes.
 
 The map
 -------
