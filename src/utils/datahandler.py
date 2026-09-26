@@ -250,7 +250,10 @@ class DataHandler:
         # Per-needle ellipsoid parameters (None entry = fall back to sphere radius).
         # needle_B is shared across all needles (same simplex tangent space).
         self.needle_M_list: List[Optional[torch.Tensor]] = []  # each (d-1, d-1)
-        self.needle_B: Optional[torch.Tensor] = None           # (d, d-1)
+        self.needle_B: Optional[torch.Tensor] = None           # (d, d-1) simplex; (d, d) box
+        # Search domain (src/utils/domain.py). Set by ZoMBIHop, like
+        # _full_bounds_ref; None ⇒ simplex. Only consulted for the fallback basis.
+        self.domain = None
 
         # --- Exclusion zones -------------------------------------------------
         # Penalised regions that are NOT needles: an activation that burns its
@@ -1094,7 +1097,7 @@ class DataHandler:
             if B is not None:
                 self.needle_B = B.to(device=self.device, dtype=self.dtype)
             elif self.needle_B is None:
-                self.needle_B = get_tangent_basis(self.d, self.device, self.dtype)
+                self.needle_B = self._tangent_basis()
 
         self.needles_results.append({
             'point': needle.clone(),
@@ -1237,6 +1240,12 @@ class DataHandler:
     # Penalty mask
     # =========================================================================
 
+    def _tangent_basis(self) -> torch.Tensor:
+        """Ellipsoid basis for an M supplied without one: the domain's, else the simplex's."""
+        if self.domain is not None:
+            return self.domain.tangent_basis(self.d, self.device, self.dtype)
+        return get_tangent_basis(self.d, self.device, self.dtype)
+
     def _stack_optional_M(
         self, M_list: List[Optional[torch.Tensor]]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1326,7 +1335,7 @@ class DataHandler:
             if B is not None:
                 self.needle_B = B.to(device=self.device, dtype=self.dtype)
             elif self.needle_B is None:
-                self.needle_B = get_tangent_basis(self.d, self.device, self.dtype)
+                self.needle_B = self._tangent_basis()
 
         self._update_penalty_mask()
 

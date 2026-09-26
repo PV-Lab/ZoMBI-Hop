@@ -4,6 +4,7 @@ ZoMBI-Hop: Zooming Multi-Basin Identification with Hopping
 
 A novel Bayesian optimization algorithm for discovering multiple optima
 in simplex-constrained spaces, designed for materials research applications.
+Also runs on axis-aligned boxes: pass ``domain=BoxDomain()`` (src/utils/domain.py).
 """
 
 import threading
@@ -18,6 +19,7 @@ from ..utils.simplex import (
     Ellipsoid,
 )
 from ..utils.datahandler import DataHandler
+from ..utils.domain import Domain, make_domain, _bounds_jaccard_simplex  # noqa: F401 — re-exported
 from ..utils.gp_simplex import GPSimplex
 from .hparam_live import (
     apply_pending as apply_pending_hparams,
@@ -44,46 +46,13 @@ def _is_global_bounds(bounds: torch.Tensor, eps: float = 0.01) -> bool:
     return bounds[0].max().item() < eps and bounds[1].min().item() > 1.0 - eps
 
 
-def _bounds_jaccard_simplex(
-    bounds_a: torch.Tensor,
-    bounds_b: torch.Tensor,
-    n_samples: int = 500,
-    device: torch.device = None,
-    dtype: torch.dtype = None,
-) -> float:
-    """
-    Jaccard overlap of two AABB boxes restricted to the simplex, estimated via Monte Carlo.
-
-    Samples uniformly from the simplex; counts what fraction fall inside each box;
-    returns  |A ∩ B| / |A ∪ B|  (both sets restricted to the simplex).
-    """
-    d = bounds_a.shape[1]
-    kw: dict = {}
-    if device is not None:
-        kw["device"] = device
-    if dtype is not None:
-        kw["dtype"] = dtype
-    # Uniform Dirichlet samples
-    u = torch.rand(n_samples, d, **kw).clamp(min=1e-9)
-    u = u / u.sum(dim=1, keepdim=True)
-
-    def _in_box(pts, lo, hi):
-        return ((pts >= lo.unsqueeze(0)) & (pts <= hi.unsqueeze(0))).all(dim=1)
-
-    in_a = _in_box(u, bounds_a[0], bounds_a[1])
-    in_b = _in_box(u, bounds_b[0], bounds_b[1])
-    n_a = in_a.sum().item()
-    n_b = in_b.sum().item()
-    n_ab = (in_a & in_b).sum().item()
-    denom = n_a + n_b - n_ab
-    return 0.0 if denom == 0 else n_ab / denom
-
-
 class ZoMBIHop:
     """
     Zooming Multi-Basin Identification with Hopping.
 
     Trust regions are ellipsoids on the simplex in tangent space (see ``Ellipsoid``).
+    The search domain defaults to the simplex; ``domain=BoxDomain()`` runs the same
+    algorithm on a box (see src/utils/domain.py).
     """
 
     def __init__(self,
@@ -137,8 +106,16 @@ class ZoMBIHop:
                  min_iters_per_zoom: int = 3,
                  needle_min_repeats: int = 5,
                  needle_repeat_radius_frac: float = 0.10,
-                 max_lines_per_activation: int = 30):
+                 max_lines_per_activation: int = 30,
+                 domain: Optional[Domain] = None):
         """Initialize ZoMBIHop optimizer.
+
+        ``domain`` selects the search geometry: ``None`` / "simplex" (default,
+        compositions summing to 1) or "box" / ``BoxDomain(...)`` (a hyper-rectangle,
+        by default the unit cube). It supplies the defaults for ``proj_fn``,
+        ``random_sampler`` and ``random_direction_sampler`` (explicit arguments still
+        win), for ``bounds``, and the ascent step, ellipsoid basis, boundary penalty
+        and zoom-overlap estimate used internally.
 
         Search-discipline constraints (hard, not tuned):
           * ``needle_min_repeats`` / ``needle_repeat_radius_frac`` — the
@@ -181,15 +158,16 @@ class ZoMBIHop:
         self.verbose = verbose
 
         d = X_init_actual.shape[1]
+        self.domain = make_domain(domain)
 
         # Per-dimension search box (2, d): row 0 = lower, row 1 = upper. Defaults to
-        # the full [0,1]^d simplex, but callers may pass a tighter box (e.g. a dim
-        # constrained to [0, 0.3]). Every "reset to the full simplex" throughout the
-        # optimiser resets to THIS box, and _is_global_bounds tests against it — so a
-        # tightened box is the true global region, not [0,1]^d.
+        # the domain's full box ([0,1]^d for the simplex and the unit cube), but
+        # callers may pass a tighter box (e.g. a dim constrained to [0, 0.3]). Every
+        # "reset to the full simplex" throughout the optimiser resets to THIS box, and
+        # _is_global_bounds tests against it — so a tightened box is the true global
+        # region, not [0,1]^d.
         if bounds is None:
-            full_bounds = torch.zeros(2, d, device=self.device, dtype=self.dtype)
-            full_bounds[1] = 1.0
+            full_bounds = self.domain.default_bounds(d, self.device, self.dtype)
         else:
             full_bounds = torch.as_tensor(bounds, device=self.device, dtype=self.dtype).clone()
             assert full_bounds.shape == (2, d), \
@@ -223,11 +201,11 @@ class ZoMBIHop:
                 print(f"Initialized ZoMBIHop on CUDA device: {torch.cuda.get_device_name()}")
                 print(f"Initial CUDA memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
-        # Simplex utilities (functions; not checkpointable)
-        self.proj_fn = proj_fn if proj_fn is not None else proj_simplex
-        self.random_sampler = random_sampler if random_sampler is not None else random_simplex
+        # Domain utilities (functions; not checkpointable)
+        self.proj_fn = proj_fn if proj_fn is not None else self.domain.project
+        self.random_sampler = random_sampler if random_sampler is not None else self.domain.sample
         self.random_direction_sampler = (random_direction_sampler if random_direction_sampler is not None
-                                         else random_zero_sum_directions)
+                                         else self.domain.directions)
         self.objective = objective
 
         if top_m_points is None:
@@ -327,6 +305,19 @@ class ZoMBIHop:
         # case — including a caller-tightened box such as [0, 0.3] on one axis — so
         # set it unconditionally rather than relying on the checkpoint.
         self.data_handler._full_bounds_ref = self.full_bounds.clone()
+        self.data_handler.domain = self.domain
+
+        # A checkpoint's ellipsoids are expressed in its domain's tangent basis —
+        # (d, d-1) on the simplex, (d, d) on a box — so resuming it under the other
+        # domain would silently misread every penalty region. Refuse instead.
+        saved_B = self.data_handler.needle_B
+        if saved_B is not None:
+            expected_k = self.domain.tangent_basis(d, self.device, self.dtype).shape[1]
+            if saved_B.shape[1] != expected_k:
+                raise ValueError(
+                    f"checkpoint ellipsoid basis is {tuple(saved_B.shape)} but "
+                    f"{self.domain!r} uses ({d}, {expected_k}); resume the run with "
+                    f"the domain it was started with.")
 
         # GP handler
         self.gp_handler = GPSimplex(
@@ -343,6 +334,7 @@ class ZoMBIHop:
             device=str(self.device),
             dtype=self.dtype,
             verbose=self.verbose,
+            domain=self.domain,
         )
 
     # --- Properties (expose data handler state) ---
@@ -1026,7 +1018,7 @@ class ZoMBIHop:
         X_actual = X_actual.to(device=self.device, dtype=self.dtype)
         Y = Y.to(device=self.device, dtype=self.dtype)
 
-        # Project actual measurements onto the simplex so off-simplex apparatus
+        # Project actual measurements onto the domain so off-domain apparatus
         # noise doesn't corrupt stored data, distance calculations, or needle positions.
         X_actual = self.proj_fn(X_actual)
 
@@ -1597,7 +1589,7 @@ class ZoMBIHop:
                     if not self._is_global_bounds(new_bounds):
                         repeated_jac = 0.0
                         for prev_bounds in zoom_bounds_history:
-                            jac = _bounds_jaccard_simplex(
+                            jac = self.domain.region_jaccard(
                                 new_bounds, prev_bounds, device=self.device, dtype=self.dtype
                             )
                             if jac > self.zoom_jaccard_threshold:

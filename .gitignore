@@ -74,6 +74,8 @@ test_rfs/
 
 # Large binaries
 *.pt
+# ...except small test fixtures (e.g. the 12 KB simplex golden run)
+!tests/fixtures/*.pt
 *.pth
 *.pkl
 *.pickle

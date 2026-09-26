@@ -23,6 +23,13 @@ from .gp_simplex import (
     GPSimplex,
     RepulsiveAcquisition,
 )
+from .domain import (
+    Domain,
+    SimplexDomain,
+    BoxDomain,
+    UnitBoxScaler,
+    make_domain,
+)
 from .dataclasses import ZoMBIHopConfig
 
 __all__ = [
@@ -37,6 +44,12 @@ __all__ = [
     "polytope_volume",
     "composition_to_ilr",
     "ilr_to_composition",
+    # Search domains
+    "Domain",
+    "SimplexDomain",
+    "BoxDomain",
+    "UnitBoxScaler",
+    "make_domain",
     # Visualization
     "plot_optimization_progress",
     "plot_simplex_2d",
