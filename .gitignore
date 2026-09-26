@@ -82,3 +82,4 @@ test_rfs/
 
 # babysitter runtime state (logs, crash reports, cooldown stamps, lock)
 optimize/scripts/.babysitter/
+warm_start/warm_gp_landscape/peaks_cache/fullgp_6d_seed0_n2042_c200000_s0.06_p0.12.json

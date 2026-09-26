@@ -13,23 +13,16 @@ averaged over.
 
 Metrics
 -------
-The deliverable is the *set* of optima (METHODS §1), so the headline is how much of
-that set was recovered and how much of what was reported is real. Those are two
-numbers, not one, and they move in opposite directions:
+The deliverable is the *set* of optima (METHODS §1), so a cell is scored by how
+close the needles it declared sit to that set, and by how many it declared:
 
-    recall            fraction of the landscape's TRUE optima with a declared
-                      needle inside ``MATCH_RADIUS``. Denominator is n.
-    precision         fraction of the DECLARED needles that sit inside
-                      ``MATCH_RADIUS`` of some true optimum. Denominator is the
-                      declared count — this is ``metric_pct_matched_comp / 100``,
-                      which earlier versions of this module reported under the name
-                      ``recall``. It never had n as its denominator.
-    dist_to_needles   the MOBO objective: mean distance from each true optimum to
-                      the nearest declared needle, with a penalty for unmatched
-                      ones. Lower is better. Sensitive to *how badly* a miss missed,
-                      which neither recall nor precision is.
+    dist_to_needles   the MOBO objective and the headline: mean distance from each
+                      true optimum to the nearest declared needle, with a penalty
+                      for unmatched ones. Lower is better. It is sensitive to *how
+                      badly* a miss missed, not merely to whether one happened.
     n_needles         how many needles were declared, matched or not. Read next to
-                      recall it separates "found few" from "declared few".
+                      ``dist_to_needles`` it separates "declared too few" from
+                      "declared plenty, placed badly".
     median_nn_spacing median nearest-neighbour distance between the samples a cell
                       took, in composition L2. HIGHER is better. It replaces
                       ``dup_fraction``, which saturates at 0.999 on every cell of
@@ -76,8 +69,6 @@ DEFAULT_N_BOOT = 2000
 
 #: Metric key -> (column label, is-lower-better).
 METRICS: dict[str, tuple[str, bool]] = {
-    "recall": ("recall (true optima found / n)", False),
-    "precision": ("precision (declared needles that are real)", False),
     "dist_to_needles": ("dist_to_needles", True),
     "n_needles": ("needles declared", False),
     "median_nn_spacing": ("median NN spacing (x10^-3)", False),
@@ -91,64 +82,6 @@ METRIC_SCALE: dict[str, float] = {"median_nn_spacing": 1e3}
 
 
 # ─── Collection ──────────────────────────────────────────────────────────────────
-
-def _match_stats(trial_dir: str, n_true: int) -> tuple[float | None, float | None]:
-    """``(recall, precision)`` of one cell's declared needles, or ``(None, None)``.
-
-    Both are computed at the same ``eval_metrics.match_radius_comp`` (0.05 in
-    composition L2, dimension-independent) so they are two readings of one pairing,
-    but they divide by opposite things and answer opposite questions:
-
-        recall     |{true optima with SOME needle within r}| / n_true
-                   "how much of the landscape did it find". Falls when the
-                   optimiser declares too few needles.
-        precision  |{needles within r of SOME optimum}| / n_declared
-                   "how much of what it declared is real". Falls when it declares
-                   spurious needles.
-
-    Neither alone is a verdict — an optimiser that declares one perfect needle on a
-    50-optimum landscape scores precision 1.0 and recall 0.02 — which is exactly
-    why both are carried.
-
-    HISTORY, because it changes how earlier figures read: this function used to
-    return ``metric_pct_matched_comp / 100`` under the name ``recall``. That
-    function divides by ``len(discovered)``, so it was *precision* all along, and
-    the docstring's claim that "the placement guarantees the denominator is exactly
-    n" was never true of the code. The value is still reported, under its right
-    name; ``recall`` is now computed here rather than borrowed.
-    """
-    import pandas as pd
-    from eval_metrics import match_radius_comp
-
-    needles_csv = os.path.join(trial_dir, "needles.csv")
-    ens_cfg = os.path.join(trial_dir, "ensemble_config.json")
-    if not (os.path.isfile(needles_csv) and os.path.isfile(ens_cfg)):
-        return (None, None)
-    with open(ens_cfg) as f:
-        cfg = json.load(f)
-    true_optima = [np.asarray(c, dtype=float) for c in cfg.get("pinned_optima", [])]
-    if len(true_optima) != n_true:
-        return (None, None)
-    dim = len(true_optima[0])
-    df = pd.read_csv(needles_csv)
-    # 3d runs write the composition columns by name (FA/MA/Br); every other
-    # dimension writes x0..x{d-1}.
-    coord_cols = [c for c in df.columns if len(c) > 1 and c[0] == "x" and c[1:].isdigit()] \
-        or [c for c in ("FA", "MA", "Br") if c in df.columns]
-    coord_cols.sort(key=lambda c: int(c[1:]) if c[1:].isdigit() else 0)
-    disc = (df[coord_cols].to_numpy(dtype=float) if len(df) and coord_cols
-            else np.empty((0, dim)))
-    T = np.asarray(true_optima, dtype=float)
-    if len(disc) == 0:
-        # Declared nothing: found none of the optima, and has no declarations for a
-        # precision to be about. 0.0 rather than None — this is a measurement.
-        return (0.0, 0.0)
-    r = float(match_radius_comp(dim))
-    C = np.linalg.norm(disc[:, None, :] - T[None, :, :], axis=2)
-    recall = float((C.min(axis=0) <= r).mean())      # over true optima
-    precision = float((C.min(axis=1) <= r).mean())   # over declared needles
-    return (recall, precision)
-
 
 def _median_nn_spacing(trial_dir: str) -> float | None:
     """Median nearest-neighbour distance between a cell's samples, composition L2.
@@ -204,12 +137,9 @@ def collect(out_dir: str) -> list[dict]:
         m = rec.get("metrics", {})
         land = rec.get("landscape", {})
         bud = rec.get("budget", {})
-        recall, precision = _match_stats(target, rec["n_needles"])
         rows.append({
             "cell": rec["cell"], "draw": rec["draw"], "dim": rec["dim"],
             "n_needles": rec["n_needles"], "basin_width": rec["basin_width"],
-            "recall": recall,
-            "precision": precision,
             "median_nn_spacing": _median_nn_spacing(target),
             "dist_to_needles": m.get("dist_to_needles"),
             "n_needles_found": m.get("n_needles"),
@@ -241,9 +171,9 @@ def collect(out_dir: str) -> list[dict]:
 def _boot_ci(values: np.ndarray, ci: float, n_boot: int, rng) -> tuple[float, float]:
     """Percentile bootstrap CI of the MEAN, resampling draws.
 
-    A symmetric mean +/- sd band would run outside the range of a bounded metric
-    like ``recall``; resampling the draws keeps the interval inside whatever range
-    the metric actually has.
+    A symmetric mean +/- sd band would run outside the range of a bounded metric;
+    resampling the draws keeps the interval inside whatever range the metric
+    actually has.
     """
     if len(values) < 2:
         return (float("nan"), float("nan"))
@@ -358,72 +288,6 @@ def _heatmap_grid(agg: list[dict], metric: str, manifest: dict,
                     if any(manifest.get("hparams", {}).get(str(d), {}).get("is_stand_in")
                            for d in dims) else ""),
                  fontsize=11)
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _recall_vs_axis(agg: list[dict], manifest: dict, path: str) -> None:
-    """Recall AND precision against each swept axis, marginalised over the other two.
-
-    The heatmaps show the interaction; this shows the main effects, which is what a
-    one-line answer to "what is ZoMBI-Hop robust to" needs. Error bars are the
-    bootstrap CI of the mean over every cell in that slice.
-
-    The two series are drawn together because they are the pair that has to be read
-    together: on the ``n`` axis they cross, and a figure showing only one of them
-    invites exactly the wrong conclusion — precision rises with n purely because the
-    declared count stays flat while the number of things there are to hit goes up.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    axes_spec = [("n_needles_true", "number of needles $n$"),
-                 ("basin_width", "basin sharpness $b$"),
-                 ("dim", "dimension $d$")]
-    # Both series on one axis on purpose: they are the same kind of quantity (a
-    # fraction in [0, 1] at one match radius), so they share a scale honestly, and
-    # the whole point is that they move in OPPOSITE directions on the n axis —
-    # which is invisible in two separate figures.
-    series = [("recall", "recall (of true optima)", "#2b6cb0", "o", "-"),
-              ("precision", "precision (of declarations)", "#d97706", "s", "--")]
-    fig, axs = plt.subplots(1, 3, figsize=(11.5, 3.4), squeeze=False)
-    for ax, (key, label) in zip(axs[0], axes_spec):
-        levels = sorted({r[key] for r in agg})
-        for metric, mlabel, colour, marker, ls in series:
-            xs, ys, los, his = [], [], [], []
-            for lv in levels:
-                vals = [r[f"{metric}_mean"] for r in agg
-                        if r[key] == lv and r.get(f"{metric}_mean") is not None]
-                if not vals:
-                    continue
-                v = np.asarray(vals, dtype=float)
-                lo, hi = _boot_ci(v, DEFAULT_CI, DEFAULT_N_BOOT,
-                                  np.random.default_rng(0))
-                xs.append(lv)
-                ys.append(v.mean())
-                los.append(v.mean() - (lo if np.isfinite(lo) else v.mean()))
-                his.append((hi if np.isfinite(hi) else v.mean()) - v.mean())
-            if not xs:
-                continue
-            ax.errorbar(range(len(xs)), ys, yerr=[los, his], marker=marker,
-                        capsize=3, color=colour, ls=ls, lw=1.8, ms=5,
-                        label=mlabel)
-            ax.set_xticks(range(len(xs)), [f"{x:g}" for x in xs])
-        ax.set_xlabel(label)
-        ax.set_ylim(0, 1.02)
-        ax.grid(alpha=0.25, axis="y")
-        ax.set_axisbelow(True)
-        for side in ("top", "right"):
-            ax.spines[side].set_visible(False)
-    axs[0][0].set_ylabel("fraction")
-    handles, labels = axs[0][0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, frameon=False, loc="upper center", ncol=2,
-                   fontsize=9, bbox_to_anchor=(0.5, 0.99))
-    fig.suptitle("Recall and precision by axis, marginalised over the other two "
-                 f"({manifest.get('n_draws', '?')} draw(s) per configuration)",
-                 fontsize=11, y=1.07)
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
@@ -679,8 +543,6 @@ def summarize(out_dir: str, *, ci: float = DEFAULT_CI, n_boot: int = DEFAULT_N_B
     for metric in METRICS:
         _heatmap_grid(agg, metric, manifest,
                       os.path.join(sdir, f"{metric}_heatmap.png"))
-    _recall_vs_axis(agg, manifest, os.path.join(sdir, "recall_by_axis.png"))
-
     curves = collect_curves(out_dir, manifest)
     if curves:
         _traj_by_axis(curves, manifest,
@@ -728,23 +590,9 @@ def summarize(out_dir: str, *, ci: float = DEFAULT_CI, n_boot: int = DEFAULT_N_B
         "",
         "| metric | denominator | direction |",
         "|---|---|---|",
-        "| `recall` | the landscape's *n* true optima | higher |",
-        "| `precision` | the needles the run declared | higher |",
         "| `dist_to_needles` | — (mean distance + unmatched penalty) | lower |",
         "| `n_needles` | — (count declared) | higher is not better |",
         "| `median_nn_spacing` | — (composition L2, shown x10^-3) | higher |",
-        "",
-        "`recall` and `precision` share one match radius "
-        "(`eval_metrics.MATCH_RADIUS` = 0.05, composition L2, dimension-independent) "
-        "and differ only in what they divide by, so they must be read as a pair: an "
-        "optimiser that declares four needles on a 50-optimum landscape and gets all "
-        "four right scores precision 1.00 and recall 0.08.",
-        "",
-        "**`precision` is the quantity earlier versions of this summary labelled "
-        "`recall`.** It came from `eval_metrics.metric_pct_matched_comp`, which "
-        "divides by `len(discovered)`; the denominator was never *n*, so every "
-        "figure written before this change reads as precision regardless of its "
-        "axis label. `recall` is now computed here rather than borrowed.",
         "",
         "`median_nn_spacing` replaces `dup_fraction`, which saturates at 0.999 on "
         "every cell of this campaign — LineBO measures 24 points along one line, and "
@@ -756,9 +604,6 @@ def summarize(out_dir: str, *, ci: float = DEFAULT_CI, n_boot: int = DEFAULT_N_B
         "",
         "## Figures",
         "",
-        "![recall](recall_heatmap.png)",
-        "![precision](precision_heatmap.png)",
-        "![recall and precision by axis](recall_by_axis.png)",
         "![dist_to_needles](dist_to_needles_heatmap.png)",
         "![needles declared](n_needles_heatmap.png)",
         "![median NN spacing](median_nn_spacing_heatmap.png)",

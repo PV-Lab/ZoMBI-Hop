@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -117,6 +118,18 @@ CAMPAIGNS: dict[int, dict] = {
         "db": "data/3rd_real_run.db",
         "columns": ("FAPbI3", "MAPbI3", "MAPbBr3", "CsPbI3"),
         "n_campaign_lines": 60,
+    },
+    # The 6-component campaign of 2026-08-12 (``data/6d.db``: 2423 rows, 2042 of
+    # them scored, 109 lines).  Same schema as the d=3/4 DBs — ``Iteration`` is the
+    # line index and ``Objective`` the measured value — with three further
+    # precursors.  The column order extends the d=4 basis rather than replacing it,
+    # so component i means the same thing at every dimension.  There is no simplex
+    # lattice at d=6 (see :func:`detect_peaks_cloud`), so only the GP surfaces are
+    # available here, not the figures.
+    6: {
+        "db": "data/6d.db",
+        "columns": ("FAPbI3", "MAPbI3", "MAPbBr3", "CsPbI3", "FAPbBr3", "MACl"),
+        "n_campaign_lines": 109,
     },
 }
 
@@ -320,6 +333,209 @@ def detect_peaks(grid: np.ndarray, z: np.ndarray, *,
     return grid[kept_arr], z[kept_arr]
 
 
+# ── peak detection without a lattice (d >= 5) ────────────────────────────────
+#
+# :func:`detect_peaks` scans a dense simplex LATTICE, and ``plot_run.simplex_grid``
+# only builds one for d in {3, 4} — the lattice has C(n+d-1, d-1) points, so the
+# d=4 setting (n=42, ~14k points) becomes ~1.5M at d=6 and is hopeless past that.
+# The 6-component campaign therefore needs a detector that does not enumerate the
+# space, while answering the same question the lattice one answers: where are the
+# local maxima of this GP surface, however many there are.
+#
+# The substitute is sample-then-climb.  A uniform cloud on the simplex locates the
+# basins (a bump of the fixed 0.05-length-scale GP is wide enough that a 200k cloud
+# lands inside every one of them at d=6), the cloud's best points are thinned to one
+# seed per basin, and each seed then climbs to its own local maximum under a
+# shrinking-step stochastic ascent.  Climbing is what makes the reported peak a
+# PEAK and not merely the best sample near it: cloud spacing at d=6 is far coarser
+# than the 0.05 bump width, so an un-climbed cloud point sits typically ~0.1 off the
+# true summit, which is the same order as the metric it feeds.
+#
+# The acceptance rules that follow — prominence over the background, then a min_sep
+# merge — are :func:`detect_peaks`' own, reused verbatim so that "the GP landscape's
+# peaks" means one thing at d=3, 4 and 6.
+_CLOUD_N = 200_000          # uniform simplex samples used to locate the basins
+_CLOUD_SEED_FRAC = 0.01     # top fraction of the cloud kept as climb seeds
+_CLIMB_CANDIDATES = 8       # proposals per seed per step
+_CLIMB_STEPS = 80           # hard cap; the step-size floor normally stops it first
+_CLIMB_STEP0 = 0.05         # initial proposal scale = the GP length scale
+_CLIMB_STEP_MIN = 1e-3      # below this a seed has converged
+_CLIMB_SHRINK = 0.7         # step multiplier on a failed step
+_PREDICT_CHUNK = 20_000     # GP predict batch (keeps the kernel matrix bounded)
+
+
+def _simplex_cloud(dim: int, n: int, seed: int) -> np.ndarray:
+    """``n`` points drawn uniformly on the ``(dim-1)``-simplex.
+
+    ``Dirichlet(1, …, 1)`` is exactly the uniform distribution there, so this is
+    the unbiased stand-in for the lattice the lower dimensions enumerate.
+    """
+    return np.random.default_rng(int(seed)).dirichlet(np.ones(int(dim)), size=int(n))
+
+
+def _project_simplex(X: np.ndarray) -> np.ndarray:
+    """Clip to non-negative and renormalise, row-wise.
+
+    Not the Euclidean projection onto the simplex, deliberately: this is applied to
+    small random proposals around points already inside it, where the two agree to
+    well under the step size, and it costs one pass instead of a sort per row.
+    A row that clips to all-zero (possible only for an absurd step) falls back to
+    the barycentre rather than dividing by zero.
+    """
+    Y = np.clip(X, 0.0, None)
+    tot = Y.sum(axis=1, keepdims=True)
+    bad = (tot <= 0).ravel()
+    if bad.any():
+        Y[bad] = 1.0 / Y.shape[1]
+        tot[bad] = 1.0
+    return Y / tot
+
+
+def _predict_chunked(predict, X: np.ndarray) -> np.ndarray:
+    """``predict`` over ``X`` in batches.
+
+    A single call on the whole cloud would build an ``len(X) x n_train`` kernel
+    matrix — 200k x 2042 in float64 is ~3 GB — so the batch size is what keeps peak
+    detection inside a normal job's memory.
+    """
+    return np.concatenate([predict(X[i:i + _PREDICT_CHUNK])
+                           for i in range(0, len(X), _PREDICT_CHUNK)])
+
+
+def _thin_by_separation(X: np.ndarray, z: np.ndarray, min_sep: float,
+                        limit: int | None = None) -> np.ndarray:
+    """Indices of ``X`` in descending ``z``, keeping only points ``min_sep`` apart.
+
+    The same greedy rule :func:`detect_peaks` applies to its lattice candidates.
+    Used twice here: once to thin cloud seeds to one per basin (so the climb is not
+    run hundreds of times inside a single bump), and once to merge climbed summits.
+    """
+    order = np.argsort(z)[::-1]
+    kept: list[int] = []
+    for idx in order:
+        if limit is not None and len(kept) >= limit:
+            break
+        if all(np.linalg.norm(X[idx] - X[k]) >= min_sep for k in kept):
+            kept.append(int(idx))
+    return np.array(kept, dtype=int)
+
+
+def detect_peaks_cloud(predict, dim: int, *, seed: int = SEED,
+                       min_sep: float = _PEAK_MIN_SEP,
+                       prominence_frac: float = _PEAK_PROMINENCE_FRAC,
+                       n_cloud: int = _CLOUD_N,
+                       ) -> tuple[np.ndarray, np.ndarray]:
+    """Local maxima of a GP surface at any dimension, without a lattice.
+
+    The lattice-free counterpart of :func:`detect_peaks`, for d >= 5.  A uniform
+    cloud locates the basins, its top ``_CLOUD_SEED_FRAC`` is thinned to one seed
+    per basin, each seed climbs to its own summit, and the surviving summits are
+    filtered by the same prominence rule and merged by the same ``min_sep`` rule
+    the lattice detector uses.
+
+    The background that prominence is measured against is the CLOUD's median, which
+    is the same quantity the lattice version takes (the level the fixed-length-scale
+    GP relaxes to away from the data) estimated by sampling instead of enumeration.
+
+    Deterministic in ``seed``.  Returns ``(peaks, values)`` in descending value.
+    """
+    dim = int(dim)
+    rng = np.random.default_rng(int(seed) + 1_000)
+
+    cloud = _simplex_cloud(dim, n_cloud, seed)
+    z_cloud = _predict_chunked(predict, cloud)
+    background = float(np.median(z_cloud))
+
+    n_seed = max(1, int(round(n_cloud * _CLOUD_SEED_FRAC)))
+    top = np.argsort(z_cloud)[::-1][:n_seed]
+    seed_idx = top[_thin_by_separation(cloud[top], z_cloud[top], min_sep)]
+    P = cloud[seed_idx].copy()
+    v = z_cloud[seed_idx].copy()
+
+    # Stochastic ascent, all seeds advanced together: one GP call per step for the
+    # whole population rather than one per seed. A seed whose proposals all fail
+    # shrinks its own step, so converged seeds stop moving while others keep going.
+    step = np.full(len(P), _CLIMB_STEP0)
+    for _ in range(_CLIMB_STEPS):
+        live = step > _CLIMB_STEP_MIN
+        if not live.any():
+            break
+        idx = np.where(live)[0]
+        k, m = len(idx), _CLIMB_CANDIDATES
+        prop = _project_simplex(
+            np.repeat(P[idx], m, axis=0)
+            + rng.normal(size=(k * m, dim)) * np.repeat(step[idx], m)[:, None])
+        zp = _predict_chunked(predict, prop).reshape(k, m)
+        best = zp.argmax(axis=1)
+        best_v = zp[np.arange(k), best]
+        better = best_v > v[idx]
+        moved = idx[better]
+        P[moved] = prop.reshape(k, m, dim)[np.where(better)[0], best[better]]
+        v[moved] = best_v[better]
+        step[idx[~better]] *= _CLIMB_SHRINK
+
+    floor = background + prominence_frac * (float(max(v.max(), z_cloud.max())) - background)
+    keep = np.where(v >= floor)[0]
+    if len(keep) == 0:
+        keep = np.array([int(np.argmax(v))])
+    merged = keep[_thin_by_separation(P[keep], v[keep], min_sep)]
+    order = np.argsort(v[merged])[::-1]
+    return P[merged][order], v[merged][order]
+
+
+# Detected peaks are deterministic in (which surface, dim, seed) but cost a minute
+# of GP calls at d=6, and every run of a campaign rebuilds the same landscape. The
+# cache turns that into one computation per surface for the whole campaign; it is
+# keyed by everything the result depends on, so a changed constant misses rather
+# than silently serving stale peaks.
+_PEAK_CACHE_DIR = OUT_DIR / "peaks_cache"
+
+
+def _cloud_peaks_cached(predict, dim: int, *, which: str, seed: int,
+                        n_train: int) -> tuple[np.ndarray, np.ndarray]:
+    """:func:`detect_peaks_cloud`, memoised to ``warm_gp_landscape/peaks_cache/``."""
+    key = (f"{which}_{int(dim)}d_seed{int(seed)}_n{int(n_train)}"
+           f"_c{_CLOUD_N}_s{_PEAK_MIN_SEP}_p{_PEAK_PROMINENCE_FRAC}.json")
+    path = _PEAK_CACHE_DIR / key
+    if path.is_file():
+        try:
+            blob = json.loads(path.read_text())
+            return (np.asarray(blob["peaks"], dtype=float),
+                    np.asarray(blob["values"], dtype=float))
+        except Exception as exc:                     # corrupt / partial write
+            print(f"  [peaks] ignoring unreadable cache {path}: {exc}")
+    peaks, values = detect_peaks_cloud(predict, dim, seed=seed)
+    try:
+        _PEAK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        # Write-then-rename: two workers starting together must never leave a
+        # half-written file behind for a third to read.
+        tmp = path.with_suffix(f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps({"peaks": peaks.tolist(),
+                                   "values": values.tolist()}))
+        os.replace(tmp, path)
+    except Exception as exc:
+        print(f"  [peaks] could not cache {path}: {exc}")
+    return peaks, values
+
+
+def surface_peaks(predict, dim: int, *, which: str, seed: int, n_train: int
+                  ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Reference peaks of a GP surface, by whichever detector the dimension allows.
+
+    Returns ``(peaks, values, grid_pts, grid_vals)``; the grid is the dense lattice
+    at d in {3, 4} (the ternary render grid is taken from it at d=3) and None above
+    that, where no lattice is built at all.
+    """
+    if int(dim) in (3, 4):
+        grid = simplex_grid(GRID_3D if int(dim) == 3 else GRID_4D, int(dim))
+        z = _predict_chunked(predict, grid)
+        peaks, values = detect_peaks(grid, z)
+        return peaks, values, grid, z
+    peaks, values = _cloud_peaks_cached(predict, dim, which=which, seed=seed,
+                                        n_train=n_train)
+    return peaks, values, None, None
+
+
 # ── objective adapter (for MOBO hyperparameter tuning) ───────────────────────
 
 def warmgp_objective(dim: int, *, seed: int = SEED) -> dict:
@@ -344,21 +560,20 @@ def warmgp_objective(dim: int, *, seed: int = SEED) -> dict:
     """
     L = build_warm_landscape(dim, seed=seed)
     predict = L["predict"]
-    grid = simplex_grid(GRID_3D if int(dim) == 3 else GRID_4D, int(dim))
-    z = predict(grid)
-    peaks, _ = detect_peaks(grid, z)
+    peaks, _, grid, z = surface_peaks(predict, dim, which="warmgp", seed=seed,
+                                      n_train=int(L["X_warm"].shape[0]))
 
     def fn(x: np.ndarray) -> float:
         return float(predict(np.asarray(x, dtype=float).reshape(1, -1))[0])
 
-    grid_vals = z if int(dim) == 3 else None
+    ternary = int(dim) == 3
     return {
         "dim": int(dim),
         "fn": fn,
         "predict": predict,
         "peaks": peaks,
-        "grid_pts": grid if int(dim) == 3 else None,
-        "grid_vals": grid_vals,
+        "grid_pts": grid if ternary else None,
+        "grid_vals": z if ternary else None,
         "n_warm_lines": L["n_warm_lines"],
         "picked_lines": [int(i) for i in L["picked_lines"]],
     }
@@ -403,20 +618,20 @@ def fullgp_objective(dim: int, *, seed: int = SEED) -> dict:
     """
     L = build_full_landscape(dim, seed=seed)
     predict = L["predict"]
-    grid = simplex_grid(GRID_3D if int(dim) == 3 else GRID_4D, int(dim))
-    z = predict(grid)
-    peaks, _ = detect_peaks(grid, z)
+    peaks, _, grid, z = surface_peaks(predict, dim, which="fullgp", seed=seed,
+                                      n_train=int(L["n_points"]))
 
     def fn(x: np.ndarray) -> float:
         return float(predict(np.asarray(x, dtype=float).reshape(1, -1))[0])
 
+    ternary = int(dim) == 3
     return {
         "dim": int(dim),
         "fn": fn,
         "predict": predict,
         "peaks": peaks,
-        "grid_pts": grid if int(dim) == 3 else None,
-        "grid_vals": z if int(dim) == 3 else None,
+        "grid_pts": grid if ternary else None,
+        "grid_vals": z if ternary else None,
         "n_points": L["n_points"],
         "n_lines": L["n_lines"],
     }
@@ -525,7 +740,16 @@ def figure_4d(L: dict, grid, z, peaks, out_png, subtitle, plt) -> None:
 # ── driver ───────────────────────────────────────────────────────────────────
 
 def render(dim: int, out_dir: Path, *, seed: int = SEED) -> dict:
-    """Build the warm landscape at ``dim``, auto-detect its peaks, draw the figure."""
+    """Build the warm landscape at ``dim``, auto-detect its peaks, draw the figure.
+
+    Figures exist only for d=3 (ternary contour) and d=4 (tetrahedron); there is no
+    faithful static view of a 5-simplex, so higher dimensions are surfaces only —
+    use ``fullgp_objective`` / ``warmgp_objective`` for those.
+    """
+    if int(dim) not in (3, 4):
+        raise SystemExit(
+            f"warm_gp_landscape renders d=3 and d=4 only (got d={dim}); the GP "
+            "surface and its peaks are still available via warmgp_objective().")
     import matplotlib.pyplot as plt
 
     L = build_warm_landscape(dim, seed=seed)
