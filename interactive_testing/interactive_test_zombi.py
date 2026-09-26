@@ -3,36 +3,46 @@ interactive_test_zombi.py
 =========================
 Interactive ZoMBI-Hop simulator.
 
-By default the objective is a Random-Forest surrogate built from
-``campaign1a.csv``.  Passing ``--ackley {centroid|edge|vertex|multimodal}``
-swaps the RF for one of the analytic negated-Ackley test functions defined in
-``synthetic_data/ackley.py`` (the same objectives used by
-``scripts/run_zombi_test.py``), which is handy for visualising a ZoMBI-Hop run
-against a landscape with known optima.
+At startup you choose the search space (or pass ``--domain``):
+
+  * **simplex**   — 3-component compositions (sum to 1), drawn as ternary plots.
+  * **cartesian** — the unit square [0, 1]^2 (ZoMBI-Hop's ``BoxDomain``), drawn
+    as ordinary square height maps.
+
+By default the objective is a synthetic ``Ensemble`` landscape from
+``synthetic_data/ensemble.py`` (``Ensemble(dim=3)`` on the simplex,
+``CartesianEnsemble(dim=2)`` on the square), drawn from the same Sobol' config
+sweep the benchmarks use (``--seed`` / ``--index``) with **anisotropy forced
+off** (``aniso_strength = 0``).  Two simplex-only alternatives remain:
+``--rf`` trains a Random-Forest surrogate on ``campaign1a.csv``, and
+``--ackley {centroid|edge|vertex|multimodal}`` uses one of the analytic
+negated-Ackley test functions in ``synthetic_data/ackley.py``.
 
 Workflow
 --------
+0. Choose **simplex** or **cartesian** at the prompt (skipped with ``--domain``).
 1. Build the objective:
-     * default — load ``data/campaign1a.csv`` and train a 500-tree
-       Random-Forest on (FAPbI3, MAPbI3, MAPbBr3) → Objective; or
-     * ``--ackley VARIANT`` — use the analytic Ackley surrogate (no CSV / RF
-       training). Its peaks are maxima, so the run is forced to **maximize**
-       and the analytic optima are used as the reference extrema (no clicking).
-2. Choose **minimize** or **maximize** at the prompt (ZoMBI always runs as a
-   maximiser internally; minimizing uses negated observations).  Skipped under
-   ``--ackley`` (always maximizes the Ackley peaks).
-3. Open an interactive ternary plot.  Left-click near a local minimum or
-   maximum (per your choice); L-BFGS-B refinement (gradient-based on the
-   surrogate) snaps to a nearby extremum.  Press Enter / Q when done selecting.
-   (Skipped under ``--background``, which has no window to click on, and under
-   ``--ackley``, whose reference optima are known analytically.)
+     * default — the Ensemble landscape for the chosen domain (anisotropy off).
+       Its true optima are maxima, so the run is forced to **maximize** and the
+       known optima are used as the reference extrema (no clicking);
+     * ``--rf`` (simplex only) — load ``data/campaign1a.csv`` and train a
+       500-tree Random-Forest on (FAPbI3, MAPbI3, MAPbBr3) → Objective; or
+     * ``--ackley VARIANT`` (simplex only) — the analytic Ackley surrogate,
+       likewise forced to maximize with analytic reference optima.
+2. ``--rf`` only: choose **minimize** or **maximize** at the prompt (ZoMBI
+   always runs as a maximiser internally; minimizing uses negated observations).
+3. ``--rf`` only: open an interactive ternary plot.  Left-click near a local
+   minimum or maximum (per your choice); L-BFGS-B refinement (gradient-based on
+   the surrogate) snaps to a nearby extremum.  Press Enter / Q when done
+   selecting.  (Skipped under ``--background``, which has no window to click on.)
 4. Run ZoMBI-Hop (with LineBO), exactly as in ``scripts/run_zombi_main.py``,
-   but evaluating the surrogate (RF or Ackley) instead of a physical instrument.
-   Input noise (ILR std=NOISE_LEVEL_ILR) and multiplicative output noise
-   (OUTPUT_NOISE_FRAC × |y|) are added at every sample, matched to data/2nd_real_run.db.
-5. After every objective call, save a two-panel ternary figure to
-   ``interactive_testing/plots/`` and display it (non-blocking; PNGs are still
-   saved but not displayed under ``--background``):
+   but evaluating the surrogate instead of a physical instrument.  On the
+   simplex, the requested line is pushed through the physics print model; on the
+   square it is sampled as-is.  Multiplicative output noise
+   (OUTPUT_NOISE_FRAC × |y|) is added at every sample, matched to data/2nd_real_run.db.
+5. After every objective call, save a two-panel figure (ternary or square, per
+   the domain) to ``interactive_testing/plots/`` and display it (non-blocking;
+   PNGs are still saved but not displayed under ``--background``):
      Left  – reference surrogate landscape + blue ★ for confirmed extrema (min or max).
      Right – ZoMBI-Hop exploration:
                • all sampled points (older = more transparent),
@@ -52,11 +62,25 @@ Usage
 
 Flags
 -----
+  --domain {simplex,cartesian}
+      Search space; skips the startup prompt. Defaults to simplex when stdin is
+      not a terminal.
+        python interactive_testing/interactive_test_zombi.py --domain cartesian
+
+  --seed N / --index N
+      Pick the Ensemble landscape: the ``index``-th config of the Sobol' sweep
+      scrambled by ``seed`` (``random_ensemble_config``). Both default to 0.
+      Anisotropy is always switched off regardless of what the config draws.
+
+  --rf
+      (simplex only) Use the campaign1a Random-Forest surrogate instead of the
+      Ensemble landscape, with the min/max prompt and interactive picker.
+
   --ackley {centroid,edge,vertex,multimodal}
-      Use an analytic negated-Ackley objective (from ``synthetic_data/ackley.py``)
-      instead of the campaign1a RF surrogate. The chosen variant's peak(s) are
-      the maxima, so the run is forced to maximize and the analytic optima are
-      drawn as reference extrema (the interactive picker / CSV load are skipped).
+      (simplex only) Use an analytic negated-Ackley objective (from
+      ``synthetic_data/ackley.py``) instead of the Ensemble landscape. The
+      chosen variant's peak(s) are the maxima, so the run is forced to maximize
+      and the analytic optima are drawn as reference extrema.
         python interactive_testing/interactive_test_zombi.py --ackley centroid
 
   --hparams PATH
@@ -119,15 +143,22 @@ from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.lines import Line2D
 
 from src import ZoMBIHop, LineBO
-from src.core.linebo import line_simplex_segment, zero_sum_dirs
-from src.utils.simplex import Ellipsoid, composition_to_ilr, ilr_to_composition, proj_simplex
+from src.core.linebo import batch_line_bounds_segments, line_simplex_segment, zero_sum_dirs
+from src.utils.domain import BoxDomain, SimplexDomain
+from src.utils.simplex import Ellipsoid, composition_to_ilr, ilr_to_composition
 from synthetic_data.ackley import Ackley
+from synthetic_data.ensemble import Ensemble, random_ensemble_config
 from optimize.composition_prediction import physics_simulate_line
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 COMPOSITION_COLS = ["FAPbI3", "MAPbI3", "MAPbBr3"]
 OBJECTIVE_COL = "Objective"
 CORNER_LABELS = ("FAPbI3", "MAPbI3", "MAPbBr3")
+AXIS_LABELS = ("x₁", "x₂")   # cartesian (unit-square) axes
+
+# Search spaces offered at startup: dimensionality and the ensemble.py domain name.
+DOMAIN_DIMS = {"simplex": 3, "cartesian": 2}
+ENSEMBLE_DOMAINS = {"simplex": "simplex", "cartesian": "cube"}
 
 RF_N_ESTIMATORS = 500
 OUTPUT_NOISE_FRAC = 0.045  # output noise as a fraction of the true y (measured ≈ within 4.5%)
@@ -247,6 +278,40 @@ def ternary_grid(n: int = 120) -> np.ndarray:
     return np.array(pts, dtype=float)
 
 
+# ── Domain-aware plot geometry ───────────────────────────────────────────────
+# ``domain`` is "simplex" (ternary drawing) or "cartesian" (unit square, where a
+# point's plot coordinates are just its two components).
+
+def to_xy(pts: np.ndarray, domain: str) -> np.ndarray:
+    """(N, d) domain points → (N, 2) plot coordinates."""
+    if domain == "simplex":
+        return comp_to_xy(pts)
+    p = np.asarray(pts, dtype=float)
+    return p.reshape(1, -1) if p.ndim == 1 else p
+
+
+def draw_frame(ax, domain: str, pad: float = 0.04) -> None:
+    """Triangle outline (simplex) or unit-square outline + axes (cartesian)."""
+    if domain == "simplex":
+        draw_ternary_frame(ax, pad)
+        return
+    ax.plot([0, 1, 1, 0, 0], [0, 0, 1, 1, 0], "k-", lw=1.2)
+    ax.set_aspect("equal")
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_xlabel(AXIS_LABELS[0])
+    ax.set_ylabel(AXIS_LABELS[1])
+
+
+def domain_grid(domain: str, n: int = TERNARY_GRID_N) -> np.ndarray:
+    """Uniform evaluation grid over the domain: ternary (simplex) or n×n (square)."""
+    if domain == "simplex":
+        return ternary_grid(n)
+    g = np.linspace(0.0, 1.0, n + 1)
+    gx, gy = np.meshgrid(g, g)
+    return np.column_stack([gx.ravel(), gy.ravel()])
+
+
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 def load_data(csv_path: str) -> tuple[np.ndarray, np.ndarray]:
@@ -292,6 +357,24 @@ def prompt_minimize_or_maximize() -> bool:
         if raw in ("max", "x", "maximize"):
             return True
         print("  Please enter 'min' or 'max'.")
+
+
+def prompt_domain() -> str:
+    """Ask whether to search the 3-component simplex or the 2-D unit square."""
+    if not sys.stdin.isatty():
+        print("\n  stdin is not a terminal and --domain was not given — using 'simplex'.")
+        return "simplex"
+    while True:
+        raw = input(
+            "\nSearch space: type 'simplex' (3-component compositions, ternary plots)\n"
+            "or 'cartesian' (unit square [0,1]², square plots)  (default: simplex).\n"
+            "> "
+        ).strip().lower()
+        if raw in ("", "s", "simplex"):
+            return "simplex"
+        if raw in ("c", "cart", "cartesian", "box", "cube", "square"):
+            return "cartesian"
+        print("  Please enter 'simplex' or 'cartesian'.")
 
 
 def _log_params_to_simplex(log_x: np.ndarray) -> np.ndarray:
@@ -453,14 +536,14 @@ def make_sim_objective(
     dtype: torch.dtype,
     *,
     maximize: bool,
+    domain: str = "simplex",
 ):
     """
     Return ``sim_objective(endpoints) → (x_actual, y)`` where:
       * ``endpoints`` is a ``(k, 2, d)`` tensor of ranked line endpoints,
-      * the first line (index 0) is sampled at NUM_EXPERIMENTS evenly-spaced points,
-      * Logistic-normal input noise (std=NOISE_LEVEL_ILR in ILR space) preserves the
-        compositional geometry; multiplicative output noise (std=OUTPUT_NOISE_FRAC × |y|)
-        is added to outputs,
+      * the first line (index 0) is sampled at NUM_EXPERIMENTS points — through
+        the physics print model on the simplex, evenly spaced on the square,
+      * multiplicative output noise (std=OUTPUT_NOISE_FRAC × |y|) is added to outputs,
       * returns ``(x_actual: (N, d), y: (N,))`` tensors on ``device``.
 
     ZoMBIHop maximizes ``y``. When ``maximize`` is False, RF outputs are negated so
@@ -470,12 +553,18 @@ def make_sim_objective(
     def sim_objective(endpoints: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         left = endpoints[0, 0].to(dtype=torch.float64)
         right = endpoints[0, 1].to(dtype=torch.float64)
-        # Physics-based "actual" compositions: push the requested start→end line
-        # through the deterministic hardware print model (ramp lag/overshoot +
-        # junction-volume diffusion mixing) instead of adding random ILR-space
-        # input noise.
-        pts_t = physics_simulate_line(left, right, num_points=NUM_EXPERIMENTS,
-                                      device=left.device, dtype=torch.float64)  # (N, 3)
+        if domain == "simplex":
+            # Physics-based "actual" compositions: push the requested start→end line
+            # through the deterministic hardware print model (ramp lag/overshoot +
+            # junction-volume diffusion mixing) instead of adding random ILR-space
+            # input noise.
+            pts_t = physics_simulate_line(left, right, num_points=NUM_EXPERIMENTS,
+                                          device=left.device, dtype=torch.float64)  # (N, 3)
+        else:
+            # The print model is composition-specific; on the square the requested
+            # line is measured as-is.
+            t = torch.linspace(0.0, 1.0, NUM_EXPERIMENTS, device=left.device, dtype=torch.float64)
+            pts_t = left.unsqueeze(0) + t.unsqueeze(1) * (right - left).unsqueeze(0)
         pts_np = pts_t.detach().cpu().numpy()                  # numpy only at sklearn boundary
         raw = torch.tensor(rf.predict(pts_np).ravel(), dtype=dtype, device=device)
         y = raw if maximize else -raw
@@ -494,6 +583,7 @@ def make_linebo_wrapper(
     device: torch.device,
     dtype: torch.dtype,
     plot_state: dict,
+    zdomain=None,
 ):
     """
     Build a ZoMBIHop-compatible objective wrapper::
@@ -502,14 +592,17 @@ def make_linebo_wrapper(
 
     Internally uses ``LineBO.ranked_line_endpoints`` (not ``LineBO.sampler``)
     so we can capture the top-2 ranked lines before evaluation and store them
-    in ``plot_state`` for the per-iteration plots.
+    in ``plot_state`` for the per-iteration plots.  ``zdomain`` is the ZoMBI-Hop
+    ``Domain`` (simplex or box) the lines are drawn in.
     """
+    zdomain = zdomain if zdomain is not None else SimplexDomain()
     linebo = LineBO(
         sim_obj,
         dim,
         num_points_per_line=100,
         num_lines=num_lines,
         device=str(device),
+        domain=zdomain,
     )
 
     def wrapper(x_tell, bounds: torch.Tensor, acquisition_function):
@@ -546,8 +639,8 @@ def make_linebo_wrapper(
         print(f"  [LineBO] done — {x_actual.shape[0]} pts, y=[{y.min():.4f}, {y.max():.4f}]", flush=True)
 
         # ── compute x_requested (principal direction of x_actual) ─────────────
-        # The PCA-reconstructed line lives in ℝ^d and can have negative components
-        # or not sum to 1 — project onto the simplex before returning.
+        # The PCA-reconstructed line lives in ℝ^d and can leave the domain
+        # (e.g. negative components / not summing to 1) — project back first.
         if x_actual.shape[0] > 1:
             xc = x_actual - x_actual.mean(dim=0, keepdim=True)
             _, _, Vt = torch.linalg.svd(xc, full_matrices=False)
@@ -561,7 +654,7 @@ def make_linebo_wrapper(
                 x_actual.mean(dim=0).unsqueeze(0)
                 + t_vals.unsqueeze(1) * direction.unsqueeze(0)
             )
-            x_requested = proj_simplex(x_requested)   # guarantee simplex membership
+            x_requested = zdomain.project(x_requested)   # guarantee domain membership
         else:
             x_requested = x_actual.clone()
 
@@ -603,6 +696,8 @@ def make_plotting_wrapper(
     maximize: bool,
     show_sampling: bool = False,
     gp_ref: list | None = None,
+    domain: str = "simplex",
+    landscape_name: str = "RF",
 ):
     """
     Wrap ``inner_wrapper`` so that after every objective call a snapshot of
@@ -638,7 +733,7 @@ def make_plotting_wrapper(
             pared_X = xp.detach().cpu().numpy()
             pared_Y = yp.detach().cpu().numpy().ravel()
             if not maximize:
-                pared_Y = -pared_Y   # un-negate so display shows true RF values
+                pared_Y = -pared_Y   # un-negate so display shows true objective values
         else:
             pared_X = None
             pared_Y = None
@@ -664,6 +759,8 @@ def make_plotting_wrapper(
             save_dir=save_dir,
             gp_grid_vals=_gp_landscape_vals(
                 gp_ref[0] if gp_ref else None, grid_pts, maximize),
+            domain=domain,
+            landscape_name=landscape_name,
         )
         plot_queue.put(payload)
         return x_requested, x_actual, y
@@ -673,10 +770,21 @@ def make_plotting_wrapper(
 
 # ── Plotting helpers ──────────────────────────────────────────────────────────
 
-def _draw_bounds_region(ax, bounds, n_sample: int = 5000) -> None:
+def _draw_bounds_region(ax, bounds, n_sample: int = 5000, domain: str = "simplex") -> None:
     """
-    Draw the trust-region (tensor bounds or Ellipsoid) as a dashed-red convex hull on the ternary.
+    Draw the trust-region (tensor bounds or Ellipsoid) as a dashed-red region:
+    the convex hull of simplex ∩ box on the ternary, or the box itself on the square.
     """
+    if domain == "cartesian":
+        if not (isinstance(bounds, torch.Tensor) and bounds.shape[0] == 2):
+            return
+        lo = bounds[0].detach().cpu().numpy()
+        hi = bounds[1].detach().cpu().numpy()
+        xs = [lo[0], hi[0], hi[0], lo[0], lo[0]]
+        ys = [lo[1], lo[1], hi[1], hi[1], lo[1]]
+        ax.fill(xs, ys, color="red", alpha=0.06, zorder=4)
+        ax.plot(xs, ys, "--", color="red", lw=2.0, alpha=0.75, zorder=5, label="Trust bounds")
+        return
     from src.utils.simplex import random_simplex
     try:
         if isinstance(bounds, torch.Tensor) and bounds.shape[0] == 2:
@@ -715,6 +823,7 @@ def _needle_penalty_bands(
     *,
     n_bands: int = 18,
     n_ang: int = 160,
+    domain: str = "simplex",
 ) -> list[tuple[np.ndarray, float]]:
     """Non-overlapping annular rings coloured by the smooth repulsion penalty.
 
@@ -728,8 +837,12 @@ def _needle_penalty_bands(
 
     Tangent-space mode (B is not None):  boundary {x* + B @ u : u^T M u = 1}
     ILR mode (B is None):                boundary {ilr⁻¹(ilr(x*) + u) : u^T M u = 1}
+    On the square (``domain="cartesian"``) the box's basis is the identity, and
+    contours are clipped to [0, 1]^2 rather than renormalised onto the simplex.
     """
     d = needle_x.shape[0]
+    if domain == "cartesian" and B is None:
+        B = torch.eye(d, dtype=torch.float64)
     M_np = M.cpu().numpy()
     eigvals, eigvecs = np.linalg.eigh(M_np)
     eigvals = np.maximum(eigvals, 1e-12)
@@ -750,6 +863,8 @@ def _needle_penalty_bands(
             ell = ilr_to_composition(
                 torch.tensor(needle_ilr + u_ell, dtype=torch.float64), d).cpu().numpy()
         ell = np.clip(ell, 0, 1)
+        if domain == "cartesian":
+            return ell
         ssum = ell.sum(axis=1, keepdims=True)
         return ell / np.where(ssum < 1e-9, 1.0, ssum)
 
@@ -772,6 +887,7 @@ def _draw_needle_ellipsoid(
     needle_x: np.ndarray,
     M: torch.Tensor | None,
     B: torch.Tensor | None,
+    domain: str = "simplex",
 ) -> None:
     """
     Plot a red star for the needle and, if ellipsoid parameters are available, a
@@ -779,7 +895,7 @@ def _draw_needle_ellipsoid(
     centre (where the repulsion is strongest) fading to fully transparent at the
     boundary (where the penalty vanishes).  Opacity is proportional to the penalty.
     """
-    xy = comp_to_xy(needle_x.reshape(1, 3))
+    xy = to_xy(needle_x.reshape(1, -1), domain)
     ax.scatter(
         xy[0, 0], xy[0, 1],
         marker="*", s=280, c="red",
@@ -788,14 +904,31 @@ def _draw_needle_ellipsoid(
     if M is None:
         return
     try:
-        for ring, penalty in _needle_penalty_bands(needle_x, M, B):
+        for ring, penalty in _needle_penalty_bands(needle_x, M, B, domain=domain):
             ax.add_patch(MplPolygon(
-                comp_to_xy(ring), closed=True,
+                to_xy(ring, domain), closed=True,
                 facecolor="red", edgecolor="none",
                 alpha=0.5 * penalty, linewidth=0, zorder=6,
             ))
     except Exception as exc:
         print(f"  [ellipse warn] {exc}")
+
+
+def _draw_landscape(ax, grid_pts: np.ndarray, vals: np.ndarray, domain: str, zorder: int):
+    """Heat-map a grid of values: point cloud on the ternary, raster on the square."""
+    if domain == "cartesian":
+        n = int(round(np.sqrt(len(grid_pts))))
+        g = grid_pts[:n, 0]   # domain_grid is row-major in x, so the first row is the x axis
+        return ax.pcolormesh(
+            g, g, np.asarray(vals).reshape(n, n),
+            cmap="viridis", shading="nearest", alpha=0.85, zorder=zorder, rasterized=True,
+        )
+    gxy = comp_to_xy(grid_pts)
+    return ax.scatter(
+        gxy[:, 0], gxy[:, 1],
+        c=vals, cmap="viridis",
+        s=6, alpha=0.72, zorder=zorder, rasterized=True,
+    )
 
 
 def _plot_iteration(
@@ -815,9 +948,12 @@ def _plot_iteration(
     save_dir: str | None = None,
     sampling_lines: list | None = None,
     gp_grid_vals: np.ndarray | None = None,
+    domain: str = "simplex",
+    landscape_name: str = "RF",
 ) -> plt.Figure:
     """
-    Generate the two-panel ternary figure for one iteration and optionally save it.
+    Generate the two-panel figure for one iteration and optionally save it —
+    ternary panels on the simplex, unit-square panels when ``domain="cartesian"``.
 
     Parameters
     ----------
@@ -843,20 +979,15 @@ def _plot_iteration(
         fontsize=13,
     )
 
-    # ── Left panel: RF reference ───────────────────────────────────────────────
-    draw_ternary_frame(ax_ref)
-    ax_ref.set_title("Reference: RF landscape", fontsize=11)
-    gxy = comp_to_xy(grid_pts)
-    sc_ref = ax_ref.scatter(
-        gxy[:, 0], gxy[:, 1],
-        c=grid_vals, cmap="viridis",
-        s=6, alpha=0.72, zorder=2, rasterized=True,
-    )
-    fig.colorbar(sc_ref, ax=ax_ref, label="RF Objective", fraction=0.046, pad=0.04)
+    # ── Left panel: surrogate reference ────────────────────────────────────────
+    draw_frame(ax_ref, domain)
+    ax_ref.set_title(f"Reference: {landscape_name} landscape", fontsize=11)
+    sc_ref = _draw_landscape(ax_ref, grid_pts, grid_vals, domain, zorder=2)
+    fig.colorbar(sc_ref, ax=ax_ref, label=f"{landscape_name} Objective", fraction=0.046, pad=0.04)
     ref_lbl = "True maxima" if maximize else "True minima"
     if true_minima:
         mc = np.array([m[0] for m in true_minima])
-        mxy = comp_to_xy(mc)
+        mxy = to_xy(mc, domain)
         ax_ref.scatter(
             mxy[:, 0], mxy[:, 1],
             marker="*", s=360, c="blue",
@@ -865,27 +996,23 @@ def _plot_iteration(
         ax_ref.legend(loc="upper right", fontsize=8, framealpha=0.9)
 
     # ── Right panel: ZoMBI-Hop exploration ────────────────────────────────────
-    draw_ternary_frame(ax_exp)
+    draw_frame(ax_exp, domain)
     ax_exp.set_title("ZoMBI-Hop exploration", fontsize=11)
     legend_handles = []
 
     # Background = the GP's current belief about the objective landscape (its
-    # posterior mean over the ternary grid).
+    # posterior mean over the evaluation grid).
     if gp_grid_vals is not None and len(gp_grid_vals) == len(grid_pts):
-        sc_gp = ax_exp.scatter(
-            gxy[:, 0], gxy[:, 1],
-            c=gp_grid_vals, cmap="viridis",
-            s=6, alpha=0.72, zorder=1, rasterized=True,
-        )
+        sc_gp = _draw_landscape(ax_exp, grid_pts, gp_grid_vals, domain, zorder=1)
         fig.colorbar(sc_gp, ax=ax_exp, label="GP posterior mean",
                      fraction=0.046, pad=0.04)
 
     # Pared (noise-deduplicated) dataset — matches what the GP trains on.
-    # Older points are more transparent; colour encodes true RF objective value.
+    # Older points are more transparent; colour encodes true objective value.
     if pared_X is not None and len(pared_X) > 0:
         n      = len(pared_Y)
         alphas = np.linspace(0.15, 0.92, n) if n > 1 else np.array([0.92])
-        xy_pts = comp_to_xy(pared_X)
+        xy_pts = to_xy(pared_X, domain)
         y_lo, y_hi = pared_Y.min(), pared_Y.max()
         if y_hi <= y_lo:
             y_hi = y_lo + 1e-9
@@ -904,7 +1031,7 @@ def _plot_iteration(
 
     # Current trust ellipsoid (dashed red polygon)
     if trust_ellipsoid is not None:
-        _draw_bounds_region(ax_exp, trust_ellipsoid)
+        _draw_bounds_region(ax_exp, trust_ellipsoid, domain=domain)
 
     # Active needles: red ★ + purple ellipse
     if needles is not None and needles.shape[0] > 0:
@@ -912,13 +1039,13 @@ def _plot_iteration(
         M_list = needle_M_list or [None] * len(nx_np)
         for i, nx in enumerate(nx_np):
             Mi = M_list[i] if i < len(M_list) else None
-            _draw_needle_ellipsoid(ax_exp, nx, Mi, needle_B)
+            _draw_needle_ellipsoid(ax_exp, nx, Mi, needle_B, domain=domain)
 
     # Sampling overlay: every candidate line the acquisition was integrated over.
     # Thin and semi-transparent so the chosen main/cache lines remain readable.
     if sampling_lines:
         for k, sl in enumerate(sampling_lines):
-            sxy = comp_to_xy(np.array(sl))  # (2, 2)
+            sxy = to_xy(np.array(sl), domain)  # (2, 2)
             ax_exp.plot(
                 sxy[:, 0], sxy[:, 1],
                 "-", color="dimgray", lw=0.8, alpha=0.35,
@@ -934,7 +1061,7 @@ def _plot_iteration(
 
     # LineBO suggested lines
     if line_0 is not None:
-        ll = comp_to_xy(np.array(line_0))  # (2, 2)
+        ll = to_xy(np.array(line_0), domain)  # (2, 2)
         (h0,) = ax_exp.plot(
             ll[:, 0], ll[:, 1],
             "-", color="orange", lw=2.5, alpha=0.90,
@@ -942,7 +1069,7 @@ def _plot_iteration(
         )
         legend_handles.append(h0)
     if line_1 is not None:
-        ll = comp_to_xy(np.array(line_1))
+        ll = to_xy(np.array(line_1), domain)
         (h1,) = ax_exp.plot(
             ll[:, 0], ll[:, 1],
             ":", color="cornflowerblue", lw=2.2, alpha=0.85,
@@ -953,7 +1080,7 @@ def _plot_iteration(
     # Reference extrema on the exploration panel too (blue stars)
     if true_minima:
         mc = np.array([m[0] for m in true_minima])
-        mxy = comp_to_xy(mc)
+        mxy = to_xy(mc, domain)
         h_min = ax_exp.scatter(
             mxy[:, 0], mxy[:, 1],
             marker="*", s=360, c="blue",
@@ -982,12 +1109,13 @@ def _plot_iteration(
             wcpu = np.sort(wM.detach().cpu().numpy())
             summary_lines.append("Trust c: [" + " ".join(f"{v:.4f}" for v in c_cpu) + "]")
             summary_lines.append("Trust M eig: [" + " ".join(f"{v:.4f}" for v in wcpu) + "]")
+    def _fmt(v) -> str:
+        return "[" + " ".join(f"{x:.3f}" for x in np.asarray(v).ravel()) + "]"
+
     if line_0 is not None:
-        a, b = np.round(line_0[0], 3), np.round(line_0[1], 3)
-        summary_lines.append(f"Line0: {list(a)} → {list(b)}")
+        summary_lines.append(f"Line0: {_fmt(line_0[0])} → {_fmt(line_0[1])}")
     if line_1 is not None:
-        a, b = np.round(line_1[0], 3), np.round(line_1[1], 3)
-        summary_lines.append(f"Line1: {list(a)} → {list(b)}")
+        summary_lines.append(f"Line1: {_fmt(line_1[0])} → {_fmt(line_1[1])}")
     if summary_lines:
         ax_exp.text(
             0.01, 0.99, "\n".join(summary_lines),
@@ -1029,36 +1157,50 @@ def generate_init_data(
     dtype: torch.dtype,
     *,
     maximize: bool,
+    domain: str = "simplex",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Sample ``n_lines`` random simplex lines, evaluate the RF on each, and
-    return tensors suitable as ``X_init_actual / X_init_expected / Y_init``
+    Sample ``n_lines`` random lines through the domain's centre (simplex
+    centroid, or the middle of the unit square), evaluate the surrogate on each,
+    and return tensors suitable as ``X_init_actual / X_init_expected / Y_init``
     for ZoMBIHop.
 
-    ``Y_init`` matches ZoMBI's convention: raw RF (+ noise) when ``maximize``,
-    negated RF (+ noise) when minimizing.
+    ``Y_init`` matches ZoMBI's convention: raw objective (+ noise) when
+    ``maximize``, negated objective (+ noise) when minimizing.
     """
+    dim = DOMAIN_DIMS[domain]
     x_actual_list, x_exp_list, y_list = [], [], []
     for line_idx in range(n_lines):
         print(f"      init line {line_idx + 1}/{n_lines} …", flush=True)
-        x0 = torch.full((3,), 1.0 / 3, device=device, dtype=dtype)
-        direction = zero_sum_dirs(1, 3, device=device, dtype=dtype).squeeze(0)
-        seg = line_simplex_segment(x0, direction)
+        if domain == "simplex":
+            x0 = torch.full((dim,), 1.0 / dim, device=device, dtype=dtype)
+            direction = zero_sum_dirs(1, dim, device=device, dtype=dtype).squeeze(0)
+            seg = line_simplex_segment(x0, direction)
+        else:
+            x0 = torch.full((dim,), 0.5, device=device, dtype=dtype)
+            direction = BoxDomain().directions(1, dim, device=str(device), dtype=dtype)
+            unit = BoxDomain().default_bounds(dim, device, dtype)
+            xl, xr, t_lo, t_hi, mask = batch_line_bounds_segments(x0, direction, unit)
+            seg = (t_lo[0], t_hi[0], xl[0], xr[0]) if bool(mask.any()) else None
         if seg is None:
             print(f"      init line {line_idx + 1}: no valid segment, skipping.")
             continue
         _t_min, _t_max, x_left, x_right = seg
         t = torch.linspace(0.0, 1.0, NUM_EXPERIMENTS, dtype=torch.float64, device=device)
-        # Clean straight segment = requested line; physics-simulated print = actual
-        # (replaces the random ILR-space input noise).
+        # Clean straight segment = requested line; on the simplex the actual
+        # compositions are the physics-simulated print (replaces the random
+        # ILR-space input noise), on the square the line is measured as-is.
         pts_clean = (
             x_left.to(torch.float64).unsqueeze(0)
             + t.unsqueeze(1) * (x_right - x_left).to(torch.float64).unsqueeze(0)
         )
-        pts_t = physics_simulate_line(x_left, x_right, num_points=NUM_EXPERIMENTS,
-                                      device=device, dtype=torch.float64)
+        if domain == "simplex":
+            pts_t = physics_simulate_line(x_left, x_right, num_points=NUM_EXPERIMENTS,
+                                          device=device, dtype=torch.float64)
+        else:
+            pts_t = pts_clean.clone()
         pts_np = pts_t.detach().cpu().numpy()
-        print(f"      evaluating RF on {len(pts_np)} points …", flush=True)
+        print(f"      evaluating surrogate on {len(pts_np)} points …", flush=True)
         raw = torch.tensor(rf.predict(pts_np).ravel(), dtype=dtype, device=device)
         y_vals = raw + torch.randn_like(raw) * (OUTPUT_NOISE_FRAC * raw.abs())
         print(f"      done. y range: [{y_vals.min():.4f}, {y_vals.max():.4f}]", flush=True)
@@ -1152,6 +1294,10 @@ def main(
     show_sampling: bool = False,
     background: bool = False,
     ackley: str | None = None,
+    use_rf: bool = False,
+    domain: str | None = None,
+    seed: int = 0,
+    index: int = 0,
 ) -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(script_dir, "campaign1a.csv")
@@ -1160,25 +1306,54 @@ def main(
     save_dir = os.path.join(script_dir, "plots")
     ckpt_dir = os.path.join(script_dir, "checkpoints")
 
-    surrogate_name = f"Ackley ({ackley})" if ackley else "RF Surrogate on campaign1a.csv"
+    # ── Step 0: search space ──────────────────────────────────────────────────
+    if domain is None:
+        domain = prompt_domain()
+    if domain != "simplex" and (ackley or use_rf):
+        raise SystemExit(
+            "--rf and --ackley are simplex-only objectives; use --domain simplex, "
+            "or drop them to run the cartesian Ensemble landscape.")
+    dim = DOMAIN_DIMS[domain]
+    zdomain = SimplexDomain() if domain == "simplex" else BoxDomain()
+
+    if ackley:
+        surrogate_name, landscape_name = f"Ackley ({ackley})", "Ackley"
+    elif use_rf:
+        surrogate_name, landscape_name = "RF Surrogate on campaign1a.csv", "RF"
+    else:
+        surrogate_name = f"Ensemble (seed={seed}, index={index}, anisotropy off)"
+        landscape_name = "Ensemble"
     print("=" * 70)
     print(f"ZoMBI-Hop Interactive Test — {surrogate_name}")
+    print(f"Domain : {domain}  (d={dim}, {zdomain!r})")
     print(f"Device : {DEVICE}")
     print(f"Noise  : input ILR std={NOISE_LEVEL_ILR}  |  output frac={OUTPUT_NOISE_FRAC} (× |y|)")
     print("=" * 70)
 
     # ── Step 1: build the objective surrogate ─────────────────────────────────
     # ``rf`` is any object exposing a scikit-learn-style ``predict((N, d)) → (N,)``
-    # method: either a trained RandomForestRegressor (default) or an analytic
-    # ``Ackley`` instance (``--ackley``). Everything downstream is agnostic to which.
+    # method: an ``Ensemble`` landscape (default), a trained RandomForestRegressor
+    # (``--rf``) or an analytic ``Ackley`` instance (``--ackley``). Everything
+    # downstream is agnostic to which.
+    grid_pts = domain_grid(domain)
     if ackley:
         print(f"\n[1] Using analytic Ackley objective ('{ackley}') — no CSV / RF training.")
         rf = Ackley(ackley)
-        grid_pts = ternary_grid(TERNARY_GRID_N)
         grid_vals = rf.predict(grid_pts)
         # Ackley peaks are maxima; ZoMBI maximizes them directly.
         maximize = True
         print("    Mode forced: MAXIMIZE (Ackley peaks are maxima).")
+    elif not use_rf:
+        cfg = random_ensemble_config(dim, index, seed=seed, domain=ENSEMBLE_DOMAINS[domain])
+        cfg["aniso_strength"] = 0.0   # anisotropy always off in this harness
+        rf = Ensemble(**cfg)
+        assert np.allclose(rf.axis_scale, 1.0), "anisotropy should be off"
+        print(f"\n[1] Using {rf!r}")
+        print("    Anisotropy: OFF (aniso_strength = 0, isotropic distance metric).")
+        grid_vals = rf.predict(grid_pts)
+        # The ensemble's true optima are its global maxima.
+        maximize = True
+        print("    Mode forced: MAXIMIZE (Ensemble true optima are maxima).")
     else:
         print("\n[1] Loading data and training RF …")
         X_data, y_data = load_data(csv_path)
@@ -1186,8 +1361,7 @@ def main(
         rf = train_rf(X_data, y_data)
         print(f"    Train R² = {rf.score(X_data, y_data):.4f}")
 
-        print("    Building ternary evaluation grid …")
-        grid_pts = ternary_grid(TERNARY_GRID_N)
+        print("    Evaluating RF on the ternary grid …")
         grid_vals = rf.predict(grid_pts)
 
         maximize = prompt_minimize_or_maximize()
@@ -1200,14 +1374,14 @@ def main(
     # The picker needs a GUI to click on, so it is skipped under --background
     # (Agg has no window). Reference extrema are display-only overlays, so an
     # empty list just omits the blue ★ markers.
-    # Under --ackley the optima are known analytically, so the picker is skipped
-    # and the analytic maxima are used directly.
+    # For Ackley / Ensemble the optima are known, so the picker is skipped and
+    # the known maxima are used directly.
     goal_pl = "maxima" if maximize else "minima"
-    if ackley:
+    if not use_rf:
         true_minima = rf.known_maxima
         if not background:
             plt.ion()   # keep Tk root alive for the live per-iteration figures
-        print(f"\n[2] --ackley: using {len(true_minima)} analytic reference {goal_pl}:")
+        print(f"\n[2] Using {len(true_minima)} known reference {goal_pl}:")
         for i, (c, v) in enumerate(true_minima):
             print(f"      #{i + 1}  comp={np.round(c, 4)}  y={v:.5f}")
     elif background:
@@ -1224,7 +1398,6 @@ def main(
 
     # ── Step 3: ZoMBI-Hop setup ───────────────────────────────────────────────
     print("\n[3] Initialising ZoMBI-Hop …")
-    dim = 3
     zparams = dict(ZOMBI_PARAMS)
     if hparams_path is not None:
         zparams.update(load_hparams(hparams_path))
@@ -1235,10 +1408,10 @@ def main(
     plot_queue: queue.Queue = queue.Queue()
 
     print("    Building sim objective …")
-    sim_obj = make_sim_objective(rf, DEVICE, DTYPE, maximize=maximize)
+    sim_obj = make_sim_objective(rf, DEVICE, DTYPE, maximize=maximize, domain=domain)
     print("    Building LineBO wrapper …")
     inner_wrap = make_linebo_wrapper(
-        sim_obj, dim, NUM_LINES, DEVICE, DTYPE, plot_state,
+        sim_obj, dim, NUM_LINES, DEVICE, DTYPE, plot_state, zdomain=zdomain,
     )
     print("    Building plotting wrapper …")
     full_wrap = make_plotting_wrapper(
@@ -1249,11 +1422,13 @@ def main(
         maximize=maximize,
         show_sampling=show_sampling,
         gp_ref=gp_ref,
+        domain=domain,
+        landscape_name=landscape_name,
     )
 
     print(f"    Generating initial data ({N_INIT_LINES} lines × {NUM_EXPERIMENTS} pts) …")
     X_init_a, X_init_e, Y_init = generate_init_data(
-        rf, N_INIT_LINES, DEVICE, DTYPE, maximize=maximize,
+        rf, N_INIT_LINES, DEVICE, DTYPE, maximize=maximize, domain=domain,
     )
     print(f"    {X_init_a.shape[0]} initial points generated.")
     y_rng_lbl = "ZoMBI-internal Y" if maximize else "ZoMBI-internal Y (negated RF)"
@@ -1271,6 +1446,7 @@ def main(
         run_uuid=None,
         checkpoint_dir=ckpt_dir,
         num_iterations_saved=50,
+        domain=zdomain,
     )
     dh_ref[0] = optimizer.data_handler  # connect plotting wrapper to live DataHandler
     gp_ref[0] = optimizer.gp_handler    # GP belief landscape for the panel background
@@ -1366,14 +1542,15 @@ def main(
         for i, (nx, nv) in enumerate(
             zip(all_locs.cpu().numpy(), all_vals.cpu().numpy().ravel())
         ):
-            y_rf = float(nv) if maximize else -float(nv)
-            print(f"    #{i + 1}  {np.round(nx, 4)}  y (RF) = {y_rf:.5f}")
+            y_obj = float(nv) if maximize else -float(nv)
+            print(f"    #{i + 1}  {np.round(nx, 4)}  y ({landscape_name}) = {y_obj:.5f}")
     else:
         print("  No needles found yet.")
 
     if true_minima:
         ref_word = "maxima" if maximize else "minima"
-        print(f"  Reference {ref_word} (interactive selection):")
+        ref_src = "interactive selection" if use_rf else "known optima"
+        print(f"  Reference {ref_word} ({ref_src}):")
         for i, (c, v) in enumerate(true_minima):
             print(f"    #{i + 1}  {np.round(c, 4)}  y = {v:.5f}")
 
@@ -1397,17 +1574,40 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Interactive ZoMBI-Hop simulator on an RF or Ackley surrogate."
+        description="Interactive ZoMBI-Hop simulator on an Ensemble, RF or Ackley "
+                    "surrogate, in simplex or cartesian space."
     )
     parser.add_argument(
+        "--domain",
+        choices=tuple(DOMAIN_DIMS),
+        default=None,
+        help="Search space: 'simplex' (3-component compositions, ternary plots) or "
+             "'cartesian' (unit square, square plots). Prompted for if omitted.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0,
+        help="Ensemble landscape: Sobol' scramble / placement seed (default 0).",
+    )
+    parser.add_argument(
+        "--index", type=int, default=0,
+        help="Ensemble landscape: index into the Sobol' config sweep (default 0).",
+    )
+    objective = parser.add_mutually_exclusive_group()
+    objective.add_argument(
+        "--rf",
+        action="store_true",
+        help="(simplex only) Use the campaign1a Random-Forest surrogate instead of "
+             "the Ensemble landscape, with the min/max prompt and interactive picker.",
+    )
+    objective.add_argument(
         "--ackley",
         choices=Ackley.VARIANTS,
         default=None,
         metavar="{centroid,edge,vertex,multimodal}",
-        help="Use an analytic negated-Ackley objective from synthetic_data/ackley.py "
-             "instead of the campaign1a RF surrogate. The variant's peak(s) are the "
-             "maxima, so the run is forced to maximize, the analytic optima are used "
-             "as reference extrema, and the interactive picker / CSV load are skipped.",
+        help="(simplex only) Use an analytic negated-Ackley objective from "
+             "synthetic_data/ackley.py instead of the Ensemble landscape. The "
+             "variant's peak(s) are the maxima, so the run is forced to maximize "
+             "and the analytic optima are used as reference extrema.",
     )
     parser.add_argument(
         "--hparams",
@@ -1438,4 +1638,8 @@ if __name__ == "__main__":
         show_sampling=args.show_sampling,
         background=args.background,
         ackley=args.ackley,
+        use_rf=args.rf,
+        domain=args.domain,
+        seed=args.seed,
+        index=args.index,
     )
