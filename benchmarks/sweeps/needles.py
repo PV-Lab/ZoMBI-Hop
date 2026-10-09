@@ -123,6 +123,21 @@ def prominence_separation(basin_width: float, dim: int) -> float:
     return -2.0 * math.log(e_max) * math.sqrt(float(dim)) / b
 
 
+def found_radius(basin_width: float, dim: int) -> float:
+    """Radius within which a sample counts as having FOUND an optimum.
+
+    The distance at which the objective has fallen one output-noise sd below the
+    peak: solves ``1.0 - (0.5 + 0.5*exp(-b*r/sqrt(d))) = sigma_y`` for ``r``.
+    Inside it a measurement cannot be told apart from one at the optimum, so it is
+    the closest a sample-based search can be asked to localise a needle. It is a
+    property of the landscape alone (no method, budget or result enters), and it
+    is exactly half of :func:`prominence_separation`, so optima placed at their
+    prominence target never have overlapping found-balls and one sample can find
+    at most one optimum.
+    """
+    return 0.5 * prominence_separation(basin_width, dim)
+
+
 def target_separation(basin_width: float, dim: int) -> float:
     """``s* = max(sigma_x, s_prom(b, d))`` — both of METHODS' resolvability tests."""
     return max(float(SIGMA_X), prominence_separation(basin_width, dim))
@@ -356,6 +371,35 @@ def build_landscape(dim: int, n: int, basin_width: float, seed: int) -> dict:
     }
     return {"config": cfg, "fn": fn, "record": record,
             "centers": np.asarray(fn.centers, dtype=float)}
+
+
+# ─── Landscape kinds ─────────────────────────────────────────────────────────────
+
+#: ``plan --landscape`` choices. "needles" is this module; the others are modules
+#: with the same interface (build_landscape, found_radius, plan_feasibility,
+#: selftest, PLAIN_Y, PEAK_Y).
+LANDSCAPE_KINDS = ("needles", "varied_height")
+
+
+def landscape_module(kind: str | None = None):
+    """The module that builds landscapes of ``kind`` (None -> "needles", which is
+    what manifests written before kinds existed hold)."""
+    kind = kind or "needles"
+    if kind == "needles":
+        import sys
+        return sys.modules[__name__]
+    if kind == "varied_height":
+        from . import varied_height
+        return varied_height
+    raise ValueError(f"unknown landscape kind {kind!r}; known: {LANDSCAPE_KINDS}")
+
+
+def fn_from_config(cfg: dict):
+    """Rebuild a cell's objective from its ``ensemble_config.json``."""
+    if cfg.get("kind", "needles") == "needles":
+        from synthetic_data.ensemble import Ensemble
+        return Ensemble(**cfg)
+    return landscape_module(cfg["kind"]).from_config(cfg)
 
 
 # ─── Self-test ───────────────────────────────────────────────────────────────────

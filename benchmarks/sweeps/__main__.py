@@ -61,6 +61,9 @@ def _add_grid_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--basin-widths",
                    default=",".join(f"{v:g}" for v in nd.GRID_BASIN_WIDTH),
                    help="basin sharpness values (Ackley b) to sweep")
+    p.add_argument("--landscape", choices=nd.LANDSCAPE_KINDS, default="needles",
+                   help="landscape family: equal-height needles on a 0.75 plain, or "
+                        "varied_height (peaks U(0.5, 1), plain 0; see varied_height.py)")
 
 
 def _add_config_args(p: argparse.ArgumentParser) -> None:
@@ -265,7 +268,8 @@ def main() -> None:
 
     p = sub.add_parser("selftest",
                        help="verify the landscape module's closed-form identities")
-    p.set_defaults(func=lambda a: nd.selftest())
+    p.set_defaults(func=lambda a: [nd.landscape_module(k).selftest()
+                                   for k in nd.LANDSCAPE_KINDS])
 
     args = ap.parse_args()
     args.func(args)

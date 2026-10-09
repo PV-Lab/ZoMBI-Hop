@@ -312,7 +312,9 @@ def plan(args) -> str:
             f.write(f"{t['tid']}\t{t['method']}\t{t['name']}\t{t['dim']}\t"
                     f"{t['n_needles']}\t{t['basin_width']:g}\t{t['draw']}\n")
 
-    feasibility = nd.plan_feasibility(dims, counts, widths)
+    kind = getattr(args, "landscape", None) or "needles"
+    land = nd.landscape_module(kind)
+    feasibility = land.plan_feasibility(dims, counts, widths)
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "generated": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -338,13 +340,17 @@ def plan(args) -> str:
         "seed_base": int(args.seed_base),
         "method_configs": configs,
         "landscape": {
-            "kind": "needles", "domain": nd.DOMAIN,
-            "description": ("bumps-only CartesianEnsemble on [0,1]^dim: n negated-"
-                            "Ackley optima of sharpness b on a flat plain, every "
-                            "other feature off"),
+            "kind": kind, "domain": nd.DOMAIN,
+            "description": (
+                "bumps-only CartesianEnsemble on [0,1]^dim: n negated-Ackley optima "
+                "of sharpness b on a flat plain, every other feature off"
+                if kind == "needles" else
+                "n negated-Ackley optima of sharpness b on [0,1]^dim, heights "
+                "U(0.5, 1) with the tallest set to 1, on a flat plain at 0: "
+                "y = max_c h_c * max(2 exp(-b|x-c|/sqrt d) - 1, 0)"),
             "sigma_x": float(nd.SIGMA_X),
             "sigma_y_at_peak": round(float(nd.sigma_y_at_peak()), 6),
-            "plain_y": nd.PLAIN_Y, "peak_y": nd.PEAK_Y,
+            "plain_y": land.PLAIN_Y, "peak_y": land.PEAK_Y,
         },
         "feasibility": feasibility,
         "reclaim_after_min": float(args.reclaim_after_min),
@@ -377,6 +383,7 @@ def plan(args) -> str:
 
     print(f"\n  plan -> {out_dir}")
     print(f"    methods: {', '.join(methods)}")
+    print(f"    landscape kind: {kind}")
     print(f"    landscapes: dims {dims} x needles {counts} x basin widths {widths} "
           f"= {manifest['n_configurations']} configuration(s) on the unit cube")
     print(f"    x {n_draws} draw(s) x {len(methods)} method(s) = {len(tasks)} cell(s)")
@@ -404,7 +411,10 @@ def plan(args) -> str:
     tight = [r for r in feasibility if not r["feasible"]]
     if tight:
         print(f"    NOTE: {len(tight)} configuration(s) above the packing bound; "
-              "placement falls back to the input-noise floor and records it.")
+              + ("placement falls back to the input-noise floor and records it."
+                 if kind == "needles" else
+                 "placement relaxes the optima apart and records it "
+                 "(placement_relaxed, n_prominence_resolved)."))
     print(f"    {n_workers} self-restarting worker(s) @ {args.walltime_hours:g} h on "
           f"{args.partition}" + (f" ({args.gres})" if args.gres else ""))
     print(f"    submit:      sbatch {sbatch_path}")
@@ -534,8 +544,9 @@ def run_one_cell(task: dict, out_dir: str, manifest: dict, target: str,
     """Build the landscape, run the method on it, write the cell and its record."""
     device = device or _default_device()
     seed_base = int(manifest.get("seed_base", 0))
-    built = nd.build_landscape(task["dim"], task["n_needles"], task["basin_width"],
-                               landscape_seed(seed_base, task))
+    land = nd.landscape_module(manifest.get("landscape", {}).get("kind"))
+    built = land.build_landscape(task["dim"], task["n_needles"], task["basin_width"],
+                                 landscape_seed(seed_base, task))
     fn = built["fn"]
     truth = GroundTruth(optima=built["centers"],
                         peak_value=float(fn.predict(built["centers"]).max()))
