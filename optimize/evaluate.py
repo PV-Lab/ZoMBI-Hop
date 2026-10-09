@@ -1047,7 +1047,7 @@ def _force_zoom_floors() -> tuple[int, int]:
     Mirrors the HPARAM_SPACE lower bounds run_mobo enforces during hparam search,
     but derived from ZoMBIHop's actual search-discipline defaults so the two can't
     drift: a needle can only be declared once the search has zoomed to level
-    ``min_zoom_for_needle + 1`` (so ``max_zooms`` must be able to reach it) and only
+    ``min_zoom_for_needle`` (so ``max_zooms`` must exceed it) and only
     after at least ``min_iters_per_zoom`` lines have been sampled at that zoom.
     """
     import inspect

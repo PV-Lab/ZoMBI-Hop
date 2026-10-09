@@ -133,16 +133,36 @@ class ZoMBIHop:
                  min_axis_noise_mult: float = 2.0,
                  jaccard_window: int = 3,
                  jaccard_threshold: float = 0.9,
-                 min_zoom_for_needle: int = 1,
+                 min_zoom_for_needle: int = 2,
                  min_iters_per_zoom: int = 3,
+                 needle_min_repeats: int = 5,
+                 needle_repeat_radius_frac: float = 0.10,
                  max_lines_per_activation: int = 30):
         """Initialize ZoMBIHop optimizer.
 
         Search-discipline constraints (hard, not tuned):
+          * ``needle_min_repeats`` / ``needle_repeat_radius_frac`` — the
+            REPEATABILITY GATE. A needle may only be declared at a point that has
+            at least ``needle_min_repeats`` OTHER unpenalised measurements within
+            ``needle_repeat_radius_frac`` of the composition range in L2 (default
+            5 within an absolute 0.10; see ``_repeat_radius``). A single high reading is a noise spike until
+            the neighbourhood repeats it, so an ungated declaration plants needles
+            on outliers. When the gate is not met the optimiser keeps sampling and
+            re-tests on the next line. When it IS met, the declared point is not
+            the argmax of the cluster but the repeat whose Y is CLOSEST TO THE
+            CLUSTER MEDIAN — the median is the noise-free estimate of the local
+            value, so declaring the argmax would systematically bias every needle
+            value upward by one noise excursion. The gate sits alongside the
+            ``min_zoom_for_needle`` depth requirement below rather than replacing
+            it: depth buys a tighter region to declare in, repeatability buys
+            confidence that the point in it is real.
           * ``min_zoom_for_needle`` — a needle may only be declared once the
-            search has zoomed to this 0-indexed level or deeper (default 1 ⇒
-            zoom level 2+). This also forces the optimiser to zoom in at least
-            ``min_zoom_for_needle + 1`` times before it can localise an optimum.
+            search has zoomed to this 0-indexed level or deeper (default 2 ⇒
+            the log's "Zoom 3" and beyond). Zoom index 0 is the full search box,
+            so the level index equals the number of zoom-ins performed: the
+            default forces the optimiser to zoom in at least TWICE before it can
+            localise an optimum, and ``max_zooms`` must be > this to be able to
+            reach it at all.
           * ``min_iters_per_zoom`` — at least this many objective lines must be
             sampled at the current zoom level before the optimiser may declare a
             needle or zoom in/out from it (default 3).
@@ -189,6 +209,12 @@ class ZoMBIHop:
         self.min_axis_noise_mult = float(min_axis_noise_mult)
         self.min_zoom_for_needle = int(min_zoom_for_needle)
         self.min_iters_per_zoom = int(min_iters_per_zoom)
+        self.needle_min_repeats = int(needle_min_repeats)
+        # Why the last declaration attempt did not produce a needle; see
+        # _select_needle_point. Read by the main loop to choose between
+        # "keep sampling" (gate not met) and "leave this zoom" (nothing here).
+        self.last_needle_status = "ok"
+        self.needle_repeat_radius_frac = float(needle_repeat_radius_frac)
         self.max_lines_per_activation = int(max_lines_per_activation)
 
         if self.device.type == 'cuda':
@@ -445,6 +471,96 @@ class ZoMBIHop:
                 return True, True
             return False, True
 
+    def _repeat_radius(self, bounds: Optional[torch.Tensor]) -> float:
+        """Radius, in composition L2, inside which measurements count as REPEATS.
+
+        ``needle_repeat_radius_frac`` of the COMPOSITION RANGE — an absolute 0.10
+        by default, independent of zoom level and of dimension.
+
+        Scaling it with the active box instead was measured to be much worse: 10%
+        of the full 6-d simplex diagonal is 0.245, which on a 60-line smoke run
+        swept 76 of 1464 points into the "repeat" cluster. The gate then passes on
+        every converged zoom and the median-closest pick lands on a middling point
+        somewhere near the peak rather than on a repeat OF the peak — and since
+        zoom forcing was removed, most declarations happen at zoom 0 where the box
+        IS the full simplex. At a fixed 0.10 the same neighbourhood held 8 points,
+        so the gate binds without being unsatisfiable.
+        """
+        return float(self.needle_repeat_radius_frac)
+
+    def _select_needle_point(
+        self,
+        dh,
+        bounds: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[int], str]:
+        """Pick the point a declaration would land on, or say why it cannot.
+
+        Two rules, in order:
+
+        1. **In-bounds argmax.** The candidate is the best unpenalised point
+           *inside* ``bounds``, never the global argmax. Convergence is judged on
+           local EI and local improvement, so declaring on a point the active
+           region never examined attributes another region's optimum to this one.
+           Unlike ``DataHandler.get_best_in_bounds`` this does NOT fall back to the
+           global best when the box holds nothing — an empty box means there is
+           nothing here to declare.
+
+        2. **Repeatability gate.** That candidate must have at least
+           ``needle_min_repeats`` OTHER unpenalised measurements within
+           ``_repeat_radius``; otherwise it is an unconfirmed spike and the answer
+           is "keep sampling". When the gate passes, the declared point is the
+           member of the cluster whose Y is closest to the CLUSTER MEDIAN, not the
+           cluster argmax: the median is the noise-free estimate of the local
+           value, and the argmax is by construction the largest upward noise
+           excursion in the neighbourhood.
+
+        Returns ``(X, Y, global_index, status)`` with status one of ``"ok"``,
+        ``"no_points"`` (nothing unpenalised in the box) or ``"not_repeatable"``
+        (gate not met yet).
+        """
+        mask = dh.get_penalty_mask()
+        if mask is None or not mask.any():
+            return None, None, None, "no_points"
+        idx = torch.where(mask)[0]
+        X_unpen = dh.X_all_actual[idx]
+        Y_unpen = dh.Y_all[idx].reshape(-1)
+
+        if bounds is not None:
+            in_b = ((X_unpen >= bounds[0].unsqueeze(0))
+                    & (X_unpen <= bounds[1].unsqueeze(0))).all(dim=1)
+            if not in_b.any():
+                return None, None, None, "no_points"
+            idx, X_unpen, Y_unpen = idx[in_b], X_unpen[in_b], Y_unpen[in_b]
+
+        best_X = X_unpen[int(Y_unpen.argmax().item())]
+
+        # Repeats are searched over ALL unpenalised points, not only the in-bounds
+        # ones: a measurement sitting just outside the box edge is still a repeat of
+        # the same composition. Penalised points are excluded — they belong to an
+        # already-declared needle, and confirming a new needle with them would
+        # re-declare that one.
+        all_unpen = torch.where(mask)[0]
+        dist = torch.norm(dh.X_all_actual[all_unpen] - best_X.unsqueeze(0), dim=1)
+        radius = self._repeat_radius(bounds)
+        near = all_unpen[dist <= radius]
+        n_others = int(near.numel()) - 1  # the candidate itself is in `near`
+        if n_others < self.needle_min_repeats:
+            self._log(
+                f"  [repeat-gate] best in-bounds point has {n_others} repeat(s) within "
+                f"{radius:.4f} (need {self.needle_min_repeats}) — keep sampling."
+            )
+            return None, None, None, "not_repeatable"
+
+        Y_near = dh.Y_all[near].reshape(-1)
+        median = Y_near.median()
+        pick = near[int((Y_near - median).abs().argmin().item())]
+        self._log(
+            f"  [repeat-gate] {n_others} repeat(s) within {radius:.4f}; "
+            f"cluster median Y={median.item():.4f}, best Y={Y_near.max().item():.4f} — "
+            f"declaring the median-closest repeat (Y={dh.Y_all[pick].reshape(-1)[0].item():.4f})."
+        )
+        return dh.X_all_actual[pick], dh.Y_all[pick], int(pick.item()), "ok"
+
     def _declare_needle_at_best(
         self,
         dh,
@@ -454,25 +570,22 @@ class ZoMBIHop:
         bounds: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """
-        Declare a needle at the best unpenalized point of the active region.
+        Declare a needle in the active region, subject to the repeatability gate.
 
-        ``bounds``: the search box the convergence decision was made in. When it
-        is a zoom box, the needle is placed at the best unpenalized point *inside
-        that box* (``get_best_in_bounds``) — convergence is judged on local EI and
-        local improvement, so the declared optimum must come from the same region.
-        Placing it at the global best would drop the needle somewhere the current
-        zoom never examined. Falls back to ``get_best_unpenalized`` on the full box
-        (or when no bounds are given).
+        The point comes from ``_select_needle_point`` (in-bounds argmax, then the
+        median-closest repeat of its cluster); ``self.last_needle_status`` records
+        why a declaration was refused so callers can tell "nothing here" from
+        "not confirmed yet" — the first ends the zoom, the second keeps sampling.
 
         Delegates to ``_declare_needle_from_point``.  Returns the needle tensor,
-        or None when no unpenalized points exist.
+        or None when no needle could be declared.
         """
-        if bounds is not None and not self._is_global_bounds(bounds):
-            needle_X, needle_Y, global_idx = dh.get_best_in_bounds(bounds)
-        else:
-            needle_X, needle_Y, global_idx = dh.get_best_unpenalized()
+        needle_X, needle_Y, global_idx, status = self._select_needle_point(dh, bounds)
+        self.last_needle_status = status
         if needle_X is None:
-            self._log("  [declare_needle] no unpenalized points — cannot declare needle.")
+            if status == "no_points":
+                self._log("  [declare_needle] no unpenalized points in the active "
+                          "region — cannot declare needle.")
             return None
         return self._declare_needle_from_point(
             dh, needle_X, needle_Y, global_idx, zoom, iteration, reason
@@ -552,6 +665,24 @@ class ZoMBIHop:
         self._log(f"  → bounds reset to full search box for next activation")
 
         return needle_X
+
+    def _best_uncovered_row(self, dh, rows) -> Optional[int]:
+        """Global row index of the best UNPENALIZED measured point among ``rows``.
+
+        Returns ``None`` if every one of ``rows`` lies inside a current penalty
+        region ("covered"). Reads ``dh.Y_all`` directly, so it reflects any
+        corrected objective values already loaded into the data handler. Shared
+        by the retroactive-needle and post-correction re-declaration paths.
+        """
+        if not rows:
+            return None
+        idx_t = torch.tensor(rows, device=dh.X_all_actual.device, dtype=torch.long)
+        mask_rows = dh.get_penalty_mask()[idx_t]
+        if not bool(mask_rows.any().item()):
+            return None
+        open_idx = idx_t[mask_rows]
+        best_local = int(torch.argmax(dh.Y_all[open_idx].reshape(-1)).item())
+        return int(open_idx[best_local].item())
 
     def retro_declare_needles(self, dry_run: bool = False) -> dict:
         """
@@ -677,17 +808,13 @@ class ZoMBIHop:
             # optimum instead of nothing. Each declaration below updates the
             # mask, so later triggers falling inside a new ellipsoid drop out
             # naturally rather than stacking duplicates.
-            idx_t = torch.tensor(rows, device=dh.X_all_actual.device, dtype=torch.long)
-            mask_rows = dh.get_penalty_mask()[idx_t]
-            if not bool(mask_rows.any().item()):
+            row = self._best_uncovered_row(dh, rows)
+            if row is None:
                 entry["skipped_reason"] = "covered"
                 _rlog(f"  [retro] activation {act}: every measured point lies "
                       f"inside an existing penalty region — skipping.")
                 candidates_out.append(entry)
                 continue
-            open_idx = idx_t[mask_rows]
-            best_local = int(torch.argmax(dh.Y_all[open_idx].reshape(-1)).item())
-            row = int(open_idx[best_local].item())
             needle_X = dh.X_all_actual[row]
             needle_Y = dh.Y_all[row]
             entry["x"] = needle_X.detach().cpu().numpy().ravel().tolist()
@@ -750,6 +877,210 @@ class ZoMBIHop:
             self._log("  [retro] no retroactive needles declared "
                       "(all candidates covered or empty).")
         return result
+
+    def redeclare_needles_after_correction(self, dry_run: bool = False) -> dict:
+        """Re-derive every needle from corrected objective values.
+
+        Intended for a run whose measured objectives were corrected in place
+        (same compositions, same activation/zoom/sample structure — see
+        ``src/core/correction.py``): the corrected ``Y`` is expected to be
+        already loaded into ``self.data_handler`` before this is called.
+
+        Replays the recorded convergence stream to find, under the run's current
+        criteria, every activation that converged (``src/core/retro.py``) — the
+        same evidence ``retro_declare_needles`` uses — then declares one needle
+        per such activation at that activation's best UNPENALIZED point *under
+        the corrected scores*, with its penalty ellipsoid refit on the corrected
+        GP. This is the "reuse convergence events" contract: the set of
+        needle-bearing activations is the recorded convergence set (not
+        re-detected from the corrected scores), so needles move and their values
+        change, and a needle merges away only when an earlier needle's new
+        ellipsoid covers its best point — the one source of a changed count.
+
+        The original needle set is cleared first (it was positioned by the old
+        scores), so this fully replaces it. Afterwards the resume position
+        advances to a fresh activation on the full search box and a permanent
+        "corrected_needles" snapshot persists everything.
+
+        ``dry_run=True`` mutates nothing and reports, per converged activation,
+        the composition/objective the needle would move to (corrected argmax over
+        the activation's rows, without coverage collapse or GP refits — apply may
+        declare fewer) alongside the original needle in that region. Never raises:
+        any internal failure returns ``{applied: False, error: ...}``.
+        """
+        try:
+            return self._redeclare_needles_after_correction(dry_run=dry_run)
+        except Exception as e:
+            msg = (f"  [correction] redeclare_needles_after_correction failed: "
+                   f"{e!r} — leaving needles unchanged.")
+            try:
+                if dry_run:
+                    if self.verbose:
+                        print(msg)
+                else:
+                    self._log(msg)
+            except Exception:
+                pass
+            return {"applied": False, "error": repr(e), "needles": []}
+
+    def _redeclare_needles_after_correction(self, dry_run: bool) -> dict:
+        dh = self.data_handler
+
+        def _clog(message: str):
+            if dry_run:
+                if self.verbose:
+                    print(message)
+            else:
+                self._log(message)
+
+        result: dict = {"applied": False, "needles": [], "triggers": []}
+        n_consec = int(dh.n_consecutive_converged)
+        if n_consec < 1:
+            result["error"] = f"invalid n_consecutive_converged={n_consec}"
+            _clog(f"  [correction] {result['error']} — aborting.")
+            return result
+        if not dh.save_enabled or dh.run_dir is None:
+            result["error"] = "run has no directory (saving disabled) — nothing to re-declare"
+            _clog(f"  [correction] {result['error']}")
+            return result
+
+        records, source = retro.load_convergence_history(dh.run_dir)
+        if not records:
+            result["error"] = f"no convergence history ({source})"
+            _clog(f"  [correction] {result['error']}")
+            return result
+
+        # Every converged activation re-declares (skip_activations empty): the
+        # original needles were positioned by the OLD scores and are cleared,
+        # so we rebuild the whole set from the recorded convergence evidence.
+        triggers = retro.find_retro_triggers(
+            records, n_consec, self.min_zoom_for_needle, self.min_iters_per_zoom,
+            skip_activations=set(),
+        )
+        result["triggers"] = triggers
+        ranges = retro.activation_point_ranges(dh.run_dir)
+        n_rows = dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0
+
+        # Map each original needle to the activation whose row range CONTAINS its
+        # index (its true measured location — not the discovery-attribution
+        # activation, which batches retro needles together), for old→new
+        # reporting. Built before clearing.
+        old_x_by_act: dict = {}
+        if dh.needle_indices is not None and dh.needle_indices.numel():
+            for k, idx in enumerate(dh.needle_indices.reshape(-1).tolist()):
+                for a, rs in ranges.items():
+                    if any(lo <= idx < hi for (lo, hi) in rs):
+                        old_x_by_act.setdefault(
+                            int(a), dh.needles[k].detach().cpu().numpy().ravel().tolist())
+                        break
+
+        _clog(f"  [correction] re-deriving needles from corrected scores: "
+              f"{len(triggers)} converged activation(s) "
+              f"{[t['activation'] for t in triggers]} "
+              f"(criteria n_consecutive={n_consec}, source {source}).")
+
+        def _rows_for(act: int) -> list:
+            return [i for (a, b) in ranges.get(act, []) for i in range(a, min(b, n_rows))]
+
+        if dry_run:
+            # Per trigger: corrected argmax over the activation's rows (no
+            # coverage collapse, no GP refit).
+            for trig in triggers:
+                act = trig["activation"]
+                entry = {"activation": act, "zoom": trig["zoom"],
+                         "iteration": trig["iteration"], "old_x": old_x_by_act.get(act)}
+                rows = _rows_for(act)
+                if not rows:
+                    entry["skipped_reason"] = "empty"
+                else:
+                    local = int(torch.argmax(dh.Y_all[torch.tensor(
+                        rows, device=dh.X_all_actual.device, dtype=torch.long)].reshape(-1)).item())
+                    row = rows[local]
+                    entry["new_x"] = dh.X_all_actual[row].detach().cpu().numpy().ravel().tolist()
+                    entry["new_y"] = float(dh.Y_all[row].item())
+                result["needles"].append(entry)
+            n_would = len([e for e in result["needles"] if "skipped_reason" not in e])
+            _clog(f"  [correction] dry run: {n_would} of {len(triggers)} needle(s) would "
+                  f"be re-declared; nothing was changed. Note: at apply time each new "
+                  f"ellipsoid can cover a later activation's best point, so the count "
+                  f"may drop.")
+            return result
+
+        # --- Apply: clear the needle/exclusion state, then re-declare. ---
+        self._clear_needle_state(dh)
+
+        declared = 0
+        needles_out: List[dict] = []
+        for trig in triggers:
+            act = trig["activation"]
+            entry = {"activation": act, "zoom": trig["zoom"],
+                     "iteration": trig["iteration"], "old_x": old_x_by_act.get(act)}
+            rows = _rows_for(act)
+            if not rows:
+                entry["skipped_reason"] = "empty"
+                _clog(f"  [correction] activation {act}: no attributable points — skipping.")
+                needles_out.append(entry)
+                continue
+            row = self._best_uncovered_row(dh, rows)
+            if row is None:
+                entry["skipped_reason"] = "covered"
+                _clog(f"  [correction] activation {act}: every point now lies inside an "
+                      f"already-declared needle's penalty region — merged away.")
+                needles_out.append(entry)
+                continue
+            needle_X = dh.X_all_actual[row]
+            needle_Y = dh.Y_all[row]
+            _clog(f"  [correction] activation {act}: re-declaring needle at corrected "
+                  f"best point (Y={needle_Y.item():.4f}) ...")
+            needle = self._declare_needle_from_point(
+                dh, needle_X, needle_Y, row,
+                zoom=int(trig["zoom"]), iteration=int(trig["iteration"]),
+                reason="EI convergence",
+            )
+            entry["new_x"] = needle_X.detach().cpu().numpy().ravel().tolist()
+            entry["new_y"] = float(needle_Y.item())
+            entry["declared"] = needle is not None
+            if needle is not None:
+                declared += 1
+            needles_out.append(entry)
+
+        result["needles"] = needles_out
+        result["n_declared"] = declared
+
+        # Advance to a fresh activation on the full box and snapshot, so the
+        # corrected state is the current view and a resume continues cleanly.
+        record_acts = [int(r["activation"]) for r in records
+                       if isinstance(r.get("activation"), int)]
+        new_act = max([int(dh.current_activation)] + record_acts + [0]) + 1
+        dh.current_zoom_bounds = self.full_bounds.clone()
+        self.bounds = self.full_bounds.clone()
+        dh.bounds = self.full_bounds.clone()
+        dh.take_snapshot("corrected_needles", permanent=True,
+                         activation=new_act, zoom=0, iteration=0)
+        result["applied"] = True
+        result["new_activation"] = new_act
+        self._log(f"  [correction] re-declared {declared} needle(s) from corrected "
+                  f"scores; resuming at fresh activation {new_act} (zoom 0, iter 0) "
+                  f"on the full search box.")
+        return result
+
+    def _clear_needle_state(self, dh) -> None:
+        """Reset all needle and exclusion state to empty, then rebuild the
+        (now permissive) penalty mask. Used before re-deriving needles from
+        corrected scores."""
+        d = dh.d
+        dev, dt = self.device, self.dtype
+        dh.needles = torch.empty((0, d), device=dev, dtype=dt)
+        dh.needle_vals = torch.empty((0, 1), device=dev, dtype=dt)
+        dh.needle_indices = torch.empty((0, 1), device=dev, dtype=torch.int64)
+        dh.needle_penalty_radii = torch.empty((0, 1), device=dev, dtype=dt)
+        dh.needle_M_list = []
+        dh.needle_B = None
+        dh.needles_results = []
+        dh.exclusions = torch.empty((0, d), device=dev, dtype=dt)
+        dh.exclusion_radii = torch.empty((0, 1), device=dev, dtype=dt)
+        dh.exclusion_M_list = []
+        dh._update_penalty_mask()
 
     def _penalize_capped_zone(self, dh, bounds: torch.Tensor) -> bool:
         """Penalise the region an activation burned its whole line budget in.
@@ -1130,6 +1461,9 @@ class ZoMBIHop:
                 dh.bounds = bounds.clone()
             activation_failed = False
             activation_capped = False
+            # Set when the zoom loop runs out of unsearched territory (see the MC
+            # Jaccard guard). Ends the activation on the same terms as the line cap.
+            no_novel_window = False
             consecutive_converged = 0
             best_f_local: float = float('-inf')
             zoom_bounds_history: List[torch.Tensor] = []
@@ -1323,7 +1657,18 @@ class ZoMBIHop:
                                 dh.take_snapshot(
                                     f"act{activation}_z{zoom}_i{iteration}_needle", permanent=True
                                 )
-                            break
+                                break
+                            if self.last_needle_status == "not_repeatable":
+                                # Converged on a point the neighbourhood has not
+                                # confirmed. Stay in this zoom and keep measuring:
+                                # the counter is left standing, so the gate is
+                                # re-tested on every subsequent line and declares
+                                # as soon as the repeats arrive.
+                                self._record_convergence(
+                                    activation=activation, zoom=zoom,
+                                    iteration=iteration, event="repeat_gate_hold")
+                            else:
+                                break
                         elif sampled_enough and not deep_enough:
                             # Converged, but the search is too shallow to declare a
                             # needle (min_zoom_for_needle). Zoom in further instead.
@@ -1451,9 +1796,22 @@ class ZoMBIHop:
                     new_bounds = dh.determine_new_bounds()  # Jaccard-aware sliding window
                     self._log(f"  [time] determine_new_bounds: {time.time()-_t0:.2f}s")
 
-                    # MC Jaccard guard: force-declare if the new bounds still heavily
-                    # overlap the previous zoom (determine_new_bounds may have exhausted
-                    # all windows; this catches the residual repeated-region case).
+                    # MC Jaccard guard: the next zoom box still heavily overlaps one
+                    # this activation already searched (determine_new_bounds may have
+                    # exhausted all its windows), so there is NO NOVEL WINDOW left.
+                    # Zooming into it again just re-measures the same region, and it
+                    # was previously a licence to FORCE-declare a needle there — which
+                    # manufactured a needle out of "I have nowhere else to go", the
+                    # weakest possible evidence. Now the activation simply ends and
+                    # the region is penalised, exactly as a line-capped activation is,
+                    # so the next activation is repelled from it instead of grinding
+                    # back in. A genuine optimum here still gets declared: it goes
+                    # through EI convergence and the repeatability gate like any other.
+                    #
+                    # The one exception is a zoom too shallow to declare in at all
+                    # (``min_zoom_for_needle``): ending there would abandon the region
+                    # before the forced zoom-in that is the only way it could ever
+                    # produce a needle, so the search advances the zoom instead.
                     if not self._is_global_bounds(new_bounds):
                         repeated_jac = 0.0
                         for prev_bounds in zoom_bounds_history:
@@ -1463,23 +1821,16 @@ class ZoMBIHop:
                             if jac > self.zoom_jaccard_threshold:
                                 repeated_jac = jac
                                 break
-                        if repeated_jac > self.zoom_jaccard_threshold and zoom >= self.min_zoom_for_needle:
+                        if (repeated_jac > self.zoom_jaccard_threshold
+                                and zoom >= self.min_zoom_for_needle):
                             self._log(
-                                f"  → repeated zoom (Jaccard={repeated_jac:.3f}) — forcing needle."
+                                f"  → no novel zoom window (Jaccard={repeated_jac:.3f} vs "
+                                f"an already-searched box) — ending the activation."
                             )
-                            needle = self._declare_needle_at_best(
-                                dh, zoom, global_iteration, reason="Jaccard convergence",
-                                bounds=bounds,
-                            )
-                            if needle is None:
-                                activation_failed = True
-                                consecutive_converged = 0
-                                data_added_since_last_failure = False
-                                continue  # re-enter failure path
-                            dh.take_snapshot(
-                                f"act{activation}_z{zoom}_jaccard_needle", permanent=True
-                            )
-                            break  # needle found
+                            self._record_convergence(activation=activation, zoom=zoom,
+                                                     event="no_novel_window")
+                            no_novel_window = True
+                            break
                         elif repeated_jac > self.zoom_jaccard_threshold:
                             # Repeated region but too shallow to declare a needle
                             # (min_zoom_for_needle) — advance the zoom anyway.
@@ -1504,17 +1855,26 @@ class ZoMBIHop:
                 else:
                     break  # exhausted all zoom levels without needle
 
-            # Cap reached without a needle: this activation spent its whole line
-            # budget circling a region it never localised. Penalise that region so
-            # the next activation is repelled from it instead of converging
-            # straight back in, and hand it the full simplex.
-            if activation_capped and needle is None and not finished:
-                self._log(
-                    f"\n  [cap] activation {activation+1} hit the "
-                    f"{self.max_lines_per_activation}-line budget "
-                    f"({lines_this_activation} measured) without declaring a "
-                    f"needle — ending it and penalising the region."
-                )
+            # Activation ended without a needle — either it spent its whole line
+            # budget circling a region it never localised, or it ran out of novel
+            # zoom windows there. Both mean the same thing: this region absorbed
+            # measurements and produced nothing. Penalise it so the next activation
+            # is repelled from it instead of converging straight back in, and hand
+            # that activation the full simplex.
+            if (activation_capped or no_novel_window) and needle is None and not finished:
+                if activation_capped:
+                    self._log(
+                        f"\n  [cap] activation {activation+1} hit the "
+                        f"{self.max_lines_per_activation}-line budget "
+                        f"({lines_this_activation} measured) without declaring a "
+                        f"needle — ending it and penalising the region."
+                    )
+                else:
+                    self._log(
+                        f"\n  [cap] activation {activation+1} ran out of novel zoom "
+                        f"windows after {lines_this_activation} line(s) without "
+                        f"declaring a needle — ending it and penalising the region."
+                    )
                 self._penalize_capped_zone(dh, bounds)
                 dh.take_snapshot(
                     f"act{activation}_z{zoom}_capped",

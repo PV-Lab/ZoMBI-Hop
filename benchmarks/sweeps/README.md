@@ -126,9 +126,41 @@ dim 3 at `n = 50` the optima sit ~0.15 apart while a `b = 2.2` basin has a plain
 radius of 0.55 — that cell is a ridged mesa with 50 resolvable tips, not 50
 isolated needles. That is what "50 needles in a triangle" *has* to mean, not a bug,
 but read that corner of the heatmap knowing it. Every cell records
-`separation_achieved`, `separation_target`, `prominence_target_met` and
-`n_prominence_resolved` in `sweep_cell.json`, and `basin_plain_radius` lands in
-`summary/cells.csv` next to them.
+`separation_achieved`, `separation_target`, `separation_own_target`,
+`prominence_target_met` and `n_prominence_resolved` in `sweep_cell.json`, and
+`basin_plain_radius` lands in `summary/cells.csv` next to them.
+
+### One placement per row, shared across the sharpness axis
+
+`s_prom` goes as `1/b`, so placing each cell at its own `s*` would let the
+sharpness axis change the *layout* as well as the basin shape — and it splits the
+axis unevenly: `b = 2.2` places at `s_prom` (0.1485 in dim 3 up to 0.2711 in dim
+10) while `b = 6, 10, 15` all place at the plain 0.128 floor. The broadest column,
+which is the one the sharp columns get read against, would be the only one laid out
+differently.
+
+So a whole `(dim, n_needles, draw)` row is placed **once** — at the strictest
+width's target (`needles.placement_width`) — and all four sharpnesses reuse those
+exact centers. `NeedleFactory.placement_seed` leaves `basin_width` out of its hash,
+so they share a seed as well as a separation. Two consequences worth having:
+
+* the sharpness axis varies sharpness alone, so a difference along it is
+  attributable to the basin shape;
+* the comparison is **paired** — the layout cancels between two widths at the same
+  draw, instead of being one more source of variance the draws have to average out.
+  This is what makes small effects decidable at five draws rather than twenty.
+
+The strictest width is the safe standard: it is the only one no column has to be
+relaxed below, so no cell ends up packed tighter than its own prominence rule
+wanted. Each cell still records `separation_own_target` — what it would have asked
+for alone — next to the shared `separation_target`, and `describe` prints both.
+
+Note that this makes `placement_seed` a function of `(dim, n_needles, draw)` only.
+Re-running a campaign planned before this change will build **different**
+landscapes than it originally did; `runs/first` was placed per-cell and its stored
+artifacts remain the record of what it actually ran. The optimiser's own seeding
+(`campaign._cell_seed_base`) is still per-cell, so the search is independently
+randomised across the axis even though the landscape is not.
 
 ---
 
