@@ -68,6 +68,13 @@ from src.core.hparam_live import (
     write_override as write_override_hparams,
 )
 from src.core.linebo import line_simplex_segment, zero_sum_dirs
+from src.hparams import (
+    KNOWN_NAMES as HPARAM_KNOWN_NAMES,
+    conflicts as hparam_conflicts,
+    load_hparams_file,
+    resolve_for_run as resolve_hparams_for_run,
+    ui_categories as hparam_ui_categories,
+)
 from src.utils.simplex import add_composition_noise, proj_simplex, get_tangent_basis
 from src.utils.datahandler import reconstruct_snapshot_tensors
 from optimize.composition_prediction import physics_simulate_line
@@ -138,98 +145,12 @@ def _draw_ternary_frame_ax(ax, la: str = "A", lb: str = "B", lc: str = "C") -> N
             x2, y2 = _ternary_xy(np.array([_a2]), np.array([_b2]), np.array([_c2]))
             ax.plot([x1[0], x2[0]], [y1[0], y2[0]], color="#cccccc", lw=0.5, zorder=0)
 
-# Hyperparameter categories: (name, type, default, display_label, tooltip_description)
-HPARAM_CATEGORIES: dict[str, list[tuple]] = {
-    "Acquisition Opt": [
-        ("nat_grad_step",      "float", 0.02, "Nat-grad step",
-         "Step size for natural gradient ascent used during acquisition optimization."),
-        ("nat_grad_max_steps", "int",   50,   "Nat-grad max steps",
-         "Maximum number of natural gradient steps per acquisition optimization call."),
-        ("n_restarts",         "int",   30,   "Restarts",
-         "Number of random restarts for multi-start acquisition function optimization."),
-        ("raw",                "int",   500,  "Raw samples",
-         "Number of raw random candidates sampled before gradient-based refinement begins."),
-    ],
-    "Acq Function": [
-        ("acquisition_type", "str",   "ucb", "Acq. type",
-         "Acquisition function used to select the next query point.\n"
-         "  ucb – Upper Confidence Bound (exploration via β)\n"
-         "  ei  – Expected Improvement"),
-        ("ucb_beta",         "float", 0.1,  "UCB β",
-         "Exploration–exploitation trade-off for UCB: higher β = more exploration. "
-         "Ignored when acquisition_type is 'ei' or 'pi'."),
-        ("input_noise",  "float", 0.128, "Input noise (composition)",
-         "Std dev of isotropic Gaussian noise added to each composition component "
-         "before simplex reprojection at every evaluation. Default matches the "
-         "measured average input noise of data/2nd_real_run.db."),
-    ],
-    "Zoom / Convergence": [
-        ("max_zooms",                   "int",   3,    "Max zooms",
-         "Maximum number of zoom (trust-region shrink) steps per activation before "
-         "the optimizer hops to a new region."),
-        ("max_iterations",              "int",   10,   "Max iters / zoom",
-         "Maximum BO iterations (objective calls) allowed within each zoom level."),
-        ("top_m_points",                "int",   4,    "Top-M points",
-         "Number of top-performing data points used to define the new trust region "
-         "after zooming in."),
-        ("n_consecutive_converged",     "int",   2,    "Consec. converged",
-         "Number of consecutive iterations that must meet the convergence criterion "
-         "before the optimizer zooms in."),
-        ("input_noise_threshold_mult",  "float", 3.0,  "Input noise mult",
-         "Convergence gate: if the best observed improvement < mult × input_noise, "
-         "the iteration is considered converged."),
-        ("output_noise_threshold_mult", "float", 2.0,  "Output noise mult",
-         "Convergence gate: if the best observed improvement < mult × output_noise std, "
-         "the iteration is considered converged."),
-        ("max_gp_points",               "int",   3000, "Max GP points",
-         "Maximum number of data points passed to the GP. Older points are dropped "
-         "when the dataset exceeds this size."),
-        ("zoom_jaccard_threshold",      "float", 0.75, "Zoom Jaccard thresh",
-         "If a new trust region overlaps a previously visited one by more than this "
-         "Jaccard fraction, the activation exits early (avoids re-exploring)."),
-        ("jaccard_window",              "int",   3,    "Jaccard window",
-         "Number of recent bounds snapshots to compare when checking for "
-         "Jaccard-based stagnation."),
-        ("jaccard_threshold",           "float", 0.9,  "Jaccard stag. thresh",
-         "Jaccard similarity above this threshold between consecutive bounds "
-         "snapshots signals stagnation and triggers an early zoom."),
-    ],
-    "Penalty & Needle": [
-        ("max_penalty_radius",           "float", 1.0,  "Max penalty radius",
-         "Maximum radius (in ILR space) of the penalization ellipsoid placed around "
-         "each discovered needle to prevent re-discovering it."),
-        ("needle_shrink_factor",         "float", 0.85, "Needle shrink factor",
-         "Multiplicative factor applied to needle ellipsoid radii each time the "
-         "optimizer re-enters a needle's penalization region."),
-        ("needle_stop_noise_multiplier", "float", 3.0,  "Needle stop mult",
-         "Stop shrinking the needle ellipsoid when its radius falls below "
-         "mult × input_noise (prevents the region from collapsing to zero)."),
-        ("ellipsoid_drop_fraction",      "float", 0.25, "Ellipsoid drop frac",
-         "Fraction of the smallest eigenvalue retained when trimming the needle "
-         "ellipsoid matrix (regularization to avoid singular matrices)."),
-        ("ellipsoid_eigenvalue_floor",   "float", 1e-6, "Eigenvalue floor",
-         "Minimum eigenvalue for the needle penalty ellipsoid (numerical stability guard)."),
-        ("bounds_shrink_factor",         "float", 0.8,  "Bounds shrink factor",
-         "Multiplicative factor by which the trust-region AABB contracts at each zoom step."),
-        ("min_axis_noise_mult",          "float", 2.0,  "Min axis noise mult",
-         "Minimum trust-region half-width as a multiple of input_noise; prevents "
-         "the search region from collapsing below the noise floor."),
-    ],
-    "Point Paring": [
-        ("paring_spatial_halfnoise",  "float", 0.5, "Spatial halfnoise",
-         "Half-bandwidth (in units of input_noise) for spatial clustering when "
-         "deduplicating repeated nearby measurements. Points within this radius "
-         "are candidates for merging."),
-        ("paring_y_noise_multiplier", "float", 1.0, "Y-noise mult",
-         "When paring duplicates, observations within mult × output_noise in Y are "
-         "averaged together into a single representative point."),
-    ],
-}
+# Hyperparameter tabs: {tab: [(name, type, default, display_label, tooltip), ...]}.
+# Built from the registry in src/hparams.py — add or document knobs there.
+HPARAM_CATEGORIES: dict[str, list[tuple]] = hparam_ui_categories()
 
-# Flat set of every tunable hyperparameter name the UI knows about.
-_KNOWN_HPARAM_NAMES: set[str] = {
-    p[0] for params in HPARAM_CATEGORIES.values() for p in params
-}
+# Flat set of every hyperparameter name the UI knows about.
+_KNOWN_HPARAM_NAMES: set[str] = set(HPARAM_KNOWN_NAMES)
 
 
 def load_hparams_json(path: str) -> dict:
@@ -238,22 +159,32 @@ def load_hparams_json(path: str) -> dict:
 
     Accepts either a file shaped like ``optimize/runs/.../trial.json`` (a
     top-level ``"hparams"`` object) or a flat ``{name: value}`` object. Only
-    keys recognised by the UI (``_KNOWN_HPARAM_NAMES``) are returned; unknown
-    keys (e.g. "metrics", "trial") are ignored.
+    registered hyperparameters are returned; a legacy MOBO record is upgraded to
+    the values it actually ran with (see src/hparams.upgrade_legacy).
     """
-    with open(path, "r") as fh:
-        data = json.load(fh)
-    if not isinstance(data, dict):
-        raise ValueError("Hyperparameter JSON must be an object.")
-    hp = data.get("hparams", data)
-    if not isinstance(hp, dict):
-        raise ValueError("'hparams' must be an object.")
-    return {k: v for k, v in hp.items() if k in _KNOWN_HPARAM_NAMES}
+    return load_hparams_file(path)
 
 
-# Default hyperparameters used when no JSON file is supplied. Single source of
-# truth lives in src/default_hparams.py — edit there, not here.
-from src.default_hparams import DEFAULT_HPARAMS, DEFAULT_HPARAMS_PROVENANCE
+def hardware_hparam_problems(hparams_path: str | None,
+                             run_dir: Path | None = None) -> list[str]:
+    """Conflicts in the configuration a hardware launch would run, or [].
+
+    Mirrors the runner: shipped defaults, then the hyperparameter file, then —
+    for a resume — the run's own config.json. Checked here so the operator hears
+    about it before the subprocess starts printing initial lines.
+    """
+    passed = load_hparams_file(hparams_path) if hparams_path else {}
+    run_cfg = None
+    if run_dir is not None and (Path(run_dir) / "config.json").exists():
+        try:
+            run_cfg = json.loads((Path(run_dir) / "config.json").read_text(encoding="utf-8-sig"))
+        except Exception:
+            run_cfg = None
+    return hparam_conflicts(resolve_hparams_for_run(passed, run_cfg))
+
+
+# Default hyperparameters used when no JSON file is supplied (src/hparams.py).
+from src.hparams import ALL_DEFAULTS, DEFAULT_HPARAMS, DEFAULT_HPARAMS_PROVENANCE
 
 
 # ── synthetic-run helpers ─────────────────────────────────────────────────────
@@ -1410,6 +1341,241 @@ class NeedlesFrame(ttk.Frame):
         self._detail.delete("1.0", "end")
         self._detail.insert("end", json.dumps(n, indent=2))
         self._detail.config(state="disabled")
+
+
+# ── needle repeats panel ──────────────────────────────────────────────────────
+
+def _run_hparam(rd: "RunData", name: str) -> tuple:
+    """A run's value for hyperparameter ``name`` and where it came from.
+
+    Checks ``hparams_effective.json`` (the values actually in force) then
+    ``config.json``; runs that predate the knob fall back to the shipped default.
+    """
+    for fname in ("hparams_effective.json", "config.json"):
+        p = rd.run_dir / fname
+        if not p.exists():
+            continue
+        try:
+            v = json.loads(p.read_text()).get(name)
+        except Exception:
+            continue
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return v, fname
+    return ALL_DEFAULTS.get(name), "default"
+
+
+class NeedleRepeatsFrame(ttk.Frame):
+    """Per-needle repeat clusters, as the repeatability gate defines them.
+
+    A repeat of a needle is any measurement within ``needle_repeat_radius_frac``
+    (composition L2, absolute — see ``ZoMBIHop._repeat_radius``) of it. The top
+    table gives each needle's cluster statistics; selecting a needle lists its
+    individual repeats below.
+
+    Post hoc: stats cover every measurement in the snapshot inside the radius of
+    the *declared* needle. The live gate counted only then-unpenalised points
+    around the in-bounds argmax, then declared the repeat closest to the median.
+    """
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=2, pady=2)
+        ttk.Label(bar, text="Repeat radius (composition L2):").pack(side="left")
+        self._radius_var = tk.StringVar(value="")
+        ent = ttk.Entry(bar, textvariable=self._radius_var, width=8)
+        ent.pack(side="left", padx=4)
+        ent.bind("<Return>", lambda _e: self._apply_radius())
+        ttk.Button(bar, text="Apply", command=self._apply_radius).pack(side="left")
+        ttk.Button(bar, text="Reset", command=self._reset_radius).pack(side="left", padx=4)
+        self._info = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self._info, foreground="gray").pack(
+            side="left", padx=8)
+
+        pw = ttk.PanedWindow(self, orient="vertical")
+        pw.pack(fill="both", expand=True)
+
+        top = ttk.LabelFrame(pw, text="Needles — repeat-cluster statistics")
+        pw.add(top, weight=2)
+        self._tree = ttk.Treeview(top, show="headings", height=10)
+        sb = ttk.Scrollbar(top, orient="vertical", command=self._tree.yview)
+        sbx = ttk.Scrollbar(top, orient="horizontal", command=self._tree.xview)
+        self._tree.configure(yscrollcommand=sb.set, xscrollcommand=sbx.set)
+        self._tree.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        sbx.grid(row=1, column=0, sticky="ew")
+        top.rowconfigure(0, weight=1); top.columnconfigure(0, weight=1)
+        self._tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        self._bot = ttk.LabelFrame(pw, text="Repeats of selected needle")
+        pw.add(self._bot, weight=3)
+        self._rep = ttk.Treeview(self._bot, show="headings", height=12)
+        sb2 = ttk.Scrollbar(self._bot, orient="vertical", command=self._rep.yview)
+        sbx2 = ttk.Scrollbar(self._bot, orient="horizontal", command=self._rep.xview)
+        self._rep.configure(yscrollcommand=sb2.set, xscrollcommand=sbx2.set)
+        self._rep.grid(row=0, column=0, sticky="nsew")
+        sb2.grid(row=0, column=1, sticky="ns")
+        sbx2.grid(row=1, column=0, sticky="ew")
+        self._bot.rowconfigure(0, weight=1); self._bot.columnconfigure(0, weight=1)
+        self._rep.tag_configure("declared", background="#fff3c4")
+
+        self._rd: Optional[RunData] = None
+        self._run_radius: float = 0.10
+        self._radius: float = 0.10
+        self._min_repeats: int = 0
+        self._needles: Optional[np.ndarray] = None   # (k, d)
+        self._decl_idx: list = []                    # per-needle declared point idx
+        self._members: list = []                     # per-needle sorted point idx
+        self._dists: Optional[np.ndarray] = None     # (k, n)
+
+    # ── data ──────────────────────────────────────────────────────────────────
+
+    def update(self, rd: RunData):
+        new_run = self._rd is None or self._rd.run_dir != rd.run_dir
+        self._rd = rd
+        r, src = _run_hparam(rd, "needle_repeat_radius_frac")
+        self._run_radius = float(r) if r else 0.10
+        self._radius_src = src
+        m, _ = _run_hparam(rd, "needle_min_repeats")
+        self._min_repeats = int(m) if m is not None else 0
+        # Keep a user-entered radius while scrubbing snapshots of the same run.
+        if new_run or not self._radius_var.get().strip():
+            self._radius = self._run_radius
+            self._radius_var.set(f"{self._radius:g}")
+        self._recompute()
+
+    def _apply_radius(self):
+        try:
+            r = float(self._radius_var.get())
+        except ValueError:
+            r = -1.0
+        if not r > 0:
+            messagebox.showerror("Needle repeats", "Radius must be a positive number.")
+            self._radius_var.set(f"{self._radius:g}")
+            return
+        self._radius = r
+        if self._rd is not None:
+            self._recompute()
+
+    def _reset_radius(self):
+        self._radius = self._run_radius
+        self._radius_var.set(f"{self._radius:g}")
+        if self._rd is not None:
+            self._recompute()
+
+    def _needle_points(self, rd: RunData) -> Optional[np.ndarray]:
+        if rd.needles is not None and len(rd.needles):
+            return np.asarray(rd.needles, dtype=float).reshape(-1, rd.d)
+        pts = [n.get("point") for n in rd.needles_json if n.get("point") is not None]
+        return np.asarray(pts, dtype=float).reshape(-1, rd.d) if pts else None
+
+    def _recompute(self):
+        rd = self._rd
+        self._tree.delete(*self._tree.get_children())
+        self._rep.delete(*self._rep.get_children())
+        self._members, self._decl_idx = [], []
+        self._needles = self._needle_points(rd) if rd.X_all is not None else None
+
+        gate = (f"gate needs ≥{self._min_repeats} other repeats"
+                if self._min_repeats else "gate disabled")
+        self._info.set(f"run value {self._run_radius:g} ({self._radius_src}) · {gate} · "
+                       f"stats over all snapshot measurements within the radius")
+
+        if self._needles is None or not len(self._needles):
+            self._tree["columns"] = ["info"]
+            self._tree.heading("info", text="No needles" if rd.X_all is not None
+                               else "No data loaded.")
+            self._tree.column("info", width=300)
+            self._rep["columns"] = []
+            return
+
+        X, Y = rd.X_all, rd.Y_all
+        self._dists = np.linalg.norm(X[None, :, :] - self._needles[:, None, :], axis=2)
+        k = len(self._needles)
+        ni = rd.needle_indices
+        for j in range(k):
+            near = np.where(self._dists[j] <= self._radius)[0]
+            self._members.append(near[np.argsort(self._dists[j][near], kind="stable")])
+            if ni is not None and j < len(ni) and 0 <= int(ni[j]) < len(X):
+                self._decl_idx.append(int(ni[j]))
+            else:  # older runs: the declared point is the measurement AT the needle
+                self._decl_idx.append(int(np.argmin(self._dists[j])))
+
+        ccols = _run_comp_labels(rd)
+        cols = (["#"] + ccols +
+                ["value", "n", "mean", "median", "std", "min", "max", "gate", "zoom"])
+        headings = {"value": "declared value", "n": "repeats",
+                    "mean": "mean Y", "median": "median Y", "std": "std Y",
+                    "min": "min Y", "max": "max Y"}
+        widths = {"value": 105, "n": 60, "gate": 45, "zoom": 45}
+        self._tree["columns"] = cols
+        for c in cols:
+            self._tree.heading(c, text=headings.get(c, c))
+            w = 35 if c == "#" else (60 if c.startswith("x[") else widths.get(c, 80))
+            self._tree.column(c, width=w, anchor="e", minwidth=w)
+
+        rows = []
+        for j in range(k):
+            ys = Y[self._members[j]]
+            meta = rd.needles_json[j] if j < len(rd.needles_json) else {}
+            if rd.needle_vals is not None and j < len(rd.needle_vals):
+                val = float(rd.needle_vals[j])
+            else:
+                val = meta.get("value")
+            n_others = len(ys) - 1  # the declared point is itself in the cluster
+            stats = ([f"{ys.mean():.5f}", f"{np.median(ys):.5f}", f"{ys.std():.5f}",
+                      f"{ys.min():.5f}", f"{ys.max():.5f}"] if len(ys)
+                     else ["", "", "", "", ""])
+            ok = "✓" if n_others >= self._min_repeats else "✗"
+            rows.append((val, j, [str(j)] + [f"{v:.4f}" for v in self._needles[j]]
+                         + [f"{val:.5f}" if val is not None else "", str(len(ys))]
+                         + stats + [ok, meta.get("zoom", "")]))
+        # Highest-value needles first, as in the Needles tab; iid stays the index.
+        rows.sort(key=lambda r: r[0] if isinstance(r[0], (int, float))
+                  and not math.isnan(r[0]) else float("-inf"), reverse=True)
+        for _, j, values in rows:
+            self._tree.insert("", "end", iid=str(j), values=values)
+
+        rcols = (["idx", "dist"] + ccols + ["Y", "dY_med", "declared", "valid"])
+        rheadings = {"idx": "#", "dist": "L2 dist", "dY_med": "Y − median",
+                     "declared": "declared"}
+        self._rep["columns"] = rcols
+        for c in rcols:
+            self._rep.heading(c, text=rheadings.get(c, c))
+            w = (45 if c == "idx" else 60 if c.startswith("x[")
+                 else 65 if c in ("declared", "valid") else 80)
+            self._rep.column(c, width=w, anchor="e", minwidth=w)
+        self._bot.config(text="Repeats of selected needle")
+
+        first = self._tree.get_children()
+        if first:
+            self._tree.selection_set(first[0])
+
+    def _on_select(self, _e=None):
+        sel = self._tree.selection()
+        if not sel or self._rd is None:
+            return
+        j = int(sel[0])
+        if j >= len(self._members):
+            return
+        rd = self._rd
+        self._rep.delete(*self._rep.get_children())
+        idx = self._members[j]
+        ys = rd.Y_all[idx]
+        med = float(np.median(ys)) if len(ys) else float("nan")
+        pm = rd.penalty_mask
+        for i in idx:
+            decl = i == self._decl_idx[j]
+            ok = "✓" if (pm is not None and i < len(pm) and pm[i]) else ""
+            self._rep.insert(
+                "", "end", tags=("declared",) if decl else (),
+                values=[str(i), f"{self._dists[j][i]:.4f}"]
+                + [f"{v:.4f}" for v in rd.X_all[i]]
+                + [f"{rd.Y_all[i]:.5f}", f"{rd.Y_all[i] - med:+.5f}",
+                   "★" if decl else "", ok])
+        self._bot.config(
+            text=f"Repeats of needle #{j} — {len(idx)} point(s) within "
+                 f"{self._radius:g} (★ = declared point)")
 
 
 # ── GP query panel ────────────────────────────────────────────────────────────
@@ -4448,6 +4614,10 @@ class NewRunDialog(tk.Toplevel):
                 if not loaded:
                     raise ValueError(f"No recognised hyperparameters in {syn_path}.")
                 hp.update(loaded)
+            problems = hparam_conflicts(hp)
+            if problems:
+                raise ValueError("These hyperparameters make needles impossible:\n  - "
+                                 + "\n  - ".join(problems))
             max_act  = float("inf")   # hardcoded: run until stopped
             outdir   = self._outdir_var.get()
             # Dim selection + per-dim search box. d = number of checked dims; the
@@ -5176,6 +5346,7 @@ class ZoMBIApp(tk.Tk):
         self._dist  = DistancePlotFrame   (self._nb, figsize=(9, 4))
         self._pts   = PointsTableFrame    (self._nb)
         self._neds  = NeedlesFrame        (self._nb)
+        self._reps  = NeedleRepeatsFrame  (self._nb)
         self._gp    = GPQueryFrame        (self._nb, self)
         self._tern  = TernaryPlotFrame    (self._nb)
 
@@ -5183,6 +5354,7 @@ class ZoMBIApp(tk.Tk):
         self._nb.add(self._dist,  text="Distance")
         self._nb.add(self._pts,   text="Points")
         self._nb.add(self._neds,  text="Needles")
+        self._nb.add(self._reps,  text="Needle Repeats")
         self._nb.add(self._gp,    text="GP Query")
         self._nb.add(self._tern,  text="Ternary")
         self._manual = ManualControlFrame(self._nb)
@@ -5197,6 +5369,7 @@ class ZoMBIApp(tk.Tk):
             str(self._dist): self._dist.update,
             str(self._pts):  self._pts.update,
             str(self._neds): self._neds.update,
+            str(self._reps): self._reps.update,
             str(self._gp):   self._gp.update_for_run,
             str(self._tern): self._tern.update,
         }
@@ -5486,6 +5659,22 @@ class ZoMBIApp(tk.Tk):
         if script   is None: script   = str(Path(__file__).resolve().parent.parent / "scripts" / "main.py")
         if python   is None: python   = sys.executable
         if ckpt_dir is None: ckpt_dir = self.ckpt_dir
+
+        # Refuse to start hardware on a configuration that can never declare a
+        # needle (the runner checks too, but only after spawning).
+        try:
+            problems = hardware_hparam_problems(
+                hparams_path, Path(ckpt_dir) / f"run_{uuid}" if uuid else None)
+        except Exception as exc:
+            problems = [f"could not read hyperparameters: {exc}"]
+        if problems:
+            messagebox.showerror(
+                "Hyperparameter conflict",
+                "Not launching — this configuration makes needles impossible:\n\n- "
+                + "\n- ".join(problems)
+                + ("\n\nFor a resume, the run's config.json values win; edit it or "
+                   "change the conflicting knob." if uuid else ""))
+            return
 
         proj_root = str(Path(script).resolve().parent.parent)
 
