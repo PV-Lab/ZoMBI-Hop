@@ -18,6 +18,7 @@ warm_start/pareto_plots/*
 benchmarks/public_db/data/*
 benchmarks/sweeps/runs/*
 benchmarks/scripts/logs/*
+analysis/*
 
 # UV artifacts
 .python-version

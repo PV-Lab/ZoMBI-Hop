@@ -22,7 +22,7 @@ import uuid
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Union, Callable
 
-from .dataclasses import ZoMBIHopConfig
+from ..hparams import ALL_DEFAULTS as _HP, owned_by as _hparams_owned_by
 from .simplex import (
     Ellipsoid,
     proj_simplex,
@@ -48,10 +48,11 @@ class DataHandler:
     Parameters
     ----------
     max_zooms, max_iterations, top_m_points, n_restarts, raw,
-    convergence_pi_threshold, input_noise_threshold_mult,
-    output_noise_threshold_mult, n_consecutive_converged, max_gp_points,
-    repulsion_lambda, acquisition_type, ucb_beta, nat_grad_step,
-    nat_grad_max_steps : control variables
+    input_noise_threshold_mult, output_noise_threshold_mult,
+    n_consecutive_converged, max_gp_points, repulsion_lambda, acquisition_type,
+    ucb_beta, nat_grad_step, nat_grad_max_steps, paring_spatial_halfnoise,
+    paring_y_noise_multiplier, input_noise, jaccard_window, jaccard_threshold :
+        hyperparameters; see src/hparams.py. Defaults are the shipped values.
     directory : str, optional
         Base directory for snapshots. If None, no saving occurs.
     run_uuid : str, optional
@@ -61,31 +62,27 @@ class DataHandler:
     max_snapshots : int, optional
         Max snapshots to keep (None = keep all).
     device, dtype : compute settings
-    config : ZoMBIHopConfig or dict, optional
-        If provided, values override the individual keyword arguments.
-        Kept for backward compatibility.
     d : int, optional
         Dimensionality (auto-set in save_init).
     """
 
     def __init__(
         self,
-        # --- Control variables ---
-        max_zooms: int = 3,
-        max_iterations: int = 10,
-        top_m_points: Optional[int] = None,
-        n_restarts: int = 30,
-        raw: int = 500,
-        convergence_pi_threshold: float = 0.01,
-        input_noise_threshold_mult: float = 3.0,
-        output_noise_threshold_mult: float = 2.0,
-        n_consecutive_converged: int = 2,
-        max_gp_points: int = 3000,
-        repulsion_lambda: Optional[float] = None,
-        acquisition_type: str = "ucb",
-        ucb_beta: float = 0.1,
-        nat_grad_step: float = 0.02,
-        nat_grad_max_steps: int = 50,
+        # --- Hyperparameters (src/hparams.py) ---
+        max_zooms: int = _HP["max_zooms"],
+        max_iterations: int = _HP["max_iterations"],
+        top_m_points: Optional[int] = _HP["top_m_points"],
+        n_restarts: int = _HP["n_restarts"],
+        raw: int = _HP["raw"],
+        input_noise_threshold_mult: float = _HP["input_noise_threshold_mult"],
+        output_noise_threshold_mult: float = _HP["output_noise_threshold_mult"],
+        n_consecutive_converged: int = _HP["n_consecutive_converged"],
+        max_gp_points: int = _HP["max_gp_points"],
+        repulsion_lambda: Optional[float] = _HP["repulsion_lambda"],
+        acquisition_type: str = _HP["acquisition_type"],
+        ucb_beta: float = _HP["ucb_beta"],
+        nat_grad_step: float = _HP["nat_grad_step"],
+        nat_grad_max_steps: int = _HP["nat_grad_max_steps"],
         # --- Storage settings ---
         directory: Optional[str] = None,
         run_uuid: Optional[str] = None,
@@ -95,53 +92,23 @@ class DataHandler:
         # --- Compute settings ---
         device: str = 'cuda',
         dtype: torch.dtype = torch.float64,
-        # --- Backward compat ---
-        config: Optional[Union[ZoMBIHopConfig, Dict[str, Any]]] = None,
         d: Optional[int] = None,
         # --- Point paring ---
-        paring_spatial_halfnoise: float = 0.5,
-        paring_y_noise_multiplier: float = 1.0,
-        input_noise: Optional[float] = None,
-        input_noise_ilr: Optional[float] = None,
+        paring_spatial_halfnoise: float = _HP["paring_spatial_halfnoise"],
+        paring_y_noise_multiplier: float = _HP["paring_y_noise_multiplier"],
+        input_noise: float = _HP["input_noise"],
         # --- Jaccard sliding-window bounds ---
-        jaccard_window: int = 3,
-        jaccard_threshold: float = 0.9,
+        jaccard_window: int = _HP["jaccard_window"],
+        jaccard_threshold: float = _HP["jaccard_threshold"],
         # --- Logging ---
         verbose: bool = False,
     ):
-        # If a config object/dict is provided, extract values from it
-        if config is not None:
-            cfg = config if isinstance(config, ZoMBIHopConfig) else ZoMBIHopConfig.from_dict(config)
-            max_zooms = cfg.max_zooms
-            max_iterations = cfg.max_iterations
-            if cfg.top_m_points is not None:
-                top_m_points = cfg.top_m_points
-            n_restarts = cfg.n_restarts
-            raw = cfg.raw
-            convergence_pi_threshold = cfg.convergence_pi_threshold
-            input_noise_threshold_mult = cfg.input_noise_threshold_mult
-            output_noise_threshold_mult = cfg.output_noise_threshold_mult
-            n_consecutive_converged = cfg.n_consecutive_converged
-            max_gp_points = cfg.max_gp_points
-            repulsion_lambda = cfg.repulsion_lambda
-            acquisition_type = getattr(cfg, 'acquisition_type', acquisition_type)
-            ucb_beta = getattr(cfg, 'ucb_beta', ucb_beta)
-            nat_grad_step = getattr(cfg, 'nat_grad_step', nat_grad_step)
-            nat_grad_max_steps = getattr(cfg, 'nat_grad_max_steps', nat_grad_max_steps)
-            paring_spatial_halfnoise = getattr(cfg, 'paring_spatial_halfnoise', paring_spatial_halfnoise)
-            paring_y_noise_multiplier = getattr(cfg, 'paring_y_noise_multiplier', paring_y_noise_multiplier)
-            if getattr(cfg, 'input_noise', None) is not None:
-                input_noise = cfg.input_noise
-            elif getattr(cfg, 'input_noise_ilr', None) is not None:
-                input_noise = cfg.input_noise_ilr / 3.0
-
         # --- Store all control variables as plain attributes ---
         self.max_zooms = max_zooms
         self.max_iterations = max_iterations
         self.top_m_points = top_m_points
         self.n_restarts = n_restarts
         self.raw = raw
-        self.convergence_pi_threshold = convergence_pi_threshold
         self.input_noise_threshold_mult = input_noise_threshold_mult
         self.output_noise_threshold_mult = output_noise_threshold_mult
         self.n_consecutive_converged = n_consecutive_converged
@@ -155,18 +122,19 @@ class DataHandler:
         # Point paring
         self.paring_spatial_halfnoise = float(paring_spatial_halfnoise)
         self.paring_y_noise_multiplier = float(paring_y_noise_multiplier)
-        if input_noise is not None:
-            self.input_noise = float(input_noise)
-        elif input_noise_ilr is not None:
-            self.input_noise = float(input_noise_ilr) / 3.0
-        else:
-            self.input_noise = 0.128
+        self.input_noise = float(input_noise)
 
         # Jaccard sliding-window
         self.jaccard_window = int(jaccard_window)
         self.jaccard_threshold = float(jaccard_threshold)
 
         self.verbose = verbose
+
+        # Set by the owner (ZoMBIHop): returns the hyperparameters it keeps itself,
+        # so config.json records the whole configuration. load_state leaves the
+        # parsed file in loaded_config for the owner to restore those from.
+        self.extra_config: Optional[Callable[[], Dict[str, Any]]] = None
+        self.loaded_config: Optional[Dict[str, Any]] = None
 
         # Compute settings
         self.device = torch.device(device)
@@ -348,30 +316,19 @@ class DataHandler:
             self.take_snapshot("init", permanent=True)
 
     def _save_config(self):
-        """Write config.json once at init (human-readable, for inspection)."""
-        config = {
-            'run_uuid': self.run_uuid,
-            'd': self.d,
-            'max_zooms': self.max_zooms,
-            'max_iterations': self.max_iterations,
-            'top_m_points': self.top_m_points,
-            'n_restarts': self.n_restarts,
-            'raw': self.raw,
-            'convergence_pi_threshold': self.convergence_pi_threshold,
-            'input_noise_threshold_mult': self.input_noise_threshold_mult,
-            'output_noise_threshold_mult': self.output_noise_threshold_mult,
-            'n_consecutive_converged': self.n_consecutive_converged,
-            'max_gp_points': self.max_gp_points,
-            'repulsion_lambda': self.repulsion_lambda,
-            'acquisition_type': self.acquisition_type,
-            'ucb_beta': self.ucb_beta,
-            'nat_grad_step': self.nat_grad_step,
-            'nat_grad_max_steps': self.nat_grad_max_steps,
-            'input_noise': self.input_noise,
-            'paring_spatial_halfnoise': self.paring_spatial_halfnoise,
-            'device': str(self.device),
-            'dtype': str(self.dtype),
-        }
+        """Write config.json: the run's identity plus every hyperparameter in force.
+
+        Rewritten on every live hyperparameter change (hparam_live), so it is the
+        run's record of its current settings. ``extra_config`` lets the owner add
+        the hyperparameters it keeps outside this handler (ZoMBIHop's own).
+        """
+        config = {'run_uuid': self.run_uuid, 'd': self.d}
+        for name in _hparams_owned_by("dh"):
+            config[name] = getattr(self, name)
+        if self.extra_config is not None:
+            config.update(self.extra_config())
+        config['device'] = str(self.device)
+        config['dtype'] = str(self.dtype)
         with open(self.run_dir / 'config.json', 'w') as f:
             json.dump(config, f, indent=2)
 
@@ -617,21 +574,15 @@ class DataHandler:
             with open(config_path, encoding='utf-8-sig') as f:
                 cfg = json.load(f)
             self.d = cfg.get('d', self.d)
-            self.max_zooms = cfg.get('max_zooms', self.max_zooms)
-            self.max_iterations = cfg.get('max_iterations', self.max_iterations)
-            self.top_m_points = cfg.get('top_m_points', self.top_m_points)
-            self.n_restarts = cfg.get('n_restarts', self.n_restarts)
-            self.raw = cfg.get('raw', self.raw)
-            self.convergence_pi_threshold = cfg.get('convergence_pi_threshold', self.convergence_pi_threshold)
-            self.input_noise_threshold_mult = cfg.get('input_noise_threshold_mult', self.input_noise_threshold_mult)
-            self.output_noise_threshold_mult = cfg.get('output_noise_threshold_mult', self.output_noise_threshold_mult)
-            self.n_consecutive_converged = cfg.get('n_consecutive_converged', self.n_consecutive_converged)
-            self.max_gp_points = cfg.get('max_gp_points', self.max_gp_points)
-            self.repulsion_lambda = cfg.get('repulsion_lambda', self.repulsion_lambda)
-            self.acquisition_type = cfg.get('acquisition_type', self.acquisition_type)
-            self.ucb_beta = cfg.get('ucb_beta', self.ucb_beta)
-            self.nat_grad_step = cfg.get('nat_grad_step', self.nat_grad_step)
-            self.nat_grad_max_steps = cfg.get('nat_grad_max_steps', self.nat_grad_max_steps)
+            # Algorithm knobs come from the run's own record, so a resume continues
+            # the run it was (operators edit config.json to retune a stopped run).
+            # input_noise is the exception: it is a calibration of the apparatus,
+            # so the CURRENT measurement passed in by the caller wins.
+            for name in _hparams_owned_by("dh"):
+                if name != "input_noise" and name in cfg:
+                    setattr(self, name, cfg[name])
+            # The whole file, for the owner's own hyperparameters (ZoMBIHop).
+            self.loaded_config = cfg
 
         # Try new snapshot format first (latest.txt -> snapshots/)
         latest_path = self.run_dir / 'latest.txt'

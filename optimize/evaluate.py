@@ -173,6 +173,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_mobo as rm
+from src.hparams import KNOWN_NAMES as HPARAM_KNOWN_NAMES, repair_conflicts
 from mobo_landscapes import build_synthetic_landscape, parse_synthetic_batch_fields, resolve_surrogate_csv_path
 
 # Analytic benchmark objectives (negated Ackley on the d-simplex).
@@ -664,36 +665,36 @@ def build_ensemble_ds(config: dict, dataset: str, *, time_limit_hours: float | N
 
 # ─── Hyperparameter loading ─────────────────────────────────────────────────────
 
-# Keys allowed in hparams JSON beyond the MOBO search space (override ZOMBI_FIXED).
-_ZOMBI_OVERRIDE_KEYS = frozenset({"input_noise", "max_gp_points", "acquisition_type", "verbose"})
+# Keys allowed in hparams JSON beyond the MOBO search space: every registered
+# untuned knob (src/hparams.py) plus the logging switch. They override ZOMBI_FIXED.
+_ZOMBI_OVERRIDE_KEYS = frozenset((HPARAM_KNOWN_NAMES - set(rm.HPARAM_NAMES)) | {"verbose"})
 
 
 def _split_hparams(hp: dict, *, source: str = "hparams") -> tuple[dict, dict]:
     """Return (mobo_hparams, zombi_fixed_overrides).
 
-    Keys in neither set are DROPPED — they never reach ZoMBIHop, which falls back to
-    its constructor default for them. That is the intended behaviour for a trial
-    recorded by an older code revision whose search space has since lost a knob, but
-    it is silent, and a silently ignored hyperparameter is indistinguishable from an
-    honoured one when reading a config file. So say so: the showdown_6d_clamped_reps10_v2
-    configs advertise input_noise_threshold_mult 0.5-6.0, retired from HPARAM_SPACE in
-    56dd11d, and every one of those 200 runs actually used ZoMBIHop's default of 3.0.
+    A legacy (pre-2026-10-12) record is first upgraded to the values it actually
+    ran with — see ``src.hparams.upgrade_legacy``. Keys in neither set are DROPPED
+    and reported: a silently ignored hyperparameter is indistinguishable from an
+    honoured one when reading a config file.
     """
+    hp, notes = rm.upgrade_legacy(hp)
+    if notes:
+        print(f"      [run] {source}: legacy record — " + "; ".join(notes))
     mobo = {k: hp[k] for k in rm.HPARAM_NAMES if k in hp}
     overrides = {k: hp[k] for k in _ZOMBI_OVERRIDE_KEYS if k in hp}
     ignored = sorted(set(hp) - set(mobo) - set(overrides))
     if ignored:
-        print(f"      [run] {source}: ignoring {len(ignored)} key(s) that are not in "
-              f"the current search space — ZoMBIHop's defaults apply instead: "
+        print(f"      [run] {source}: ignoring {len(ignored)} retired/unknown key(s): "
               + ", ".join(f"{k}={hp[k]}" for k in ignored))
     return mobo, overrides
 
 
 def _normalize_hparams(hp: dict, *, source: str) -> dict:
-    missing = [k for k in rm.HPARAM_NAMES if k not in hp]
+    mobo, overrides = _split_hparams(hp, source=source)
+    missing = [k for k in rm.HPARAM_NAMES if k not in mobo]
     if missing:
         sys.exit(f"{source}: missing hparams {missing} (stale hyperparameter set?).")
-    mobo, overrides = _split_hparams(hp, source=source)
     return {**mobo, **overrides}
 
 
@@ -769,12 +770,7 @@ def load_hparams_from_json(json_path: str) -> dict[int, dict]:
     if not isinstance(hp, dict):
         sys.exit(f"--hparams-json: expected a dict with hparam keys (or an "
                  f"'hparams' key containing them).")
-    missing = [k for k in rm.HPARAM_NAMES if k not in hp]
-    if missing:
-        sys.exit(f"--hparams-json: missing hparams {missing} "
-                 f"(stale hyperparameter set?).")
-    mobo, overrides = _split_hparams(hp, source=os.path.basename(json_path))
-    hp = {**mobo, **overrides}
+    hp = _normalize_hparams(hp, source=f"--hparams-json {os.path.basename(json_path)}")
     print(f"  [hparams-json] loaded {len(hp)} hyperparameters from {json_path}")
     return {0: hp}
 
@@ -1041,22 +1037,6 @@ def save_convergence_metrics_plot(
 
 # ─── Single evaluation run ──────────────────────────────────────────────────────
 
-def _force_zoom_floors() -> tuple[int, int]:
-    """Minimum ``(max_zooms, max_iterations)`` that let a run declare a needle.
-
-    Mirrors the HPARAM_SPACE lower bounds run_mobo enforces during hparam search,
-    but derived from ZoMBIHop's actual search-discipline defaults so the two can't
-    drift: a needle can only be declared once the search has zoomed to level
-    ``min_zoom_for_needle`` (so ``max_zooms`` must exceed it) and only
-    after at least ``min_iters_per_zoom`` lines have been sampled at that zoom.
-    """
-    import inspect
-    params = inspect.signature(rm.ZoMBIHop.__init__).parameters
-    min_zoom = int(params["min_zoom_for_needle"].default)
-    min_iters = int(params["min_iters_per_zoom"].default)
-    return min_zoom + 1, min_iters
-
-
 def run_single_eval(
     hparams: dict,
     ds: dict,
@@ -1145,15 +1125,12 @@ def run_single_eval(
     if dim > 3 and (hp.get("top_m_points") is None or hp.get("top_m_points", 0) < dim + 1):
         hp["top_m_points"] = max(dim + 1, 4)
 
-    # Force-zooming discipline: MOBO clamps these via HPARAM_SPACE, but a fixed
-    # re-evaluation reads hparams straight from JSON, so enforce the same floors
-    # here or a low-max_zooms config could never zoom deep enough to declare a needle.
-    _zoom_floor, _iter_floor = _force_zoom_floors()
-    for _key, _floor in (("max_zooms", _zoom_floor), ("max_iterations", _iter_floor)):
-        if hp.get(_key) is not None and hp[_key] < _floor:
-            print(f"      [run] raising {_key} {hp[_key]} -> {_floor} to satisfy "
-                  f"force-zooming constraints.")
-            hp[_key] = _floor
+    # A recorded config can be one ZoMBIHop refuses (e.g. n_consecutive_converged
+    # above max_iterations, sampled before MOBO repaired such points). Re-evaluate
+    # the nearest feasible config, as MOBO would have, and say so.
+    hp, _repairs = repair_conflicts(hp)
+    if _repairs:
+        print(f"      [run] hyperparameter conflict repaired: {'; '.join(_repairs)}")
 
     zombi_fixed = dict(rm.ZOMBI_FIXED)
     for k in _ZOMBI_OVERRIDE_KEYS:

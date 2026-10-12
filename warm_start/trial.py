@@ -275,7 +275,8 @@ def run_trial(arm: str, rep: int, landscape, trial_dir: str, *,
         X_a, X_e, Y = build_cold_init(fn_callable, dim, maximize, init_seed)
     n_init = int(X_a.shape[0])
 
-    hp = dict(REFERENCE_HPARAMS if hparams is None else hparams)
+    # A pre-2026-10-12 record runs with the values it originally ran with.
+    hp, _ = rm.upgrade_legacy(REFERENCE_HPARAMS if hparams is None else hparams)
     optimizer = ZoMBIHop(
         objective=obj_wrapper,
         X_init_actual=X_a, X_init_expected=X_e, Y_init=Y,

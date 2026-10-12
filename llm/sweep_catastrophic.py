@@ -235,7 +235,7 @@ def load_trial(trial_json: Path) -> Tuple[int, Dict[str, Any]]:
     block, filtered to the current ZoMBI-Hop hyperparameter names.
     """
     obj = json.loads(trial_json.read_text())
-    hp_raw = obj.get("hparams") or {}
+    hp_raw, _ = R.upgrade_legacy(obj.get("hparams") or {})
     hp = {k: hp_raw[k] for k in R.HPARAM_NAMES if k in hp_raw}
     missing = [k for k in R.HPARAM_NAMES if k not in hp]
     if missing:

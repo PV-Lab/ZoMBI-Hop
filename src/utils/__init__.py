@@ -23,7 +23,6 @@ from .gp_simplex import (
     GPSimplex,
     RepulsiveAcquisition,
 )
-from .dataclasses import ZoMBIHopConfig
 
 __all__ = [
     # Simplex utilities
@@ -47,6 +46,4 @@ __all__ = [
     # GP handling
     "GPSimplex",
     "RepulsiveAcquisition",
-    # Configuration
-    "ZoMBIHopConfig",
 ]

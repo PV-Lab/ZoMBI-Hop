@@ -282,7 +282,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE  = torch.float64
 
 # Simulated input noise: per-component composition std, measured from runs/run_39af/composition_log.jsonl, the 6-dim hardware run of 2026-08-12 (109 lines / 2042 samples), which logs the sent composition directly: pooled per-component std 0.128, mean L2 0.271
-# (see visualization/input_noise.py and default_hparams.DEFAULT_INPUT_NOISE).
+# (see visualization/input_noise.py and src/hparams.DEFAULT_INPUT_NOISE).
 # Also fed to ZoMBI as the known ``input_noise``.
 NOISE_LEVEL       = 0.128
 # Simulated output noise: the measured objective is within ~4.5% of the true value,
@@ -349,11 +349,11 @@ TIME_LIMIT_HOURS = 0.4
 # (guards against a runaway loop on a systemic failure; transient failures just retry).
 MAX_CONSEC_FAIL = 5
 
-# ZoMBI-Hop fixed params (not optimised — infrastructure / noise model constants)
+# ZoMBI-Hop settings that are not MOBO axes but differ from the shipped defaults
+# for a simulated trial. Every other untuned knob (max_gp_points, acquisition_type,
+# …) takes its value from src/hparams.py through the ZoMBIHop constructor.
 ZOMBI_FIXED = dict(
-    max_gp_points=3000,
-    acquisition_type="ucb",
-    input_noise=NOISE_LEVEL,
+    input_noise=NOISE_LEVEL,   # match the simulator's noise model
     verbose=False,
 )
 
@@ -392,9 +392,21 @@ def unique_run_dir(parent: str, prefix: str) -> str:
 # reach for it as rm.HPARAM_SPACE / rm.HPARAM_NAMES. (Works whether launched as a
 # script, with optimize/ on the path, or as the optimize.run_mobo package module.)
 try:
-    from optimize.hparam_space import HPARAM_SPACE, HPARAM_NAMES, N_HPARAMS
+    from optimize.hparam_space import (
+        HPARAM_SPACE, HPARAM_NAMES, N_HPARAMS, repair_conflicts, upgrade_legacy)
 except ImportError:
-    from hparam_space import HPARAM_SPACE, HPARAM_NAMES, N_HPARAMS
+    from hparam_space import (
+        HPARAM_SPACE, HPARAM_NAMES, N_HPARAMS, repair_conflicts, upgrade_legacy)
+
+
+def trial_hparams(hp: dict) -> dict | None:
+    """A recorded trial's hyperparameters on the current axes, or None if stale.
+
+    Pre-2026-10-12 records are upgraded to the values they actually ran with
+    (``upgrade_legacy``), so their history keeps pooling after the space grew.
+    """
+    hp, _ = upgrade_legacy(hp)
+    return hp if all(name in hp for name in HPARAM_NAMES) else None
 
 
 def norm_to_hparams(x_norm: torch.Tensor) -> dict:
@@ -1083,7 +1095,8 @@ def _collect_from_progress(path: str, X_obs: list, Y_obs: list) -> int:
     used = 0
     for t in data.get("trials", []):
         hp, m = t.get("hparams", {}), t.get("metrics", {})
-        if not all(name in hp for name in HPARAM_NAMES):
+        hp = trial_hparams(hp)
+        if hp is None:
             continue  # stale / different hyperparameter set
         try:
             x = hparams_to_norm(hp)
@@ -1213,7 +1226,8 @@ def collect_rederived_observations(runs_dir: str, new_maximize: bool,
             run_dim = 3
         for t in data.get("trials", []):
             hp, m = t.get("hparams", {}), t.get("metrics", {})
-            if not all(name in hp for name in HPARAM_NAMES):
+            hp = trial_hparams(hp)
+            if hp is None:
                 continue  # stale / different hyperparameter set
             needles_path = os.path.join(rd, f"trial_{t.get('trial')}", "needles.csv")
             try:
@@ -1422,7 +1436,8 @@ def collect_shared_observations(
                 if key in seen:
                     continue
                 hp, m = t.get("hparams", {}), t.get("metrics", {})
-                if not all(name in hp for name in HPARAM_NAMES):
+                hp = trial_hparams(hp)
+                if hp is None:
                     continue
                 try:
                     x = hparams_to_norm(hp)
@@ -1497,7 +1512,7 @@ def load_seed_hparams(trial_paths: list[str]) -> list[torch.Tensor]:
         except Exception as exc:
             print(f"  [seed] WARNING: {json_path} unreadable ({exc}) — skipping.")
             continue
-        hp = data.get("hparams", {})
+        hp, _ = upgrade_legacy(data.get("hparams", {}))
         missing = [name for name in HPARAM_NAMES if name not in hp]
         if missing:
             print(f"  [seed] WARNING: {json_path} is missing hparams {missing} "
@@ -3361,6 +3376,14 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                     x_new = candidate.squeeze(0).detach().cpu()
 
                 hparams = norm_to_hparams(x_new)
+                # The search box contains configurations that can never declare a
+                # needle (n_consecutive_converged > max_iterations). Run the nearest
+                # feasible one instead, and record THAT point, so the GP learns the
+                # response of the configuration that was actually scored.
+                hparams, _repairs = repair_conflicts(hparams)
+                if _repairs:
+                    print(f"  [repair] infeasible sample: {'; '.join(_repairs)}", flush=True)
+                    x_new = hparams_to_norm(hparams)
                 hp_str = "  ".join(f"{k}={round(v,4) if isinstance(v,float) else v}"
                                    for k, v in hparams.items())
                 print(f"\n[trial {trial_num} | {phase}]  {hp_str}", flush=True)

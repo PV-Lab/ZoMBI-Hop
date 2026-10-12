@@ -1,4 +1,9 @@
 {
+  "notes": [
+    "Shipped ZoMBI-Hop configuration: the value of every TUNED hyperparameter (src/hparams.py loads it as DEFAULT_HPARAMS, used by the GUI, the hardware runner and as ZoMBIHop's constructor defaults). It must list exactly the tuned knobs.",
+    "Origin: the 6D MOBO ensemble winner, with n_consecutive_converged 5->2 (2026-08-19) and max_iterations 2->3 (2026-08-27).",
+    "2026-10-12: needle_shrink_factor 0.99->0.8 and needle_stop_noise_multiplier 1.0->2.0 — the code used bounds_shrink_factor=0.8 / min_axis_noise_mult=2.0 instead, so these are the values every run actually had. The needle gates, Jaccard knobs, ellipsoid_drop_fraction and input_noise_threshold_mult were hidden constructor defaults and are listed at those defaults."
+  ],
   "hparams": {
     "nat_grad_step": 0.23242035,
     "nat_grad_max_steps": 400,
@@ -9,11 +14,19 @@
     "max_iterations": 3,
     "top_m_points": 8,
     "n_consecutive_converged": 2,
-    "input_noise_threshold_mult": 3.0,
     "output_noise_threshold_mult": 2.0,
+    "input_noise_threshold_mult": 3.0,
+    "zoom_jaccard_threshold": 0.75,
+    "jaccard_window": 3,
+    "jaccard_threshold": 0.9,
     "max_penalty_radius": 0.5020402,
-    "needle_shrink_factor": 0.99,
-    "needle_stop_noise_multiplier": 1.0,
+    "ellipsoid_drop_fraction": 0.25,
+    "needle_shrink_factor": 0.8,
+    "needle_stop_noise_multiplier": 2.0,
+    "min_zoom_for_needle": 2,
+    "min_iters_per_zoom": 3,
+    "needle_min_repeats": 5,
+    "needle_repeat_radius_frac": 0.1,
     "paring_spatial_halfnoise": 5.0,
     "paring_y_noise_multiplier": 10.0
   }

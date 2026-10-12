@@ -119,6 +119,7 @@ from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.lines import Line2D
 
 from src import ZoMBIHop, LineBO
+from src.hparams import ALL_DEFAULTS, extract_hparams
 from src.core.linebo import line_simplex_segment, zero_sum_dirs
 from src.utils.simplex import Ellipsoid, composition_to_ilr, ilr_to_composition, proj_simplex
 from synthetic_data.ackley import Ackley
@@ -131,7 +132,7 @@ CORNER_LABELS = ("FAPbI3", "MAPbI3", "MAPbBr3")
 
 RF_N_ESTIMATORS = 500
 OUTPUT_NOISE_FRAC = 0.045  # output noise as a fraction of the true y (measured ≈ within 4.5%)
-NOISE_LEVEL_ILR = 0.384     # input noise std in ILR space (≈ 0.128 ambient per-component × 3; see default_hparams.DEFAULT_INPUT_NOISE)
+NOISE_LEVEL_ILR = 0.384     # input noise std in ILR space (≈ 0.128 ambient per-component × 3; see src/hparams.DEFAULT_INPUT_NOISE)
 NUM_EXPERIMENTS = 24     # points sampled per suggested line (mirrors run_zombi_main.py)
 NUM_LINES = 10           # LineBO candidate lines per iteration
 TERNARY_GRID_N = 120     # ternary grid resolution for reference heatmap
@@ -158,37 +159,10 @@ if not _sys.stdin.isatty():
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.float64
 
-# ── Boundary penalty ─────────────────────────────────────────────────────────
-# Always active. Strength = repulsion_lambda (auto-scaled to acquisition magnitude);
-# ε = input_noise_ilr (existing ZoMBI param, default 0.03).
-# No additional hyperparameters required.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ZoMBI hyperparameters (mirror run_zombi_main.py)
-ZOMBI_PARAMS: dict = dict(
-    max_zooms=6,
-    max_iterations=6,
-    top_m_points=4,
-    n_restarts=100,
-    raw=1323,
-    input_noise_threshold_mult=3.0,
-    output_noise_threshold_mult=0.5,
-    n_consecutive_converged=5,
-    max_gp_points=3000,
-    acquisition_type="ucb",
-    ucb_beta=0.6677950695897094,
-    nat_grad_step=0.024757059158665974,
-    nat_grad_max_steps=67,
-    max_penalty_radius=1.0,
-    # Point paring
-    paring_spatial_halfnoise=0.5,
-    paring_y_noise_multiplier=1.0,
-    input_noise_ilr=NOISE_LEVEL_ILR,
-    # Needle-ellipsoid failure handling
-    needle_shrink_factor=0.85,
-    needle_stop_noise_multiplier=3.0,
-    verbose=True,
-)
+# ZoMBI hyperparameters: the shipped defaults (src/hparams.py), the same values the
+# GUI and the hardware runner use. --hparams overrides them per key. input_noise is
+# the measured apparatus noise; the simulator's own noise is NOISE_LEVEL_ILR above.
+ZOMBI_PARAMS: dict = dict(ALL_DEFAULTS, verbose=True)
 
 _SQRT3_2 = np.sqrt(3) / 2
 
@@ -1227,7 +1201,8 @@ def main(
     dim = 3
     zparams = dict(ZOMBI_PARAMS)
     if hparams_path is not None:
-        zparams.update(load_hparams(hparams_path))
+        zparams.update(extract_hparams(load_hparams(hparams_path),
+                                       source=str(hparams_path)))
 
     plot_state: dict = {"line_0": None, "line_1": None, "fig": None, "iter": 0}
     dh_ref: list = [None]   # filled with optimizer.data_handler after construction

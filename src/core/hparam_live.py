@@ -36,103 +36,15 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from ..hparams import coerce as _coerce_registered, conflicts, live_targets
+
 OVERRIDE_FILENAME  = "hparams_override.json"
 EFFECTIVE_FILENAME = "hparams_effective.json"
 
 # name → ((owner, attribute), …). owner: "dh" = DataHandler, "gp" = GPSimplex,
-# "zombi" = the ZoMBIHop instance. Order matters only for reads (first entry is
-# the canonical source when reporting the effective value).
-_TARGETS: dict[str, tuple[tuple[str, str], ...]] = {
-    # ── acquisition optimisation (GPSimplex renames these) ────────────────
-    "nat_grad_step":      (("dh", "nat_grad_step"),      ("gp", "nat_grad_step")),
-    "nat_grad_max_steps": (("dh", "nat_grad_max_steps"), ("gp", "nat_grad_max_steps")),
-    "n_restarts":         (("dh", "n_restarts"),         ("gp", "num_restarts")),
-    "raw":                (("dh", "raw"),                ("gp", "raw_samples")),
-    # ── acquisition function ──────────────────────────────────────────────
-    "acquisition_type":   (("dh", "acquisition_type"),   ("gp", "acquisition_type")),
-    "ucb_beta":           (("dh", "ucb_beta"),           ("gp", "ucb_beta")),
-    "input_noise":        (("dh", "input_noise"),),
-    # ── zoom / convergence (DataHandler-owned) ────────────────────────────
-    "max_zooms":                   (("dh", "max_zooms"),),
-    "max_iterations":              (("dh", "max_iterations"),),
-    "top_m_points":                (("dh", "top_m_points"),),
-    "n_consecutive_converged":     (("dh", "n_consecutive_converged"),),
-    "input_noise_threshold_mult":  (("dh", "input_noise_threshold_mult"),),
-    "output_noise_threshold_mult": (("dh", "output_noise_threshold_mult"),),
-    "max_gp_points":               (("dh", "max_gp_points"),),
-    "jaccard_window":              (("dh", "jaccard_window"),),
-    "jaccard_threshold":           (("dh", "jaccard_threshold"),),
-    # ── point paring (DataHandler-owned) ──────────────────────────────────
-    "paring_spatial_halfnoise":  (("dh", "paring_spatial_halfnoise"),),
-    "paring_y_noise_multiplier": (("dh", "paring_y_noise_multiplier"),),
-    # ── penalty / needle (ZoMBIHop-owned) ─────────────────────────────────
-    "max_penalty_radius":           (("zombi", "max_penalty_radius"),),
-    "needle_shrink_factor":         (("zombi", "needle_shrink_factor"),),
-    "needle_stop_noise_multiplier": (("zombi", "needle_stop_noise_multiplier"),),
-    "ellipsoid_drop_fraction":      (("zombi", "ellipsoid_drop_fraction"),),
-    "ellipsoid_eigenvalue_floor":   (("zombi", "ellipsoid_eigenvalue_floor"),),
-    "bounds_shrink_factor":         (("zombi", "bounds_shrink_factor"),),
-    "min_axis_noise_mult":          (("zombi", "min_axis_noise_mult"),),
-    "zoom_jaccard_threshold":       (("zombi", "zoom_jaccard_threshold"),),
-}
-
-
-def _acq_cast(v: Any) -> str:
-    s = str(v).strip().lower()
-    if s not in ("ucb", "ei"):
-        raise ValueError(f"acquisition_type must be 'ucb' or 'ei', got {v!r}")
-    return s
-
-
-def _positive_int(v: Any) -> int:
-    i = int(v)
-    if i < 1:
-        raise ValueError(f"must be >= 1, got {i}")
-    return i
-
-
-def _positive_float(v: Any) -> float:
-    f = float(v)
-    if not f > 0:
-        raise ValueError(f"must be > 0, got {f}")
-    return f
-
-
-def _nonneg_float(v: Any) -> float:
-    f = float(v)
-    if f < 0:
-        raise ValueError(f"must be >= 0, got {f}")
-    return f
-
-
-_CASTS: dict[str, Callable[[Any], Any]] = {
-    "nat_grad_step":      _positive_float,
-    "nat_grad_max_steps": _positive_int,
-    "n_restarts":         _positive_int,
-    "raw":                _positive_int,
-    "acquisition_type":   _acq_cast,
-    "ucb_beta":           _nonneg_float,
-    "input_noise":        _positive_float,
-    "max_zooms":                   _positive_int,
-    "max_iterations":              _positive_int,
-    "top_m_points":                _positive_int,
-    "n_consecutive_converged":     _positive_int,
-    "input_noise_threshold_mult":  _nonneg_float,
-    "output_noise_threshold_mult": _nonneg_float,
-    "max_gp_points":               _positive_int,
-    "jaccard_window":              _positive_int,
-    "jaccard_threshold":           _nonneg_float,
-    "paring_spatial_halfnoise":    _nonneg_float,
-    "paring_y_noise_multiplier":   _nonneg_float,
-    "max_penalty_radius":           _positive_float,
-    "needle_shrink_factor":         _positive_float,
-    "needle_stop_noise_multiplier": _positive_float,
-    "ellipsoid_drop_fraction":      _nonneg_float,
-    "ellipsoid_eigenvalue_floor":   _positive_float,
-    "bounds_shrink_factor":         _positive_float,
-    "min_axis_noise_mult":          _nonneg_float,
-    "zoom_jaccard_threshold":       _nonneg_float,
-}
+# "zombi" = the ZoMBIHop instance. The first entry is the canonical source when
+# reporting the effective value. Declared per knob in src/hparams.py.
+_TARGETS: dict[str, tuple[tuple[str, str], ...]] = live_targets()
 
 #: Every hyperparameter that can be changed while a run is in flight.
 LIVE_EDITABLE_NAMES: frozenset[str] = frozenset(_TARGETS)
@@ -142,7 +54,7 @@ def coerce(name: str, value: Any) -> Any:
     """Validate/cast one hyperparameter. Raises ValueError if unusable."""
     if name not in _TARGETS:
         raise ValueError(f"{name!r} cannot be changed while a run is in flight")
-    return _CASTS[name](value)
+    return _coerce_registered(name, value)
 
 
 def _owners(zombi) -> dict[str, Any]:
@@ -205,6 +117,14 @@ def write_override(run_dir, hp: dict) -> dict:
     rather than the optimiser discovering them mid-run. Returns the coerced dict.
     """
     clean = {name: coerce(name, val) for name, val in hp.items()}
+    # Check the configuration the run would END UP with, not the edit alone:
+    # lowering max_iterations is fine on its own and fatal next to
+    # min_iters_per_zoom=3. The optimiser re-checks on apply (its own values are
+    # authoritative); this is so the UI can refuse before writing anything.
+    problems = conflicts({**read_effective(run_dir), **clean})
+    if problems:
+        raise ValueError("this change would make the run unable to declare "
+                         "needles:\n  - " + "\n  - ".join(problems))
     if clean:
         _atomic_write_json(Path(run_dir) / OVERRIDE_FILENAME, clean)
     return clean
@@ -242,19 +162,32 @@ def apply_pending(zombi, log: Optional[Callable[[str], None]] = None) -> list[st
             log("  [hparams] override file is not a JSON object; ignored.")
         return []
 
-    owners = _owners(zombi)
-    changes: list[str] = []
+    clean: dict[str, Any] = {}
     for name, value in raw.items():
         if name not in _TARGETS:
             if log:
                 log(f"  [hparams] ignoring unknown/not-live-tunable {name!r}")
             continue
         try:
-            new = coerce(name, value)
+            clean[name] = coerce(name, value)
         except (TypeError, ValueError) as exc:
             if log:
                 log(f"  [hparams] ignoring {name}={value!r}: {exc}")
-            continue
+
+    # All-or-nothing on conflicts: applying half of an edit that only makes sense
+    # as a whole (e.g. max_iterations and min_iters_per_zoom lowered together) could
+    # strand the run in an impossible state between lines.
+    problems = conflicts({**current_values(zombi), **clean})
+    if problems:
+        if log:
+            log("  [hparams] override REJECTED, it would make needles impossible:")
+            for p in problems:
+                log(f"  [hparams]   - {p}")
+        return []
+
+    owners = _owners(zombi)
+    changes: list[str] = []
+    for name, new in clean.items():
         old = None
         applied = False
         for owner_key, attr in _TARGETS[name]:

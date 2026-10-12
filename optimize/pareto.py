@@ -120,9 +120,9 @@ def _pretty_label(label: str) -> str:
 # retired input_noise_threshold_mult). hparam_space.py imports nothing heavy, so
 # reading it here costs nothing.
 try:
-    from optimize.hparam_space import HPARAM_SPACE, HPARAM_NAMES
+    from optimize.hparam_space import HPARAM_SPACE, HPARAM_NAMES, upgrade_legacy
 except ImportError:
-    from hparam_space import HPARAM_SPACE, HPARAM_NAMES
+    from hparam_space import HPARAM_SPACE, HPARAM_NAMES, upgrade_legacy
 
 
 # ─── Collaborator runs directories (cross-user shared history) ───────────────────
@@ -469,7 +469,9 @@ def collect_trials(
                 "time_key":    time_key,
                 "time_value":  time_value,
                 "npts_value":  npts_value,
-                "hparams":     t.get("hparams", {}),
+                # Pre-2026-10-12 records carry two never-wired knobs and lack the
+                # newer axes; show (and hand the showdown) what actually ran.
+                "hparams":     upgrade_legacy(t.get("hparams", {}))[0],
             })
             used += 1
         if used or skipped_failed:

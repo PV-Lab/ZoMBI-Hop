@@ -29,22 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 
 from src import ZoMBIHop
-from src.default_hparams import DEFAULT_HPARAMS, DEFAULT_INPUT_NOISE
-
-# Constructor hyperparameters an operator can set (mirrors _VALID_HPARAM_KEYS in
-# scripts/run_zombi_main.py, which is not imported here to avoid its module-level
-# hardware/DB side effects).
-_HPARAM_KEYS = (
-    "max_zooms", "max_iterations", "top_m_points", "n_restarts", "raw",
-    "input_noise_threshold_mult", "output_noise_threshold_mult",
-    "n_consecutive_converged", "max_gp_points", "repulsion_lambda",
-    "acquisition_type", "ucb_beta", "nat_grad_step", "nat_grad_max_steps",
-    "ellipsoid_drop_fraction", "ellipsoid_eigenvalue_floor", "max_penalty_radius",
-    "paring_spatial_halfnoise", "paring_y_noise_multiplier", "input_noise",
-    "needle_shrink_factor", "needle_stop_noise_multiplier",
-    "zoom_jaccard_threshold", "bounds_shrink_factor", "min_axis_noise_mult",
-    "jaccard_window", "jaccard_threshold",
-)
+from src.hparams import ALL_DEFAULTS, extract_hparams
 
 
 def _load_hparams(run_dir: Path) -> dict:
@@ -53,17 +38,19 @@ def _load_hparams(run_dir: Path) -> dict:
     re-applies config.json's subset on top during construction, exactly as a
     resume does. Without this, keys outside config.json's restored subset
     (e.g. max_penalty_radius) would silently fall back to constructor defaults."""
-    hparams = dict(DEFAULT_HPARAMS)
-    hparams.setdefault("input_noise", DEFAULT_INPUT_NOISE)
+    hparams = dict(ALL_DEFAULTS)
     eff_path = run_dir / "hparams_effective.json"
     if eff_path.exists():
         try:
             eff = json.loads(eff_path.read_text(encoding="utf-8-sig"))
-            hparams.update({k: v for k, v in eff.items() if k in _HPARAM_KEYS})
+            # extract_hparams maps an older run's retired names (e.g.
+            # bounds_shrink_factor, which held the shrink actually in force) onto
+            # the knobs that now do their job.
+            hparams.update(extract_hparams(eff, source=str(eff_path), log=None))
         except Exception as e:
             print(f"[retro-cli] Could not read hparams_effective.json ({e}); "
                   f"using hardware defaults.")
-    return {k: v for k, v in hparams.items() if k in _HPARAM_KEYS}
+    return hparams
 
 
 def _load_bounds(run_dir: Path, d: int, device: str, dtype: torch.dtype) -> torch.Tensor | None:
