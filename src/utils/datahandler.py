@@ -1310,23 +1310,49 @@ class DataHandler:
         centers, radii, M_list = self._penalty_regions()
         if centers is not None and centers.shape[0] > 0:
             for idx in range(centers.shape[0]):
-                center = centers[idx]  # (d,)
-                diff = X_flat - center.unsqueeze(0)  # (num_pts, d)
-
-                M = M_list[idx] if idx < len(M_list) else None
-                if M is not None and self.needle_B is not None:
-                    u = diff @ self.needle_B
-                    quad = (u @ M * u).sum(dim=-1)
-                    inside = quad <= 1.0
-                else:
-                    r = radii[idx].squeeze()
-                    inside = torch.norm(diff, dim=-1) <= r
-                penalized = penalized | inside
+                penalized = penalized | self._inside_region(X_flat, centers, radii, M_list, idx)
 
         if not is_2d:
             penalized = penalized.reshape(n, l)
 
         return ~penalized
+
+    def _inside_region(self, X_flat: torch.Tensor, centers: torch.Tensor, radii: torch.Tensor,
+                       M_list: List[Optional[torch.Tensor]], idx: int) -> torch.Tensor:
+        """(n,) bool: which rows of ``X_flat`` lie inside penalised region ``idx``.
+
+        Ellipsoid ``u^T M u <= 1`` in the tangent basis when the region has one,
+        otherwise the Euclidean sphere of its radius.
+        """
+        diff = X_flat - centers[idx].unsqueeze(0)  # (num_pts, d)
+        M = M_list[idx] if idx < len(M_list) else None
+        if M is not None and self.needle_B is not None:
+            u = diff @ self.needle_B
+            return (u @ M * u).sum(dim=-1) <= 1.0
+        return torch.norm(diff, dim=-1) <= radii[idx].squeeze()
+
+    def penalty_coverage(self, X: torch.Tensor) -> Tuple[float, float]:
+        """Fraction of ``X`` (n, d) inside (any penalised region, a needle region).
+
+        With ``X`` a uniform sample of the search space these are Monte Carlo
+        estimates of the fraction of the space's volume that is penalised in
+        total, and by needle zones alone (the rest is exclusion zones).
+        Overlapping regions count once.
+        """
+        X = X.to(device=self.device, dtype=self.dtype)
+        centers, radii, M_list = self._penalty_regions()
+        n_regions = centers.shape[0] if centers is not None else 0
+        if n_regions == 0 or X.shape[0] == 0:
+            return 0.0, 0.0
+        n_needles = self.needles.shape[0] if self.needles is not None else 0
+        in_needle = torch.zeros(X.shape[0], dtype=torch.bool, device=self.device)
+        in_any = torch.zeros_like(in_needle)
+        for idx in range(n_regions):
+            inside = self._inside_region(X, centers, radii, M_list, idx)
+            in_any = in_any | inside
+            if idx < n_needles:
+                in_needle = in_needle | inside
+        return float(in_any.double().mean()), float(in_needle.double().mean())
 
     def _update_penalty_mask(self):
         """Recompute cached penalty mask for all stored points and purge pared set.

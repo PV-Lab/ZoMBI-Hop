@@ -31,7 +31,7 @@ from collections import Counter
 # Per-run plots shown as columns (file name -> column heading).
 SUMMARY_PLOTS: list[tuple[str, str]] = [
     ("convergence.png",    "convergence"),
-    ("needle_values.png",  "needle values"),
+    ("penalized_space.png", "% space penalised"),
     ("conet.png",          "conet"),
     ("conet_uniform.png",  "conet uniform"),
 ]
@@ -119,21 +119,20 @@ def avg_lines_per_activation(run_dir: str | None) -> float | None:
     return mean_full_activations(lines_per_activation(run_dir))
 
 
-def ensure_needle_values_plot(run_dir: str | None) -> None:
-    """Generate ``needle_values.png`` for a run that predates it (best-effort).
+def ensure_penalized_space_plot(run_dir: str | None) -> None:
+    """Generate ``penalized_space.png`` from the run's CSVs if it is missing (best-effort).
 
-    The plot is derived entirely from the run's CSVs plus its
-    ``ensemble_config.json``, so finished runs can be backfilled without re-running
-    the optimizer.
+    Only possible for runs whose ``metrics_over_time.csv`` has the
+    ``pct_space_penalized`` columns; older runs are left without the plot.
     """
-    if not run_dir or os.path.isfile(os.path.join(run_dir, "needle_values.png")):
+    if not run_dir or os.path.isfile(os.path.join(run_dir, "penalized_space.png")):
         return
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import plot_metrics
-        plot_metrics.plot_needle_values(run_dir)
+        plot_metrics.plot_penalized_space(run_dir)
     except Exception as exc:
-        print(f"  needle_values plot failed for {run_dir}: {exc}")
+        print(f"  penalized_space plot failed for {run_dir}: {exc}")
 
 
 def _read_json(path: str) -> dict:
@@ -803,7 +802,7 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
                     continue
                 # Only repeat 1 is rendered, so it is the only one worth backfilling.
                 if rep == 1:
-                    ensure_needle_values_plot(run_dir)
+                    ensure_penalized_space_plot(run_dir)
                 act_lines = lines_per_activation(run_dir)
                 dist = met.get("dist_to_needles")
                 if not legacy_dist:

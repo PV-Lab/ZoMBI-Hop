@@ -2190,10 +2190,15 @@ def write_metrics_over_time_csv(path: str, payloads: list[dict], X_all: np.ndarr
             "pct_matched":      round(metric_pct_matched_comp(disc, true_optima, dim=dim), 4),
             "avg_pairwise_dist":round(metric_avg_pairwise_dist(disc), 6),
             "recent_needle_value": (round(recent, 6) if not math.isnan(recent) else np.nan),
+            "pct_space_penalized": p.get("pct_space_penalized", np.nan),
+            "pct_space_penalized_needles": p.get("pct_space_penalized_needles", np.nan),
         })
     cols = ["iteration", "activation", "n_needles", "dist_to_needles", "dup_fraction",
             "pct_matched_comp", "pct_matched",
             "avg_pairwise_dist", "recent_needle_value"]
+    # Only callers that measure coverage (evaluate.py) get the coverage columns.
+    if any("pct_space_penalized" in p for p in payloads):
+        cols += ["pct_space_penalized", "pct_space_penalized_needles"]
     pd.DataFrame(rows, columns=cols).to_csv(path, index=False)
 
 

@@ -517,8 +517,11 @@ def resolve_for_run(passed: dict, run_config: Optional[dict] = None) -> dict:
 def repair_conflicts(hp: dict) -> tuple[dict, list[str]]:
     """Move ``hp`` onto the nearest configuration ``conflicts`` accepts.
 
-    For MOBO, which samples a box that contains infeasible corners, and for
-    re-evaluating recorded trials. Each fix lowers the requirement rather than
+    ONLY for MOBO, which samples a box that contains infeasible corners and records
+    the repaired point it actually ran. Anything a person supplies (a config file,
+    a showdown, a GUI launch or live edit) must instead be refused with
+    ``check_conflicts`` — running a config other than the one asked for, however
+    close, is a silent substitution. Each fix lowers the requirement rather than
     raising the budget, so a repaired config never costs more lines than the
     sampled one. Returns ``(hp, notes)``.
     """
