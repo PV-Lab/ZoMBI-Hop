@@ -4,6 +4,7 @@ ZoMBI-Hop: Zooming Multi-Basin Identification with Hopping
 
 A novel Bayesian optimization algorithm for discovering multiple optima
 in simplex-constrained spaces, designed for materials research applications.
+Also runs on axis-aligned boxes: pass ``domain=BoxDomain()`` (src/utils/domain.py).
 """
 
 import threading
@@ -15,15 +16,23 @@ from ..utils.simplex import (
     proj_simplex,
     random_simplex,
     random_zero_sum_directions,
+    radius_for_simplex_fraction,
     Ellipsoid,
 )
 from ..utils.datahandler import DataHandler
+from ..utils.domain import Domain, make_domain, _bounds_jaccard_simplex  # noqa: F401 — re-exported
 from ..utils.gp_simplex import GPSimplex
 from .hparam_live import (
     apply_pending as apply_pending_hparams,
     write_effective as write_effective_hparams,
 )
 from . import retro
+from ..hparams import (
+    ALL_DEFAULTS as _HP,
+    check_conflicts,
+    lines_per_activation,
+    owned_by as _hparams_owned_by,
+)
 
 
 # --- CUDA optimization settings (when CUDA is available) ---
@@ -44,46 +53,13 @@ def _is_global_bounds(bounds: torch.Tensor, eps: float = 0.01) -> bool:
     return bounds[0].max().item() < eps and bounds[1].min().item() > 1.0 - eps
 
 
-def _bounds_jaccard_simplex(
-    bounds_a: torch.Tensor,
-    bounds_b: torch.Tensor,
-    n_samples: int = 500,
-    device: torch.device = None,
-    dtype: torch.dtype = None,
-) -> float:
-    """
-    Jaccard overlap of two AABB boxes restricted to the simplex, estimated via Monte Carlo.
-
-    Samples uniformly from the simplex; counts what fraction fall inside each box;
-    returns  |A ∩ B| / |A ∪ B|  (both sets restricted to the simplex).
-    """
-    d = bounds_a.shape[1]
-    kw: dict = {}
-    if device is not None:
-        kw["device"] = device
-    if dtype is not None:
-        kw["dtype"] = dtype
-    # Uniform Dirichlet samples
-    u = torch.rand(n_samples, d, **kw).clamp(min=1e-9)
-    u = u / u.sum(dim=1, keepdim=True)
-
-    def _in_box(pts, lo, hi):
-        return ((pts >= lo.unsqueeze(0)) & (pts <= hi.unsqueeze(0))).all(dim=1)
-
-    in_a = _in_box(u, bounds_a[0], bounds_a[1])
-    in_b = _in_box(u, bounds_b[0], bounds_b[1])
-    n_a = in_a.sum().item()
-    n_b = in_b.sum().item()
-    n_ab = (in_a & in_b).sum().item()
-    denom = n_a + n_b - n_ab
-    return 0.0 if denom == 0 else n_ab / denom
-
-
 class ZoMBIHop:
     """
     Zooming Multi-Basin Identification with Hopping.
 
     Trust regions are ellipsoids on the simplex in tangent space (see ``Ellipsoid``).
+    The search domain defaults to the simplex; ``domain=BoxDomain()`` runs the same
+    algorithm on a box (see src/utils/domain.py).
     """
 
     def __init__(self,
@@ -94,21 +70,20 @@ class ZoMBIHop:
                  proj_fn: Optional[Callable] = None,
                  random_sampler: Optional[Callable] = None,
                  random_direction_sampler: Optional[Callable] = None,
-                 max_zooms: int = 3,
-                 max_iterations: int = 10,
-                 top_m_points: Optional[int] = None,
-                 n_restarts: int = 30,
-                 raw: int = 500,
-                 convergence_pi_threshold: float = 0.01,  # deprecated/ignored: convergence now uses Expected Improvement vs the output-noise floor
-                 input_noise_threshold_mult: float = 3.0,
-                 output_noise_threshold_mult: float = 2.0,
-                 n_consecutive_converged: int = 2,
-                 max_gp_points: int = 3000,
-                 repulsion_lambda: Optional[float] = None,
-                 acquisition_type: str = "ucb",
-                 ucb_beta: float = 0.1,
-                 nat_grad_step: float = 0.02,
-                 nat_grad_max_steps: int = 50,
+                 max_zooms: int = _HP["max_zooms"],
+                 max_iterations: int = _HP["max_iterations"],
+                 top_m_points: Optional[int] = _HP["top_m_points"],
+                 n_restarts: int = _HP["n_restarts"],
+                 raw: int = _HP["raw"],
+                 input_noise_threshold_mult: float = _HP["input_noise_threshold_mult"],
+                 output_noise_threshold_mult: float = _HP["output_noise_threshold_mult"],
+                 n_consecutive_converged: int = _HP["n_consecutive_converged"],
+                 max_gp_points: int = _HP["max_gp_points"],
+                 repulsion_lambda: Optional[float] = _HP["repulsion_lambda"],
+                 acquisition_type: str = _HP["acquisition_type"],
+                 ucb_beta: float = _HP["ucb_beta"],
+                 nat_grad_step: float = _HP["nat_grad_step"],
+                 nat_grad_max_steps: int = _HP["nat_grad_max_steps"],
                  device: str = 'cuda',
                  dtype: torch.dtype = torch.float64,
                  bounds: Optional[torch.Tensor] = None,
@@ -119,33 +94,45 @@ class ZoMBIHop:
                  max_snapshots: Optional[int] = None,
                  verbose: bool = True,
                  needle_plot_points_ref: Optional[List[Any]] = None,
-                 ellipsoid_drop_fraction: float = 0.25,
-                 ellipsoid_eigenvalue_floor: float = 1e-6,
-                 max_penalty_radius: float = 1.0,
-                 paring_spatial_halfnoise: float = 0.5,
-                 paring_y_noise_multiplier: float = 1.0,
-                 input_noise: float = 0.128,
-                 input_noise_ilr: Optional[float] = None,
-                 needle_shrink_factor: float = 0.85,
-                 needle_stop_noise_multiplier: float = 3.0,
-                 zoom_jaccard_threshold: float = 0.75,
-                 bounds_shrink_factor: float = 0.8,
-                 min_axis_noise_mult: float = 2.0,
-                 jaccard_window: int = 3,
-                 jaccard_threshold: float = 0.9,
-                 min_zoom_for_needle: int = 2,
-                 min_iters_per_zoom: int = 3,
-                 needle_min_repeats: int = 5,
-                 needle_repeat_radius_frac: float = 0.10,
-                 max_lines_per_activation: int = 30):
+                 ellipsoid_drop_fraction: float = _HP["ellipsoid_drop_fraction"],
+                 ellipsoid_eigenvalue_floor: float = _HP["ellipsoid_eigenvalue_floor"],
+                 max_penalty_radius: float = _HP["max_penalty_radius"],
+                 max_penalty_fraction: float = _HP["max_penalty_fraction"],
+                 paring_spatial_halfnoise: float = _HP["paring_spatial_halfnoise"],
+                 paring_y_noise_multiplier: float = _HP["paring_y_noise_multiplier"],
+                 input_noise: float = _HP["input_noise"],
+                 needle_shrink_factor: float = _HP["needle_shrink_factor"],
+                 needle_stop_noise_multiplier: float = _HP["needle_stop_noise_multiplier"],
+                 zoom_jaccard_threshold: float = _HP["zoom_jaccard_threshold"],
+                 jaccard_window: int = _HP["jaccard_window"],
+                 jaccard_threshold: float = _HP["jaccard_threshold"],
+                 min_zoom_for_needle: int = _HP["min_zoom_for_needle"],
+                 min_iters_per_zoom: int = _HP["min_iters_per_zoom"],
+                 needle_min_repeats: int = _HP["needle_min_repeats"],
+                 needle_repeat_radius_frac: float = _HP["needle_repeat_radius_frac"],
+                 domain: Optional[Domain] = None):
         """Initialize ZoMBIHop optimizer.
 
-        Search-discipline constraints (hard, not tuned):
+        Every hyperparameter is declared — type, valid range, meaning, and whether
+        MOBO tunes it — in ``src/hparams.py``; the defaults here are the shipped
+        values from there. A configuration that makes needles impossible (see
+        ``src.hparams.conflicts``) raises ``HyperparameterConflict``, checked
+        against the values actually in force — after a resume has restored the
+        run's own config.json.
+
+        ``domain`` selects the search geometry: ``None`` / "simplex" (default,
+        compositions summing to 1) or "box" / ``BoxDomain(...)`` (a hyper-rectangle,
+        by default the unit cube). It supplies the defaults for ``proj_fn``,
+        ``random_sampler`` and ``random_direction_sampler`` (explicit arguments still
+        win), for ``bounds``, and the ascent step, ellipsoid basis, boundary penalty
+        and zoom-overlap estimate used internally.
+
+        Search-discipline gates on declaring a needle:
           * ``needle_min_repeats`` / ``needle_repeat_radius_frac`` — the
             REPEATABILITY GATE. A needle may only be declared at a point that has
             at least ``needle_min_repeats`` OTHER unpenalised measurements within
-            ``needle_repeat_radius_frac`` of the composition range in L2 (default
-            5 within an absolute 0.10; see ``_repeat_radius``). A single high reading is a noise spike until
+            ``needle_repeat_radius_frac`` in composition L2 (see
+            ``_repeat_radius``). A single high reading is a noise spike until
             the neighbourhood repeats it, so an ungated declaration plants needles
             on outliers. When the gate is not met the optimiser keeps sampling and
             re-tests on the next line. When it IS met, the declared point is not
@@ -157,39 +144,39 @@ class ZoMBIHop:
             it: depth buys a tighter region to declare in, repeatability buys
             confidence that the point in it is real.
           * ``min_zoom_for_needle`` — a needle may only be declared once the
-            search has zoomed to this 0-indexed level or deeper (default 2 ⇒
-            the log's "Zoom 3" and beyond). Zoom index 0 is the full search box,
-            so the level index equals the number of zoom-ins performed: the
-            default forces the optimiser to zoom in at least TWICE before it can
-            localise an optimum, and ``max_zooms`` must be > this to be able to
-            reach it at all.
+            search has zoomed to this 0-indexed level or deeper (2 ⇒ the log's
+            "Zoom 3" and beyond). Zoom index 0 is the full search box, so the
+            level index equals the number of zoom-ins performed. ``max_zooms``
+            must be > this to be able to reach it at all.
           * ``min_iters_per_zoom`` — at least this many objective lines must be
             sampled at the current zoom level before the optimiser may declare a
-            needle or zoom in/out from it (default 3).
-          * ``max_lines_per_activation`` — hard ceiling on objective lines
-            measured in one activation (default 30). Without it an activation's
-            cost is bounded only by ``max_zooms × max_iterations`` multiplied by
-            however many times the failure-retry path re-enters the same zoom,
-            which in practice produced single activations of 130+ lines (~3200
-            measurements) grinding on one unfruitful region. On reaching the cap
-            the activation ends and the region it was stuck in is penalised (see
-            ``_penalize_capped_zone``) so the next activation is repelled from it
-            rather than converging straight back in.
+            needle or zoom in early from it. Must be <= ``max_iterations``.
+
+        Activation line budget (``max_lines_per_activation``, derived, not set):
+        ``max_zooms × max_iterations`` — every zoom level run to completion.
+        The failure-retry path re-enters a zoom without advancing it, which used
+        to let single activations run to 130+ lines (~3200 measurements) on one
+        unfruitful region; the budget stops that. An activation that spends its
+        budget, runs out of zoom levels, or runs out of novel zoom windows without
+        declaring a needle has its region penalised (``_penalize_capped_zone``),
+        so the next activation is repelled from it rather than converging
+        straight back in.
         """
         self.device = torch.device(device)
         self.dtype = dtype
         self.verbose = verbose
 
         d = X_init_actual.shape[1]
+        self.domain = make_domain(domain)
 
         # Per-dimension search box (2, d): row 0 = lower, row 1 = upper. Defaults to
-        # the full [0,1]^d simplex, but callers may pass a tighter box (e.g. a dim
-        # constrained to [0, 0.3]). Every "reset to the full simplex" throughout the
-        # optimiser resets to THIS box, and _is_global_bounds tests against it — so a
-        # tightened box is the true global region, not [0,1]^d.
+        # the domain's full box ([0,1]^d for the simplex and the unit cube), but
+        # callers may pass a tighter box (e.g. a dim constrained to [0, 0.3]). Every
+        # "reset to the full simplex" throughout the optimiser resets to THIS box, and
+        # _is_global_bounds tests against it — so a tightened box is the true global
+        # region, not [0,1]^d.
         if bounds is None:
-            full_bounds = torch.zeros(2, d, device=self.device, dtype=self.dtype)
-            full_bounds[1] = 1.0
+            full_bounds = self.domain.default_bounds(d, self.device, self.dtype)
         else:
             full_bounds = torch.as_tensor(bounds, device=self.device, dtype=self.dtype).clone()
             assert full_bounds.shape == (2, d), \
@@ -202,11 +189,10 @@ class ZoMBIHop:
         self.ellipsoid_drop_fraction = ellipsoid_drop_fraction
         self.ellipsoid_eigenvalue_floor = ellipsoid_eigenvalue_floor
         self.max_penalty_radius = max_penalty_radius
+        self.max_penalty_fraction = float(max_penalty_fraction)
         self.needle_shrink_factor = float(needle_shrink_factor)
         self.needle_stop_noise_multiplier = float(needle_stop_noise_multiplier)
         self.zoom_jaccard_threshold = float(zoom_jaccard_threshold)
-        self.bounds_shrink_factor = float(bounds_shrink_factor)
-        self.min_axis_noise_mult = float(min_axis_noise_mult)
         self.min_zoom_for_needle = int(min_zoom_for_needle)
         self.min_iters_per_zoom = int(min_iters_per_zoom)
         self.needle_min_repeats = int(needle_min_repeats)
@@ -215,7 +201,6 @@ class ZoMBIHop:
         # "keep sampling" (gate not met) and "leave this zoom" (nothing here).
         self.last_needle_status = "ok"
         self.needle_repeat_radius_frac = float(needle_repeat_radius_frac)
-        self.max_lines_per_activation = int(max_lines_per_activation)
 
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
@@ -223,11 +208,11 @@ class ZoMBIHop:
                 print(f"Initialized ZoMBIHop on CUDA device: {torch.cuda.get_device_name()}")
                 print(f"Initial CUDA memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
-        # Simplex utilities (functions; not checkpointable)
-        self.proj_fn = proj_fn if proj_fn is not None else proj_simplex
-        self.random_sampler = random_sampler if random_sampler is not None else random_simplex
+        # Domain utilities (functions; not checkpointable)
+        self.proj_fn = proj_fn if proj_fn is not None else self.domain.project
+        self.random_sampler = random_sampler if random_sampler is not None else self.domain.sample
         self.random_direction_sampler = (random_direction_sampler if random_direction_sampler is not None
-                                         else random_zero_sum_directions)
+                                         else self.domain.directions)
         self.objective = objective
 
         if top_m_points is None:
@@ -249,7 +234,6 @@ class ZoMBIHop:
             top_m_points=top_m_points,
             n_restarts=n_restarts,
             raw=raw,
-            convergence_pi_threshold=convergence_pi_threshold,
             input_noise_threshold_mult=input_noise_threshold_mult,
             output_noise_threshold_mult=output_noise_threshold_mult,
             n_consecutive_converged=n_consecutive_converged,
@@ -269,11 +253,14 @@ class ZoMBIHop:
             paring_spatial_halfnoise=paring_spatial_halfnoise,
             paring_y_noise_multiplier=paring_y_noise_multiplier,
             input_noise=input_noise,
-            input_noise_ilr=input_noise_ilr,
             jaccard_window=jaccard_window,
             jaccard_threshold=jaccard_threshold,
             verbose=verbose,
         )
+        # config.json records ZoMBIHop's own hyperparameters too, so a resume (and a
+        # live edit persisted by hparam_live) restores the whole configuration.
+        self.data_handler.extra_config = lambda: {
+            name: getattr(self, name) for name in _hparams_owned_by("zombi")}
 
         # Resume from snapshot or start fresh
         if do_resume:
@@ -282,6 +269,7 @@ class ZoMBIHop:
             activation, zoom, iteration, _ = self.data_handler.load_state()
             if self.verbose:
                 print(f"Loaded state: activation={activation}, zoom={zoom}, iteration={iteration}")
+            self._restore_own_hparams(self.data_handler.loaded_config)
         else:
             if self.verbose:
                 print(f"Starting new run with UUID: {self.data_handler.run_uuid}")
@@ -302,6 +290,11 @@ class ZoMBIHop:
 
         # self.bounds is a convenience alias; always kept in sync with data_handler.bounds
         self.bounds = self.data_handler.bounds
+
+        # Checked on the values actually in force: on a resume those are the run's
+        # own config.json, not what the caller passed.
+        check_conflicts(self.hparams_in_force(),
+                        context=f"run {self.data_handler.run_uuid}" if do_resume else "")
 
         # Resuming a checkpoint that has no saved bounds (e.g. the run crashed before
         # writing its first snapshot, so load_state restored only the iteration
@@ -327,6 +320,19 @@ class ZoMBIHop:
         # case — including a caller-tightened box such as [0, 0.3] on one axis — so
         # set it unconditionally rather than relying on the checkpoint.
         self.data_handler._full_bounds_ref = self.full_bounds.clone()
+        self.data_handler.domain = self.domain
+
+        # A checkpoint's ellipsoids are expressed in its domain's tangent basis —
+        # (d, d-1) on the simplex, (d, d) on a box — so resuming it under the other
+        # domain would silently misread every penalty region. Refuse instead.
+        saved_B = self.data_handler.needle_B
+        if saved_B is not None:
+            expected_k = self.domain.tangent_basis(d, self.device, self.dtype).shape[1]
+            if saved_B.shape[1] != expected_k:
+                raise ValueError(
+                    f"checkpoint ellipsoid basis is {tuple(saved_B.shape)} but "
+                    f"{self.domain!r} uses ({d}, {expected_k}); resume the run with "
+                    f"the domain it was started with.")
 
         # GP handler
         self.gp_handler = GPSimplex(
@@ -343,6 +349,7 @@ class ZoMBIHop:
             device=str(self.device),
             dtype=self.dtype,
             verbose=self.verbose,
+            domain=self.domain,
         )
 
     # --- Properties (expose data handler state) ---
@@ -368,6 +375,54 @@ class ZoMBIHop:
     def d(self) -> int:
         return self.data_handler.d
 
+    @property
+    def max_lines_per_activation(self) -> int:
+        """Line budget of one activation, ``max_zooms × max_iterations``.
+
+        Read live, so an operator's edit to either knob moves the budget with it.
+        """
+        dh = self.data_handler
+        return lines_per_activation({"max_zooms": dh.max_zooms,
+                                     "max_iterations": dh.max_iterations})
+
+    @property
+    def penalty_axis_cap(self) -> float:
+        """Cap on every semi-axis of a needle or exclusion ellipsoid.
+
+        The smaller of ``max_penalty_radius`` and the radius of a ball holding
+        ``max_penalty_fraction`` of the simplex. The second is what keeps one
+        zone from swallowing most of a high-dimensional simplex: a 0.5 radius
+        covers ~60% of the 6-d simplex from a typical centre. Read live, so an
+        operator's edit to either knob applies to the next ellipsoid fitted.
+        """
+        return min(float(self.max_penalty_radius),
+                   radius_for_simplex_fraction(self.d, self.max_penalty_fraction))
+
+    def hparams_in_force(self) -> dict:
+        """Every hyperparameter's current value, read from where the loop reads it."""
+        out = {name: getattr(self.data_handler, name)
+               for name in _hparams_owned_by("dh")}
+        out.update({name: getattr(self, name) for name in _hparams_owned_by("zombi")})
+        return out
+
+    def _restore_own_hparams(self, cfg: Optional[dict]) -> None:
+        """On resume, take ZoMBIHop-owned hyperparameters from the run's config.json.
+
+        Mirrors what DataHandler.load_state does for its own knobs, so the whole
+        configuration — including live edits made before the stop — carries over.
+        Runs whose config.json predates this (2026-10-12) recorded none of these,
+        and keep the values passed to the constructor.
+        """
+        if not cfg:
+            return
+        restored = []
+        for name in _hparams_owned_by("zombi"):
+            if name in cfg and cfg[name] != getattr(self, name):
+                restored.append(f"{name}={cfg[name]}")
+                setattr(self, name, cfg[name])
+        if restored and self.verbose:
+            print("Restored from config.json: " + ", ".join(restored))
+
     def _is_global_bounds(self, bounds: torch.Tensor, eps: float = 0.01) -> bool:
         """True when ``bounds`` essentially equals the configured search box.
 
@@ -380,8 +435,8 @@ class ZoMBIHop:
                 torch.abs(bounds[1] - fb[1]).max().item() < eps)
 
     def _all_needle_axes_below_min(self, dh) -> bool:
-        """True when every semi-axis is below min_axis_noise_mult × input_noise."""
-        threshold = self.min_axis_noise_mult * dh.input_noise
+        """True when every semi-axis is below needle_stop_noise_multiplier × input_noise."""
+        threshold = self.needle_stop_noise_multiplier * dh.input_noise
         if threshold <= 0:
             return False
         for M in dh.needle_M_list:
@@ -407,7 +462,7 @@ class ZoMBIHop:
         Case 2 — subsequent failure after objective was called: recompute zoom
           bounds with Jaccard-aware determine_new_bounds(add_to_history=False).
         Case 3 — subsequent failure with no new data: shrink radii; terminate
-          when all axes fall below min_axis_noise_mult × input_noise.
+          when all axes fall below needle_stop_noise_multiplier × input_noise.
         """
         n_needles = dh.needles.shape[0] if dh.needles is not None else 0
 
@@ -423,7 +478,7 @@ class ZoMBIHop:
                         max_gp_points=dh.max_gp_points,
                         drop_fraction=self.ellipsoid_drop_fraction,
                         eigenvalue_floor=self.ellipsoid_eigenvalue_floor,
-                        max_penalty_radius=self.max_penalty_radius,
+                        max_penalty_radius=self.penalty_axis_cap,
                     )
                     dh.update_all_needle_radii(new_M_list)
                     self._log(f"  [failure] ellipsoids recomputed for {n_needles} needle(s).")
@@ -439,9 +494,9 @@ class ZoMBIHop:
                                     needle=dh.needles[i],
                                     drop_fraction=self.ellipsoid_drop_fraction,
                                     eigenvalue_floor=self.ellipsoid_eigenvalue_floor,
-                                    max_radius=self.max_penalty_radius,
+                                    max_radius=self.penalty_axis_cap,
                                 )
-                                dh.needle_M_list[i] = M_new
+                                dh.set_needle_ellipsoid(i, M_new)
                             except Exception as e2:
                                 self._log(f"  [failure] pared refit needle {i} failed: {e2}")
                         dh._update_penalty_mask()
@@ -461,9 +516,9 @@ class ZoMBIHop:
                 self._log("  [failure] all needle axes below noise floor — stopping.")
                 return True, True
             self._log(
-                f"  [failure] no new data — shrinking radii by factor {self.bounds_shrink_factor:.2f} ..."
+                f"  [failure] no new data — shrinking radii by factor {self.needle_shrink_factor:.2f} ..."
             )
-            dh.shrink_all_needle_radii(self.bounds_shrink_factor)
+            dh.shrink_all_needle_radii(self.needle_shrink_factor)
             max_r = dh.max_needle_radius()
             self._log(f"  [failure] max needle radius after shrink: {max_r:.4f}")
             if self._all_needle_axes_below_min(dh):
@@ -631,7 +686,7 @@ class ZoMBIHop:
             needle=needle_X,
             drop_fraction=self.ellipsoid_drop_fraction,
             eigenvalue_floor=self.ellipsoid_eigenvalue_floor,
-            max_radius=self.max_penalty_radius,
+            max_radius=self.penalty_axis_cap,
         )
         self._log(f"  [declare] ellipsoid: {time.time()-_t0:.2f}s")
         self._log("Penalizing with Hessian ellipsoid.")
@@ -1075,6 +1130,7 @@ class ZoMBIHop:
         dh.needle_indices = torch.empty((0, 1), device=dev, dtype=torch.int64)
         dh.needle_penalty_radii = torch.empty((0, 1), device=dev, dtype=dt)
         dh.needle_M_list = []
+        dh.needle_shrink_scale = []
         dh.needle_B = None
         dh.needles_results = []
         dh.exclusions = torch.empty((0, d), device=dev, dtype=dt)
@@ -1083,11 +1139,12 @@ class ZoMBIHop:
         dh._update_penalty_mask()
 
     def _penalize_capped_zone(self, dh, bounds: torch.Tensor) -> bool:
-        """Penalise the region an activation burned its whole line budget in.
+        """Penalise the region an activation spent itself in without a needle.
 
         Counterpart to ``_declare_needle_at_best``: same ellipsoid machinery, but
-        recorded as an *exclusion zone* rather than a needle. Hitting the cap means
-        the search kept re-converging somewhere without ever satisfying the needle
+        recorded as an *exclusion zone* rather than a needle. Ending an activation
+        this way (line budget spent, zoom levels exhausted, or no novel zoom window)
+        means the search kept working one region without ever satisfying the needle
         criteria — that is a statement about where NOT to look again, not a
         discovered optimum, so it must not enter the needle record (``needles.csv``
         and every metric derived from it, e.g. dist_to_needles).
@@ -1117,7 +1174,7 @@ class ZoMBIHop:
                         needle=center,
                         drop_fraction=self.ellipsoid_drop_fraction,
                         eigenvalue_floor=self.ellipsoid_eigenvalue_floor,
-                        max_radius=self.max_penalty_radius,
+                        max_radius=self.penalty_axis_cap,
                     )
             except Exception as e:
                 self._log(f"  [cap] ellipsoid fit failed ({e}) — falling back to a sphere.")
@@ -1127,12 +1184,11 @@ class ZoMBIHop:
                 dh.add_exclusion(center=center, M=M_excl, B=B_excl)
             else:
                 # Sphere fallback: half the diagonal of the bounds the activation
-                # was working in — literally "the zone it was stuck in". NOT
-                # max_penalty_radius, which caps an ellipsoid SEMI-AXIS; read as a
-                # sphere radius its default of 1.0 exceeds the simplex diameter
-                # (√2) and would penalise the entire search space in one go.
+                # was working in — literally "the zone it was stuck in" — capped
+                # like any ellipsoid semi-axis, so it too covers at most
+                # max_penalty_fraction of the simplex.
                 r = 0.5 * torch.norm(bounds[1] - bounds[0]).item()
-                r = min(r, float(self.max_penalty_radius))
+                r = min(r, self.penalty_axis_cap)
                 dh.add_exclusion(center=center, M=None, radius=r)
             _y = center_Y.item() if torch.is_tensor(center_Y) else center_Y
             self._log(f"  [cap] exclusion zone added at {center.cpu().numpy()} "
@@ -1244,7 +1300,7 @@ class ZoMBIHop:
         X_actual = X_actual.to(device=self.device, dtype=self.dtype)
         Y = Y.to(device=self.device, dtype=self.dtype)
 
-        # Project actual measurements onto the simplex so off-simplex apparatus
+        # Project actual measurements onto the domain so off-domain apparatus
         # noise doesn't corrupt stored data, distance calculations, or needle positions.
         X_actual = self.proj_fn(X_actual)
 
@@ -1464,6 +1520,8 @@ class ZoMBIHop:
             # Set when the zoom loop runs out of unsearched territory (see the MC
             # Jaccard guard). Ends the activation on the same terms as the line cap.
             no_novel_window = False
+            # Set when the deepest zoom level finishes its lines without a needle.
+            zooms_exhausted = False
             consecutive_converged = 0
             best_f_local: float = float('-inf')
             zoom_bounds_history: List[torch.Tensor] = []
@@ -1815,7 +1873,7 @@ class ZoMBIHop:
                     if not self._is_global_bounds(new_bounds):
                         repeated_jac = 0.0
                         for prev_bounds in zoom_bounds_history:
-                            jac = _bounds_jaccard_simplex(
+                            jac = self.domain.region_jaccard(
                                 new_bounds, prev_bounds, device=self.device, dtype=self.dtype
                             )
                             if jac > self.zoom_jaccard_threshold:
@@ -1853,28 +1911,34 @@ class ZoMBIHop:
                     current_zoom += 1
                     start_iteration = 0
                 else:
+                    zooms_exhausted = True
                     break  # exhausted all zoom levels without needle
+            else:
+                # Loop condition failed rather than a break: an operator lowered
+                # max_zooms below the level this activation had reached.
+                if not finished and needle is None:
+                    zooms_exhausted = True
 
-            # Activation ended without a needle — either it spent its whole line
-            # budget circling a region it never localised, or it ran out of novel
-            # zoom windows there. Both mean the same thing: this region absorbed
-            # measurements and produced nothing. Penalise it so the next activation
-            # is repelled from it instead of converging straight back in, and hand
-            # that activation the full simplex.
-            if (activation_capped or no_novel_window) and needle is None and not finished:
+            # Activation ended without a needle — it spent its whole line budget
+            # circling a region it never localised, ran out of novel zoom windows
+            # there, or ran every zoom level to completion without the needle
+            # criteria ever passing. All three mean the same thing: this region
+            # absorbed measurements and produced nothing. Penalise it so the next
+            # activation is repelled from it instead of converging straight back
+            # in, and hand that activation the full simplex.
+            if ((activation_capped or no_novel_window or zooms_exhausted)
+                    and needle is None and not finished):
                 if activation_capped:
-                    self._log(
-                        f"\n  [cap] activation {activation+1} hit the "
-                        f"{self.max_lines_per_activation}-line budget "
-                        f"({lines_this_activation} measured) without declaring a "
-                        f"needle — ending it and penalising the region."
-                    )
+                    why = (f"hit the {self.max_lines_per_activation}-line budget "
+                           f"({lines_this_activation} measured)")
+                elif no_novel_window:
+                    why = (f"ran out of novel zoom windows after "
+                           f"{lines_this_activation} line(s)")
                 else:
-                    self._log(
-                        f"\n  [cap] activation {activation+1} ran out of novel zoom "
-                        f"windows after {lines_this_activation} line(s) without "
-                        f"declaring a needle — ending it and penalising the region."
-                    )
+                    why = (f"finished all {dh.max_zooms} zoom level(s) "
+                           f"({lines_this_activation} line(s))")
+                self._log(f"\n  [cap] activation {activation+1} {why} without "
+                          f"declaring a needle — ending it and penalising the region.")
                 self._penalize_capped_zone(dh, bounds)
                 dh.take_snapshot(
                     f"act{activation}_z{zoom}_capped",

@@ -22,7 +22,7 @@ import uuid
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Union, Callable
 
-from .dataclasses import ZoMBIHopConfig
+from ..hparams import ALL_DEFAULTS as _HP, owned_by as _hparams_owned_by
 from .simplex import (
     Ellipsoid,
     proj_simplex,
@@ -48,10 +48,11 @@ class DataHandler:
     Parameters
     ----------
     max_zooms, max_iterations, top_m_points, n_restarts, raw,
-    convergence_pi_threshold, input_noise_threshold_mult,
-    output_noise_threshold_mult, n_consecutive_converged, max_gp_points,
-    repulsion_lambda, acquisition_type, ucb_beta, nat_grad_step,
-    nat_grad_max_steps : control variables
+    input_noise_threshold_mult, output_noise_threshold_mult,
+    n_consecutive_converged, max_gp_points, repulsion_lambda, acquisition_type,
+    ucb_beta, nat_grad_step, nat_grad_max_steps, paring_spatial_halfnoise,
+    paring_y_noise_multiplier, input_noise, jaccard_window, jaccard_threshold :
+        hyperparameters; see src/hparams.py. Defaults are the shipped values.
     directory : str, optional
         Base directory for snapshots. If None, no saving occurs.
     run_uuid : str, optional
@@ -61,31 +62,27 @@ class DataHandler:
     max_snapshots : int, optional
         Max snapshots to keep (None = keep all).
     device, dtype : compute settings
-    config : ZoMBIHopConfig or dict, optional
-        If provided, values override the individual keyword arguments.
-        Kept for backward compatibility.
     d : int, optional
         Dimensionality (auto-set in save_init).
     """
 
     def __init__(
         self,
-        # --- Control variables ---
-        max_zooms: int = 3,
-        max_iterations: int = 10,
-        top_m_points: Optional[int] = None,
-        n_restarts: int = 30,
-        raw: int = 500,
-        convergence_pi_threshold: float = 0.01,
-        input_noise_threshold_mult: float = 3.0,
-        output_noise_threshold_mult: float = 2.0,
-        n_consecutive_converged: int = 2,
-        max_gp_points: int = 3000,
-        repulsion_lambda: Optional[float] = None,
-        acquisition_type: str = "ucb",
-        ucb_beta: float = 0.1,
-        nat_grad_step: float = 0.02,
-        nat_grad_max_steps: int = 50,
+        # --- Hyperparameters (src/hparams.py) ---
+        max_zooms: int = _HP["max_zooms"],
+        max_iterations: int = _HP["max_iterations"],
+        top_m_points: Optional[int] = _HP["top_m_points"],
+        n_restarts: int = _HP["n_restarts"],
+        raw: int = _HP["raw"],
+        input_noise_threshold_mult: float = _HP["input_noise_threshold_mult"],
+        output_noise_threshold_mult: float = _HP["output_noise_threshold_mult"],
+        n_consecutive_converged: int = _HP["n_consecutive_converged"],
+        max_gp_points: int = _HP["max_gp_points"],
+        repulsion_lambda: Optional[float] = _HP["repulsion_lambda"],
+        acquisition_type: str = _HP["acquisition_type"],
+        ucb_beta: float = _HP["ucb_beta"],
+        nat_grad_step: float = _HP["nat_grad_step"],
+        nat_grad_max_steps: int = _HP["nat_grad_max_steps"],
         # --- Storage settings ---
         directory: Optional[str] = None,
         run_uuid: Optional[str] = None,
@@ -95,53 +92,23 @@ class DataHandler:
         # --- Compute settings ---
         device: str = 'cuda',
         dtype: torch.dtype = torch.float64,
-        # --- Backward compat ---
-        config: Optional[Union[ZoMBIHopConfig, Dict[str, Any]]] = None,
         d: Optional[int] = None,
         # --- Point paring ---
-        paring_spatial_halfnoise: float = 0.5,
-        paring_y_noise_multiplier: float = 1.0,
-        input_noise: Optional[float] = None,
-        input_noise_ilr: Optional[float] = None,
+        paring_spatial_halfnoise: float = _HP["paring_spatial_halfnoise"],
+        paring_y_noise_multiplier: float = _HP["paring_y_noise_multiplier"],
+        input_noise: float = _HP["input_noise"],
         # --- Jaccard sliding-window bounds ---
-        jaccard_window: int = 3,
-        jaccard_threshold: float = 0.9,
+        jaccard_window: int = _HP["jaccard_window"],
+        jaccard_threshold: float = _HP["jaccard_threshold"],
         # --- Logging ---
         verbose: bool = False,
     ):
-        # If a config object/dict is provided, extract values from it
-        if config is not None:
-            cfg = config if isinstance(config, ZoMBIHopConfig) else ZoMBIHopConfig.from_dict(config)
-            max_zooms = cfg.max_zooms
-            max_iterations = cfg.max_iterations
-            if cfg.top_m_points is not None:
-                top_m_points = cfg.top_m_points
-            n_restarts = cfg.n_restarts
-            raw = cfg.raw
-            convergence_pi_threshold = cfg.convergence_pi_threshold
-            input_noise_threshold_mult = cfg.input_noise_threshold_mult
-            output_noise_threshold_mult = cfg.output_noise_threshold_mult
-            n_consecutive_converged = cfg.n_consecutive_converged
-            max_gp_points = cfg.max_gp_points
-            repulsion_lambda = cfg.repulsion_lambda
-            acquisition_type = getattr(cfg, 'acquisition_type', acquisition_type)
-            ucb_beta = getattr(cfg, 'ucb_beta', ucb_beta)
-            nat_grad_step = getattr(cfg, 'nat_grad_step', nat_grad_step)
-            nat_grad_max_steps = getattr(cfg, 'nat_grad_max_steps', nat_grad_max_steps)
-            paring_spatial_halfnoise = getattr(cfg, 'paring_spatial_halfnoise', paring_spatial_halfnoise)
-            paring_y_noise_multiplier = getattr(cfg, 'paring_y_noise_multiplier', paring_y_noise_multiplier)
-            if getattr(cfg, 'input_noise', None) is not None:
-                input_noise = cfg.input_noise
-            elif getattr(cfg, 'input_noise_ilr', None) is not None:
-                input_noise = cfg.input_noise_ilr / 3.0
-
         # --- Store all control variables as plain attributes ---
         self.max_zooms = max_zooms
         self.max_iterations = max_iterations
         self.top_m_points = top_m_points
         self.n_restarts = n_restarts
         self.raw = raw
-        self.convergence_pi_threshold = convergence_pi_threshold
         self.input_noise_threshold_mult = input_noise_threshold_mult
         self.output_noise_threshold_mult = output_noise_threshold_mult
         self.n_consecutive_converged = n_consecutive_converged
@@ -155,18 +122,19 @@ class DataHandler:
         # Point paring
         self.paring_spatial_halfnoise = float(paring_spatial_halfnoise)
         self.paring_y_noise_multiplier = float(paring_y_noise_multiplier)
-        if input_noise is not None:
-            self.input_noise = float(input_noise)
-        elif input_noise_ilr is not None:
-            self.input_noise = float(input_noise_ilr) / 3.0
-        else:
-            self.input_noise = 0.128
+        self.input_noise = float(input_noise)
 
         # Jaccard sliding-window
         self.jaccard_window = int(jaccard_window)
         self.jaccard_threshold = float(jaccard_threshold)
 
         self.verbose = verbose
+
+        # Set by the owner (ZoMBIHop): returns the hyperparameters it keeps itself,
+        # so config.json records the whole configuration. load_state leaves the
+        # parsed file in loaded_config for the owner to restore those from.
+        self.extra_config: Optional[Callable[[], Dict[str, Any]]] = None
+        self.loaded_config: Optional[Dict[str, Any]] = None
 
         # Compute settings
         self.device = torch.device(device)
@@ -250,7 +218,14 @@ class DataHandler:
         # Per-needle ellipsoid parameters (None entry = fall back to sphere radius).
         # needle_B is shared across all needles (same simplex tangent space).
         self.needle_M_list: List[Optional[torch.Tensor]] = []  # each (d-1, d-1)
-        self.needle_B: Optional[torch.Tensor] = None           # (d, d-1)
+        self.needle_B: Optional[torch.Tensor] = None           # (d, d-1) simplex; (d, d) box
+        # Cumulative shrink applied to each needle's ellipsoid (1.0 = unshrunk).
+        # A refit (update_all_needle_radii / set_needle_ellipsoid) re-applies it, so
+        # territory handed back by a shrink stays handed back.
+        self.needle_shrink_scale: List[float] = []
+        # Search domain (src/utils/domain.py). Set by ZoMBIHop, like
+        # _full_bounds_ref; None ⇒ simplex. Only consulted for the fallback basis.
+        self.domain = None
 
         # --- Exclusion zones -------------------------------------------------
         # Penalised regions that are NOT needles: an activation that burns its
@@ -334,6 +309,7 @@ class DataHandler:
         self.needle_penalty_radii = torch.empty((0, 1), device=self.device, dtype=self.dtype)
         self.needle_M_list = []
         self.needle_B = None
+        self.needle_shrink_scale = []
 
         self.exclusions = torch.empty((0, self.d), device=self.device, dtype=self.dtype)
         self.exclusion_radii = torch.empty((0, 1), device=self.device, dtype=self.dtype)
@@ -348,30 +324,19 @@ class DataHandler:
             self.take_snapshot("init", permanent=True)
 
     def _save_config(self):
-        """Write config.json once at init (human-readable, for inspection)."""
-        config = {
-            'run_uuid': self.run_uuid,
-            'd': self.d,
-            'max_zooms': self.max_zooms,
-            'max_iterations': self.max_iterations,
-            'top_m_points': self.top_m_points,
-            'n_restarts': self.n_restarts,
-            'raw': self.raw,
-            'convergence_pi_threshold': self.convergence_pi_threshold,
-            'input_noise_threshold_mult': self.input_noise_threshold_mult,
-            'output_noise_threshold_mult': self.output_noise_threshold_mult,
-            'n_consecutive_converged': self.n_consecutive_converged,
-            'max_gp_points': self.max_gp_points,
-            'repulsion_lambda': self.repulsion_lambda,
-            'acquisition_type': self.acquisition_type,
-            'ucb_beta': self.ucb_beta,
-            'nat_grad_step': self.nat_grad_step,
-            'nat_grad_max_steps': self.nat_grad_max_steps,
-            'input_noise': self.input_noise,
-            'paring_spatial_halfnoise': self.paring_spatial_halfnoise,
-            'device': str(self.device),
-            'dtype': str(self.dtype),
-        }
+        """Write config.json: the run's identity plus every hyperparameter in force.
+
+        Rewritten on every live hyperparameter change (hparam_live), so it is the
+        run's record of its current settings. ``extra_config`` lets the owner add
+        the hyperparameters it keeps outside this handler (ZoMBIHop's own).
+        """
+        config = {'run_uuid': self.run_uuid, 'd': self.d}
+        for name in _hparams_owned_by("dh"):
+            config[name] = getattr(self, name)
+        if self.extra_config is not None:
+            config.update(self.extra_config())
+        config['device'] = str(self.device)
+        config['dtype'] = str(self.dtype)
         with open(self.run_dir / 'config.json', 'w') as f:
             json.dump(config, f, indent=2)
 
@@ -488,6 +453,8 @@ class DataHandler:
             'needle_penalty_radii': self.needle_penalty_radii,
             'needle_M_stack': needle_M_stack,
             'needle_has_M': needle_has_M,
+            'needle_shrink_scale': torch.tensor(self._needle_scales(), dtype=self.dtype,
+                                                device=self.device),
             'needle_B': self.needle_B,
             'exclusions': (self.exclusions if self.exclusions is not None
                            else torch.zeros(0, _d, device=self.device, dtype=self.dtype)),
@@ -617,21 +584,15 @@ class DataHandler:
             with open(config_path, encoding='utf-8-sig') as f:
                 cfg = json.load(f)
             self.d = cfg.get('d', self.d)
-            self.max_zooms = cfg.get('max_zooms', self.max_zooms)
-            self.max_iterations = cfg.get('max_iterations', self.max_iterations)
-            self.top_m_points = cfg.get('top_m_points', self.top_m_points)
-            self.n_restarts = cfg.get('n_restarts', self.n_restarts)
-            self.raw = cfg.get('raw', self.raw)
-            self.convergence_pi_threshold = cfg.get('convergence_pi_threshold', self.convergence_pi_threshold)
-            self.input_noise_threshold_mult = cfg.get('input_noise_threshold_mult', self.input_noise_threshold_mult)
-            self.output_noise_threshold_mult = cfg.get('output_noise_threshold_mult', self.output_noise_threshold_mult)
-            self.n_consecutive_converged = cfg.get('n_consecutive_converged', self.n_consecutive_converged)
-            self.max_gp_points = cfg.get('max_gp_points', self.max_gp_points)
-            self.repulsion_lambda = cfg.get('repulsion_lambda', self.repulsion_lambda)
-            self.acquisition_type = cfg.get('acquisition_type', self.acquisition_type)
-            self.ucb_beta = cfg.get('ucb_beta', self.ucb_beta)
-            self.nat_grad_step = cfg.get('nat_grad_step', self.nat_grad_step)
-            self.nat_grad_max_steps = cfg.get('nat_grad_max_steps', self.nat_grad_max_steps)
+            # Algorithm knobs come from the run's own record, so a resume continues
+            # the run it was (operators edit config.json to retune a stopped run).
+            # input_noise is the exception: it is a calibration of the apparatus,
+            # so the CURRENT measurement passed in by the caller wins.
+            for name in _hparams_owned_by("dh"):
+                if name != "input_noise" and name in cfg:
+                    setattr(self, name, cfg[name])
+            # The whole file, for the owner's own hyperparameters (ZoMBIHop).
+            self.loaded_config = cfg
 
         # Try new snapshot format first (latest.txt -> snapshots/)
         latest_path = self.run_dir / 'latest.txt'
@@ -821,6 +782,7 @@ class DataHandler:
             ]
         else:
             self.needle_M_list = []
+        self.needle_shrink_scale = self._restore_shrink_scale(d.get('needle_shrink_scale'))
 
         nb = d.get('needle_B')
         self.needle_B = nb.to(self.device, self.dtype) if isinstance(nb, torch.Tensor) else None
@@ -922,6 +884,8 @@ class DataHandler:
             ]
         else:
             self.needle_M_list = [None] * self.needles.shape[0]
+        self.needle_shrink_scale = self._restore_shrink_scale(
+            tensors.get('needle_shrink_scale', None))
 
         nb = tensors.get('needle_B', None)
         self.needle_B = nb.to(device=self.device, dtype=self.dtype) if nb is not None else None
@@ -1090,11 +1054,12 @@ class DataHandler:
 
         # Store ellipsoid (or None for sphere fallback)
         self.needle_M_list.append(M.to(device=self.device, dtype=self.dtype) if M is not None else None)
+        self.needle_shrink_scale = self._needle_scales() + [1.0]
         if M is not None:
             if B is not None:
                 self.needle_B = B.to(device=self.device, dtype=self.dtype)
             elif self.needle_B is None:
-                self.needle_B = get_tangent_basis(self.d, self.device, self.dtype)
+                self.needle_B = self._tangent_basis()
 
         self.needles_results.append({
             'point': needle.clone(),
@@ -1237,6 +1202,12 @@ class DataHandler:
     # Penalty mask
     # =========================================================================
 
+    def _tangent_basis(self) -> torch.Tensor:
+        """Ellipsoid basis for an M supplied without one: the domain's, else the simplex's."""
+        if self.domain is not None:
+            return self.domain.tangent_basis(self.d, self.device, self.dtype)
+        return get_tangent_basis(self.d, self.device, self.dtype)
+
     def _stack_optional_M(
         self, M_list: List[Optional[torch.Tensor]]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1326,7 +1297,7 @@ class DataHandler:
             if B is not None:
                 self.needle_B = B.to(device=self.device, dtype=self.dtype)
             elif self.needle_B is None:
-                self.needle_B = get_tangent_basis(self.d, self.device, self.dtype)
+                self.needle_B = self._tangent_basis()
 
         self._update_penalty_mask()
 
@@ -1359,23 +1330,49 @@ class DataHandler:
         centers, radii, M_list = self._penalty_regions()
         if centers is not None and centers.shape[0] > 0:
             for idx in range(centers.shape[0]):
-                center = centers[idx]  # (d,)
-                diff = X_flat - center.unsqueeze(0)  # (num_pts, d)
-
-                M = M_list[idx] if idx < len(M_list) else None
-                if M is not None and self.needle_B is not None:
-                    u = diff @ self.needle_B
-                    quad = (u @ M * u).sum(dim=-1)
-                    inside = quad <= 1.0
-                else:
-                    r = radii[idx].squeeze()
-                    inside = torch.norm(diff, dim=-1) <= r
-                penalized = penalized | inside
+                penalized = penalized | self._inside_region(X_flat, centers, radii, M_list, idx)
 
         if not is_2d:
             penalized = penalized.reshape(n, l)
 
         return ~penalized
+
+    def _inside_region(self, X_flat: torch.Tensor, centers: torch.Tensor, radii: torch.Tensor,
+                       M_list: List[Optional[torch.Tensor]], idx: int) -> torch.Tensor:
+        """(n,) bool: which rows of ``X_flat`` lie inside penalised region ``idx``.
+
+        Ellipsoid ``u^T M u <= 1`` in the tangent basis when the region has one,
+        otherwise the Euclidean sphere of its radius.
+        """
+        diff = X_flat - centers[idx].unsqueeze(0)  # (num_pts, d)
+        M = M_list[idx] if idx < len(M_list) else None
+        if M is not None and self.needle_B is not None:
+            u = diff @ self.needle_B
+            return (u @ M * u).sum(dim=-1) <= 1.0
+        return torch.norm(diff, dim=-1) <= radii[idx].squeeze()
+
+    def penalty_coverage(self, X: torch.Tensor) -> Tuple[float, float]:
+        """Fraction of ``X`` (n, d) inside (any penalised region, a needle region).
+
+        With ``X`` a uniform sample of the search space these are Monte Carlo
+        estimates of the fraction of the space's volume that is penalised in
+        total, and by needle zones alone (the rest is exclusion zones).
+        Overlapping regions count once.
+        """
+        X = X.to(device=self.device, dtype=self.dtype)
+        centers, radii, M_list = self._penalty_regions()
+        n_regions = centers.shape[0] if centers is not None else 0
+        if n_regions == 0 or X.shape[0] == 0:
+            return 0.0, 0.0
+        n_needles = self.needles.shape[0] if self.needles is not None else 0
+        in_needle = torch.zeros(X.shape[0], dtype=torch.bool, device=self.device)
+        in_any = torch.zeros_like(in_needle)
+        for idx in range(n_regions):
+            inside = self._inside_region(X, centers, radii, M_list, idx)
+            in_any = in_any | inside
+            if idx < n_needles:
+                in_needle = in_needle | inside
+        return float(in_any.double().mean()), float(in_needle.double().mean())
 
     def _update_penalty_mask(self):
         """Recompute cached penalty mask for all stored points and purge pared set.
@@ -1801,13 +1798,41 @@ class DataHandler:
     # Needle radius helpers
     # =========================================================================
 
+    def _needle_scales(self) -> List[float]:
+        """``needle_shrink_scale`` padded with 1.0 to one entry per needle.
+
+        Checkpoints from before shrink scales existed restore needles without them.
+        """
+        n = len(self.needle_M_list)
+        scales = list(self.needle_shrink_scale)[:n]
+        return scales + [1.0] * (n - len(scales))
+
+    def _restore_shrink_scale(self, saved: Any) -> List[float]:
+        """Shrink scales from a checkpoint; absent (older checkpoint) means unshrunk."""
+        self.needle_shrink_scale = ([float(v) for v in saved.reshape(-1).tolist()]
+                                    if isinstance(saved, torch.Tensor) else [])
+        return self._needle_scales()
+
+    def set_needle_ellipsoid(self, i: int, M: Optional[torch.Tensor]) -> None:
+        """Install a refitted ellipsoid for needle ``i``, keeping its past shrinks.
+
+        A refit sizes the ellipsoid from scratch; dividing by the needle's
+        cumulative shrink scale squared re-applies every shrink it has had
+        (semi-axis x s <=> M / s^2). Does not refresh the penalty mask.
+        """
+        if M is not None:
+            s = self._needle_scales()[i]
+            M = M.to(device=self.device, dtype=self.dtype) / (s * s)
+        self.needle_M_list[i] = M
+
     def update_all_needle_radii(self, new_M_list: list) -> None:
-        """Replace needle_M_list with new_M_list and recompute the penalty mask."""
+        """Install refitted ellipsoids for every needle (keeping past shrinks) and
+        recompute the penalty mask."""
         assert len(new_M_list) == len(self.needle_M_list), (
             f"Length mismatch: {len(new_M_list)} vs {len(self.needle_M_list)}"
         )
         for i, M in enumerate(new_M_list):
-            self.needle_M_list[i] = M
+            self.set_needle_ellipsoid(i, M)
         self._update_penalty_mask()
 
     def shrink_all_needle_radii(self, factor: float) -> None:
@@ -1819,8 +1844,14 @@ class DataHandler:
         recovery paths call this to hand territory back when the search runs out of
         room, and a zone that could never be released would let a few capped
         activations sterilise the simplex permanently.
+
+        Shrinks are persistent. Each needle's cumulative factor is recorded in
+        ``needle_shrink_scale`` and re-applied by every refit, which would
+        otherwise restore it to full size. Exclusion zones are never refitted, so
+        scaling their M / radius in place is already permanent.
         """
         f2 = factor ** 2
+        self.needle_shrink_scale = [s * factor for s in self._needle_scales()]
         for i, M in enumerate(self.needle_M_list):
             if M is not None:
                 self.needle_M_list[i] = M / f2

@@ -282,7 +282,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE  = torch.float64
 
 # Simulated input noise: per-component composition std, measured from runs/run_39af/composition_log.jsonl, the 6-dim hardware run of 2026-08-12 (109 lines / 2042 samples), which logs the sent composition directly: pooled per-component std 0.128, mean L2 0.271
-# (see visualization/input_noise.py and default_hparams.DEFAULT_INPUT_NOISE).
+# (see visualization/input_noise.py and src/hparams.DEFAULT_INPUT_NOISE).
 # Also fed to ZoMBI as the known ``input_noise``.
 NOISE_LEVEL       = 0.128
 # Simulated output noise: the measured objective is within ~4.5% of the true value,
@@ -349,11 +349,11 @@ TIME_LIMIT_HOURS = 0.4
 # (guards against a runaway loop on a systemic failure; transient failures just retry).
 MAX_CONSEC_FAIL = 5
 
-# ZoMBI-Hop fixed params (not optimised — infrastructure / noise model constants)
+# ZoMBI-Hop settings that are not MOBO axes but differ from the shipped defaults
+# for a simulated trial. Every other untuned knob (max_gp_points, acquisition_type,
+# …) takes its value from src/hparams.py through the ZoMBIHop constructor.
 ZOMBI_FIXED = dict(
-    max_gp_points=3000,
-    acquisition_type="ucb",
-    input_noise=NOISE_LEVEL,
+    input_noise=NOISE_LEVEL,   # match the simulator's noise model
     verbose=False,
 )
 
@@ -392,9 +392,21 @@ def unique_run_dir(parent: str, prefix: str) -> str:
 # reach for it as rm.HPARAM_SPACE / rm.HPARAM_NAMES. (Works whether launched as a
 # script, with optimize/ on the path, or as the optimize.run_mobo package module.)
 try:
-    from optimize.hparam_space import HPARAM_SPACE, HPARAM_NAMES, N_HPARAMS
+    from optimize.hparam_space import (
+        HPARAM_SPACE, HPARAM_NAMES, N_HPARAMS, repair_conflicts, upgrade_legacy)
 except ImportError:
-    from hparam_space import HPARAM_SPACE, HPARAM_NAMES, N_HPARAMS
+    from hparam_space import (
+        HPARAM_SPACE, HPARAM_NAMES, N_HPARAMS, repair_conflicts, upgrade_legacy)
+
+
+def trial_hparams(hp: dict) -> dict | None:
+    """A recorded trial's hyperparameters on the current axes, or None if stale.
+
+    Pre-2026-10-12 records are upgraded to the values they actually ran with
+    (``upgrade_legacy``), so their history keeps pooling after the space grew.
+    """
+    hp, _ = upgrade_legacy(hp)
+    return hp if all(name in hp for name in HPARAM_NAMES) else None
 
 
 def norm_to_hparams(x_norm: torch.Tensor) -> dict:
@@ -1083,7 +1095,8 @@ def _collect_from_progress(path: str, X_obs: list, Y_obs: list) -> int:
     used = 0
     for t in data.get("trials", []):
         hp, m = t.get("hparams", {}), t.get("metrics", {})
-        if not all(name in hp for name in HPARAM_NAMES):
+        hp = trial_hparams(hp)
+        if hp is None:
             continue  # stale / different hyperparameter set
         try:
             x = hparams_to_norm(hp)
@@ -1213,7 +1226,8 @@ def collect_rederived_observations(runs_dir: str, new_maximize: bool,
             run_dim = 3
         for t in data.get("trials", []):
             hp, m = t.get("hparams", {}), t.get("metrics", {})
-            if not all(name in hp for name in HPARAM_NAMES):
+            hp = trial_hparams(hp)
+            if hp is None:
                 continue  # stale / different hyperparameter set
             needles_path = os.path.join(rd, f"trial_{t.get('trial')}", "needles.csv")
             try:
@@ -1422,7 +1436,8 @@ def collect_shared_observations(
                 if key in seen:
                     continue
                 hp, m = t.get("hparams", {}), t.get("metrics", {})
-                if not all(name in hp for name in HPARAM_NAMES):
+                hp = trial_hparams(hp)
+                if hp is None:
                     continue
                 try:
                     x = hparams_to_norm(hp)
@@ -1497,7 +1512,7 @@ def load_seed_hparams(trial_paths: list[str]) -> list[torch.Tensor]:
         except Exception as exc:
             print(f"  [seed] WARNING: {json_path} unreadable ({exc}) — skipping.")
             continue
-        hp = data.get("hparams", {})
+        hp, _ = upgrade_legacy(data.get("hparams", {}))
         missing = [name for name in HPARAM_NAMES if name not in hp]
         if missing:
             print(f"  [seed] WARNING: {json_path} is missing hparams {missing} "
@@ -1967,8 +1982,15 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
 
 
 def plot_convergence(path: str, dh, maximize: bool,
-                     activations: np.ndarray | None = None) -> None:
+                     activations: np.ndarray | None = None,
+                     declared_samples: np.ndarray | None = None) -> None:
     """Save a convergence plot: all Y values, running best, needle vlines.
+
+    Each needle gets two vlines: red dashed where its point was first sampled
+    (``dh.needle_indices``), and green dotted where it was declared
+    (``declared_samples``, from ``plot_metrics.needle_declaration_samples``).
+    The gap between them is how long the point sat measured before the search
+    confirmed it.
 
     ``activations``: optional per-sample activation id (same length/order as
     ``dh.Y_all``). When given, the running-best envelope is **reset at every
@@ -2020,10 +2042,6 @@ def plot_convergence(path: str, dh, maximize: bool,
                         label=(None if labeled else best_label), zorder=4,
                         drawstyle="steps-post")
                 labeled = True
-                # dashed guide at each activation boundary
-                if i < len(Y_all):
-                    ax.axvline(float(i) - 0.5, color="#888888", alpha=0.35,
-                               lw=0.7, ls=":", zorder=1)
                 start = i
     else:
         running_best = np.maximum.accumulate(Y_all)
@@ -2036,9 +2054,15 @@ def plot_convergence(path: str, dh, maximize: bool,
             if 0 <= ni < len(Y_all):
                 kw = dict(color="crimson", alpha=0.55, lw=0.9, ls="--")
                 if not labeled:
-                    kw["label"] = "needle found"
+                    kw["label"] = "needle point sampled"
                     labeled = True
                 ax.axvline(float(ni), **kw)
+
+    if declared_samples is not None:
+        # +0.5: the declaration happens after the last sample of its line.
+        for k, ds in enumerate(np.asarray(declared_samples, dtype=float).ravel()):
+            ax.axvline(ds + 0.5, color="green", alpha=0.5, lw=1.1, ls=":", zorder=5,
+                       label="needle declared" if k == 0 else None)
 
     ax.set_xlabel("Sample index")
     ax.set_ylabel("Objective Y")
@@ -2175,10 +2199,15 @@ def write_metrics_over_time_csv(path: str, payloads: list[dict], X_all: np.ndarr
             "pct_matched":      round(metric_pct_matched_comp(disc, true_optima, dim=dim), 4),
             "avg_pairwise_dist":round(metric_avg_pairwise_dist(disc), 6),
             "recent_needle_value": (round(recent, 6) if not math.isnan(recent) else np.nan),
+            "pct_space_penalized": p.get("pct_space_penalized", np.nan),
+            "pct_space_penalized_needles": p.get("pct_space_penalized_needles", np.nan),
         })
     cols = ["iteration", "activation", "n_needles", "dist_to_needles", "dup_fraction",
             "pct_matched_comp", "pct_matched",
             "avg_pairwise_dist", "recent_needle_value"]
+    # Only callers that measure coverage (evaluate.py) get the coverage columns.
+    if any("pct_space_penalized" in p for p in payloads):
+        cols += ["pct_space_penalized", "pct_space_penalized_needles"]
     pd.DataFrame(rows, columns=cols).to_csv(path, index=False)
 
 
@@ -2840,8 +2869,10 @@ def run_single_trial(
         # globally-monotone curve — each activation is a fresh ZoMBI search phase,
         # so coasting on an earlier phase's peak hides how much it re-explores.
         act_per_point, _ = _activation_zoom_per_point(n_points, snap_records)
+        import plot_metrics
         plot_convergence(os.path.join(trial_dir, "convergence.png"), dh, maximize,
-                         activations=act_per_point)
+                         activations=act_per_point,
+                         declared_samples=plot_metrics.needle_declaration_samples(trial_dir))
     except Exception as exc:
         print(f"    [trial] static plot failed: {exc}")
 
@@ -3361,6 +3392,14 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                     x_new = candidate.squeeze(0).detach().cpu()
 
                 hparams = norm_to_hparams(x_new)
+                # The search box contains configurations that can never declare a
+                # needle (n_consecutive_converged > max_iterations). Run the nearest
+                # feasible one instead, and record THAT point, so the GP learns the
+                # response of the configuration that was actually scored.
+                hparams, _repairs = repair_conflicts(hparams)
+                if _repairs:
+                    print(f"  [repair] infeasible sample: {'; '.join(_repairs)}", flush=True)
+                    x_new = hparams_to_norm(hparams)
                 hp_str = "  ".join(f"{k}={round(v,4) if isinstance(v,float) else v}"
                                    for k, v in hparams.items())
                 print(f"\n[trial {trial_num} | {phase}]  {hp_str}", flush=True)

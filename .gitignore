@@ -18,6 +18,8 @@ warm_start/pareto_plots/*
 benchmarks/public_db/data/*
 benchmarks/sweeps/runs/*
 benchmarks/axial_init/results/*
+benchmarks/scripts/logs/*
+analysis/*
 
 # UV artifacts
 .python-version
@@ -75,6 +77,8 @@ test_rfs/
 
 # Large binaries
 *.pt
+# ...except small test fixtures (e.g. the 12 KB simplex golden run)
+!tests/fixtures/*.pt
 *.pth
 *.pkl
 *.pickle
@@ -83,3 +87,7 @@ test_rfs/
 
 # babysitter runtime state (logs, crash reports, cooldown stamps, lock)
 optimize/scripts/.babysitter/
+warm_start/warm_gp_landscape/peaks_cache/fullgp_6d_seed0_n2042_c200000_s0.06_p0.12.json
+
+# Vendored HEBO (python -m benchmarks.methods install-hebo)
+benchmarks/methods/_vendor/

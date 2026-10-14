@@ -86,6 +86,7 @@ from eval_metrics import (  # noqa: E402
     metric_dup_fraction,
 )
 from src.core.zombihop import ZoMBIHop  # noqa: E402
+from src.hparams import HPARAMS, LEGACY_EFFECTIVE, upgrade_legacy  # noqa: E402
 from src.utils.datahandler import reconstruct_snapshot_tensors  # noqa: E402
 
 import matplotlib  # noqa: E402
@@ -112,17 +113,21 @@ MAXIMIZE = True                     # Objective is maximized
 N_REF_OPTIMA = 3                    # RF peaks used as reference "true optima" for needle metrics
 RESULTS_ROOT = _HERE / "results"
 
-# Hyperparameters that ZoMBI-Hop's config.json (and DataHandler.load_state) reads.
-# Overriding these is done by rewriting the resumed run's config.json.
-_CONFIG_READ_HPARAMS = {
-    "max_zooms", "max_iterations", "top_m_points", "n_restarts", "raw",
-    "input_noise_threshold_mult", "output_noise_threshold_mult",
-    "n_consecutive_converged", "ucb_beta", "nat_grad_step", "nat_grad_max_steps",
-}
-# HPARAM_SPACE keys NOT read from config.json — passed to the ZoMBIHop constructor.
-_CONSTRUCTOR_HPARAMS = {
-    "max_penalty_radius", "needle_shrink_factor", "needle_stop_noise_multiplier",
-    "paring_spatial_halfnoise", "paring_y_noise_multiplier",
+# A resumed run takes EVERY registered hyperparameter recorded in its config.json
+# (DataHandler.load_state + ZoMBIHop._restore_own_hparams), so overriding any tuned
+# knob is done by rewriting the resumed run's config.json; nothing needs to go
+# through the constructor any more.
+_CONFIG_READ_HPARAMS = frozenset(R.HPARAM_NAMES)
+_CONSTRUCTOR_HPARAMS: frozenset = frozenset()
+
+# What ZoMBIHop actually ran with for knobs a pre-2026-10-12 config.json did not
+# record (run_7eb9 and every MOBO trial of that era): that era's constructor
+# defaults, with the never-wired knobs at the values the code really used.
+_LEGACY_CONSTRUCTOR_DEFAULTS: Dict[str, Any] = {
+    **LEGACY_EFFECTIVE,
+    "max_penalty_radius": 1.0,
+    "paring_spatial_halfnoise": 0.5,
+    "paring_y_noise_multiplier": 1.0,
 }
 
 # One-line descriptions of each tunable hyperparameter for the LLM prompt.
@@ -301,7 +306,7 @@ def hparam_descriptions_block() -> str:
     for name in R.HPARAM_NAMES:
         lo, hi, tfm = R.HPARAM_SPACE[name]
         kind = "integer" if tfm == "int" else "float"
-        desc = HPARAM_DESC.get(name, "")
+        desc = HPARAM_DESC.get(name) or HPARAMS[name].help
         lines.append(f"- `{name}` ({kind}, range [{lo}, {hi}]): {desc}")
     return "\n".join(lines)
 
@@ -309,8 +314,8 @@ def hparam_descriptions_block() -> str:
 def current_hparams(run_config: Dict[str, Any]) -> Dict[str, Any]:
     """The hyperparameter values in effect at the injection point.
 
-    Config-read hyperparameters come from run_7eb9/config.json; the rest used
-    ZoMBIHop's constructor defaults during the original run.
+    Hyperparameters recorded in run_7eb9/config.json come from there; the rest are
+    the constructor defaults the original run used (_LEGACY_CONSTRUCTOR_DEFAULTS).
     """
     defaults = _constructor_hparam_defaults()
     hp = {}
@@ -323,15 +328,8 @@ def current_hparams(run_config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _constructor_hparam_defaults() -> Dict[str, Any]:
-    """ZoMBIHop constructor defaults for the constructor-set hyperparameters."""
-    import inspect
-    defaults: Dict[str, Any] = {}
-    sig = inspect.signature(ZoMBIHop.__init__)
-    for name in _CONSTRUCTOR_HPARAMS:
-        p = sig.parameters.get(name)
-        if p is not None and p.default is not inspect.Parameter.empty:
-            defaults[name] = p.default
-    return defaults
+    """Values a pre-2026-10-12 run used for knobs its records do not carry."""
+    return dict(_LEGACY_CONSTRUCTOR_DEFAULTS)
 
 
 def _hparams_from_trial(trial_hp: Dict[str, Any]) -> Dict[str, Any]:
@@ -339,6 +337,7 @@ def _hparams_from_trial(trial_hp: Dict[str, Any]) -> Dict[str, Any]:
     absent constructor-set hyperparameter from ZoMBIHop's default (mirrors
     current_hparams, but sourced from a trial record instead of run_config)."""
     defaults = _constructor_hparam_defaults()
+    trial_hp, _ = upgrade_legacy(trial_hp)
     hp: Dict[str, Any] = {}
     for name in R.HPARAM_NAMES:
         if name in trial_hp:

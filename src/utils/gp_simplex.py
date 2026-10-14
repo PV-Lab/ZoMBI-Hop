@@ -18,7 +18,8 @@ from gpytorch.utils.errors import NotPSDError
 from gpytorch.constraints import GreaterThan
 from typing import Literal, Optional, Tuple, Callable, List
 
-from .simplex import proj_simplex, random_simplex, Ellipsoid
+from .simplex import Ellipsoid
+from .domain import Domain, make_domain
 from .datahandler import DataHandler
 
 
@@ -75,6 +76,9 @@ class RepulsiveAcquisition(nn.Module):
         Decay length (in composition units) for the boundary penalty.
         penalty_i = exp(−x_i / boundary_epsilon), summed over components and
         scaled by repulsion_lambda.  0.0 disables boundary penalty.
+    boundary_fn : Callable, optional
+        ``(X_flat, eps) -> (B,)`` boundary penalty; the search domain's
+        ``boundary_penalty``. None keeps the simplex law above.
     """
 
     def __init__(
@@ -87,6 +91,7 @@ class RepulsiveAcquisition(nn.Module):
         needle_M_list: Optional[List] = None,
         needle_B: Optional[torch.Tensor] = None,
         boundary_epsilon: float = 0.0,
+        boundary_fn: Optional[Callable] = None,
     ):
         super().__init__()
         self.base = base
@@ -97,6 +102,7 @@ class RepulsiveAcquisition(nn.Module):
         self.needle_M_list = needle_M_list or []
         self.needle_B = needle_B  # (d, d-1) or None
         self.boundary_epsilon = boundary_epsilon
+        self.boundary_fn = boundary_fn
 
     def forward(self, Xq: torch.Tensor) -> torch.Tensor:
         """
@@ -146,9 +152,12 @@ class RepulsiveAcquisition(nn.Module):
 
                 total_violation = total_violation + violation ** 2
 
-        # Boundary repulsion: exp-decay from each simplex face (x_i = 0)
+        # Boundary repulsion: exp-decay from the domain's faces (simplex: x_i = 0)
         if has_boundary:
-            boundary_terms = torch.exp(-X_flat / self.boundary_epsilon).sum(dim=-1)  # (B,)
+            if self.boundary_fn is not None:
+                boundary_terms = self.boundary_fn(X_flat, self.boundary_epsilon)  # (B,)
+            else:
+                boundary_terms = torch.exp(-X_flat / self.boundary_epsilon).sum(dim=-1)  # (B,)
             total_violation = total_violation + boundary_terms
 
         penalty = (-self.repulsion_lambda * total_violation).view(base_acq.shape)
@@ -166,9 +175,9 @@ class GPSimplex:
     data_handler : DataHandler
         Data handler for accessing points and penalty info.
     proj_fn : Callable, optional
-        Projection function to simplex. Default: proj_simplex.
+        Projection onto the search domain. Default: ``domain.project``.
     random_sampler : Callable, optional
-        Random sampler for simplex. Default: random_simplex.
+        Uniform sampler over the domain ∩ bounds. Default: ``domain.sample``.
     num_restarts : int
         Number of restarts for acquisition optimization.
     raw_samples : int
@@ -192,6 +201,10 @@ class GPSimplex:
         Torch device.
     dtype : torch.dtype
         Data type.
+    domain : Domain or str, optional
+        Search domain (``SimplexDomain`` / ``BoxDomain``, or "simplex" / "box").
+        Supplies the acquisition-ascent step, the ellipsoid tangent basis and the
+        boundary penalty. Default: the simplex.
     """
 
     def __init__(
@@ -209,10 +222,12 @@ class GPSimplex:
         device: str = 'cuda',
         dtype: torch.dtype = torch.float64,
         verbose: bool = True,
+        domain: Optional[Domain] = None,
     ):
         self.data_handler = data_handler
-        self.proj_fn = proj_fn if proj_fn is not None else proj_simplex
-        self.random_sampler = random_sampler if random_sampler is not None else random_simplex
+        self.domain = make_domain(domain)
+        self.proj_fn = proj_fn if proj_fn is not None else self.domain.project
+        self.random_sampler = random_sampler if random_sampler is not None else self.domain.sample
         self.num_restarts = num_restarts
         self.raw_samples = raw_samples
         self.repulsion_lambda = repulsion_lambda  # None means auto-compute
@@ -560,7 +575,9 @@ class GPSimplex:
             repulsion_lambda=computed_lambda,
             needle_M_list=needle_M_list,
             needle_B=needle_B,
-            boundary_epsilon=self.data_handler.input_noise,
+            boundary_epsilon=(self.data_handler.input_noise
+                              if self.domain.boundary_repulsion else 0.0),
+            boundary_fn=self.domain.boundary_penalty,
         )
 
         return self.acq_fn
@@ -818,14 +835,15 @@ class GPSimplex:
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Natural-gradient ascent on the simplex, batched across all restarts.
+        Acquisition ascent within the search domain, batched across all restarts.
 
         All R restarts are advanced in a single forward+backward pass per step.
         This reduces the per-step cost from O(R × n²) to O(n²) compared to the
         sequential loop, where n is the GP training-set size.
 
-        Update rule (per restart): g = ∇acq(x), ḡ = Σᵢ xᵢ gᵢ,
-        then x ← normalize(x ⊙ exp(α(g − ḡ))), clamped to [lo, hi].
+        The update rule is the domain's ``ascent_step``. Simplex: g = ∇acq(x),
+        ḡ = Σᵢ xᵢ gᵢ, then x ← normalize(x ⊙ exp(α(g − ḡ))), clamped to [lo, hi].
+        Box: projected gradient ascent, x ← clip(x + α g, lo, hi).
         """
         if "step_size" in kwargs:
             ss = kwargs.pop("step_size")
@@ -852,9 +870,9 @@ class GPSimplex:
                 torch.empty(0, device=self.device, dtype=self.dtype),
             )
 
-        # Initialise all restarts as (R, d) on the simplex.
+        # Initialise all restarts as (R, d) inside the domain.
         x = initial_conditions[:, 0, :].clone().to(device=self.device, dtype=self.dtype)
-        x = self.proj_fn(x)  # (R, d) — project onto simplex
+        x = self.proj_fn(x)  # (R, d)
 
         # alive[r] = True while restart r has not degenerated.
         alive = torch.ones(R, dtype=torch.bool, device=self.device)
@@ -877,19 +895,7 @@ class GPSimplex:
                 break
 
             with torch.no_grad():
-                xd = x_active.detach()
-                g_bar = (xd * g).sum(dim=1, keepdim=True)         # (A, 1)
-                shift = torch.clamp(step * (g - g_bar), -10.0, 10.0)
-                x_new = xd * torch.exp(shift)                      # (A, d)
-
-                s = x_new.sum(dim=1, keepdim=True)                 # (A, 1)
-                ok = s.squeeze(1) >= 1e-12
-                x_new = x_new / s.clamp(min=1e-12)                 # normalize to simplex
-                x_new = torch.clamp(x_new, lo, hi)                 # enforce box bounds
-                s2 = x_new.sum(dim=1, keepdim=True)
-                ok &= s2.squeeze(1) >= 1e-12
-                x_new = x_new / s2.clamp(min=1e-12)
-
+                x_new, ok = self.domain.ascent_step(x_active.detach(), g, step, lo, hi)
                 x[alive_idx[ok]] = x_new[ok]
                 alive[alive_idx[~ok]] = False
 
@@ -913,14 +919,13 @@ class GPSimplex:
 
     def _get_tangent_basis(self, d: int) -> torch.Tensor:
         """
-        Return (d, d-1) orthonormal basis for the simplex tangent space
-        {v : sum(v) = 0}.  Result is cached and reused while d is unchanged.
+        Return the domain's orthonormal tangent basis: (d, d-1) spanning
+        {v : sum(v) = 0} on the simplex, the (d, d) identity on a box.
+        Result is cached and reused while d is unchanged.
         """
         if self._tangent_basis is not None and self._tangent_basis.shape[0] == d:
             return self._tangent_basis
-        P = torch.eye(d, device=self.device, dtype=self.dtype) - (1.0 / d)
-        Q, _ = torch.linalg.qr(P)
-        B = Q[:, :d - 1].contiguous()
+        B = self.domain.tangent_basis(d, self.device, self.dtype)
         self._tangent_basis = B
         return B
 
@@ -939,7 +944,8 @@ class GPSimplex:
         Returns (M, B) where a point x is inside the basin iff
             u = B^T (x - needle),  u^T M u <= 1.
 
-        M is (d-1, d-1) in tangent space; B is the shared (d, d-1) basis.
+        M is (k, k) in tangent space; B is the shared (d, k) basis, with
+        k = d-1 on the simplex and k = d on a box.
         """
         d = needle.shape[0]
         needle = needle.detach().to(device=self.device, dtype=self.dtype)
@@ -953,7 +959,7 @@ class GPSimplex:
                 self.create_acquisition()
             base_acq = getattr(self.acq_fn, "base", self.acq_fn)
 
-        u0 = torch.zeros(d - 1, device=self.device, dtype=self.dtype)
+        u0 = torch.zeros(B.shape[1], device=self.device, dtype=self.dtype)
 
         def tilde_alpha_u(u: torch.Tensor) -> torch.Tensor:
             x = needle + u @ B.T

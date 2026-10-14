@@ -31,6 +31,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_mobo as rm  # noqa: E402
+import plot_metrics  # noqa: E402
 
 
 class _DHShim:
@@ -80,7 +81,8 @@ def regen_run(run_dir: Path) -> bool:
 
     dh = _DHShim(Y, penalty, needle_idx)
     rm.plot_convergence(str(run_dir / "convergence.png"), dh, maximize=True,
-                        activations=activations)
+                        activations=activations,
+                        declared_samples=plot_metrics.needle_declaration_samples(str(run_dir)))
     return True
 
 

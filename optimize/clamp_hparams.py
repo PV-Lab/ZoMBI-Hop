@@ -40,7 +40,7 @@ import argparse
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
-from run_mobo import HPARAM_SPACE, HPARAM_NAMES  # noqa: E402
+from run_mobo import HPARAM_SPACE, HPARAM_NAMES, upgrade_legacy  # noqa: E402
 
 
 def clamp_hparams(hp: dict) -> tuple[dict, dict]:
@@ -86,7 +86,7 @@ def main() -> None:
         jp = path if path.lower().endswith(".json") else os.path.join(path, "trial.json")
         with open(jp) as f:
             blob = json.load(f)
-        hp = blob.get("hparams", blob)
+        hp, _ = upgrade_legacy(blob.get("hparams", blob))
         clamped, moved = clamp_hparams(hp)
 
         run = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(jp))))

@@ -65,12 +65,12 @@ On needle declaration (either via PI convergence or Jaccard force-declare):
 1. Fit a **clean local GP** using `fit_with_locality`: selects only data within `max_radius` of the needle first, then fills to `max_gp_points` with remaining points. This gives a locally-accurate Hessian uncontaminated by far-away observations.
 2. Compute the **Hessian of the clean base acquisition** (no repulsive penalties) at the needle in ILR space via `create_clean_acquisition`. The penalty-free acquisition gives the true local curvature rather than one distorted by proximity to other needles.
 3. Derive an **ellipsoidal exclusion zone** M from the Hessian: the region where the acquisition has dropped by a specified fraction from its peak.
-4. Record the needle, storing both the **peak value** and the **median Y of all raw observations within `paring_spatial_halfnoise × input_noise_ilr`** of the needle in ILR space. The median is a noise-robust measure of the local optimum's true value.
+4. Record the needle, storing both the **peak value** and the **median Y of all raw observations within `paring_spatial_halfnoise × input_noise`** of the needle in ILR space. The median is a noise-robust measure of the local optimum's true value.
 5. Update the penalty mask, reset to full simplex for the next activation.
 
 ### Post-Activation Pared Relabeling
 
-After every activation completes (needle found or failed), each entry in the pared dataset has its Y value replaced by the **median of all Y_all values whose X_all falls within `paring_spatial_halfnoise × input_noise_ilr`** in ILR space. This smooths noise spikes so the GP in subsequent activations trains on a clean, representative signal rather than individual noisy measurements.
+After every activation completes (needle found or failed), each entry in the pared dataset has its Y value replaced by the **median of all Y_all values whose X_all falls within `paring_spatial_halfnoise × input_noise`** in ILR space. This smooths noise spikes so the GP in subsequent activations trains on a clean, representative signal rather than individual noisy measurements.
 
 ### Failure Handling (Three-Way Dispatch)
 
@@ -82,7 +82,7 @@ When an activation fails (candidate is None, all points penalized, or force-decl
 |-----------|--------|
 | **First failure** (`not first_failure_handled`) | Recompute all needle ellipsoids using the clean local GP (`recompute_all_ellipsoids`): for each needle, `fit_with_locality` → `create_clean_acquisition` → `determine_penalty_ellipsoid`. Update `dh.needle_M_list`. Retry same zoom. |
 | **Subsequent failure, data was added** (`first_failure_handled AND data_added_since_last_failure`) | Recompute zoom bounds Jaccard-aware: `dh.determine_new_bounds(add_to_history=False)`. The `add_to_history=False` prevents failure-retry bounds from contaminating the history used by success-path zooms. Retry same zoom. |
-| **Subsequent failure, no new data** (`first_failure_handled AND NOT data_added_since_last_failure`) | Shrink all ellipsoid semi-axes: `dh.shrink_all_needle_radii(bounds_shrink_factor)`. If `max_needle_radius() < min_axis_noise_mult × input_noise_ilr`, all exclusion zones are at noise scale → stop. Otherwise retry same zoom. |
+| **Subsequent failure, no new data** (`first_failure_handled AND NOT data_added_since_last_failure`) | Shrink all ellipsoid semi-axes: `dh.shrink_all_needle_radii(needle_shrink_factor)`. If every semi-axis < `needle_stop_noise_multiplier × input_noise`, all exclusion zones are at noise scale → stop. Otherwise retry same zoom. |
 
 `data_added_since_last_failure` is set `True` immediately after `_objective_wrapper` returns (regardless of whether points are penalized), and reset to `False` after each failure dispatch.
 
@@ -167,8 +167,8 @@ Before any point enters the GP training set, it is checked against the **pared d
 ║  │  │        determine_new_bounds(add_to_history=False)          │ │    ║
 ║  │  │        update bounds  → retry same zoom                    │ │    ║
 ║  │  │      Case 3 (subsequent, no data):                         │ │    ║
-║  │  │        shrink_all_needle_radii(bounds_shrink_factor)       │ │    ║
-║  │  │        if max_radius < min_axis_noise_mult×σ → finished   │ │    ║
+║  │  │        shrink_all_needle_radii(needle_shrink_factor)       │ │    ║
+║  │  │        if max_radius < needle_stop_mult×σ → finished      │ │    ║
 ║  │  │        else → retry same zoom                              │ │    ║
 ║  │  │    data_added_since_last_failure = False                   │ │    ║
 ║  │  │    consecutive_converged = 0                               │ │    ║
@@ -227,74 +227,39 @@ Data flow between key objects:
 
 ## 4. All Hyperparameters & What They Control
 
-### Iteration Structure
+Every hyperparameter is declared once, in **`src/hparams.py`**: its type, valid
+range, meaning (the GUI tooltip), where it lives on the running objects, and, if
+MOBO tunes it, its search range. Shipped values for the tuned knobs live in
+**`optimize/hparams/6d_ensemble.json`**; untuned knobs (`input_noise`,
+`max_gp_points`, `acquisition_type`, `ellipsoid_eigenvalue_floor`,
+`repulsion_lambda`) carry their default in the registry. The GUI, the hardware
+runner, `run_mobo`/`evaluate`, interactive testing and the `ZoMBIHop` /
+`DataHandler` constructor defaults all read from there. To add a knob, add it to
+the registry.
 
-| Parameter | Default | Controls |
-|-----------|---------|----------|
-| `max_zooms` | 3 | Number of zoom levels per activation. More zooms = finer trust regions but more iterations before declaring a needle. Also used as the Jaccard history window size. |
-| `max_iterations` | 10 | Max BO iterations per zoom level. Total per activation ≤ max_zooms × max_iterations. |
-| `n_consecutive_converged` | 2 | How many successive converged iterations trigger needle declaration. Higher = more conservative (requires sustained convergence). |
-| `top_m_points` | auto (d+1) | How many top-Y unpenalized points define the AABB zoom bounds. Small = tight zoom; large = wide. |
+```bash
+python -c "import src.hparams as H; [print(f'{p.name:30s} {H.ALL_DEFAULTS[p.name]!s:>10}  {p.tune or \"fixed\"}') for p in H.HPARAMS.values()]"
+```
 
-### Convergence Thresholds
+**Derived, not set:** the activation line budget is `max_zooms × max_iterations`.
+An activation that spends it, runs every zoom level without declaring a needle,
+or runs out of novel zoom windows gets an exclusion zone over its region.
 
-| Parameter | Default | Controls |
-|-----------|---------|----------|
-| `convergence_pi_threshold` | 0.01 | **Deprecated / ignored.** Convergence now uses Expected Improvement vs the output-noise floor (`EI < GP_output_noise × output_noise_threshold_mult`); there is no separate PI threshold. Kept only so older configs/JSONs still load. |
-| `input_noise_threshold_mult` | 3.0 | Minimum trust-region width is this multiple of `input_noise` (`DataHandler.min_box_width`); each axis of a candidate zoom box narrower than that is widened about its centre before the Jaccard novelty test. 0 disables the floor. |
-| `output_noise_threshold_mult` | 2.0 | Y improvement (over the **local** prev_best within bounds) must be < this × GP output noise. Higher = easier to converge. |
+**Conflicts** (`src.hparams.conflicts`). These make needles impossible, so
+`ZoMBIHop` refuses to construct with them, the live-override channel refuses to
+apply them, and the GUI and hardware runner refuse to launch with them:
 
-### GP & Acquisition
+| Rule | Why |
+|------|-----|
+| `max_zooms > min_zoom_for_needle` | needles need zoom level `min_zoom_for_needle` or deeper |
+| `max_iterations >= min_iters_per_zoom` | a zoom must measure that many lines before declaring |
+| `max_iterations >= n_consecutive_converged` | the convergence streak has to fit inside one zoom |
 
-| Parameter | Default | Controls |
-|-----------|---------|----------|
-| `max_gp_points` | 3000 | Cap on GP training set size. When zoomed, this budget is filled first by pared points within bounds, then by raw unpenalized points within bounds. Prevents O(n³) GP cost blowing up. |
-| `acquisition_type` | "ucb" | Base acquisition: `"ucb"` (Upper Confidence Bound) or `"ei"` (Log Expected Improvement). |
-| `ucb_beta` | 0.1 | Exploration weight for UCB: α(x) = μ + β½σ. Higher = more exploration. |
-| `repulsion_lambda` | None (auto) | Strength of ellipsoid repulsion penalty. `None` = auto-computed as max(10×median\|acq\|, 100) each call. |
-| `n_restarts` | 30 | Number of nat-grad restarts for acquisition optimization (get_candidate). |
-| `raw` | 500 | Initial random samples before selecting restart seeds. |
-| `nat_grad_step` | 0.02 | Step size α for natural-gradient ascent: x ← normalize(x ⊙ exp(α(g − ḡ))). |
-| `nat_grad_max_steps` | 50 | Max gradient steps per restart. |
+MOBO samples a box that contains infeasible corners, so `run_mobo` maps each
+sample through `repair_conflicts` (lowering the requirement to fit the budget)
+and records the configuration it actually ran.
 
-### Ellipsoid Penalty
-
-| Parameter | Default | Controls |
-|-----------|---------|----------|
-| `max_penalty_radius` | 1.0 | Caps the maximum ellipsoid semi-axis length (ILR units). Prevents a single needle from excluding too much of the simplex. |
-| `ellipsoid_drop_fraction` | 0.25 | Fraction of peak acquisition value that defines the ellipsoid boundary. Larger = bigger exclusion zone. |
-| `ellipsoid_eigenvalue_floor` | 1e-6 | Minimum eigenvalue of –H before computing M. Prevents degenerate flat-Hessian ellipsoids. |
-
-### Point Paring (Deduplication)
-
-| Parameter | Default | Controls |
-|-----------|---------|----------|
-| `paring_spatial_halfnoise` | 0.5 | Spatial duplicate threshold in ILR units: points within `factor × input_noise_ilr` are candidates for deduplication. Also controls the neighbourhood radius for median relabeling of pared Y values and the needle median value computation. |
-| `paring_y_noise_multiplier` | 1.0 | Y-value duplicate threshold: `factor × GP_output_noise`. |
-| `input_noise` | 0.064 | Known physical input noise σ per composition component (instrument precision), measured from `data/2nd_real_run.db`. Used for paring, median neighbourhood radius, needle shrink stop condition, old-needle radius, and the GP min-lengthscale floor. (Legacy `input_noise_ilr` ≈ `input_noise × 3` is still accepted and converted.) |
-
-### Needle Shrink & Stop
-
-| Parameter | Default | Controls |
-|-----------|---------|----------|
-| `needle_shrink_factor` | 0.85 | Per-demotion-retry multiplicative shrink on all ellipsoid radii. M ← M / f² tightens the exclusion zone. |
-| `needle_stop_noise_multiplier` | 3.0 | Stop shrinking when max ellipsoid semi-axis < this × `input_noise_ilr`. Prevents shrinking below measurement resolution. |
-
-### Repeated-Zoom Detection (Jaccard Sliding Window)
-
-| Parameter | Default | Controls |
-|-----------|---------|----------|
-| `jaccard_window` | 3 | Number of recent bounding boxes to compare against when selecting new zoom bounds. `determine_new_bounds` slides over windows of top-M points to find a box with Jaccard ≤ `jaccard_threshold` vs all recent boxes in this window. |
-| `jaccard_threshold` | 0.9 | Maximum Jaccard overlap allowed between a candidate bounding box and any box in the recent history window. A higher value accepts more overlap before trying the next window. |
-
-The secondary MC Jaccard guard (`_bounds_jaccard_simplex`, threshold 0.75) is still used at zoom transitions as a force-declare trigger when the sliding-window bounds selection nonetheless produces a box that overlaps with history.
-
-### Failure Retry
-
-| Parameter | Default | Controls |
-|-----------|---------|----------|
-| `bounds_shrink_factor` | 0.8 | Radius shrink factor applied to all needle ellipsoids on a persistent-failure (no new data) retry. M ← M / factor². |
-| `min_axis_noise_mult` | 2.0 | Stop condition for shrinking: if `max_needle_radius() < min_axis_noise_mult × input_noise_ilr`, all ellipsoids are at noise scale and the run terminates. |
+---
 
 ## 5. File-by-File Reference
 
@@ -427,16 +392,9 @@ Utility: membership test; pairwise Euclidean, Aitchison (CLR-based), or KL-diver
 
 ### 5.2 `utils/dataclasses.py`
 
-**Role:** Configuration dataclasses. `ZoMBIHopConfig` is the single source of truth for all hyperparameters; `Checkpoint` is a legacy metadata struct for backward compatibility.
+**Role:** `Checkpoint`, a legacy metadata struct kept for backward compatibility. Hyperparameters are declared in `src/hparams.py` (see §4); the old `ZoMBIHopConfig` dataclass was removed on 2026-10-12.
 
 ---
-
-#### `ZoMBIHopConfig` (dataclass)
-
-All hyperparameters with defaults (see §4 for descriptions). Key methods:
-- `to_dict()` / `from_dict(data)` — JSON serialization, with forward-compatibility: unknown keys are silently dropped in `from_dict`.
-- `get_torch_dtype()` — maps string dtype name to `torch.dtype`.
-- `__post_init__()` — validates all fields on construction (raises `AssertionError` on bad values).
 
 ---
 
@@ -509,7 +467,7 @@ Reads `latest.txt`, loads `tensors.pt` and `summary.json` from the referenced sn
 
 #### `add_needle(needle, needle_value, needle_penalty_radius, activation, zoom, iteration, M, B, needle_median_value)`
 
-Appends the needle to all needle tensors and `needles_results`. Stores both the peak `needle_value` and the noise-robust `needle_median_value` (median Y of all raw observations within `paring_spatial_halfnoise × input_noise_ilr` of the needle). Stores M (ellipsoid precision) and B (tangent basis, `None` for ILR-mode ellipsoids). Calls `_update_penalty_mask()` which also purges any now-penalized points from the pared set.
+Appends the needle to all needle tensors and `needles_results`. Stores both the peak `needle_value` and the noise-robust `needle_median_value` (median Y of all raw observations within `paring_spatial_halfnoise × input_noise` of the needle). Stores M (ellipsoid precision) and B (tangent basis, `None` for ILR-mode ellipsoids). Calls `_update_penalty_mask()` which also purges any now-penalized points from the pared set.
 
 ---
 
@@ -545,7 +503,7 @@ Adds new UNPENALIZED points to the pared dataset with deduplication:
    - If duplicates exist AND pared set is large enough: **fair coin** — 50% keep old (discard new), 50% replace oldest duplicate with new.
    - If no duplicates: add unconditionally.
 
-**Spatial threshold:** `paring_spatial_halfnoise × input_noise_ilr`  
+**Spatial threshold:** `paring_spatial_halfnoise × input_noise`  
 **Y threshold:** `paring_y_noise_multiplier × max(GP_output_noise, 1e-6)`  
 **Minimum pared size before dedup starts:** `max(2(d−1), 5)`
 
@@ -586,7 +544,7 @@ Used as the `prev_best` reference in the convergence check when zoomed, so the Y
 
 #### `_relabel_pared_with_medians()` ← **post-activation smoothing**
 
-Called once after every activation (success or failure). For each entry in `X_pared`, replaces `Y_pared[i]` with the **median of all Y_all values whose corresponding X_all falls within `paring_spatial_halfnoise × input_noise_ilr`** in ILR space.
+Called once after every activation (success or failure). For each entry in `X_pared`, replaces `Y_pared[i]` with the **median of all Y_all values whose corresponding X_all falls within `paring_spatial_halfnoise × input_noise`** in ILR space.
 
 **Effect:** Smooths individual noise spikes that survived the paring deduplication step. Subsequent activations train their GPs on a smoother, more representative signal. Increments `_pared_version` if any Y value changed.
 
@@ -962,7 +920,7 @@ Validates dimensions, sets defaults (e.g. `top_m_points = max(d+1, 4)` if not sp
 
 #### `ZoMBIHop._all_needle_axes_below_min(dh)` → `bool`
 
-Returns True when `dh.max_needle_radius() < min_axis_noise_mult × dh.input_noise_ilr`. Used inside `_handle_failure_retry` Case 3 to decide whether to stop after shrinking.
+Returns True when `dh.max_needle_radius() < needle_stop_noise_multiplier × dh.input_noise`. Used inside `_handle_failure_retry` Case 3 to decide whether to stop after shrinking.
 
 ---
 
@@ -971,7 +929,7 @@ Three-way dispatch called from the while-zoom loop whenever `activation_failed` 
 
 - **Case 1** (`not first_failure_handled`): calls `gp_handler.recompute_all_ellipsoids(...)` then `dh.update_all_needle_radii(new_M_list)`. On exception, falls back to an inline pared-GP refit (fit global GP, create repulsive acquisition, recompute each needle's M). Returns `(False, True)`.
 - **Case 2** (`first_failure_handled AND data_added_since_last_failure`): calls `dh.determine_new_bounds(add_to_history=False)` and updates `dh.bounds`/`self.bounds`. Returns `(False, True)`.
-- **Case 3** (`first_failure_handled AND NOT data_added_since_last_failure`): calls `dh.shrink_all_needle_radii(bounds_shrink_factor)`. If `_all_needle_axes_below_min(dh)`, returns `(True, True)` (stop). Otherwise returns `(False, True)`.
+- **Case 3** (`first_failure_handled AND NOT data_added_since_last_failure`): calls `dh.shrink_all_needle_radii(needle_shrink_factor)`. If `_all_needle_axes_below_min(dh)`, returns `(True, True)` (stop). Otherwise returns `(False, True)`.
 
 After the call, the caller resets `data_added_since_last_failure = False`, `activation_failed = False`, `consecutive_converged = 0`, reloads GP data for the (possibly updated) bounds, and issues `continue` to retry the same `current_zoom` level.
 
@@ -982,7 +940,7 @@ After the call, the caller resets `data_added_since_last_failure = False`, `acti
 Shared needle declaration logic called by both the PI convergence path and the Jaccard force-declare path.
 
 1. Get current best unpenalized point (globally via `get_best_unpenalized()`).
-2. Compute **needle median value**: median Y of all `X_all_actual` points within `paring_spatial_halfnoise × input_noise_ilr` in ILR space of the needle.
+2. Compute **needle median value**: median Y of all `X_all_actual` points within `paring_spatial_halfnoise × input_noise` in ILR space of the needle.
 3. Log: needle location, peak value, and local median.
 4. **Fit a clean local GP** via `gp_handler.fit_with_locality(needle, dh.X_all_actual, dh.Y_all, ...)` — uses only data near the needle for a locally-accurate Hessian, without contamination from far-away observations.
 5. **Create penalty-free acquisition** via `gp_handler.create_clean_acquisition()` — excludes RepulsiveAcquisition so the Hessian reflects only the local objective landscape, not proximity to other needles.
@@ -1251,7 +1209,7 @@ This section documents three algorithm improvements applied in May 2026.
 
 **Fix:** `gp_simplex.py` now provides two additional methods used during needle declaration:
 
-- **`fit_with_locality(X, Y, bounds=None, radius_mult=3.0)`** — refits the GP using only points whose ILR coordinates fall within `radius_mult × input_noise_ilr` of the best point. Falls back to all unpenalized data when fewer than `top_m_points` local points exist. This produces a tight, local-only GP whose Hessian reflects only the local landscape.
+- **`fit_with_locality(X, Y, bounds=None, radius_mult=3.0)`** — refits the GP using only points whose ILR coordinates fall within `radius_mult × input_noise` of the best point. Falls back to all unpenalized data when fewer than `top_m_points` local points exist. This produces a tight, local-only GP whose Hessian reflects only the local landscape.
 
 - **`create_clean_acquisition()`** — builds a base acquisition (UCB or EI) **without** ellipsoidal repulsion penalties. The Hessian at the needle from this penalty-free acquisition gives the true local curvature.
 
@@ -1324,8 +1282,8 @@ Dimensions where **both** boxes have zero width (width < 1e-12) are projected ou
 
 | Parameter | Default | Controls |
 |-----------|---------|----------|
-| `bounds_shrink_factor` | 0.8 | Radius shrink factor applied to all needle ellipsoids on a no-new-data failure. |
-| `min_axis_noise_mult` | 2.0 | Stop condition: if `max_needle_radius() < min_axis_noise_mult × input_noise_ilr`, all ellipsoids are at noise scale and shrinking further is pointless. |
+| `needle_shrink_factor` | 0.8 | Radius shrink factor applied to all needle ellipsoids on a no-new-data failure. |
+| `needle_stop_noise_multiplier` | 2.0 | Stop condition: if `max_needle_radius() < needle_stop_noise_multiplier × input_noise`, all ellipsoids are at noise scale and shrinking further is pointless. |
 
 #### Loop Restructure
 
@@ -1370,15 +1328,15 @@ Case 2 (repeated failure, new data since last failure):
 
 Case 3 (repeated failure, no new data):
     first_failure_handled AND NOT data_added_since_last_failure
-    → dh.shrink_all_needle_radii(bounds_shrink_factor)
-    → if dh.max_needle_radius() < min_axis_noise_mult × input_noise_ilr:
+    → dh.shrink_all_needle_radii(needle_shrink_factor)
+    → if dh.max_needle_radius() < needle_stop_noise_multiplier × input_noise:
           return (should_stop=True, ...)   ← all ellipsoids at noise scale
     → return (should_stop=False, first_failure_handled=True)
 ```
 
 #### `_all_needle_axes_below_min(dh)`
 
-Helper that returns `True` when `dh.max_needle_radius() < self.min_axis_noise_mult × self.config.input_noise_ilr`. Called inside `_handle_failure_retry` to decide whether to stop.
+Helper that returns `True` when `dh.max_needle_radius() < self.needle_stop_noise_multiplier × dh.input_noise`. Called inside `_handle_failure_retry` to decide whether to stop.
 
 #### Secondary Jaccard Guard
 

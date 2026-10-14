@@ -280,11 +280,9 @@ def test_successive_demotion_stops_when_needles_exhausted(torch):
     z.d = 3
     z.ellipsoid_drop_fraction = 0.25
     z.ellipsoid_eigenvalue_floor = 1e-6
-    z.needle_shrink_factor = 0.85
-    z.needle_stop_noise_multiplier = 3.0
+    z.needle_shrink_factor = 0.8
+    z.needle_stop_noise_multiplier = 2.0
     z.max_penalty_radius = 1.0
-    z.bounds_shrink_factor = 0.8
-    z.min_axis_noise_mult = 2.0
     z.zoom_jaccard_threshold = 0.75
     z.random_sampler = lambda n, a, b, **kwargs: torch.rand((n, 3), dtype=dtype, device=device)
     z.proj_fn = lambda X: X

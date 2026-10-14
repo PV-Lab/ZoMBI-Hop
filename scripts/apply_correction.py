@@ -48,40 +48,27 @@ import torch
 
 from src import ZoMBIHop
 from src.core import correction
-from src.default_hparams import DEFAULT_HPARAMS, DEFAULT_INPUT_NOISE
+from src.hparams import ALL_DEFAULTS, extract_hparams
 from src.utils.datahandler import reconstruct_snapshot_tensors
-
-# Constructor hyperparameters an operator can set — mirrors the list in
-# scripts/retro_needles.py (kept in lock-step so both offline tools construct
-# ZoMBIHop identically to the live resume).
-_HPARAM_KEYS = (
-    "max_zooms", "max_iterations", "top_m_points", "n_restarts", "raw",
-    "input_noise_threshold_mult", "output_noise_threshold_mult",
-    "n_consecutive_converged", "max_gp_points", "repulsion_lambda",
-    "acquisition_type", "ucb_beta", "nat_grad_step", "nat_grad_max_steps",
-    "ellipsoid_drop_fraction", "ellipsoid_eigenvalue_floor", "max_penalty_radius",
-    "paring_spatial_halfnoise", "paring_y_noise_multiplier", "input_noise",
-    "needle_shrink_factor", "needle_stop_noise_multiplier",
-    "zoom_jaccard_threshold", "bounds_shrink_factor", "min_axis_noise_mult",
-    "jaccard_window", "jaccard_threshold",
-)
 
 
 def _load_hparams(run_dir: Path) -> dict:
     """In-force hyperparameters, matching the real resume (see retro_needles.py):
     hardware defaults overlaid with hparams_effective.json; load_state re-applies
     config.json's subset during construction."""
-    hparams = dict(DEFAULT_HPARAMS)
-    hparams.setdefault("input_noise", DEFAULT_INPUT_NOISE)
+    hparams = dict(ALL_DEFAULTS)
     eff_path = run_dir / "hparams_effective.json"
     if eff_path.exists():
         try:
             eff = json.loads(eff_path.read_text(encoding="utf-8-sig"))
-            hparams.update({k: v for k, v in eff.items() if k in _HPARAM_KEYS})
+            # extract_hparams maps an older run's retired names (e.g.
+            # bounds_shrink_factor, which held the shrink actually in force) onto
+            # the knobs that now do their job.
+            hparams.update(extract_hparams(eff, source=str(eff_path), log=None))
         except Exception as e:
             print(f"[correction] Could not read hparams_effective.json ({e}); "
                   f"using hardware defaults.")
-    return {k: v for k, v in hparams.items() if k in _HPARAM_KEYS}
+    return hparams
 
 
 def _load_bounds(run_dir: Path, d: int, device: str, dtype: torch.dtype):

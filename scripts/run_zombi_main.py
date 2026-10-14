@@ -208,49 +208,29 @@ def log_compositions(
     except Exception as exc:
         print(f"[comp-log] WARNING: failed to build composition record: {exc}")
 
-# Built-in (arbitrary) ZoMBI-Hop hyperparameters used when no --hparams JSON file
-# is supplied. Single source of truth lives in src/default_hparams.py — edit
-# there, not here. The hardware runner folds in the measured physical input
-# noise (not a tuned hyperparameter, so kept out of DEFAULT_HPARAMS).
-from src.default_hparams import DEFAULT_HPARAMS, DEFAULT_INPUT_NOISE
-DEFAULT_HW_HPARAMS: Dict[str, Any] = {**DEFAULT_HPARAMS, "input_noise": DEFAULT_INPUT_NOISE}
-
-# ZoMBIHop tunable kwargs that may be set from a hyperparameter JSON file.
-_VALID_HPARAM_KEYS = {
-    "max_zooms", "max_iterations", "top_m_points", "n_restarts", "raw",
-    "input_noise_threshold_mult",
-    "output_noise_threshold_mult", "n_consecutive_converged", "max_gp_points",
-    "repulsion_lambda", "acquisition_type", "ucb_beta", "nat_grad_step",
-    "nat_grad_max_steps", "ellipsoid_drop_fraction", "ellipsoid_eigenvalue_floor",
-    "max_penalty_radius", "paring_spatial_halfnoise", "paring_y_noise_multiplier",
-    "input_noise", "needle_shrink_factor", "needle_stop_noise_multiplier",
-    "zoom_jaccard_threshold", "bounds_shrink_factor", "min_axis_noise_mult",
-    "jaccard_window", "jaccard_threshold",
-}
+# ZoMBI-Hop hyperparameters used when no --hparams JSON file is supplied: the
+# shipped defaults from src/hparams.py (tuned values from
+# optimize/hparams/6d_ensemble.json, plus the measured physical input noise).
+from src.hparams import (
+    ALL_DEFAULTS,
+    check_conflicts,
+    load_hparams_file,
+    resolve_for_run,
+)
+DEFAULT_HW_HPARAMS: Dict[str, Any] = dict(ALL_DEFAULTS)
 
 
 def _load_hparams_file(path: str) -> Dict[str, Any]:
-    """
-    Load hyperparameters from a trial.json-style file.
+    """Registered hyperparameters from a trial.json-style or flat JSON file.
 
-    Accepts a top-level ``"hparams"`` object (as in optimize/runs/.../trial.json)
-    or a flat ``{name: value}`` object. Returns only keys ZoMBIHop accepts;
-    unknown keys (metrics, trial, phase, …) are ignored. Returns {} on failure.
+    A legacy MOBO record is upgraded to the values it actually ran with. Returns
+    {} (with a warning) if the file cannot be read.
     """
     try:
-        with open(path, "r") as fh:
-            data = json.load(fh)
+        return load_hparams_file(path, log=lambda m: print(f"[ZoMBI] {m}"))
     except Exception as exc:
         print(f"[ZoMBI] WARNING: could not read hyperparameters from {path!r}: {exc}")
         return {}
-    if not isinstance(data, dict):
-        print(f"[ZoMBI] WARNING: {path!r} is not a JSON object; ignoring.")
-        return {}
-    hp = data.get("hparams", data)
-    if not isinstance(hp, dict):
-        print(f"[ZoMBI] WARNING: 'hparams' in {path!r} is not an object; ignoring.")
-        return {}
-    return {k: v for k, v in hp.items() if k in _VALID_HPARAM_KEYS}
 
 
 def y_measured_to_optimizer(y: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
@@ -1495,6 +1475,19 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
         else:
             print(f"[ZoMBI] No usable hyperparameters found in {hparams_path}; "
                   f"using built-in defaults.")
+
+    # Refuse a configuration that can never declare a needle BEFORE any hardware
+    # moves (a new run prints its initial lines before ZoMBIHop is constructed). On
+    # resume the run's config.json wins over these values, so check that merge.
+    _run_cfg = None
+    if resume_uuid is not None:
+        _cfg_path = (Path(checkpoint_dir) if checkpoint_dir is not None
+                     else Path("actual_runs") / "checkpoints") / f"run_{resume_uuid}" / "config.json"
+        if _cfg_path.exists():
+            _run_cfg = json.loads(_cfg_path.read_text(encoding="utf-8-sig"))
+    check_conflicts(resolve_for_run(hw_hparams, _run_cfg),
+                    context=f"resume of run_{resume_uuid} (config.json values win)"
+                    if resume_uuid else "new hardware run")
 
     # Clear objective DB and handshake so the first read waits for fresh data (new run or resume).
     communication.reset_objective()
