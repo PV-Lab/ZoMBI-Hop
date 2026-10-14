@@ -24,6 +24,7 @@
    - [core/linebo.py](#55-corelinebopy)  
    - [core/zombihop.py](#56-corezombihoppy)  
    - [utils/visualization.py](#57-utilisvisualizationpy)  
+   - [utils/axial_init.py](#58-utilsaxial_initpy--initial-design-for-hardware-runs)  
 6. [Key Mathematical Derivations](#6-key-mathematical-derivations)  
 7. [Benefits, Drawbacks, and Known Failure Modes](#7-benefits-drawbacks-and-known-failure-modes)  
 8. [Recent Algorithm Edits (May 2026)](#8-recent-algorithm-edits-may-2026)  
@@ -462,6 +463,18 @@ Called on PI convergence (`reason="PI convergence"`) or Jaccard force-declare (`
 - `plot_simplex_2d` — ternary diagram with colormap scatter + needle stars  
 - `plot_simplex_3d` — tetrahedral 3D plot projecting 4-simplex coordinates to 3D  
 - `plot_needles_summary` — bar chart of needle values + discovery timeline
+
+---
+
+### 5.8 `utils/axial_init.py` — initial design for hardware runs
+
+**Role:** The seed lines a hardware run measures before the optimiser exists (`scripts/run_zombi_main.py`), replacing the two random lines used before. One straight composition gradient ("trace") per optimizing dim, from the dim at its maximum (pure on the bare simplex) to the opposite face (dim at its minimum, the rest sharing the remainder). Every trace crosses every other at a common point (the centroid on the bare simplex), so each dim is swept over its full range and the design scales with dimensionality.
+
+- **Count:** number of dims rounded **down to even**, because each objective call prints a (main, cache) pair on the front and back transporters. With an odd count the narrowest-range dim loses its trace (ties → last dim; override with `INIT_DROP_DIM`); it still varies as background on the other traces. 3 dims → 2 traces (1 pair), 6 → 6 (3 pairs), 10 → 10 (5 pairs).
+- **Search boxes:** traces are full chords of the box-constrained simplex through a feasible crossing point, so both ends sit on the box boundary and every dim still spans its full feasible range (e.g. a dim capped at 0.3 is swept 0 → 0.3). Bare simplex and lower-bounds-only reduce exactly to the reference design ("Axial trace initialization for simplex-constrained search spaces", Oct 2026).
+- **Hardware flow (`run_axial_initialization` + `utils/init_queue.py`):** the same compositions.db / objective.db handshake as the optimisation loop, with the GP replaced by a queue: every objective result sends the next queued (main, cache) pair instead of a prediction, and nothing ever waits for a particular transporter. Results are matched to traces by their measured compositions (stale results from an earlier run are ignored). DiSCO sends nothing for a slide that fails completely, so a trace that never reports while later ones do is re-sent (at most `INIT_MAX_SENDS` times, then skipped), and a stall watchdog sized from the observed send → result latency covers silence. Results arriving together share one pair. No GP exists until the queue is done. Traces print face → pure (`INIT_PRINT_PURE_LAST`), which the print model reaches far better at high dimension.
+- **Resume:** progress is saved to `<run_dir>/init_state.json` after every event; resuming a run stopped mid-initialization keeps what was measured and continues the queue.
+- **Validation:** `tests/test_axial_init.py`, `tests/test_init_queue.py` (incl. 1,000 simulated campaigns via `benchmarks/axial_init/disco_sim.py`), `tests/test_axial_init_hardware.py`, `python -m benchmarks.axial_init.validate`.
 
 ---
 

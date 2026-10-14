@@ -8,9 +8,12 @@ This module contains the DB-backed objective + runner that used to live in
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
+import os
 import sys
 import time
+import uuid as _uuidlib
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -20,11 +23,8 @@ import numpy as np
 import torch
 
 from src import ZoMBIHop, LineBO
-from src.core.linebo import (
-    batch_line_bounds_segments,
-    batch_line_simplex_segments,
-    zero_sum_dirs,
-)
+from src.utils.axial_init import AxialTrace, axial_design, pair_traces
+from src.utils.init_queue import InitQueue
 
 from scripts import communication
 
@@ -41,8 +41,42 @@ except Exception:
 # DEFAULT_NUM_MINIMA = 3
 # DEFAULT_TIME_LIMIT_HOURS = 24.0
 NUM_EXPERIMENTS = 24
-NUM_INIT_DATA = 2
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Initial design: axial traces (src/utils/axial_init.py), one composition gradient
+# per optimizing dim from its maximum to the opposite face, all crossing at a common
+# point. The count is the number of dims rounded DOWN to even, because every
+# objective call prints a (main, cache) pair on the front and back transporters.
+# When the count is odd one dim loses its trace: the narrowest-range dim, ties to
+# the last. Set this to a hardware dim index (e.g. 9) to choose it instead.
+INIT_DROP_DIM: int | None = None
+# Print each trace from the opposite-face mixture TO the pure component. Same
+# compositions either way, but in the print model (optimize/composition_prediction
+# .physics_simulate_line) a gradient that starts pure and ramps the other n-1
+# syringes up from zero lags badly at its far end as n grows (10 dims: the swept
+# component only gets down to 0.50 instead of 0), while face -> pure reaches ~92%
+# of the line at every n. Set False to print pure -> face.
+INIT_PRINT_PURE_LAST = True
+# Progress file for the initial design, in the run directory. Lets a run that is
+# stopped mid-initialization resume at the next unmeasured pair.
+INIT_STATE_NAME = "init_state.json"
+# Initialization stall watchdog (src/utils/init_queue.py). DiSCO sends nothing for a
+# slide that fails completely, so if no result arrives for this long the outstanding
+# traces are presumed lost and re-sent (each at most INIT_MAX_SENDS times, then
+# skipped) instead of waiting forever. Before any result: INIT_FIRST_RESULT_TIMEOUT_MIN
+# (hardware runs see their first result ~75 min after launch). After that:
+# INIT_STALL_MULT x the observed send -> result latency, at least INIT_STALL_FLOOR_MIN.
+INIT_FIRST_RESULT_TIMEOUT_MIN = 240.0
+INIT_STALL_FLOOR_MIN = 45.0
+INIT_STALL_MULT = 3.0
+INIT_MAX_SENDS = 3
+# Minimum spacing between two init writes. DiSCO picks compositions.db up through a
+# ~1 Hz serial sync, so a pair replaced within a second may never reach it.
+INIT_MIN_WRITE_GAP_S = 5.0
+# No print can report sooner than this after it was sent (hardware: first result ~75
+# min after launch). A result that does is a leftover from an earlier run (run_9dfe got
+# two at launch) and is not taken for an init trace.
+INIT_MIN_RESULT_LATENCY_MIN = 15.0
 
 # ARCHERFISH MODULES TO PRINT AND OPTIMIZE FROM
 OPTIMIZING_DIMS = [0, 8, 9]
@@ -574,6 +608,8 @@ def get_y_measurements(
     verbose: bool = False,
     ready_for_objectives: bool = False,
     return_indices: bool = False,
+    timeout_s: float | None = None,
+    accept_empty: bool = False,
 ):
     """
     Read objective values (and compositions → x_meas) from the objective DB.
@@ -588,6 +624,12 @@ def get_y_measurements(
     where ``valid_indices`` maps each returned (non-NaN) row back to its row in the
     input ``x`` send order, so callers can attribute rows to the correct rail even
     when some points were dropped.
+
+    ``timeout_s`` bounds the wait for the handshake: None is returned if no packet
+    arrives in time. With ``accept_empty`` a packet that has no usable row (all NaN,
+    no rows, all-zero compositions) is returned as empty arrays and consumed, instead
+    of waiting for the next packet. Both are used only by the initialization queue;
+    the defaults keep the optimisation loop's behaviour unchanged.
     """
     import os as _os
     import sqlite3
@@ -598,9 +640,13 @@ def get_y_measurements(
     mismatch_polls = 0
     max_mismatch_polls = 30  # ~30 s of 1 Hz re-reads before falling back
     empty_polls = 0
+    deadline = None if timeout_s is None else _time.time() + max(0.0, float(timeout_s))
+    _n_opt = len(OPTIMIZING_DIMS)
 
     if ready_for_objectives:
         while True:
+            if deadline is not None and _time.time() >= deadline:
+                return None
             try:
                 conn = sqlite3.connect(db, timeout=10.0)
                 cur = conn.cursor()
@@ -636,23 +682,21 @@ def get_y_measurements(
                 cur = conn.cursor()
                 cur.execute("SELECT * FROM objective")
                 all_rows = cur.fetchall()
-                if not all_rows:
-                    conn.close()
-                    _time.sleep(1)
-                    continue
                 if len(all_rows) == 1 and len(all_rows[0]) > 1:
                     flat = list(all_rows[0])
-                elif len(all_rows) > 1 and len(all_rows[0]) == 1:
+                elif len(all_rows) >= 1 and len(all_rows[0]) == 1:
                     flat = [r[0] for r in all_rows]
                 else:
-                    conn.close()
-                    _time.sleep(1)
-                    continue
+                    flat = []
                 y_all = np.array(flat, dtype=float)
                 valid_mask = ~np.isnan(y_all)
                 valid_indices = np.where(valid_mask)[0]
                 if len(valid_indices) == 0:
                     conn.close()
+                    if accept_empty:
+                        y, x_meas = np.zeros(0), np.zeros((0, _n_opt))
+                        valid_indices = np.zeros(0, dtype=int)
+                        break
                     _time.sleep(1)
                     continue
                 y = y_all[valid_indices].reshape(-1)
@@ -718,6 +762,9 @@ def get_y_measurements(
                     x_meas = x_meas[keep_rows]
                     y = y[keep_rows]
                     valid_indices = valid_indices[keep_rows]
+                    if len(y) == 0 and accept_empty:
+                        conn.close()
+                        break
                     if len(y) == 0:
                         # Nothing usable in this packet. Waiting is the only correct
                         # move -- there is no real composition to hand the GP -- but
@@ -800,28 +847,13 @@ def expected_from_actual(x_actual: torch.Tensor) -> torch.Tensor:
     return x_requested
 
 
-def objective(
+def _write_line_pair(
     endpoints: torch.Tensor,
-    ready_for_objectives: bool = True,
-    endpoints_log_ref: Dict[str, Any] | None = None,
-    num_experiments: int = NUM_EXPERIMENTS,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Single objective: accepts (n, 2, d) torch tensor with n >= 2.
-    Sends first two lines endpoints[0] and endpoints[1] (each 2,d = left, right) to communication,
-    waits on response, returns (x_actual, y) for the first line as tensors.
-    Logs the endpoints passed in to endpoints_log_ref when provided.
-    """
-    print(
-        "[objective] called with params:\n"
-        f"  endpoints.shape={getattr(endpoints, 'shape', None)}, dtype={getattr(endpoints, 'dtype', None)}, device={getattr(endpoints, 'device', None)}\n"
-        f"  ready_for_objectives={ready_for_objectives}\n"
-        f"  endpoints_log_ref keys={list(endpoints_log_ref.keys()) if endpoints_log_ref is not None else None}\n"
-        f"  num_experiments={num_experiments}"
-    )
-    assert endpoints.dim() == 3 and endpoints.shape[0] >= 2 and endpoints.shape[1] == 2
-    device = endpoints.device
-    dtype = endpoints.dtype
+    endpoints_log_ref: Dict[str, Any] | None,
+    num_experiments: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Write lines endpoints[0] (main rail) and endpoints[1] (cache rail) to
+    compositions.db as one packet. Returns the sent (x_main, x_cache) points."""
     line0 = endpoints[0]  # (2, d) left, right
     line1 = endpoints[1]  # (2, d) left, right
     line_0_left = line0[0].cpu().numpy()
@@ -853,6 +885,32 @@ def objective(
         array_cache=x_cache_norm,
         timestamp=time.time(),
     )
+    return x_main, x_cache
+
+
+def objective(
+    endpoints: torch.Tensor,
+    ready_for_objectives: bool = True,
+    endpoints_log_ref: Dict[str, Any] | None = None,
+    num_experiments: int = NUM_EXPERIMENTS,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Single objective: accepts (n, 2, d) torch tensor with n >= 2.
+    Sends first two lines endpoints[0] and endpoints[1] (each 2,d = left, right) to communication,
+    waits on response, returns (x_actual, y) for the first line as tensors.
+    Logs the endpoints passed in to endpoints_log_ref when provided.
+    """
+    print(
+        "[objective] called with params:\n"
+        f"  endpoints.shape={getattr(endpoints, 'shape', None)}, dtype={getattr(endpoints, 'dtype', None)}, device={getattr(endpoints, 'device', None)}\n"
+        f"  ready_for_objectives={ready_for_objectives}\n"
+        f"  endpoints_log_ref keys={list(endpoints_log_ref.keys()) if endpoints_log_ref is not None else None}\n"
+        f"  num_experiments={num_experiments}"
+    )
+    assert endpoints.dim() == 3 and endpoints.shape[0] >= 2 and endpoints.shape[1] == 2
+    device = endpoints.device
+    dtype = endpoints.dtype
+    x_main, x_cache = _write_line_pair(endpoints, endpoints_log_ref, num_experiments)
     # Clear before reading so we only accept data sent in response to this request.
     # Always reset (not just when ready_for_objectives) so stale rows from a previous
     # call never bleed into the next one.
@@ -1001,48 +1059,272 @@ def linebo_sampler_wrapper(
     return wrapper, _flush_state
 
 
-def initial_lines_on_boundary(
-    num_lines: int,
+def _save_init_state(run_dir: Path, state: Dict[str, Any]) -> None:
+    """Atomically write the initialization progress file."""
+    path = Path(run_dir) / INIT_STATE_NAME
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=1))
+    os.replace(tmp, path)
+
+
+def _load_init_state(run_dir: Path) -> Dict[str, Any] | None:
+    path = Path(run_dir) / INIT_STATE_NAME
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception as exc:
+        print(f"[init] WARNING could not read {path}: {exc}")
+        return None
+
+
+def plan_axial_initialization(
+    bounds: torch.Tensor,
+    run_uuid: str,
+    drop_dim: int | None = None,
+) -> Dict[str, Any]:
+    """Build the axial initial design for the search box and its print queue.
+
+    Returns the JSON-able progress state. The queue order is shuffled (seeded by the
+    run UUID) so no component is confounded with drift over the initialization.
+    """
+    lo = bounds[0].detach().cpu().numpy().astype(float)
+    hi = bounds[1].detach().cpu().numpy().astype(float)
+    drop: Any = "auto"
+    if drop_dim is not None:
+        if drop_dim in OPTIMIZING_DIMS:
+            drop = OPTIMIZING_DIMS.index(drop_dim)
+        else:
+            print(f"[init] INIT_DROP_DIM={drop_dim} is not an optimizing dim "
+                  f"{OPTIMIZING_DIMS}; choosing automatically")
+    design = axial_design(len(OPTIMIZING_DIMS), lower=lo, upper=hi, drop=drop)
+    seed = int(hashlib.sha256(str(run_uuid).encode()).hexdigest()[:8], 16)
+    order = [t for pair in pair_traces(design.traces, seed=seed) for t in pair]
+    return {
+        "version": 2,
+        "design": "axial",
+        "optimizing_dims": list(OPTIMIZING_DIMS),
+        "bounds_lo": lo.tolist(),
+        "bounds_hi": hi.tolist(),
+        "num_experiments": NUM_EXPERIMENTS,
+        "print_pure_last": bool(INIT_PRINT_PURE_LAST),
+        "reference": design.reference.tolist(),
+        "dropped_dims": [OPTIMIZING_DIMS[i] for i in design.dropped],
+        "queue": InitQueue(order, max_sends=INIT_MAX_SENDS, points_per_trace=NUM_EXPERIMENTS,
+                           min_latency=INIT_MIN_RESULT_LATENCY_MIN * 60.0).to_state(),
+        "complete": False,
+    }
+
+
+def _result_waiting(db: str = "./sql/objective.db") -> bool:
+    """True if an objective handshake is already raised (a result is waiting)."""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(db, timeout=5.0)
+        row = conn.execute("SELECT new_objective_available FROM handshake WHERE id = 1").fetchone()
+        conn.close()
+        return bool(row and row[0] == 1)
+    except Exception:
+        return False
+
+
+def _print_ends(trace: AxialTrace, pure_last: bool) -> Tuple[np.ndarray, np.ndarray]:
+    """(first, last) printed composition of a trace."""
+    return (trace.end, trace.start) if pure_last else (trace.start, trace.end)
+
+
+def _print_init_plan(state: Dict[str, Any], q: InitQueue) -> None:
+    dims = state["optimizing_dims"]
+    pure_last = state.get("print_pure_last", True)
+    print("=" * 80)
+    print(f"INITIALIZATION: axial traces - {len(q.traces)} traces for {len(dims)} dims, "
+          f"{state['num_experiments']} points each, sent two at a time (main, cache): "
+          f"every objective result sends the next queued pair")
+    if state.get("dropped_dims"):
+        print(f"  no trace for dim(s) {state['dropped_dims']} (count rounded down to even); "
+              f"they still vary as background on the other traces")
+    print(f"  traces cross at {np.round(state['reference'], 3).tolist()}")
+    for k, t in enumerate(q.traces):
+        first, last = _print_ends(t, pure_last)
+        print(f"  trace {k + 1}: dim {dims[t.component]:>2}  {np.round(first, 3).tolist()} -> "
+              f"{np.round(last, 3).tolist()}  [{q.status[k]}]")
+    print("=" * 80)
+
+
+def run_axial_initialization(
+    run_dir: Path,
+    run_uuid: str,
     bounds: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype = torch.float64,
-    max_retries: int = 10,
-) -> np.ndarray:
-    """
-    Generate num_lines with endpoints on the search-box boundary.
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Print and measure the axial initial design through the hardware handshake.
 
-    Sample num_lines interior points inside the box-constrained simplex and
-    num_lines random zero-sum directions; for each point + direction, extend to
-    the boundary of ``[bounds[0], bounds[1]]`` (linebo.batch_line_bounds_segments)
-    to get (x_left, x_right). Clipping to the box — not to the bare simplex face —
-    matters whenever a dim is capped below 1 (e.g. [0, 0.3]): extending to the
-    simplex face would seed the run with points outside the requested box.
-    Returns ordered_endpoints of shape (num_lines, 2, d) where [i, 0] is left
-    and [i, 1] is right endpoint on the boundary.
+    Works like the optimisation loop with the GP replaced by a queue: the first pair
+    is written, then every objective result sends the next queued pair instead of a
+    prediction. Nothing waits for a particular transporter. Results are matched to
+    traces by their measured compositions; traces that never report (overwritten
+    before a transporter took them, or failed silently - DiSCO sends nothing for an
+    all-NaN slide) are re-sent, and a stall watchdog keeps an all-silent hardware
+    from holding the run (see src/utils/init_queue.py). The optimiser, and so every
+    prediction, starts only after the queue is done. Progress is saved to
+    ``<run_dir>/init_state.json`` after every event, so a stopped run resumes where
+    it left off.
+
+    Returns (X_init_actual, X_init_expected, Y_init) with Y in optimizer sign.
     """
-    d = bounds.shape[1]
-    low, high = bounds[0], bounds[1]
-    # Interior points on simplex (sum=1, within the per-dim box)
-    points = ZoMBIHop.random_simplex(num_lines, low, high, device=device)
-    bounds = bounds.to(device=points.device, dtype=points.dtype)
-    endpoints_list = []
-    for i in range(num_lines):
-        x0 = points[i]
-        for _ in range(max_retries):
-            direction = zero_sum_dirs(1, d, device=device, dtype=dtype).squeeze(0)
-            x_left, x_right, _t_min, _t_max, mask = batch_line_bounds_segments(
-                x0, direction.unsqueeze(0).to(x0.dtype), bounds
-            )
-            if bool(mask.any()):
-                endpoints_list.append([x_left[0].cpu().numpy(),
-                                       x_right[0].cpu().numpy()])
-                break
+    run_dir = Path(run_dir)
+    state = _load_init_state(run_dir)
+    if state is not None and state.get("version") != 2:
+        print(f"[init] {INIT_STATE_NAME} is from an older format; planning afresh")
+        state = None
+    if state is None:
+        state = plan_axial_initialization(bounds, run_uuid, INIT_DROP_DIM)
+        _save_init_state(run_dir, state)
+    else:
+        if list(state.get("optimizing_dims", [])) != list(OPTIMIZING_DIMS):
+            raise RuntimeError(
+                f"{run_dir / INIT_STATE_NAME} was planned for dims "
+                f"{state.get('optimizing_dims')}, but this run optimizes {OPTIMIZING_DIMS}")
+        print(f"[init] Continuing initialization from {INIT_STATE_NAME}")
+    q = InitQueue.from_state(state["queue"], resume=True)
+    pure_last = state.get("print_pure_last", True)
+    n_exp = int(state.get("num_experiments", NUM_EXPERIMENTS))
+    _print_init_plan(state, q)
+
+    def _sent_points(tr: AxialTrace) -> np.ndarray:
+        first, last = _print_ends(tr, pure_last)
+        return np.array([first + t * (last - first) for t in np.linspace(0, 1, n_exp)])
+
+    def _save() -> None:
+        state["queue"] = q.to_state()
+        state["complete"] = q.complete()
+        _save_init_state(run_dir, state)
+
+    plot_x: List[np.ndarray] = []
+    plot_y: List[float] = []
+    for b in q.measured():
+        plot_x.extend(np.asarray(b["x"], float))
+        plot_y.extend(float(v) for v in b["y"])
+    refs: Dict[str, Dict[str, Any]] = {"last": {}, "prior": {}}
+
+    def _send(now: float) -> None:
+        pair = q.next_pair(now)
+        if pair is None:
+            return
+        main, cache = q.traces[pair[0]], q.traces[pair[1]]
+        ep = torch.tensor(np.stack([_print_ends(main, pure_last), _print_ends(cache, pure_last)]),
+                          device=device, dtype=torch.float64)
+        ref: Dict[str, Any] = {}
+        _write_line_pair(ep, ref, n_exp)
+        refs["prior"], refs["last"] = refs["last"], ref
+        print(f"[init] sent: main = dim {OPTIMIZING_DIMS[main.component]} trace, cache = dim "
+              f"{OPTIMIZING_DIMS[cache.component]} trace"
+              f"{' (replicate)' if pair[0] == pair[1] else ''}; {len(q.queue)} still queued, "
+              f"{len(q.outstanding())} awaiting results")
+        _save()
+
+    # A result already flagged now was raised for something we never sent in this
+    # session (a slide still in flight when the previous run stopped, or a stale flag);
+    # clear it so it is not taken as a result of the first pair.
+    communication.clear_in_flight_objective_state()
+    if q.queue:
+        _send(time.time())
+    # A result marks the next pair as due. It is written as soon as no other result
+    # is waiting and INIT_MIN_WRITE_GAP_S has passed since the previous write: results
+    # landing together share one pair (it fills both freed transporters), and no pair
+    # is overwritten before DiSCO's ~1 Hz composition sync has picked it up.
+    send_due = False
+    while not q.complete():
+        now = time.time()
+        last_write = q.writes[-1]["t"] if q.writes else 0.0
+        if (send_due and q.queue and now - last_write >= INIT_MIN_WRITE_GAP_S
+                and not _result_waiting()):
+            _send(now)
+            send_due = False
+            continue
+        timeout = q.stall_timeout(INIT_FIRST_RESULT_TIMEOUT_MIN * 60.0,
+                                  INIT_STALL_FLOOR_MIN * 60.0, INIT_STALL_MULT)
+        anchor = q.last_activity_t if q.last_activity_t is not None else now
+        stall_at = anchor + timeout
+        wake = stall_at
+        if send_due and q.queue:
+            wake = min(wake, last_write + INIT_MIN_WRITE_GAP_S)
+        pkt = get_y_measurements(None, verbose=True, ready_for_objectives=True,
+                                 return_indices=True, timeout_s=max(0.05, wake - now),
+                                 accept_empty=True)
+        now = time.time()
+        if pkt is None:
+            if now >= stall_at:
+                ev = q.on_stall(now)
+                print(f"[init] no result for {timeout / 60:.0f} min; presuming the "
+                      f"outstanding trace(s) lost: re-queued {len(ev['requeued'])}, gave up "
+                      f"on {len(ev['abandoned'])}")
+                send_due = bool(q.queue)
+                _save()
+            continue
+        y, x_meas, idx = pkt
+        ev = q.on_result(x_meas, y, now)
+        i = ev["trace"]
+        if ev["kind"] == "foreign":
+            print(f"[init] result ({ev['n']} points) does not match any init trace sent "
+                  f"(distance {ev['distance']}); ignored")
+        elif ev["kind"] == "empty":
+            print(f"[init] result with no usable points; counted for the dim "
+                  f"{OPTIMIZING_DIMS[q.traces[i].component]} trace")
         else:
-            # Fallback: chord between two independently sampled in-box points, so a
-            # degenerate direction never seeds a line outside the search box.
-            pair = ZoMBIHop.random_simplex(2, low, high, device=device)
-            endpoints_list.append([pair[0].cpu().numpy(), pair[1].cpu().numpy()])
-    return np.array(endpoints_list)
+            w = q.writes[q.sent_in[i][-1]]
+            rail = 0 if w["main"] == i else 1
+            mt, ct = q.traces[w["main"]], q.traces[w["cache"]]
+            (m0, m1), (c0, c1) = _print_ends(mt, pure_last), _print_ends(ct, pure_last)
+            blk = q.data[i][-1]
+            log_compositions(
+                sent_main=_sent_points(mt), sent_cache=_sent_points(ct),
+                endpoints_log_ref={"line_0_left": m0, "line_0_right": m1,
+                                   "line_1_left": c0, "line_1_right": c1},
+                measured=np.asarray(blk["x"], float), y_measured=np.asarray(blk["y"], float),
+                valid_indices=rail * n_exp + np.arange(len(blk["y"])),
+                num_experiments=n_exp,
+            )
+            plot_x.extend(np.asarray(blk["x"], float))
+            plot_y.extend(float(v) for v in blk["y"])
+            _write_live_plot_state(run_dir, OPTIMIZING_DIMS, plot_x, plot_y, refs["last"], [],
+                                   prior_endpoints_ref=refs["prior"])
+            print(f"[init] result for the dim {OPTIMIZING_DIMS[q.traces[i].component]} trace "
+                  f"({len(blk['y'])} points, {ev['distance']:.3f} from the line)"
+                  + (f"; re-queued {len(ev['requeued'])} trace(s) that never reported"
+                     if ev["requeued"] else "")
+                  + (f"; gave up on {len(ev['abandoned'])}" if ev["abandoned"] else ""))
+        send_due = send_due or ev["kind"] != "foreign"
+        _save()
+    _save()
+
+    d = len(OPTIMIZING_DIMS)
+    xa, xe, ys = [], [], []
+    for b in q.measured():
+        x = torch.tensor(b["x"], device=device, dtype=dtype).reshape(-1, d)
+        xa.append(x)
+        xe.append(expected_from_actual(x))
+        ys.append(torch.tensor(y_measured_to_optimizer(np.asarray(b["y"], float)),
+                               device=device, dtype=dtype))
+    n_given_up = sum(s == "abandoned" for s in q.status)
+    if not xa:
+        raise RuntimeError(
+            "initialization finished without a single usable measurement "
+            f"({n_given_up} trace(s) never reported); resume the run to retry them")
+    print(f"[init] Initialization complete: {sum(len(y) for y in ys)} points from "
+          f"{len(xa)} results"
+          + (f"; {n_given_up} trace(s) never reported and were skipped" if n_given_up else ""))
+    return torch.cat(xa), torch.cat(xe), torch.cat(ys).reshape(-1, 1)
+
+
+def _fresh_run_uuid(ckpt_path: Path) -> str:
+    """A new 4-character run UUID (DataHandler's format) not already on disk. The
+    run directory has to exist before the optimiser does, to hold init_state.json."""
+    while True:
+        u = str(_uuidlib.uuid4())[:4]
+        if not (Path(ckpt_path) / f"run_{u}").exists():
+            return u
 
 
 def _latest_snapshot_dir(run_dir: Path) -> Path | None:
@@ -1247,9 +1529,24 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
     if bounds_lo or bounds_hi:
         print(f"[ZoMBI] Search box: lo={bounds[0].tolist()} hi={bounds[1].tolist()}")
 
+    # Which run (if any) still needs its initial design measured. A new run always
+    # does. A resumed run does too when it was stopped during initialization: it has
+    # an init_state.json but no optimiser snapshot yet, so it continues the design
+    # instead of loading a snapshot.
+    init_uuid: str | None = None
+    if resume_uuid is None:
+        init_uuid = new_run_uuid or _fresh_run_uuid(ckpt_path)
+    else:
+        _rd = ckpt_path / f"run_{resume_uuid}"
+        if (_rd.exists() and _latest_snapshot_dir(_rd) is None
+                and _load_init_state(_rd) is not None):
+            init_uuid = resume_uuid
+            print(f"[Resume] run_{resume_uuid} was stopped during initialization; "
+                  f"continuing its initial design.")
+
     resume_plot_data: Tuple[List[float], List[float], List[np.ndarray]] | None = None
     needle_plot_points: List[Dict[str, float]] = []
-    if resume_uuid is not None:
+    if resume_uuid is not None and init_uuid is None:
         run_dir = ckpt_path / f"run_{resume_uuid}"
         if run_dir.exists():
             resume_plot_data = _load_plot_data_from_run(run_dir)
@@ -1263,63 +1560,46 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
     run_dir_ref: List = [None]
     optimizer_ref: List = [None]
 
-    objective_wrapper, _flush_initial_state = linebo_sampler_wrapper(
-        dimensions=dimensions,
-        num_lines=10,
-        device=device,
-        dtype=dtype,
-        resume_plot_data=resume_plot_data,
-        needle_plot_points=needle_plot_points,
-        run_dir_ref=run_dir_ref,
-        optimizer_ref=optimizer_ref,
-        show_live_plots=False,  # hardware mode: use GUI ternary tab, no popup
-    )
+    def _make_objective_wrapper(plot_seed):
+        return linebo_sampler_wrapper(
+            dimensions=dimensions,
+            num_lines=10,
+            device=device,
+            dtype=dtype,
+            resume_plot_data=plot_seed,
+            needle_plot_points=needle_plot_points,
+            run_dir_ref=run_dir_ref,
+            optimizer_ref=optimizer_ref,
+            show_live_plots=False,  # hardware mode: use GUI ternary tab, no popup
+        )
 
-    if resume_uuid is None:
+    if init_uuid is not None:
         print("=" * 80)
-        print("STARTING NEW ZOMBIHOP TRIAL (DATABASE-DRIVEN)")
+        print("STARTING NEW ZOMBIHOP TRIAL (DATABASE-DRIVEN)" if resume_uuid is None
+              else "CONTINUING ZOMBIHOP TRIAL INITIALIZATION (DATABASE-DRIVEN)")
         print("=" * 80)
         print(f"Dimensions: {dimensions} (from OPTIMIZING_DIMS: {OPTIMIZING_DIMS})")
         print(f"Device: {device}")
+        print(f"Run directory: {ckpt_path / f'run_{init_uuid}'}")
         if MINIMIZE_OBJECTIVE:
             print("Objective: minimize measured y (LineBO+ZoMBI maximize -y internally).")
         else:
             print("Objective: maximize measured y.")
         print("=" * 80 + "\n")
 
+        # The optimiser (and with it every prediction) is created only after the
+        # whole initial design has been measured.
         print("Generating initial data via database...")
-        n_init_data = NUM_INIT_DATA
-        ordered_endpoints = initial_lines_on_boundary(
-            2 * n_init_data, bounds, device, dtype=torch.float64
-        )
-        n_total = len(ordered_endpoints)
-        x_actual_list: List[torch.Tensor] = []
-        x_expected_list: List[torch.Tensor] = []
-        y_list: List[torch.Tensor] = []
-        for i in range(n_init_data):
-            idx0 = 2 * i
-            idx1 = 2 * i + 1
-            line0 = ordered_endpoints[idx0]  # (2, d) left, right
-            line1 = ordered_endpoints[idx1]
-            # Ensure main and cache are different (avoid same values in cache and real)
-            if np.allclose(line0, line1, rtol=1e-6, atol=1e-8):
-                idx1 = (2 * i + 2) % n_total
-                if idx1 == idx0:
-                    idx1 = (idx0 + 1) % n_total
-                line1 = ordered_endpoints[idx1]
-            ep = torch.tensor(
-                np.stack([line0, line1], axis=0),
-                device=device,
-                dtype=torch.float64,
-            )
-            x_act, y_act = objective(ep, ready_for_objectives=True)
-            x_exp = expected_from_actual(x_act)
-            x_actual_list.append(x_act)
-            x_expected_list.append(x_exp)
-            y_list.append(y_act)
-        X_init_actual = torch.cat(x_actual_list, dim=0)
-        X_init_expected = torch.cat(x_expected_list, dim=0)
-        Y_init = torch.cat(y_list, dim=0).reshape(-1, 1)
+        run_dir = ckpt_path / f"run_{init_uuid}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        set_composition_log_dir(run_dir)  # record each init pair as it is measured
+        X_init_actual, X_init_expected, Y_init = run_axial_initialization(
+            run_dir, init_uuid, bounds, device, dtype)
+        objective_wrapper, _flush_initial_state = _make_objective_wrapper((
+            list(range(1, Y_init.shape[0] + 1)),
+            Y_init.ravel().tolist(),
+            list(X_init_actual.detach().cpu().numpy()),
+        ))
 
         # ZoMBI hyperparameters: DEFAULT_HW_HPARAMS, optionally overridden by --hparams.
         new_hparams = dict(hw_hparams)
@@ -1332,7 +1612,7 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
             device=str(device),
             dtype=dtype,
             bounds=bounds,
-            run_uuid=new_run_uuid,
+            run_uuid=init_uuid,
             resume=False,
             checkpoint_dir=str(ckpt_path),
             num_iterations_saved=50,
@@ -1341,11 +1621,12 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
             **new_hparams,
         )
 
-        run_dir_ref[0] = ckpt_path / f"run_{optimizer.run_uuid}"
+        run_dir_ref[0] = run_dir
         optimizer_ref[0] = optimizer
-        set_composition_log_dir(run_dir_ref[0])  # flush any buffered seed-line records
+        _flush_initial_state()  # initial design (with penalty mask) to the GUI
         print(f"✅ Starting new trial with UUID: {optimizer.run_uuid}")
     else:
+        objective_wrapper, _flush_initial_state = _make_objective_wrapper(resume_plot_data)
         run_dir = ckpt_path / f"run_{resume_uuid}"
         if not run_dir.exists():
             raise FileNotFoundError(f"Checkpoint not found for UUID {resume_uuid} (expected {run_dir})")
