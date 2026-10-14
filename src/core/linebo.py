@@ -9,7 +9,8 @@ LineBO optimizes over the probability simplex by:
 3. Integrating an acquisition function along segments and picking the best line.
 4. Evaluating the objective along that line and returning requested/actual points and values.
 
-All tensors use float64 for numerical stability. Shapes use k = number of lines, d = dimensions,
+The geometry (simplex or box) comes from a ``Domain`` (src/utils/domain.py);
+the simplex is the default. All tensors use float64 for numerical stability. Shapes use k = number of lines, d = dimensions,
 n = number of evaluation points.
 """
 
@@ -24,6 +25,7 @@ from ..utils.simplex import (
     sample_ellipsoid,
     proj_simplex,
 )
+from ..utils.domain import Domain, make_domain
 
 # Backward-compatible aliases
 random_zero_sum_directions = random_simplex_direction
@@ -380,18 +382,21 @@ def random_chords_through_simplex(
     bounds: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
+    domain: Optional[Domain] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generate up to k random chord endpoint pairs clipped to the current bounds.
     Interior anchor points are sampled from within the bounds; chords extend to
-    the bounds boundary (not the full simplex), keeping evaluations inside the
-    current zoom region.
+    the bounds boundary (not the full domain), keeping evaluations inside the
+    current zoom region. ``domain`` supplies the anchor sampler and the chord
+    directions (default: the simplex — zero-sum directions).
     """
+    domain = make_domain(domain)
     d = bounds.shape[1]
     lo, hi = bounds[0], bounds[1]
     oversample = max(k * 3, k + 20)
-    interior_pts = random_simplex(oversample, lo, hi, device=str(device), torch_dtype=dtype)
-    directions = random_simplex_direction(oversample, d, device=str(device), dtype=dtype)
+    interior_pts = domain.sample(oversample, lo, hi, device=str(device), torch_dtype=dtype)
+    directions = domain.directions(oversample, d, device=str(device), dtype=dtype)
 
     lefts: List[torch.Tensor] = []
     rights: List[torch.Tensor] = []
@@ -438,6 +443,8 @@ class LineBO:
         verbatim. Default: None (legacy auto budget: 10*d).
     device : str
         Device for computations. Default: 'cuda'.
+    domain : Domain or str, optional
+        Search domain ("simplex" / "box" or a ``Domain``). Default: the simplex.
     """
 
     def __init__(
@@ -447,6 +454,7 @@ class LineBO:
         num_points_per_line: int = 100,
         num_lines: Optional[int] = None,
         device: str = "cuda",
+        domain: Optional[Domain] = None,
     ):
         """Initialize LineBO sampler: store objective, dimensions, line-discretization and device."""
         self.objective_function = objective_function
@@ -460,6 +468,7 @@ class LineBO:
             self.num_lines = max(1, int(num_lines))
         self.device = torch.device(device)
         self.dtype = torch.float64
+        self.domain = make_domain(domain)
 
     def _integrate_acquisition_along_lines(self, x_left: torch.Tensor, x_right: torch.Tensor,
                                          acquisition_function: nn.Module) -> torch.Tensor:
@@ -544,32 +553,29 @@ class LineBO:
         Parameters
         ----------
         x_tell : torch.Tensor
-            Starting point (d,) on simplex.
+            Starting point (d,) in the domain.
         bounds : torch.Tensor, optional
             (2, d) tensor: bounds[0] = lower, bounds[1] = upper.
-            If None, uses the full simplex [0, 1]^d.
+            If None, uses the domain's full box.
         acquisition_function : nn.Module, optional
             Acquisition function to rank lines. If None, random order.
         """
         x_tell = x_tell.to(device=self.device, dtype=self.dtype)
 
-        assert abs(x_tell.sum().item() - 1.0) < 1e-12, f"x_tell must sum to 1, got {x_tell.sum().item()}"
+        self.domain.check_point(x_tell)
 
-        # Build effective bounds (full simplex if not provided)
+        # Build effective bounds (the domain's full box if not provided)
         d = self.d
         if bounds is not None:
             bounds_eff = bounds.to(device=self.device, dtype=self.dtype)
         else:
-            bounds_eff = torch.stack([
-                torch.zeros(d, device=self.device, dtype=self.dtype),
-                torch.ones(d, device=self.device, dtype=self.dtype),
-            ], dim=0)
+            bounds_eff = self.domain.default_bounds(d, self.device, self.dtype)
 
         x_left_parts: List[torch.Tensor] = []
         x_right_parts: List[torch.Tensor] = []
 
         rand_xl, rand_xr = random_chords_through_simplex(
-            self.num_lines, bounds_eff, self.device, self.dtype
+            self.num_lines, bounds_eff, self.device, self.dtype, domain=self.domain
         )
 
         if rand_xl.shape[0] > 0:
