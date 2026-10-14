@@ -119,6 +119,9 @@ from pareto import (  # noqa: E402
 )
 from summary_table import write_landscape_summary  # noqa: E402
 
+sys.path.insert(0, _REPO)
+from src.hparams import conflicts, extract_hparams  # noqa: E402
+
 
 DEFAULT_N_LANDSCAPES = 5
 # Sampling budget per run, in MEASURED POINTS. Every run of a showdown gets the same
@@ -371,6 +374,20 @@ echo "[$(date)] worker $SLURM_ARRAY_TASK_ID done, ran $n_ran task(s) over $pass_
 
 def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
     """Write configs/, the manifest and the SLURM array script. Returns the sbatch path."""
+    # Refuse to plan a configuration ZoMBIHop cannot run, before writing anything.
+    # Checked as evaluate.py will read it (legacy records upgraded first), so a
+    # config that passes here is the config the workers run — nothing is repaired.
+    bad = {}
+    for c in chosen:
+        name = c.get("config_name") or f"{c['selected_for']}{c['rank']}"
+        problems = conflicts(extract_hparams(c, source=name, log=None))
+        if problems:
+            bad[name] = problems
+    if bad:
+        sys.exit("Hyperparameter conflict — no showdown planned:\n" + "\n".join(
+            f"  {n}:\n" + "\n".join(f"    - {p}" for p in probs)
+            for n, probs in bad.items()))
+
     out_dir = os.path.abspath(args.out)
     os.makedirs(os.path.join(out_dir, "configs"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)

@@ -58,7 +58,8 @@ def _apply_set(zombi, hp: dict, log: Optional[Callable[[str], None]]) -> list[st
 
     Mirrors the write path of ``hparam_live.apply_pending`` but takes the values
     from ``hp`` directly instead of a JSON file. Non-live-editable keys (none of
-    the tuned set, in practice) are skipped, and a bad value skips only itself.
+    the tuned set, in practice) are skipped; a bad value raises, since ``arm``
+    already validated both sets and a silent skip would run a mixed schedule.
     """
     from src.core import hparam_live as hl
 
@@ -68,12 +69,7 @@ def _apply_set(zombi, hp: dict, log: Optional[Callable[[str], None]]) -> list[st
         targets = hl._TARGETS.get(name)
         if not targets:
             continue
-        try:
-            new = hl.coerce(name, value)
-        except (TypeError, ValueError) as exc:
-            if log:
-                log(f"  [dynamic] skip {name}={value!r}: {exc}")
-            continue
+        new = hl.coerce(name, value)
         applied = False
         for owner_key, attr in targets:
             obj = owners.get(owner_key)
@@ -115,6 +111,24 @@ def _wrapper(zombi, log: Optional[Callable[[str], None]] = None) -> list[str]:
     return changes
 
 
+def _check_schedule(warm_hp: dict, best_hp: dict) -> None:
+    """Raise ``HyperparameterConflict`` if either block would be impossible.
+
+    The run is constructed with ``warm_hp``; each block then overwrites only the
+    live-editable keys of its set, so a value from the other set can persist into
+    it. Check the configuration in force during each block, not the sets alone.
+    """
+    from src.core import hparam_live as hl
+    from src.hparams import check_conflicts
+
+    live = lambda hp: {k: v for k, v in hp.items() if k in hl._TARGETS}
+    best_block = {**warm_hp, **live(best_hp)}
+    check_conflicts(warm_hp, context="dynamic schedule, WARM block")
+    check_conflicts(best_block, context="dynamic schedule, BEST_HPARAMS block")
+    check_conflicts({**best_block, **live(warm_hp)},
+                    context="dynamic schedule, WARM block after a BEST block")
+
+
 def arm(warm_hp: dict, best_hp: dict, period: int = 10) -> None:
     """Install the alternating schedule for every ZoMBIHop run in this process."""
     global _SCHEDULE, _ORIG_APPLY
@@ -122,6 +136,7 @@ def arm(warm_hp: dict, best_hp: dict, period: int = 10) -> None:
 
     if int(period) < 1:
         raise ValueError(f"period must be >= 1, got {period}")
+    _check_schedule(warm_hp, best_hp)
     if _ORIG_APPLY is None:
         _ORIG_APPLY = zh.apply_pending_hparams
     _SCHEDULE = (dict(warm_hp), dict(best_hp), int(period))

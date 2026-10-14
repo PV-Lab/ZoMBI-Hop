@@ -20,6 +20,10 @@ Protocol
                                      the optimiser (a request, applied once).
 ``<run_dir>/hparams_effective.json``  written by the optimiser → the values
                                      currently in force (what the UI prefills).
+``<run_dir>/hparams_override_rejected.json``  written by the optimiser when it
+                                     refuses a request → read & deleted by the UI,
+                                     which must surface it as an error. A refused
+                                     request is never applied in part.
 
 Why a registry
 --------------
@@ -40,6 +44,7 @@ from ..hparams import coerce as _coerce_registered, conflicts, live_targets
 
 OVERRIDE_FILENAME  = "hparams_override.json"
 EFFECTIVE_FILENAME = "hparams_effective.json"
+REJECTED_FILENAME  = "hparams_override_rejected.json"
 
 # name → ((owner, attribute), …). owner: "dh" = DataHandler, "gp" = GPSimplex,
 # "zombi" = the ZoMBIHop instance. The first entry is the canonical source when
@@ -121,13 +126,56 @@ def write_override(run_dir, hp: dict) -> dict:
     # lowering max_iterations is fine on its own and fatal next to
     # min_iters_per_zoom=3. The optimiser re-checks on apply (its own values are
     # authoritative); this is so the UI can refuse before writing anything.
-    problems = conflicts({**read_effective(run_dir), **clean})
+    # Without the run's published values there is nothing to check the edit
+    # against (conflicts() would fall back to the shipped defaults, which are not
+    # what this run is using), so refuse rather than pass it unchecked.
+    effective = read_effective(run_dir)
+    if not effective:
+        raise ValueError(f"the run has not published its in-force hyperparameters "
+                         f"({EFFECTIVE_FILENAME}) yet, so this change cannot be "
+                         f"checked; wait for its first iteration and try again")
+    problems = conflicts({**effective, **clean})
     if problems:
         raise ValueError("this change would make the run unable to declare "
                          "needles:\n  - " + "\n  - ".join(problems))
     if clean:
+        # A stale refusal belongs to an earlier request; drop it so the UI
+        # doesn't report it against this one.
+        _unlink(Path(run_dir) / REJECTED_FILENAME)
         _atomic_write_json(Path(run_dir) / OVERRIDE_FILENAME, clean)
     return clean
+
+
+def read_rejection(run_dir) -> Optional[dict]:
+    """Consume the optimiser's refusal of the last request, or None if there is none.
+
+    Returns ``{"requested": {...}, "problems": [...]}``. Deleted once read so each
+    refusal is reported exactly once.
+    """
+    path = Path(run_dir) / REJECTED_FILENAME
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+    _unlink(path)
+    return data if isinstance(data, dict) else {"requested": {}, "problems": [str(data)]}
+
+
+def _reject(zombi, requested: dict, problems: list[str],
+            log: Optional[Callable[[str], None]]) -> None:
+    """Refuse a whole override: log it and tell the requester (the UI) why."""
+    if log:
+        log("  [hparams] override REJECTED, nothing was applied:")
+        for p in problems:
+            log(f"  [hparams]   - {p}")
+    rd = _run_dir(zombi)
+    if rd is not None:
+        try:
+            _atomic_write_json(rd / REJECTED_FILENAME,
+                               {"requested": requested, "problems": problems})
+        except Exception as exc:
+            if log:
+                log(f"  [hparams] could not record the rejection for the UI: {exc}")
 
 
 def apply_pending(zombi, log: Optional[Callable[[str], None]] = None) -> list[str]:
@@ -137,7 +185,9 @@ def apply_pending(zombi, log: Optional[Callable[[str], None]] = None) -> list[st
     description of each change (empty when there was nothing to do).
 
     The override file is deleted once read, so a request applies exactly once.
-    Bad values are skipped individually — one typo must not abort the run.
+    A request is applied whole or not at all: an unknown name, a bad value or a
+    resulting conflict refuses all of it (the run keeps going on its current
+    values) and the reason goes to ``REJECTED_FILENAME`` for the UI to report.
     """
     rd = _run_dir(zombi)
     if rd is None:
@@ -148,9 +198,8 @@ def apply_pending(zombi, log: Optional[Callable[[str], None]] = None) -> list[st
             return []
         raw = json.loads(path.read_text())
     except Exception as exc:
-        if log:
-            log(f"  [hparams] could not read override file: {exc}")
         _unlink(path)
+        _reject(zombi, {}, [f"could not read {OVERRIDE_FILENAME}: {exc}"], log)
         return []
 
     # Remove first: if applying raises, we still must not re-apply on every
@@ -158,31 +207,24 @@ def apply_pending(zombi, log: Optional[Callable[[str], None]] = None) -> list[st
     _unlink(path)
 
     if not isinstance(raw, dict):
-        if log:
-            log("  [hparams] override file is not a JSON object; ignored.")
+        _reject(zombi, {}, [f"{OVERRIDE_FILENAME} is not a JSON object"], log)
         return []
 
+    # All-or-nothing: applying half of an edit that only makes sense as a whole
+    # (e.g. max_iterations and min_iters_per_zoom lowered together) could strand
+    # the run in an impossible state between lines, and silently dropping one
+    # value leaves the operator believing a change took effect when it did not.
     clean: dict[str, Any] = {}
+    problems: list[str] = []
     for name, value in raw.items():
-        if name not in _TARGETS:
-            if log:
-                log(f"  [hparams] ignoring unknown/not-live-tunable {name!r}")
-            continue
         try:
             clean[name] = coerce(name, value)
         except (TypeError, ValueError) as exc:
-            if log:
-                log(f"  [hparams] ignoring {name}={value!r}: {exc}")
-
-    # All-or-nothing on conflicts: applying half of an edit that only makes sense
-    # as a whole (e.g. max_iterations and min_iters_per_zoom lowered together) could
-    # strand the run in an impossible state between lines.
-    problems = conflicts({**current_values(zombi), **clean})
+            problems.append(f"{name}={value!r}: {exc}")
+    if not problems:
+        problems = conflicts({**current_values(zombi), **clean})
     if problems:
-        if log:
-            log("  [hparams] override REJECTED, it would make needles impossible:")
-            for p in problems:
-                log(f"  [hparams]   - {p}")
+        _reject(zombi, raw, problems, log)
         return []
 
     owners = _owners(zombi)

@@ -173,7 +173,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_mobo as rm
-from src.hparams import KNOWN_NAMES as HPARAM_KNOWN_NAMES, repair_conflicts
+from src.hparams import KNOWN_NAMES as HPARAM_KNOWN_NAMES, check_conflicts, conflicts
 from mobo_landscapes import build_synthetic_landscape, parse_synthetic_batch_fields, resolve_surrogate_csv_path
 
 # Analytic benchmark objectives (negated Ackley on the d-simplex).
@@ -226,6 +226,9 @@ DEFAULT_DB_VALUE = "Objective"
 # point back at that dir (or any dir / JSON holding a ``true_optima`` list) to skip
 # the interactive picker on later runs.
 NEWRF_OPTIMA_FILENAME = "newRF_optima.json"
+# Uniform simplex samples behind metrics_over_time.csv's pct_space_penalized*
+# columns: ~0.2 percentage-point Monte Carlo error at 50% coverage.
+PENALTY_COVERAGE_SAMPLES = 50_000
 
 # Canonical campaign1a RF reference optima from mobo_05_06_15_32 (interactive picker).
 TRIAL112_REFERENCE_OPTIMA = os.path.join(
@@ -1069,6 +1072,12 @@ def run_single_eval(
     gp_ref = [None]
     grid_pts = ds.get("grid_pts")
 
+    # Fixed uniform sample of the simplex for the penalised-volume estimate. It has
+    # its own generator so measuring coverage never moves the optimiser's RNG.
+    coverage_X = torch.as_tensor(
+        np.random.default_rng(0).dirichlet(np.ones(dim), size=PENALTY_COVERAGE_SAMPLES),
+        dtype=rm.DTYPE, device=rm.DEVICE)
+
     sim_obj = rm.make_sim_obj(fn, rm.DEVICE, rm.DTYPE, maximize=maximize)
     inner = rm.make_linebo_wrapper(sim_obj, dim, rm.NUM_LINES, rm.DEVICE, rm.DTYPE, plot_state)
 
@@ -1085,6 +1094,7 @@ def run_single_eval(
         else:
             pared_X = pared_Y = None
         needles = dh.needles
+        pen_any, pen_needle = dh.penalty_coverage(coverage_X)
         payloads.append(dict(
             iter_num=call_counter[0],
             pared_X=pared_X, pared_Y=pared_Y,
@@ -1101,6 +1111,8 @@ def run_single_eval(
             n_points_before=(dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0),
             # Activation this line was measured in (see run_mobo.write_metrics_over_time_csv).
             activation=int(dh.current_activation),
+            pct_space_penalized=100.0 * pen_any,
+            pct_space_penalized_needles=100.0 * pen_needle,
             gp_grid_vals=(rm.gp_landscape_vals(gp_ref[0], grid_pts, maximize)
                           if dim == 3 else None),
         ))
@@ -1125,12 +1137,11 @@ def run_single_eval(
     if dim > 3 and (hp.get("top_m_points") is None or hp.get("top_m_points", 0) < dim + 1):
         hp["top_m_points"] = max(dim + 1, 4)
 
-    # A recorded config can be one ZoMBIHop refuses (e.g. n_consecutive_converged
-    # above max_iterations, sampled before MOBO repaired such points). Re-evaluate
-    # the nearest feasible config, as MOBO would have, and say so.
-    hp, _repairs = repair_conflicts(hp)
-    if _repairs:
-        print(f"      [run] hyperparameter conflict repaired: {'; '.join(_repairs)}")
+    # Never re-evaluate a config other than the one asked for: a conflict (e.g.
+    # n_consecutive_converged above max_iterations) is an error, not something to
+    # repair quietly. main() already refused these before any run; this guards
+    # direct callers.
+    check_conflicts(hp, context="evaluate.run_single_eval")
 
     zombi_fixed = dict(rm.ZOMBI_FIXED)
     for k in _ZOMBI_OVERRIDE_KEYS:
@@ -1259,6 +1270,11 @@ def run_single_eval(
             plot_metrics.plot_needle_values(out_dir, true_best=tb)
         except Exception as exc:
             print(f"      [run] needle values plot failed: {exc}")
+        try:
+            import plot_metrics
+            plot_metrics.plot_penalized_space(out_dir)
+        except Exception as exc:
+            print(f"      [run] penalized space plot failed: {exc}")
 
     try:
         if no_plots:
@@ -1797,6 +1813,16 @@ def main() -> None:
         assert args.hparams_json
         hparams_by_trial = load_hparams_from_json(args.hparams_json)
         trial_nums = list(hparams_by_trial.keys())
+
+    # Refuse impossible configurations up front, before any landscape is built or
+    # any run is spent: a config ZoMBIHop cannot run must fail loudly, never be
+    # swapped for a "nearest feasible" one the caller did not ask for.
+    _bad = {t: conflicts(hp) for t, hp in hparams_by_trial.items()}
+    _bad = {t: p for t, p in _bad.items() if p}
+    if _bad:
+        sys.exit("Hyperparameter conflict — not running:\n" + "\n".join(
+            f"  trial {t}:\n" + "\n".join(f"    - {p}" for p in probs)
+            for t, probs in _bad.items()))
 
     if "RF" in datasets and not runs_path:
         sys.exit("--dataset RF requires --runs-path.")

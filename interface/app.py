@@ -65,6 +65,7 @@ from src.core.hparam_live import (
     OVERRIDE_FILENAME as OVERRIDE_HPARAMS_FILENAME,
     coerce as coerce_hparam,
     read_effective as read_effective_hparams,
+    read_rejection as read_rejected_hparams,
     write_override as write_override_hparams,
 )
 from src.core.linebo import line_simplex_segment, zero_sum_dirs
@@ -4308,9 +4309,23 @@ class LiveHparamsDialog(tk.Toplevel):
 
     def _poll(self):
         """Watch for the optimiser consuming the override, then show what
-        actually took effect."""
+        actually took effect — or, if it refused the request, say so loudly."""
         pending = (self._run_dir / OVERRIDE_HPARAMS_FILENAME).exists()
-        if not pending:
+        rejected = None if pending else read_rejected_hparams(self._run_dir)
+        if rejected is not None:
+            problems = rejected.get("problems") or ["(no reason recorded)"]
+            requested = ", ".join(f"{k}={v}" for k, v in
+                                  (rejected.get("requested") or {}).items())
+            self._status_var.set("REJECTED by the run — nothing was changed.")
+            self._app.log_to_main(
+                f"[hparams] change REJECTED by {self._run_id}"
+                + (f" ({requested})" if requested else "") + ": "
+                + "; ".join(problems), tag="error", run_id=self._run_id)
+            messagebox.showerror(
+                "Hyperparameter change rejected",
+                "The run refused this change and is still using its previous "
+                "values:\n\n- " + "\n- ".join(problems), parent=self)
+        elif not pending:
             new_eff = self._read_in_force()
             if new_eff and new_eff != self._effective:
                 changed = {k: v for k, v in new_eff.items()

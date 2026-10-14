@@ -4,6 +4,7 @@ Plot metrics_over_time.csv from a ZoMBI-Hop MOBO run.
 Usage:
     python optimize/plot_metrics.py <csv_path> [--log-x] [--log-y]
     python optimize/plot_metrics.py --needle-values <run_dir> [--out PNG]
+    python optimize/plot_metrics.py --penalized-space <run_dir> [--out PNG]
 
 Examples:
     python optimize/plot_metrics.py optimize/runs/mobo_04_06_11_47/trial_2/metrics_over_time.csv
@@ -154,6 +155,55 @@ def plot_needle_values(run_dir: str, save_path: str | None = None, *,
     return save_path
 
 
+def plot_penalized_space(run_dir: str, save_path: str | None = None, *,
+                         title: str | None = None) -> str | None:
+    """Percentage of the search space inside a penalty zone, per measured line.
+
+    Reads ``pct_space_penalized`` (any zone) and ``pct_space_penalized_needles``
+    (needle zones only) from ``metrics_over_time.csv``; both are Monte Carlo volume
+    estimates recorded by ``evaluate.py`` while the run happened, because the zones
+    shrink and grow and cannot be rebuilt from the finished run's CSVs. Stacked as
+    needle zones + the extra volume only exclusion zones (capped activations)
+    cover, so the top edge is the total. Returns None for a run that predates the
+    columns.
+    """
+    run_dir = os.path.abspath(run_dir)
+    save_path = save_path or os.path.join(run_dir, "penalized_space.png")
+    mot = os.path.join(run_dir, "metrics_over_time.csv")
+    if not os.path.isfile(mot):
+        return None
+    df = pd.read_csv(mot)
+    if "pct_space_penalized" not in df.columns or df["pct_space_penalized"].isna().all():
+        return None
+    df = df.dropna(subset=["pct_space_penalized"])
+    it = df["iteration"].to_numpy(dtype=float)
+    total = df["pct_space_penalized"].to_numpy(dtype=float)
+    needle = df["pct_space_penalized_needles"].to_numpy(dtype=float)
+    disc_it, _ = needle_discoveries(run_dir)
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.stackplot(it, needle, total - needle, step="post",
+                 colors=["steelblue", "darkorange"], alpha=0.75,
+                 labels=["needle zones", "exclusion zones (capped activations)"])
+    ax.step(it, total, where="post", color="#333333", lw=1.2,
+            label=f"total (final {total[-1]:.1f}%)")
+    for i, x in enumerate(disc_it):
+        ax.axvline(x, color="crimson", ls="--", lw=0.8, alpha=0.5,
+                   label=f"needle found ({disc_it.size})" if i == 0 else None)
+
+    ax.set_xlim(0, it[-1])
+    ax.set_ylim(0, max(1.0, float(total.max()) * 1.1))
+    ax.set_xlabel("Iteration (measured line)")
+    ax.set_ylabel("% of simplex penalised")
+    ax.set_title(title or "Space Penalised Over Time", fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=7, loc="upper left")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    return save_path
+
+
 def plot_metrics(csv_path: str, log_x: bool = False, log_y: bool = False,
                  save_path: str | None = None):
     """Plot the time-series metrics from ``metrics_over_time.csv``.
@@ -259,9 +309,15 @@ if __name__ == "__main__":
     parser.add_argument("--log-y", action="store_true", help="Log scale on y-axis")
     parser.add_argument("--needle-values", action="store_true",
                         help="write needle_values.png for the given run directory")
-    parser.add_argument("--out", default=None, help="output PNG (with --needle-values)")
+    parser.add_argument("--penalized-space", action="store_true",
+                        help="write penalized_space.png for the given run directory")
+    parser.add_argument("--out", default=None,
+                        help="output PNG (with --needle-values / --penalized-space)")
     args = parser.parse_args()
-    if args.needle_values:
+    if args.penalized_space:
+        out = plot_penalized_space(args.csv_path, args.out)
+        print(out or "nothing to plot (run predates pct_space_penalized)")
+    elif args.needle_values:
         out = plot_needle_values(args.csv_path, args.out)
         print(out or "nothing to plot")
     else:
