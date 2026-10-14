@@ -581,6 +581,7 @@ class RunData:
         self.needle_vals: Optional[np.ndarray]   = None  # (k,)
         self.needle_indices: Optional[np.ndarray]= None  # (k,) int
         self.activation_starts: Optional[np.ndarray] = None  # (a,) int sample idx
+        self.declared_samples: Optional[np.ndarray] = None   # (k,) sample idx per needle declaration
         self.needles_json: list                  = []
         self.summary: dict                       = {}
         self.d: int                              = 0
@@ -613,19 +614,33 @@ def _list_snapshots(run_dir: Path) -> list[str]:
 _ACT_RE = re.compile(r"_act(\d+)")
 
 
-def _activation_starts(run_dir: Path, snapshot_name: str) -> np.ndarray:
-    """Sample indices at which each *new* activation's points begin.
+def _activation_timeline(run_dir: Path, snapshot_name: str) -> tuple[np.ndarray, np.ndarray]:
+    """Activation start indices and needle-declaration sample indices.
 
     Replays the delta snapshots up to ``snapshot_name`` (the same traversal
-    ``reconstruct_snapshot_tensors`` uses) and records the cumulative point count
-    each time the ``actN`` number in the snapshot-dir name increments. The leading
-    0 (init / activation 0) is dropped so callers get only the interior reset
-    boundaries. Empty for legacy full-copy runs with no per-snapshot deltas."""
+    ``reconstruct_snapshot_tensors`` uses).
+
+    ``starts``: the cumulative point count each time the ``actN`` number in the
+    snapshot-dir name increments. The leading 0 (init / activation 0) is dropped
+    so callers get only the interior reset boundaries.
+
+    ``declared``: one entry per needle, in discovery order — the last sample
+    index measured before the snapshot whose needle stack first grew. A needle
+    snapshot is taken right after the declaration, so this is the snapshot-replay
+    equivalent of ``plot_metrics.needle_declaration_samples`` (which needs the
+    end-of-run CSVs), and it stays correct while scrubbing or on live runs. When
+    the stack is rebuilt rather than appended to (e.g. ``corrected_needles``
+    replaces every needle), the earlier declarations are dropped and all of the
+    rebuilt stack's needles count as declared at that snapshot.
+
+    Both empty for legacy full-copy runs with no per-snapshot deltas."""
     snap_dir = run_dir / "snapshots"
     if not snap_dir.is_dir():
-        return np.array([], dtype=int)
+        return np.array([], dtype=int), np.array([], dtype=int)
     starts: list[int] = []
+    declared: list[int] = []
     n_seen = 0
+    stack: list[int] = []   # needle_indices of the current needle stack
     cur_act: Optional[int] = None
     for sdir in sorted(s for s in snap_dir.iterdir() if s.is_dir()):
         delta_path = sdir / "delta.pt"
@@ -634,19 +649,28 @@ def _activation_starts(run_dir: Path, snapshot_name: str) -> np.ndarray:
                 d = torch.load(str(delta_path), map_location="cpu", weights_only=False)
                 x_new = d.get("X_new")
                 n_new = int(x_new.shape[0]) if isinstance(x_new, torch.Tensor) else 0
+                ni = d.get("needle_indices")
+                new_stack = (ni.long().ravel().tolist() if isinstance(ni, torch.Tensor)
+                             else stack)
             except Exception:
-                n_new = 0
+                n_new, new_stack = 0, stack
         else:
-            n_new = 0
+            n_new, new_stack = 0, stack
         m = _ACT_RE.search(sdir.name)
         act = int(m.group(1)) if m else cur_act
         if act is not None and act != cur_act and n_new > 0:
             starts.append(n_seen)
             cur_act = act
         n_seen += n_new
+        if new_stack != stack:
+            if new_stack[:len(stack)] != stack:   # rebuilt, not appended to
+                declared = []
+            declared.extend([n_seen - 1] * (len(new_stack) - len(declared)))
+            stack = new_stack
         if sdir.name == snapshot_name:
             break
-    return np.array(sorted({s for s in starts if s > 0}), dtype=int)
+    return (np.array(sorted({s for s in starts if s > 0}), dtype=int),
+            np.array(declared, dtype=int))
 
 
 def load_run(run_dir: Path, snapshot_name: Optional[str] = None) -> RunData:
@@ -696,7 +720,7 @@ def load_run(run_dir: Path, snapshot_name: Optional[str] = None) -> RunData:
         if ni is not None:
             rd.needle_indices = ni.long().numpy().ravel()
 
-        rd.activation_starts = _activation_starts(run_dir, snapshot_name)
+        rd.activation_starts, rd.declared_samples = _activation_timeline(run_dir, snapshot_name)
 
         # Trust region (current zoom bounds, fall back to full bounds) +
         # per-needle penalty-ellipsoid params, for the ternary overlays.
@@ -1126,15 +1150,24 @@ class ConvergencePlotFrame(PlotFrame):
                 labeled = True
             ax.plot(idx[start:end], seg_best, **kw)
 
+        # Each needle gets two vlines (as in run_mobo.plot_convergence): red dashed
+        # where its point was first sampled, green dotted where it was declared.
+        # The gap is how long the point sat measured before the search confirmed it.
         if rd.needle_indices is not None and len(rd.needle_indices) > 0:
             labeled = False
             for ni in rd.needle_indices:
                 if 0 <= ni < len(Y):
                     kw = dict(color="crimson", alpha=0.55, lw=0.9, ls="--")
                     if not labeled:
-                        kw["label"] = "needle found"
+                        kw["label"] = "needle point sampled"
                         labeled = True
                     ax.axvline(float(ni), **kw)
+
+        if rd.declared_samples is not None:
+            # +0.5: the declaration happens after the last sample of its line.
+            for k, ds in enumerate(rd.declared_samples):
+                ax.axvline(float(ds) + 0.5, color="green", alpha=0.5, lw=1.1, ls=":",
+                           zorder=5, label="needle declared" if k == 0 else None)
 
         ax.set_xlabel("Sample index")
         ax.set_ylabel("Objective Y")
