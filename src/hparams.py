@@ -258,6 +258,13 @@ _REGISTRY: tuple[HParam, ...] = (
            "ellipsoid.",
            (("zombi", "max_penalty_radius"),),
            tune=(0.15, 1.5, "linear")),
+    HParam("max_penalty_fraction", "float", _open_unit, _NEEDLE, "Max penalty fraction",
+           "Dimension-aware cap: no single needle or exclusion zone may cover more "
+           "than this fraction of the simplex's volume. Each semi-axis is capped at "
+           "the radius of a ball of that volume (0.208 in 6-d for 0.10), or at "
+           "max_penalty_radius if that is smaller.",
+           (("zombi", "max_penalty_fraction"),),
+           default=0.10),
     HParam("ellipsoid_drop_fraction", "float", _open_unit, _NEEDLE,
            "Ellipsoid drop frac",
            "Penalty ellipsoid boundary: where the acquisition has dropped by this "

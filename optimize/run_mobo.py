@@ -1982,8 +1982,15 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
 
 
 def plot_convergence(path: str, dh, maximize: bool,
-                     activations: np.ndarray | None = None) -> None:
+                     activations: np.ndarray | None = None,
+                     declared_samples: np.ndarray | None = None) -> None:
     """Save a convergence plot: all Y values, running best, needle vlines.
+
+    Each needle gets two vlines: red dashed where its point was first sampled
+    (``dh.needle_indices``), and green dotted where it was declared
+    (``declared_samples``, from ``plot_metrics.needle_declaration_samples``).
+    The gap between them is how long the point sat measured before the search
+    confirmed it.
 
     ``activations``: optional per-sample activation id (same length/order as
     ``dh.Y_all``). When given, the running-best envelope is **reset at every
@@ -2035,10 +2042,6 @@ def plot_convergence(path: str, dh, maximize: bool,
                         label=(None if labeled else best_label), zorder=4,
                         drawstyle="steps-post")
                 labeled = True
-                # dashed guide at each activation boundary
-                if i < len(Y_all):
-                    ax.axvline(float(i) - 0.5, color="#888888", alpha=0.35,
-                               lw=0.7, ls=":", zorder=1)
                 start = i
     else:
         running_best = np.maximum.accumulate(Y_all)
@@ -2051,9 +2054,15 @@ def plot_convergence(path: str, dh, maximize: bool,
             if 0 <= ni < len(Y_all):
                 kw = dict(color="crimson", alpha=0.55, lw=0.9, ls="--")
                 if not labeled:
-                    kw["label"] = "needle found"
+                    kw["label"] = "needle point sampled"
                     labeled = True
                 ax.axvline(float(ni), **kw)
+
+    if declared_samples is not None:
+        # +0.5: the declaration happens after the last sample of its line.
+        for k, ds in enumerate(np.asarray(declared_samples, dtype=float).ravel()):
+            ax.axvline(ds + 0.5, color="green", alpha=0.5, lw=1.1, ls=":", zorder=5,
+                       label="needle declared" if k == 0 else None)
 
     ax.set_xlabel("Sample index")
     ax.set_ylabel("Objective Y")
@@ -2860,8 +2869,10 @@ def run_single_trial(
         # globally-monotone curve — each activation is a fresh ZoMBI search phase,
         # so coasting on an earlier phase's peak hides how much it re-explores.
         act_per_point, _ = _activation_zoom_per_point(n_points, snap_records)
+        import plot_metrics
         plot_convergence(os.path.join(trial_dir, "convergence.png"), dh, maximize,
-                         activations=act_per_point)
+                         activations=act_per_point,
+                         declared_samples=plot_metrics.needle_declaration_samples(trial_dir))
     except Exception as exc:
         print(f"    [trial] static plot failed: {exc}")
 

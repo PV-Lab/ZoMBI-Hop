@@ -15,6 +15,7 @@ from ..utils.simplex import (
     proj_simplex,
     random_simplex,
     random_zero_sum_directions,
+    radius_for_simplex_fraction,
     Ellipsoid,
 )
 from ..utils.datahandler import DataHandler
@@ -127,6 +128,7 @@ class ZoMBIHop:
                  ellipsoid_drop_fraction: float = _HP["ellipsoid_drop_fraction"],
                  ellipsoid_eigenvalue_floor: float = _HP["ellipsoid_eigenvalue_floor"],
                  max_penalty_radius: float = _HP["max_penalty_radius"],
+                 max_penalty_fraction: float = _HP["max_penalty_fraction"],
                  paring_spatial_halfnoise: float = _HP["paring_spatial_halfnoise"],
                  paring_y_noise_multiplier: float = _HP["paring_y_noise_multiplier"],
                  input_noise: float = _HP["input_noise"],
@@ -209,6 +211,7 @@ class ZoMBIHop:
         self.ellipsoid_drop_fraction = ellipsoid_drop_fraction
         self.ellipsoid_eigenvalue_floor = ellipsoid_eigenvalue_floor
         self.max_penalty_radius = max_penalty_radius
+        self.max_penalty_fraction = float(max_penalty_fraction)
         self.needle_shrink_factor = float(needle_shrink_factor)
         self.needle_stop_noise_multiplier = float(needle_stop_noise_multiplier)
         self.zoom_jaccard_threshold = float(zoom_jaccard_threshold)
@@ -390,6 +393,19 @@ class ZoMBIHop:
         return lines_per_activation({"max_zooms": dh.max_zooms,
                                      "max_iterations": dh.max_iterations})
 
+    @property
+    def penalty_axis_cap(self) -> float:
+        """Cap on every semi-axis of a needle or exclusion ellipsoid.
+
+        The smaller of ``max_penalty_radius`` and the radius of a ball holding
+        ``max_penalty_fraction`` of the simplex. The second is what keeps one
+        zone from swallowing most of a high-dimensional simplex: a 0.5 radius
+        covers ~60% of the 6-d simplex from a typical centre. Read live, so an
+        operator's edit to either knob applies to the next ellipsoid fitted.
+        """
+        return min(float(self.max_penalty_radius),
+                   radius_for_simplex_fraction(self.d, self.max_penalty_fraction))
+
     def hparams_in_force(self) -> dict:
         """Every hyperparameter's current value, read from where the loop reads it."""
         out = {name: getattr(self.data_handler, name)
@@ -470,7 +486,7 @@ class ZoMBIHop:
                         max_gp_points=dh.max_gp_points,
                         drop_fraction=self.ellipsoid_drop_fraction,
                         eigenvalue_floor=self.ellipsoid_eigenvalue_floor,
-                        max_penalty_radius=self.max_penalty_radius,
+                        max_penalty_radius=self.penalty_axis_cap,
                     )
                     dh.update_all_needle_radii(new_M_list)
                     self._log(f"  [failure] ellipsoids recomputed for {n_needles} needle(s).")
@@ -486,9 +502,9 @@ class ZoMBIHop:
                                     needle=dh.needles[i],
                                     drop_fraction=self.ellipsoid_drop_fraction,
                                     eigenvalue_floor=self.ellipsoid_eigenvalue_floor,
-                                    max_radius=self.max_penalty_radius,
+                                    max_radius=self.penalty_axis_cap,
                                 )
-                                dh.needle_M_list[i] = M_new
+                                dh.set_needle_ellipsoid(i, M_new)
                             except Exception as e2:
                                 self._log(f"  [failure] pared refit needle {i} failed: {e2}")
                         dh._update_penalty_mask()
@@ -678,7 +694,7 @@ class ZoMBIHop:
             needle=needle_X,
             drop_fraction=self.ellipsoid_drop_fraction,
             eigenvalue_floor=self.ellipsoid_eigenvalue_floor,
-            max_radius=self.max_penalty_radius,
+            max_radius=self.penalty_axis_cap,
         )
         self._log(f"  [declare] ellipsoid: {time.time()-_t0:.2f}s")
         self._log("Penalizing with Hessian ellipsoid.")
@@ -1122,6 +1138,7 @@ class ZoMBIHop:
         dh.needle_indices = torch.empty((0, 1), device=dev, dtype=torch.int64)
         dh.needle_penalty_radii = torch.empty((0, 1), device=dev, dtype=dt)
         dh.needle_M_list = []
+        dh.needle_shrink_scale = []
         dh.needle_B = None
         dh.needles_results = []
         dh.exclusions = torch.empty((0, d), device=dev, dtype=dt)
@@ -1165,7 +1182,7 @@ class ZoMBIHop:
                         needle=center,
                         drop_fraction=self.ellipsoid_drop_fraction,
                         eigenvalue_floor=self.ellipsoid_eigenvalue_floor,
-                        max_radius=self.max_penalty_radius,
+                        max_radius=self.penalty_axis_cap,
                     )
             except Exception as e:
                 self._log(f"  [cap] ellipsoid fit failed ({e}) — falling back to a sphere.")
@@ -1175,12 +1192,11 @@ class ZoMBIHop:
                 dh.add_exclusion(center=center, M=M_excl, B=B_excl)
             else:
                 # Sphere fallback: half the diagonal of the bounds the activation
-                # was working in — literally "the zone it was stuck in". NOT
-                # max_penalty_radius, which caps an ellipsoid SEMI-AXIS; read as a
-                # sphere radius its default of 1.0 exceeds the simplex diameter
-                # (√2) and would penalise the entire search space in one go.
+                # was working in — literally "the zone it was stuck in" — capped
+                # like any ellipsoid semi-axis, so it too covers at most
+                # max_penalty_fraction of the simplex.
                 r = 0.5 * torch.norm(bounds[1] - bounds[0]).item()
-                r = min(r, float(self.max_penalty_radius))
+                r = min(r, self.penalty_axis_cap)
                 dh.add_exclusion(center=center, M=None, radius=r)
             _y = center_Y.item() if torch.is_tensor(center_Y) else center_Y
             self._log(f"  [cap] exclusion zone added at {center.cpu().numpy()} "

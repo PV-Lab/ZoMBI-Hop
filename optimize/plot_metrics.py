@@ -50,6 +50,34 @@ def needle_discoveries(run_dir: str) -> tuple[np.ndarray, np.ndarray]:
     return df["iteration"].to_numpy(dtype=float), df["value"].to_numpy(dtype=float)
 
 
+def needle_declaration_samples(run_dir: str) -> np.ndarray:
+    """Sample index at which each needle was declared, in discovery order.
+
+    A declaration always ends its activation, so it falls on the last sample of
+    the activation measured on the declaring line: ``needles.csv`` gives that
+    line, ``metrics_over_time.csv`` the line's activation, and ``points.csv`` the
+    activation's last sample. Empty if any of the three is missing.
+    """
+    try:
+        nd = pd.read_csv(os.path.join(run_dir, "needles.csv"))
+        mot = pd.read_csv(os.path.join(run_dir, "metrics_over_time.csv"),
+                          usecols=["iteration", "activation"])
+        pts = pd.read_csv(os.path.join(run_dir, "points.csv"),
+                          usecols=["sample_idx", "activation"])
+    except (OSError, ValueError):
+        return np.empty(0)
+    if nd.empty or "iteration" not in nd.columns:
+        return np.empty(0)
+    act_of_line = dict(zip(mot["iteration"].astype(int), mot["activation"]))
+    last_sample = pts.groupby("activation")["sample_idx"].max().to_dict()
+    out = []
+    for it in nd["iteration"].dropna().astype(int):
+        act = act_of_line.get(it)
+        if act is not None and act in last_sample:
+            out.append(float(last_sample[act]))
+    return np.asarray(out)
+
+
 def ensemble_true_best(run_dir: str) -> float | None:
     """Noiseless objective value at the landscape's true optima, or None.
 

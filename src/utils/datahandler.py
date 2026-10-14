@@ -219,6 +219,10 @@ class DataHandler:
         # needle_B is shared across all needles (same simplex tangent space).
         self.needle_M_list: List[Optional[torch.Tensor]] = []  # each (d-1, d-1)
         self.needle_B: Optional[torch.Tensor] = None           # (d, d-1)
+        # Cumulative shrink applied to each needle's ellipsoid (1.0 = unshrunk).
+        # A refit (update_all_needle_radii / set_needle_ellipsoid) re-applies it, so
+        # territory handed back by a shrink stays handed back.
+        self.needle_shrink_scale: List[float] = []
 
         # --- Exclusion zones -------------------------------------------------
         # Penalised regions that are NOT needles: an activation that burns its
@@ -302,6 +306,7 @@ class DataHandler:
         self.needle_penalty_radii = torch.empty((0, 1), device=self.device, dtype=self.dtype)
         self.needle_M_list = []
         self.needle_B = None
+        self.needle_shrink_scale = []
 
         self.exclusions = torch.empty((0, self.d), device=self.device, dtype=self.dtype)
         self.exclusion_radii = torch.empty((0, 1), device=self.device, dtype=self.dtype)
@@ -445,6 +450,8 @@ class DataHandler:
             'needle_penalty_radii': self.needle_penalty_radii,
             'needle_M_stack': needle_M_stack,
             'needle_has_M': needle_has_M,
+            'needle_shrink_scale': torch.tensor(self._needle_scales(), dtype=self.dtype,
+                                                device=self.device),
             'needle_B': self.needle_B,
             'exclusions': (self.exclusions if self.exclusions is not None
                            else torch.zeros(0, _d, device=self.device, dtype=self.dtype)),
@@ -772,6 +779,7 @@ class DataHandler:
             ]
         else:
             self.needle_M_list = []
+        self.needle_shrink_scale = self._restore_shrink_scale(d.get('needle_shrink_scale'))
 
         nb = d.get('needle_B')
         self.needle_B = nb.to(self.device, self.dtype) if isinstance(nb, torch.Tensor) else None
@@ -873,6 +881,8 @@ class DataHandler:
             ]
         else:
             self.needle_M_list = [None] * self.needles.shape[0]
+        self.needle_shrink_scale = self._restore_shrink_scale(
+            tensors.get('needle_shrink_scale', None))
 
         nb = tensors.get('needle_B', None)
         self.needle_B = nb.to(device=self.device, dtype=self.dtype) if nb is not None else None
@@ -1041,6 +1051,7 @@ class DataHandler:
 
         # Store ellipsoid (or None for sphere fallback)
         self.needle_M_list.append(M.to(device=self.device, dtype=self.dtype) if M is not None else None)
+        self.needle_shrink_scale = self._needle_scales() + [1.0]
         if M is not None:
             if B is not None:
                 self.needle_B = B.to(device=self.device, dtype=self.dtype)
@@ -1778,13 +1789,41 @@ class DataHandler:
     # Needle radius helpers
     # =========================================================================
 
+    def _needle_scales(self) -> List[float]:
+        """``needle_shrink_scale`` padded with 1.0 to one entry per needle.
+
+        Checkpoints from before shrink scales existed restore needles without them.
+        """
+        n = len(self.needle_M_list)
+        scales = list(self.needle_shrink_scale)[:n]
+        return scales + [1.0] * (n - len(scales))
+
+    def _restore_shrink_scale(self, saved: Any) -> List[float]:
+        """Shrink scales from a checkpoint; absent (older checkpoint) means unshrunk."""
+        self.needle_shrink_scale = ([float(v) for v in saved.reshape(-1).tolist()]
+                                    if isinstance(saved, torch.Tensor) else [])
+        return self._needle_scales()
+
+    def set_needle_ellipsoid(self, i: int, M: Optional[torch.Tensor]) -> None:
+        """Install a refitted ellipsoid for needle ``i``, keeping its past shrinks.
+
+        A refit sizes the ellipsoid from scratch; dividing by the needle's
+        cumulative shrink scale squared re-applies every shrink it has had
+        (semi-axis x s <=> M / s^2). Does not refresh the penalty mask.
+        """
+        if M is not None:
+            s = self._needle_scales()[i]
+            M = M.to(device=self.device, dtype=self.dtype) / (s * s)
+        self.needle_M_list[i] = M
+
     def update_all_needle_radii(self, new_M_list: list) -> None:
-        """Replace needle_M_list with new_M_list and recompute the penalty mask."""
+        """Install refitted ellipsoids for every needle (keeping past shrinks) and
+        recompute the penalty mask."""
         assert len(new_M_list) == len(self.needle_M_list), (
             f"Length mismatch: {len(new_M_list)} vs {len(self.needle_M_list)}"
         )
         for i, M in enumerate(new_M_list):
-            self.needle_M_list[i] = M
+            self.set_needle_ellipsoid(i, M)
         self._update_penalty_mask()
 
     def shrink_all_needle_radii(self, factor: float) -> None:
@@ -1796,8 +1835,14 @@ class DataHandler:
         recovery paths call this to hand territory back when the search runs out of
         room, and a zone that could never be released would let a few capped
         activations sterilise the simplex permanently.
+
+        Shrinks are persistent. Each needle's cumulative factor is recorded in
+        ``needle_shrink_scale`` and re-applied by every refit, which would
+        otherwise restore it to full size. Exclusion zones are never refitted, so
+        scaling their M / radius in place is already permanent.
         """
         f2 = factor ** 2
+        self.needle_shrink_scale = [s * factor for s in self._needle_scales()]
         for i, M in enumerate(self.needle_M_list):
             if M is not None:
                 self.needle_M_list[i] = M / f2

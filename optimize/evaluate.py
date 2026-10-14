@@ -1240,8 +1240,10 @@ def run_single_eval(
             # plot resets its running-best envelope at each activation boundary.
             n_y = int(dh.Y_all.shape[0]) if dh.Y_all is not None else 0
             conv_acts, _ = rm._activation_zoom_per_point(n_y, snap_records)
+            import plot_metrics
             rm.plot_convergence(os.path.join(out_dir, "convergence.png"), dh, maximize,
-                                activations=conv_acts)
+                                activations=conv_acts,
+                                declared_samples=plot_metrics.needle_declaration_samples(out_dir))
         except Exception as exc:
             print(f"      [run] static plot failed: {exc}")
 

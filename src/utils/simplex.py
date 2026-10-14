@@ -25,6 +25,23 @@ Ellipsoid = namedtuple(
 )
 
 
+def radius_for_simplex_fraction(d: int, fraction: float) -> float:
+    """Radius of the (d-1)-ball whose volume is ``fraction`` of the standard simplex.
+
+    Ball volume pi^(k/2) r^k / Gamma(k/2 + 1) with k = d - 1, simplex volume
+    sqrt(d) / (d-1)!. Any penalty ellipsoid whose semi-axes are all <= this radius
+    has at most this volume, so it covers at most ``fraction`` of the simplex
+    wherever it is centred (less when it overhangs a face). For a 10% cap that is
+    0.166 in 3-d, 0.208 in 6-d and 0.186 in 10-d.
+    """
+    k = d - 1
+    if k < 1:
+        return 0.0
+    log_simplex = 0.5 * math.log(d) - math.lgamma(d)
+    log_unit_ball = 0.5 * k * math.log(math.pi) - math.lgamma(0.5 * k + 1.0)
+    return math.exp((math.log(fraction) + log_simplex - log_unit_ball) / k)
+
+
 def get_tangent_basis(d: int, device, dtype=torch.float64) -> torch.Tensor:
     """
     QR basis for the centred hyperplane Σ v_i = 0: orthonormal columns (d × d−1).
