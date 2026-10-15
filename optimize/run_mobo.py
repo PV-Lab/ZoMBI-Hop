@@ -291,6 +291,13 @@ OUTPUT_NOISE_FRAC = 0.045
 NUM_EXPERIMENTS = 24
 NUM_LINES       = 10
 N_INIT_LINES    = 2
+# Initial design before the optimiser's first call (--init). "random": N_INIT_LINES
+# random lines through the centroid (the design every run before 2026-10-15 used).
+# "axial": the hardware design (src/utils/axial_init.py, scripts/run_zombi_main.py),
+# one trace per component rounded down to even, each printed face -> pure. Axial
+# runs are stamped ``init_design`` in run_config.json and never pool with random ones.
+INIT_DESIGNS    = ("random", "axial")
+INIT_DESIGN     = "random"
 
 # MOBO settings
 N_INIT_TRIALS    = 8       # Sobol initial designs before BO begins
@@ -726,6 +733,10 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
         cfg["variant"] = _variant
     if ackley_variant is not None:
         cfg["ackley_variant"] = ackley_variant
+    # Only stamped when non-default, so random-init runs keep the signature every
+    # older run (and eve_lal's fork) has, and still pool with them.
+    if INIT_DESIGN != "random":
+        cfg["init_design"] = INIT_DESIGN
     if landscape.landscape == "rf":
         cfg["csv_path"] = landscape.csv_path
         cfg["objective_column"] = landscape.objective_column
@@ -1368,6 +1379,7 @@ def _run_signature(cfg: dict) -> dict:
         "variant": cfg.get("variant"),
         "ensemble_optima_margin": cfg.get("ensemble_optima_margin"),
         "ensemble_repeats": cfg.get("ensemble_repeats"),
+        "init_design": cfg.get("init_design"),
     }
 
 
@@ -1739,17 +1751,46 @@ def make_linebo_wrapper(sim_obj, dim, num_lines, device, dtype, plot_state: dict
     return wrapper
 
 
-def _gen_init_data(fn_callable, maximize: bool, dim: int = 3):
-    """Generate ``N_INIT_LINES`` random simplex lines on the ``dim``-simplex;
-    return (X_a, X_e, Y)."""
-    x_a_list, x_e_list, y_list = [], [], []
+def n_init_lines(dim: int, init_design: str | None = None) -> int:
+    """Lines the initial design measures before the optimiser's first call."""
+    if (init_design or INIT_DESIGN) == "axial":
+        from src.utils.axial_init import n_traces_for
+        return n_traces_for(int(dim))
+    return N_INIT_LINES
+
+
+def _init_line_ends(dim: int, init_design: str):
+    """Yield the (first, last) printed composition of each initial line, in print order.
+
+    A generator so the random design draws each direction just before that line is
+    measured — the same RNG order as before ``--init`` existed.
+    """
+    if init_design == "axial":
+        # Mirrors run_zombi_main.run_axial_initialization on the bare simplex: the
+        # same traces, printed face -> pure (INIT_PRINT_PURE_LAST), shuffled so no
+        # component is tied to a fixed slot (pair_traces does this on hardware).
+        from src.utils.axial_init import axial_design
+        traces = axial_design(int(dim)).traces
+        for i in torch.randperm(len(traces)).tolist():
+            yield (torch.as_tensor(traces[i].end, device=DEVICE, dtype=DTYPE),
+                   torch.as_tensor(traces[i].start, device=DEVICE, dtype=DTYPE))
+        return
+    if init_design != "random":
+        raise ValueError(f"init_design must be one of {INIT_DESIGNS}, got {init_design!r}")
     for _ in range(N_INIT_LINES):
         x0 = torch.full((dim,), 1.0 / dim, device=DEVICE, dtype=DTYPE)
         dir_ = zero_sum_dirs(1, dim, device=DEVICE, dtype=DTYPE).squeeze(0)
         seg  = line_simplex_segment(x0, dir_)
-        if seg is None:
-            continue
-        _, _, x_left, x_right = seg
+        if seg is not None:
+            yield seg[2], seg[3]
+
+
+def _gen_init_data(fn_callable, maximize: bool, dim: int = 3,
+                   init_design: str | None = None):
+    """Measure the initial design (``INIT_DESIGN`` unless *init_design* is given)
+    on the ``dim``-simplex; return (X_a, X_e, Y)."""
+    x_a_list, x_e_list, y_list = [], [], []
+    for x_left, x_right in _init_line_ends(dim, init_design or INIT_DESIGN):
         t     = torch.linspace(0.0, 1.0, NUM_EXPERIMENTS, dtype=torch.float64, device=DEVICE)
         # Clean straight segment = what we "request"; physics-simulated print =
         # what we "measure" (replaces the random add_composition_noise perturbation).
@@ -3750,6 +3791,25 @@ def _apply_runtime_overrides(*, device: str | None = None,
         TIME_LIMIT_HOURS = float(time_limit_hours)
 
 
+def _set_init_design(cli_value: str | None, saved_cfg: dict | None = None) -> None:
+    """Set module-level INIT_DESIGN from --init, or from a run being resumed.
+
+    A resumed run keeps the design it was started with (its stored trials were
+    scored on it); an explicit --init that contradicts it is an error, not a switch.
+    """
+    global INIT_DESIGN
+    if saved_cfg is not None:
+        saved = saved_cfg.get("init_design") or "random"
+        if cli_value is not None and cli_value != saved:
+            sys.exit(f"--init {cli_value} contradicts the resumed run, which was "
+                     f"started with init_design={saved!r}.")
+        INIT_DESIGN = saved
+    else:
+        INIT_DESIGN = cli_value or "random"
+    if INIT_DESIGN != "random":
+        print(f"  [init] initial design: {INIT_DESIGN}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="ZoMBI-Hop MOBO hyperparameter optimisation (RF or synthetic benchmarks).",
@@ -3797,6 +3857,13 @@ def main() -> None:
                              f"--dataset ensemble; the four metrics are averaged "
                              f"across them to reduce landscape noise (default: "
                              f"{ENSEMBLE_N_REPEATS}).")
+    parser.add_argument("--init", choices=INIT_DESIGNS, default=None,
+                        help="initial design every trial measures before the optimiser "
+                             f"starts: 'random' = {N_INIT_LINES} random lines (default), "
+                             "'axial' = the hardware axial-trace design (dim traces, "
+                             "rounded down to even). Axial runs only share history with "
+                             "axial runs. On --resume/--resume-from the saved run's "
+                             "design is used.")
     parser.add_argument("--warmgp-seed", type=int, default=0,
                         help="seed for the warm-start GP landscape (--dataset "
                              "warmgp / mixture): selects which campaign lines form "
@@ -3892,6 +3959,7 @@ def main() -> None:
     if args.time_limit is not None and args.time_limit_hours is not None:
         sys.exit("Use only one of --time-limit / --time-limit-hours.")
     time_limit_override = args.time_limit_hours if args.time_limit_hours is not None else args.time_limit
+    _set_init_design(args.init)
 
     max_trials = args.max_trials
     batch_name = None
@@ -4053,6 +4121,7 @@ def main() -> None:
 
     if args.resume:
         cfg = load_latest_run_config(runs_dir)
+        _set_init_design(args.init, cfg)
         if cfg.get("hparam_names") != HPARAM_NAMES:
             print("  [resume] WARNING: latest run's hparam_names differ from the current "
                   "HPARAM_SPACE; only matching trials are collected.")
@@ -4197,6 +4266,7 @@ def main() -> None:
         if not os.path.isdir(run_path):
             sys.exit(f"--resume-from: directory not found: {run_path}")
         cfg = load_run_config_from_path(run_path)
+        _set_init_design(args.init, cfg)
         if cfg.get("hparam_names") and cfg["hparam_names"] != HPARAM_NAMES:
             print("  [resume-from] WARNING: source run's hparam_names differ from the "
                   "current HPARAM_SPACE; only matching trials are collected.")

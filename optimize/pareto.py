@@ -237,6 +237,7 @@ def _run_signature(cfg: dict) -> dict:
         "variant": cfg.get("variant"),
         "ensemble_optima_margin": cfg.get("ensemble_optima_margin"),
         "ensemble_repeats": cfg.get("ensemble_repeats"),
+        "init_design": cfg.get("init_design"),
     }
 
 

@@ -764,6 +764,16 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
     A(f"# Showdown — {manifest['dim']}D ensemble, "
       f"{len(configs)} configs × {len(landscapes)} landscapes")
     A("")
+    setup = [f"init design: **{manifest.get('init_design') or 'random'}**"]
+    if manifest.get("max_lines") is not None:
+        setup.append(f"budget: {manifest.get('budget_points')} points "
+                     f"({manifest.get('n_init_lines', 2)} init + {manifest['max_lines']} "
+                     "optimizer lines)")
+    if manifest.get("ensemble_overrides"):
+        setup.append("landscape overrides: " + ", ".join(
+            f"`{k}={v}`" for k, v in manifest["ensemble_overrides"].items()))
+    A(" · ".join(setup))
+    A("")
 
     A("## Configurations")
     A("")

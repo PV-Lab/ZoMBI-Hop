@@ -130,11 +130,12 @@ DEFAULT_N_LANDSCAPES = 5
 # secondary safety cap only.
 DEFAULT_BUDGET_POINTS = 3000
 # One LineBO line = NUM_EXPERIMENTS measured points, and every run starts with a fixed
-# preamble of N_INIT_LINES init lines before the optimizer's first objective call.
-# Mirrors run_mobo.NUM_EXPERIMENTS / N_INIT_LINES (run_mobo.py:291); duplicated here so
+# preamble of init lines before the optimizer's first objective call (see
+# n_init_lines). Mirrors run_mobo.NUM_EXPERIMENTS / N_INIT_LINES; duplicated here so
 # planning stays importable without pulling in torch.
 POINTS_PER_LINE = 24
 N_INIT_LINES = 2
+INIT_DESIGNS = ("random", "axial")
 # Sobol landscape indices are drawn from [0, LANDSCAPE_INDEX_MAX). The sequence is
 # low-discrepancy over the whole ensemble configuration space, so any window works;
 # this one is wide enough that a 5-draw collision is negligible and small enough to
@@ -229,21 +230,34 @@ def select_configs(records: list[dict], *, n_per_objective: int = 2) -> list[dic
     return chosen
 
 
-def budget_to_max_lines(budget_points: int) -> int | None:
+def n_init_lines(dim: int, init_design: str = "random") -> int:
+    """Init lines measured before the optimizer's first call (run_mobo.n_init_lines).
+
+    Axial: one trace per component rounded down to even (axial_init.n_traces_for),
+    restated here so planning does not import torch through src.utils.
+    """
+    if init_design == "axial":
+        return int(dim) - int(dim) % 2 if dim >= 2 else 0
+    return N_INIT_LINES
+
+
+def budget_to_max_lines(budget_points: int, n_init: int = N_INIT_LINES) -> int | None:
     """Measured-point budget -> the ``--max-lines`` cap evaluate.py takes.
 
     ``--max-lines`` counts objective calls, i.e. lines the OPTIMIZER asked for; the
-    ``N_INIT_LINES`` init lines are a deterministic preamble that runs before the first
-    such call, so they come off the budget rather than counting against the cap.
-    Returns None when the budget is <= 0, meaning "no point cap, time budget only".
+    *n_init* init lines are a deterministic preamble that runs before the first such
+    call, so they come off the budget rather than counting against the cap — an axial
+    init (more lines) leaves fewer optimizer lines, and every run still measures the
+    same number of points. Returns None when the budget is <= 0, meaning "no point
+    cap, time budget only".
     """
     if budget_points is None or budget_points <= 0:
         return None
-    n_lines = int(budget_points // POINTS_PER_LINE) - N_INIT_LINES
+    n_lines = int(budget_points // POINTS_PER_LINE) - n_init
     if n_lines < 1:
         raise SystemExit(
             f"--budget-points {budget_points} leaves no optimizer lines after the "
-            f"{N_INIT_LINES} init line(s) of {POINTS_PER_LINE} point(s) each")
+            f"{n_init} init line(s) of {POINTS_PER_LINE} point(s) each")
     return n_lines
 
 
@@ -349,7 +363,7 @@ while [ "$out_of_time" -eq 0 ]; do
             --num-runs 1 \\
             --ensemble-landscape-indices "$LS" \\
             --ensemble-seed {landscape_seed} \\
-            --time-limit-min {time_limit_min} \\
+            {extra_flags}--time-limit-min {time_limit_min} \\
             {max_lines_flag}--device cuda \\
             --no-video $PLOTFLAG \\
             --out-dir "$RUN_OUT" < /dev/null
@@ -388,6 +402,15 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
             f"  {n}:\n" + "\n".join(f"    - {p}" for p in probs)
             for n, probs in bad.items()))
 
+    # Reject a mistyped override key now rather than in every worker.
+    if args.ensemble_overrides:
+        from synthetic_data.ensemble import random_ensemble_config
+        valid = random_ensemble_config(args.dim, landscapes[0], seed=args.landscape_seed)
+        unknown = sorted(set(args.ensemble_overrides) - set(valid))
+        if unknown:
+            sys.exit(f"--ensemble-override: unknown ensemble key(s) {unknown}; "
+                     f"valid: {sorted(valid)}")
+
     out_dir = os.path.abspath(args.out)
     os.makedirs(os.path.join(out_dir, "configs"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
@@ -406,13 +429,17 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
                       f, indent=2, default=str)
 
     n_repeats = max(1, int(args.n_repeats))
-    max_lines = budget_to_max_lines(args.budget_points)
+    n_init = n_init_lines(args.dim, args.init)
+    max_lines = budget_to_max_lines(args.budget_points, n_init)
     manifest = {
         "generated": datetime.datetime.now().isoformat(timespec="seconds"),
         "dim": args.dim,
         "time_limit_hours": args.time_limit,
         "budget_points": args.budget_points if max_lines is not None else None,
         "max_lines": max_lines,
+        "init_design": args.init,
+        "n_init_lines": n_init,
+        "ensemble_overrides": args.ensemble_overrides or None,
         "landscape_seed": args.landscape_seed,
         "landscapes": landscapes,
         "n_repeats": n_repeats,
@@ -471,6 +498,12 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
     # A worker stops claiming once less than one task-reserve of wall-time is left,
     # so this — not the raw wall-time — is the budget the campaign has to drain in.
     claim_h = walltime_h - task_h
+    extra_flags = ""
+    if args.init != "random":
+        extra_flags += f"--init {args.init} \\\n            "
+    if args.ensemble_overrides:
+        spec = ",".join(f"{k}={json.dumps(v)}" for k, v in args.ensemble_overrides.items())
+        extra_flags += f"--ensemble-override '{spec}' \\\n            "
     sbatch = SBATCH_TEMPLATE.format(
         job_name=args.job_name or f"showdown_{args.dim}d",
         out_dir=out_dir,
@@ -486,6 +519,7 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
         max_lines_flag=(f"--max-lines {max_lines} \\\n            "
                         if max_lines is not None else ""),
         landscape_seed=args.landscape_seed,
+        extra_flags=extra_flags,
     )
     sbatch_path = os.path.join(out_dir, "showdown.sbatch")
     with open(sbatch_path, "w") as f:
@@ -496,8 +530,10 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
     print(f"    {len(names)} config(s) x {len(landscapes)} landscape(s) x "
           f"{n_repeats} repeat(s) = {len(tasks)} run(s)")
     print(f"    landscapes: {landscapes}")
+    if args.ensemble_overrides:
+        print(f"    landscape overrides: {args.ensemble_overrides}")
     if max_lines is not None:
-        print(f"    budget: {args.budget_points} point(s)/run = {N_INIT_LINES} init + "
+        print(f"    budget: {args.budget_points} point(s)/run = {n_init} {args.init} init + "
               f"{max_lines} optimizer line(s) @ {POINTS_PER_LINE} point(s); "
               f"--time-limit {args.time_limit:g} h is only a safety cap, so runs "
               "usually finish well inside the estimates below")
@@ -592,6 +628,23 @@ def load_explicit_configs(paths: list[str]) -> list[dict]:
     return out
 
 
+def _parse_overrides(spec: str | None) -> dict:
+    """'basin_width=2.2,n_optima=15' -> dict (same rules as evaluate.parse_ensemble_overrides)."""
+    out: dict = {}
+    for item in (spec or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise SystemExit(f"--ensemble-override: {item!r} is not KEY=VALUE")
+        k, v = (t.strip() for t in item.split("=", 1))
+        try:
+            out[k] = json.loads(v)
+        except ValueError:
+            out[k] = v
+    return out
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -612,6 +665,14 @@ def main() -> None:
                          "experiments. --time-limit then acts only as a safety cap. "
                          "0 disables the cap and reverts to a pure wall-clock budget "
                          "(default: %(default)s)")
+    ap.add_argument("--init", choices=INIT_DESIGNS, default="random",
+                    help="initial design for every run (evaluate.py --init). 'axial' "
+                         "measures more init lines, so it gets fewer optimizer lines "
+                         "under the same --budget-points (default: %(default)s)")
+    ap.add_argument("--ensemble-override", default=None, metavar="KEY=VAL[,...]",
+                    help="pin ensemble knobs on every landscape (evaluate.py "
+                         "--ensemble-override), e.g. 'basin_width=2.2,n_optima=15'; the "
+                         "rest of each Sobol draw is kept")
     ap.add_argument("--n-landscapes", type=int, default=DEFAULT_N_LANDSCAPES,
                     help="how many shared landscapes every config is run on")
     ap.add_argument("--n-per-objective", type=int, default=2,
@@ -649,6 +710,7 @@ def main() -> None:
     ap.add_argument("--status", action="store_true",
                     help="print queue progress (done / claimed / pending) and exit")
     args = ap.parse_args()
+    args.ensemble_overrides = _parse_overrides(args.ensemble_override)
 
     out_dir = os.path.abspath(args.out)
 

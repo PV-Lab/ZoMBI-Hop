@@ -810,36 +810,49 @@ def load_trial_hparams(runs_path: str, trial_nums: list[int]) -> dict[int, dict]
 # ─── Init data + CSV writers ────────────────────────────────────────────────────
 
 def gen_init_data(fn_callable, maximize: bool, dim: int):
-    """Generate ``run_mobo.N_INIT_LINES`` random simplex lines on the ``dim``-simplex."""
-    x_a_list, x_e_list, y_list = [], [], []
-    for _ in range(rm.N_INIT_LINES):
-        x0 = torch.full((dim,), 1.0 / dim, device=rm.DEVICE, dtype=rm.DTYPE)
-        dir_ = rm.zero_sum_dirs(1, dim, device=rm.DEVICE, dtype=rm.DTYPE).squeeze(0)
-        seg = rm.line_simplex_segment(x0, dir_)
-        if seg is None:
+    """Measure the initial design (``run_mobo.INIT_DESIGN``, set by ``--init``)."""
+    return rm._gen_init_data(fn_callable, maximize, dim=dim)
+
+
+def parse_ensemble_overrides(spec: str | None) -> dict:
+    """``"basin_width=2.2,n_optima=15"`` -> ``{"basin_width": 2.2, "n_optima": 15}``.
+
+    Values are JSON-parsed when possible (numbers, true/false/null), else kept as
+    strings. Keys are checked against a real config in the run loop.
+    """
+    out: dict = {}
+    for item in (spec or "").split(","):
+        item = item.strip()
+        if not item:
             continue
-        _, _, x_left, x_right = seg
-        t = torch.linspace(0.0, 1.0, rm.NUM_EXPERIMENTS, dtype=torch.float64, device=rm.DEVICE)
-        # Clean straight segment = what we "request"; physics-simulated print =
-        # what we "measure" (replaces the random add_composition_noise perturbation).
-        pts_clean = (x_left.to(torch.float64).unsqueeze(0)
-                     + t.unsqueeze(1) * (x_right - x_left).to(torch.float64).unsqueeze(0))
-        pts_t = rm.physics_simulate_line(x_left, x_right, num_points=rm.NUM_EXPERIMENTS,
-                                         device=rm.DEVICE, dtype=torch.float64)
-        pts_np = pts_t.detach().cpu().numpy()
-        raw = np.array([fn_callable(x) for x in pts_np], dtype=float)
-        y_t = torch.tensor(raw if maximize else -raw, dtype=rm.DTYPE, device=rm.DEVICE)
-        y_t = y_t + torch.randn_like(y_t) * (rm.OUTPUT_NOISE_FRAC * y_t.abs())
-        pts_out = pts_t.to(dtype=rm.DTYPE, device=rm.DEVICE)
-        pts_clean = pts_clean.to(dtype=rm.DTYPE, device=rm.DEVICE)
-        x_a_list.append(pts_out)
-        x_e_list.append(pts_clean)
-        y_list.append(y_t)
-    if not x_a_list:
-        raise RuntimeError("Could not generate any initial simplex lines.")
-    return (torch.cat(x_a_list, dim=0),
-            torch.cat(x_e_list, dim=0),
-            torch.cat(y_list, dim=0).reshape(-1, 1))
+        if "=" not in item:
+            raise SystemExit(f"--ensemble-override: {item!r} is not KEY=VALUE")
+        k, v = (t.strip() for t in item.split("=", 1))
+        try:
+            out[k] = json.loads(v)
+        except ValueError:
+            out[k] = v
+    return out
+
+
+def apply_ensemble_overrides(cfg: dict, overrides: dict) -> dict:
+    """Pin *overrides* onto a Sobol-drawn config, keeping every other knob.
+
+    Integer knobs stay integers (``n_optima=15.0`` -> 15) so ``Ensemble(**cfg)``
+    sees the types it was drawn with.
+    """
+    unknown = sorted(set(overrides) - set(cfg))
+    if unknown:
+        raise SystemExit(f"--ensemble-override: unknown ensemble key(s) {unknown}; "
+                         f"valid: {sorted(cfg)}")
+    out = dict(cfg)
+    for k, v in overrides.items():
+        if isinstance(cfg[k], int) and not isinstance(cfg[k], bool) and isinstance(v, float):
+            if not v.is_integer():
+                raise SystemExit(f"--ensemble-override: {k} must be an integer, got {v}")
+            v = int(v)
+        out[k] = v
+    return out
 
 
 def coord_cols(dim: int, dataset: str) -> list[str]:
@@ -1513,6 +1526,9 @@ def evaluate_dataset(
     syn_defaults = synthetic_defaults or {}
     is_ensemble = dataset in ENSEMBLE_DATASETS
     ens_dim = int(syn_defaults.get("dim", args.dim))
+    ens_overrides = parse_ensemble_overrides(getattr(args, "ensemble_override", None))
+    if ens_overrides and not is_ensemble:
+        raise SystemExit(f"--ensemble-override only applies to ensemble datasets, not {dataset!r}")
 
     # Explicit Sobol landscape indices, one per repeat, shared by every trial (see the
     # run loop). None -> the default per-(trial, run) indexing.
@@ -1543,6 +1559,8 @@ def evaluate_dataset(
             "ensemble_seed": args.ensemble_seed,
             "ensemble_optima_margin": args.ensemble_margin,
             "ensemble_landscape_indices": landscape_indices,
+            "ensemble_overrides": ens_overrides or None,
+            "init_design": rm.INIT_DESIGN,
             "runs_path": runs_path,
             "trials": trial_nums,
             "num_runs": args.num_runs,
@@ -1627,6 +1645,8 @@ def evaluate_dataset(
                 ens_cfg = random_ensemble_config(
                     ens_dim, idx, seed=int(args.ensemble_seed),
                     optima_margin=args.ensemble_margin)
+                if ens_overrides:
+                    ens_cfg = apply_ensemble_overrides(ens_cfg, ens_overrides)
                 run_ds = build_ensemble_ds(
                     ens_cfg, dataset, time_limit_hours=time_limit_min / 60.0)
                 os.makedirs(run_dir, exist_ok=True)
@@ -1746,6 +1766,13 @@ def main() -> None:
     parser.add_argument("--ensemble-margin", type=float, default=0.2,
                         help="optima_margin for the 'ensemble' dataset — normalized gap "
                              "the background stays below the optima (default: 0.2).")
+    parser.add_argument("--ensemble-override", default=None, metavar="KEY=VAL[,...]",
+                        help="pin ensemble knobs on every landscape, keeping the rest of "
+                             "each Sobol draw, e.g. 'basin_width=2.2,n_optima=15'. "
+                             "Recorded in each run's ensemble_config.json.")
+    parser.add_argument("--init", choices=rm.INIT_DESIGNS, default="random",
+                        help="initial design: 'random' = run_mobo.N_INIT_LINES random "
+                             "lines (default), 'axial' = the hardware axial-trace design.")
     parser.add_argument("--device", choices=("cpu", "cuda"), default=None,
                         help="Override compute device.")
     parser.add_argument("--max-lines", type=int, default=None,
@@ -1774,6 +1801,7 @@ def main() -> None:
     parser.add_argument("--out-dir", default=None, metavar="DIR",
                         help="Exact output directory (skip auto rerun_* naming).")
     args = parser.parse_args()
+    rm.INIT_DESIGN = args.init
 
     if args.num_runs < 1:
         sys.exit("--num-runs must be >= 1.")
