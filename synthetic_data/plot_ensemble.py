@@ -143,6 +143,13 @@ def build_app():
                     "cluster-spread", 0.0, 1.0, 0.05, 0.0, 0.25, str),
         ], style={"borderTop": "2px solid #999", "padding": "4px 0"}),
 
+        # Off by default: random_ensemble_config never sets basin_smoothing, so
+        # every benchmark landscape has cusped (pointed) optima.
+        _feature_block("Peak Rounding (true + weak optima)", "tog-smooth", [
+            _slider("Smoothing (higher = broader dome)", "basin-smooth",
+                    0.0, 6.0, 0.1, 1.5, 1.0, lambda v: f"{v:.1f}"),
+        ], enabled=False),
+
         _feature_block("Weak Optima (distractors)", "tog-weak", [
             _slider("Count", "n-weak", 0, 30, 1, 6, 5, str),
             _slider("Basin Width (b)", "weak-width", 5, 300, 1, 120, 50, str),
@@ -294,6 +301,7 @@ def build_app():
         Output("tog-aniso", "value"),
         Output("tog-plateaus", "value"),
         Output("tog-edge", "value"),
+        Output("tog-smooth", "value"),
         Input("randomize-btn", "n_clicks"),
         State("dim-select", "value"),
         State("domain-select", "value"),
@@ -339,6 +347,7 @@ def build_app():
             on(cfg["aniso_strength"] > 0),               # tog-aniso
             on(cfg["n_plateaus"] > 0),                   # tog-plateaus
             on(cfg["edge_region"] is not None),          # tog-edge
+            on(cfg.get("basin_smoothing", 0.0) > 0),     # tog-smooth
         )
 
     @callback(
@@ -352,6 +361,8 @@ def build_app():
         Input("n-clusters", "value"),
         Input("cluster-conc", "value"),
         Input("cluster-spread", "value"),
+        Input("tog-smooth", "value"),
+        Input("basin-smooth", "value"),
         Input("tog-weak", "value"),
         Input("n-weak", "value"),
         Input("weak-width", "value"),
@@ -383,6 +394,7 @@ def build_app():
     )
     def update_plot(domain, dim_sel, n_optima, basin_width, optima_margin,
                     optima_layout, n_clusters, cluster_conc, cluster_spread,
+                    tog_smooth, basin_smooth,
                     tog_weak, n_weak, weak_width, weak_amp,
                     tog_ridges, n_ridges, ridge_width, ridge_amp, ridge_length,
                     tog_rough, noise_freq, noise_amp, noise_oct,
@@ -397,6 +409,7 @@ def build_app():
             domain=domain,
             n_optima=int(n_optima),
             basin_width=float(basin_width),
+            basin_smoothing=float(basin_smooth) if on(tog_smooth) else 0.0,
             optima_margin=float(optima_margin),
             optima_layout=str(optima_layout),
             n_optima_clusters=int(n_clusters),
