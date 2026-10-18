@@ -210,10 +210,14 @@ def log_compositions(
 
 # ZoMBI-Hop hyperparameters used when no --hparams JSON file is supplied: the
 # shipped defaults from src/hparams.py (tuned values from
-# optimize/hparams/6d_ensemble.json, plus the measured physical input noise).
+# optimize/hparams/6d_ensemble.json, plus the measured physical input noise). A NEW
+# run also takes src/hparams.DIM_DEFAULTS for its number of optimizing dims (6 dims:
+# the hand-tuned penalty zones), under any --hparams file.
 from src.hparams import (
     ALL_DEFAULTS,
+    DIM_DEFAULTS,
     check_conflicts,
+    defaults_for_dim,
     load_hparams_file,
     resolve_for_run,
 )
@@ -1464,10 +1468,19 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
     if optimizing_dims is not None:
         OPTIMIZING_DIMS = list(optimizing_dims)
 
-    # Merge built-in defaults with any user-supplied hyperparameter file.
-    hw_hparams: Dict[str, Any] = dict(DEFAULT_HW_HPARAMS)
+    # Merge built-in defaults with any user-supplied hyperparameter file. A new run
+    # gets its dimension's defaults too; a resume does not — its config.json wins
+    # for every knob it recorded, and a knob it never recorded (an older run) keeps
+    # the value that run was started with, which is ALL_DEFAULTS.
+    new_run_dim = len(OPTIMIZING_DIMS) if resume_uuid is None else None
+    hw_hparams: Dict[str, Any] = (dict(defaults_for_dim(new_run_dim))
+                                  if new_run_dim else dict(DEFAULT_HW_HPARAMS))
+    if new_run_dim in DIM_DEFAULTS:
+        print(f"[ZoMBI] {new_run_dim}-dim run: using the {new_run_dim}-d defaults "
+              f"{DIM_DEFAULTS[new_run_dim]} (an --hparams file overrides them).")
+    overrides: Dict[str, Any] = {}
     if hparams_path:
-        overrides = _load_hparams_file(hparams_path)
+        overrides = _load_hparams_file(hparams_path) or {}
         if overrides:
             hw_hparams.update(overrides)
             print(f"[ZoMBI] Applied {len(overrides)} hyperparameter override(s) "
@@ -1485,7 +1498,7 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
                      else Path("actual_runs") / "checkpoints") / f"run_{resume_uuid}" / "config.json"
         if _cfg_path.exists():
             _run_cfg = json.loads(_cfg_path.read_text(encoding="utf-8-sig"))
-    check_conflicts(resolve_for_run(hw_hparams, _run_cfg),
+    check_conflicts(resolve_for_run(hw_hparams, _run_cfg, dim=new_run_dim),
                     context=f"resume of run_{resume_uuid} (config.json values win)"
                     if resume_uuid else "new hardware run")
 
@@ -1536,6 +1549,14 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
             init_uuid = resume_uuid
             print(f"[Resume] run_{resume_uuid} was stopped during initialization; "
                   f"continuing its initial design.")
+            # No optimiser (and so no config.json) exists yet: it is built fresh
+            # below, so it takes the same per-dim defaults a new run would.
+            if dimensions in DIM_DEFAULTS:
+                hw_hparams = {**defaults_for_dim(dimensions), **overrides}
+                check_conflicts(hw_hparams, context=f"resume of run_{resume_uuid} "
+                                "(initialization not finished)")
+                print(f"[ZoMBI] {dimensions}-dim run: using the {dimensions}-d defaults "
+                      f"{DIM_DEFAULTS[dimensions]} (an --hparams file overrides them).")
 
     resume_plot_data: Tuple[List[float], List[float], List[np.ndarray]] | None = None
     needle_plot_points: List[Dict[str, float]] = []

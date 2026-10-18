@@ -100,6 +100,7 @@ import os
 import sys
 import json
 import glob
+import shutil
 import argparse
 import datetime
 
@@ -277,8 +278,8 @@ SBATCH_TEMPLATE = """#!/bin/bash
 #SBATCH --time={walltime}
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=128G
-#SBATCH --partition=sched_mit_sloan_gpu_r8
+#SBATCH --mem={mem}
+#SBATCH --partition={partition}
 #SBATCH --gres=gpu:1
 #SBATCH --array=0-{last_worker}
 
@@ -323,6 +324,26 @@ DEADLINE=$(( $(date +%s) + {worker_seconds} - {task_seconds} ))
 
 echo "[$(date)] worker $SLURM_ARRAY_TASK_ID up on $(hostname), gpu=${{CUDA_VISIBLE_DEVICES:-?}}, queue=$WORKQ (offset $OFFSET/$NTASKS)"
 
+# A broken GPU makes every run die in seconds with "CUDA unknown error"; check it
+# BEFORE claiming, so a bad node takes no work from the healthy workers.
+if ! uv run python -c "import torch; torch.zeros(1, device='cuda')" < /dev/null; then
+    echo "[$(date)] worker $SLURM_ARRAY_TASK_ID: CUDA unusable on $(hostname) — exiting without claiming"
+    exit 1
+fi
+
+# Each claim records its owner (array job + task). A preempted worker is REQUEUED under
+# the same id and its earlier incarnation is dead, so any unfinished claim it owns is
+# abandoned work — release it, or the requeued worker would skip its own tasks.
+ME="${{SLURM_ARRAY_JOB_ID}}_${{SLURM_ARRAY_TASK_ID}}"
+for c in "$CLAIMS"/*/; do
+    [ -d "$c" ] || continue
+    TID_C=$(basename "$c")
+    if [ ! -d "$DONE/$TID_C" ] && [ "$(cat "$c/owner" 2>/dev/null)" = "$ME" ]; then
+        echo "[$(date)] worker $SLURM_ARRAY_TASK_ID: releasing own pre-requeue claim $TID_C"
+        rm -rf "$c"
+    fi
+done
+
 n_ran=0
 out_of_time=0
 pass_no=0
@@ -346,9 +367,12 @@ while [ "$out_of_time" -eq 0 ]; do
         fi
         # Atomic claim: mkdir fails for every worker but the first.
         mkdir "$CLAIMS/$TID" 2>/dev/null || continue
+        echo "$ME" > "$CLAIMS/$TID/owner"
         claimed_this_pass=$(( claimed_this_pass + 1 ))
 
         RUN_OUT="{out_dir}/runs/${{CFG}}__ls${{LS}}__r${{REP}}"
+        # A retried task must not inherit a killed attempt's partial files.
+        rm -rf "$RUN_OUT"
         echo "[$(date)] worker $SLURM_ARRAY_TASK_ID -> task $TID: config=$CFG landscape=$LS repeat=$REP"
 
         # Repeat 1 renders the full artifact set; the rest pass --no-plots and produce only
@@ -359,10 +383,7 @@ while [ "$out_of_time" -eq 0 ]; do
 
         uv run python optimize/evaluate.py \\
             --hparams-json "{out_dir}/configs/$CFG.json" \\
-            --dataset ensemble --dim {dim} \\
-            --num-runs 1 \\
-            --ensemble-landscape-indices "$LS" \\
-            --ensemble-seed {landscape_seed} \\
+            {dataset_flags}--num-runs 1 \\
             {extra_flags}--time-limit-min {time_limit_min} \\
             {max_lines_flag}--device cuda \\
             --no-video $PLOTFLAG \\
@@ -370,11 +391,14 @@ while [ "$out_of_time" -eq 0 ]; do
         # `< /dev/null` matters: without it the child inherits this loop's stdin and can
         # swallow the rest of the queue, silently truncating it.
 
-        if [ $? -eq 0 ]; then
+        # evaluate.py catches a failed run and still exits 0, so success is the run's
+        # metrics.json existing — not the exit code alone.
+        RC=$?
+        if [ "$RC" -eq 0 ] && compgen -G "$RUN_OUT/trial_*/run_*/metrics.json" > /dev/null; then
             mkdir -p "$DONE/$TID"
             n_ran=$(( n_ran + 1 ))
         else
-            echo "[$(date)] worker $SLURM_ARRAY_TASK_ID: task $TID FAILED (claim kept; --reset-stale requeues it)"
+            echo "[$(date)] worker $SLURM_ARRAY_TASK_ID: task $TID FAILED rc=$RC or no metrics.json (claim kept; --reset-stale requeues it)"
         fi
     done < "$WORKQ"
 
@@ -403,6 +427,10 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
             for n, probs in bad.items()))
 
     # Reject a mistyped override key now rather than in every worker.
+    if args.dataset != "ensemble" and args.ensemble_overrides:
+        sys.exit("--ensemble-override only applies to --dataset ensemble")
+    if args.dataset == "rungp" and not args.gp_run:
+        sys.exit("--dataset rungp needs --gp-run RUN_DIR")
     if args.ensemble_overrides:
         from synthetic_data.ensemble import random_ensemble_config
         valid = random_ensemble_config(args.dim, landscapes[0], seed=args.landscape_seed)
@@ -434,6 +462,9 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
     manifest = {
         "generated": datetime.datetime.now().isoformat(timespec="seconds"),
         "dim": args.dim,
+        "dataset": args.dataset,
+        "gp_run": os.path.abspath(args.gp_run) if args.dataset == "rungp" else None,
+        "gp_length_scale": args.gp_length_scale if args.dataset == "rungp" else None,
         "time_limit_hours": args.time_limit,
         "budget_points": args.budget_points if max_lines is not None else None,
         "max_lines": max_lines,
@@ -498,6 +529,13 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
     # A worker stops claiming once less than one task-reserve of wall-time is left,
     # so this — not the raw wall-time — is the budget the campaign has to drain in.
     claim_h = walltime_h - task_h
+    if args.dataset == "rungp":
+        dataset_flags = (f"--dataset rungp --gp-run '{os.path.abspath(args.gp_run)}' "
+                         f"--gp-length-scale {args.gp_length_scale:g} \\\n            ")
+    else:
+        dataset_flags = (f"--dataset ensemble --dim {args.dim} \\\n            "
+                         f"--ensemble-landscape-indices \"$LS\" \\\n            "
+                         f"--ensemble-seed {args.landscape_seed} \\\n            ")
     extra_flags = ""
     if args.init != "random":
         extra_flags += f"--init {args.init} \\\n            "
@@ -514,11 +552,12 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
         last_worker=args.n_workers - 1,
         n_workers=args.n_workers,
         n_tasks=len(tasks),
-        dim=args.dim,
+        mem=args.mem,
+        partition=args.partition,
+        dataset_flags=dataset_flags,
         time_limit_min=f"{time_limit_min:g}",
         max_lines_flag=(f"--max-lines {max_lines} \\\n            "
                         if max_lines is not None else ""),
-        landscape_seed=args.landscape_seed,
         extra_flags=extra_flags,
     )
     sbatch_path = os.path.join(out_dir, "showdown.sbatch")
@@ -581,16 +620,33 @@ def reset_stale(out_dir: str) -> int:
     every later submission — the campaign would look "drained" while silently missing
     runs. Safe to run only when no workers are live; a claim on a RUNNING task looks
     exactly like an abandoned one.
+
+    Also drops a done marker whose run has no ``metrics.json``: workers before
+    2026-10-18 marked a task done on evaluate.py's exit code alone, which is 0 even
+    when the run inside it failed.
     """
     claims = os.path.join(out_dir, "claims")
     done = os.path.join(out_dir, "done")
     if not os.path.isdir(claims):
         print(f"  no claims dir in {out_dir} — nothing to reset")
         return 0
+    queue = os.path.join(out_dir, "tasks.tsv")
+    if os.path.isfile(queue):
+        with open(queue) as f:
+            for ln in f:
+                if not ln.strip():
+                    continue
+                tid, cfg, ls, rep = ln.split("\t")[:4]
+                run_out = os.path.join(out_dir, "runs", f"{cfg}__ls{ls}__r{rep}")
+                if (os.path.isdir(os.path.join(done, tid))
+                        and not glob.glob(os.path.join(run_out, "trial_*", "run_*",
+                                                       "metrics.json"))):
+                    os.rmdir(os.path.join(done, tid))
+                    print(f"  task {tid}: done marker without metrics.json — requeued")
     n = 0
     for tid in sorted(os.listdir(claims)):
         if not os.path.isdir(os.path.join(done, tid)):
-            os.rmdir(os.path.join(claims, tid))
+            shutil.rmtree(os.path.join(claims, tid))
             n += 1
     n_done = len(os.listdir(done)) if os.path.isdir(done) else 0
     print(f"  reset {n} stale claim(s); {n_done} task(s) already complete")
@@ -675,6 +731,18 @@ def main() -> None:
                          "rest of each Sobol draw is kept")
     ap.add_argument("--n-landscapes", type=int, default=DEFAULT_N_LANDSCAPES,
                     help="how many shared landscapes every config is run on")
+    ap.add_argument("--landscapes", default=None, metavar="IDX[,IDX...]",
+                    help="explicit ensemble landscape indices instead of a random "
+                         "--n-landscapes draw, e.g. '9182,22358' to reuse an earlier "
+                         "showdown's landscapes")
+    ap.add_argument("--dataset", choices=("ensemble", "rungp"), default="ensemble",
+                    help="'rungp': ONE fixed landscape, the GP fit to --gp-run's measured "
+                         "points (evaluate.py --dataset rungp); its dimension comes from "
+                         "the run, and the landscape list is just [0]")
+    ap.add_argument("--gp-run", default=None, metavar="RUN_DIR",
+                    help="rungp: run directory to fit the GP to (e.g. runs/run_69af)")
+    ap.add_argument("--gp-length-scale", type=float, default=0.05,
+                    help="rungp: fixed Matern length scale (default: %(default)s)")
     ap.add_argument("--n-per-objective", type=int, default=2,
                     help="configs taken from each of dist_to_needles / dup_fraction")
     ap.add_argument("--landscape-seed", type=int, default=0,
@@ -700,6 +768,11 @@ def main() -> None:
                          "longer fits, so this can be shorter than the whole campaign "
                          "(default: %(default)s, the partition maximum)")
     ap.add_argument("--job-name", default=None)
+    ap.add_argument("--partition", default="sched_mit_sloan_gpu_r8",
+                    help="SLURM partition(s), comma-separated (default: %(default)s)")
+    ap.add_argument("--mem", default="128G",
+                    help="SLURM memory per worker; workers peak at ~6 GB "
+                         "(default: %(default)s)")
     ap.add_argument("--no-shared-history", action="store_true",
                     help="when --runs is a single run dir, do NOT pool its siblings")
     ap.add_argument("--summary-only", action="store_true",
@@ -739,7 +812,12 @@ def main() -> None:
         records = collect_pool(args.runs, shared_history=not args.no_shared_history)
         chosen = select_configs(records, n_per_objective=args.n_per_objective)
 
-    landscapes = pick_landscapes(args.n_landscapes, args.landscape_seed)
+    if args.dataset == "rungp":
+        landscapes = [0]
+    elif args.landscapes:
+        landscapes = sorted(int(t) for t in args.landscapes.split(",") if t.strip())
+    else:
+        landscapes = pick_landscapes(args.n_landscapes, args.landscape_seed)
     write_plan(chosen, landscapes, args)
 
 

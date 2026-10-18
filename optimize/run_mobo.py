@@ -737,6 +737,12 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
     # older run (and eve_lal's fork) has, and still pool with them.
     if INIT_DESIGN != "random":
         cfg["init_design"] = INIT_DESIGN
+    # Same rule for the zone penalty shape: not a tuned axis, so every trial runs the
+    # registry default. That default became "linear" on 2026-10-18; history without the
+    # key was scored under "quadratic" and must not pool with linear runs.
+    from src.hparams import ALL_DEFAULTS as _HP_DEFAULTS
+    if _HP_DEFAULTS["repulsion_profile"] != "quadratic":
+        cfg["repulsion_profile"] = _HP_DEFAULTS["repulsion_profile"]
     if landscape.landscape == "rf":
         cfg["csv_path"] = landscape.csv_path
         cfg["objective_column"] = landscape.objective_column
@@ -1380,6 +1386,7 @@ def _run_signature(cfg: dict) -> dict:
         "ensemble_optima_margin": cfg.get("ensemble_optima_margin"),
         "ensemble_repeats": cfg.get("ensemble_repeats"),
         "init_design": cfg.get("init_design"),
+        "repulsion_profile": cfg.get("repulsion_profile"),
     }
 
 
@@ -2025,13 +2032,14 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
 def plot_convergence(path: str, dh, maximize: bool,
                      activations: np.ndarray | None = None,
                      declared_samples: np.ndarray | None = None) -> None:
-    """Save a convergence plot: all Y values, running best, needle vlines.
+    """Save a convergence plot: all Y values, running best, needle leashes.
 
-    Each needle gets two vlines: red dashed where its point was first sampled
-    (``dh.needle_indices``), and green dotted where it was declared
-    (``declared_samples``, from ``plot_metrics.needle_declaration_samples``).
-    The gap between them is how long the point sat measured before the search
-    confirmed it.
+    Each needle gets a lollipop-and-leash marker (shared with the GUI via
+    ``visualization.plot_convergence.draw_needle_leashes``): a numbered star where
+    its point was sampled (``dh.needle_indices``), leashed horizontally to a
+    diamond where it was declared (``declared_samples``, from
+    ``plot_metrics.needle_declaration_samples``). The leash length is how long the
+    point sat measured before the search confirmed it.
 
     ``activations``: optional per-sample activation id (same length/order as
     ``dh.Y_all``). When given, the running-best envelope is **reset at every
@@ -2089,21 +2097,15 @@ def plot_convergence(path: str, dh, maximize: bool,
         ax.plot(idx, running_best, color="darkorange", lw=1.8,
                 label="running best", zorder=4, drawstyle="steps-post")
 
-    if needle_indices is not None:
-        labeled = False
-        for ni in needle_indices:
-            if 0 <= ni < len(Y_all):
-                kw = dict(color="crimson", alpha=0.55, lw=0.9, ls="--")
-                if not labeled:
-                    kw["label"] = "needle point sampled"
-                    labeled = True
-                ax.axvline(float(ni), **kw)
-
-    if declared_samples is not None:
-        # +0.5: the declaration happens after the last sample of its line.
-        for k, ds in enumerate(np.asarray(declared_samples, dtype=float).ravel()):
-            ax.axvline(ds + 0.5, color="green", alpha=0.5, lw=1.1, ls=":", zorder=5,
-                       label="needle declared" if k == 0 else None)
+    from visualization.plot_convergence import draw_needle_leashes
+    act_starts = None
+    if activations is not None and len(activations) == len(Y_all):
+        acts = np.asarray(activations).ravel()
+        act_starts = np.flatnonzero(acts[1:] != acts[:-1]) + 1
+    draw_needle_leashes(ax, Y_all, needle_indices,
+                        (np.asarray(declared_samples).ravel()
+                         if declared_samples is not None else None),
+                        act_starts)
 
     ax.set_xlabel("Sample index")
     ax.set_ylabel("Objective Y")

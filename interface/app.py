@@ -60,6 +60,7 @@ except ImportError:
     _BOTORCH_OK = False
 
 from src import ZoMBIHop, LineBO
+from visualization.plot_convergence import draw_needle_leashes
 from src.core.hparam_live import (
     LIVE_EDITABLE_NAMES,
     OVERRIDE_FILENAME as OVERRIDE_HPARAMS_FILENAME,
@@ -167,12 +168,14 @@ def load_hparams_json(path: str) -> dict:
 
 
 def hardware_hparam_problems(hparams_path: str | None,
-                             run_dir: Path | None = None) -> list[str]:
+                             run_dir: Path | None = None,
+                             dim: int | None = None) -> list[str]:
     """Conflicts in the configuration a hardware launch would run, or [].
 
-    Mirrors the runner: shipped defaults, then the hyperparameter file, then —
-    for a resume — the run's own config.json. Checked here so the operator hears
-    about it before the subprocess starts printing initial lines.
+    Mirrors the runner: shipped defaults (plus the per-dim defaults for a NEW run
+    of *dim* dims), then the hyperparameter file, then — for a resume — the run's
+    own config.json. Checked here so the operator hears about it before the
+    subprocess starts printing initial lines.
     """
     passed = load_hparams_file(hparams_path) if hparams_path else {}
     run_cfg = None
@@ -181,11 +184,12 @@ def hardware_hparam_problems(hparams_path: str | None,
             run_cfg = json.loads((Path(run_dir) / "config.json").read_text(encoding="utf-8-sig"))
         except Exception:
             run_cfg = None
-    return hparam_conflicts(resolve_hparams_for_run(passed, run_cfg))
+    return hparam_conflicts(resolve_hparams_for_run(passed, run_cfg, dim=dim))
 
 
 # Default hyperparameters used when no JSON file is supplied (src/hparams.py).
-from src.hparams import ALL_DEFAULTS, DEFAULT_HPARAMS, DEFAULT_HPARAMS_PROVENANCE
+# DIM_DEFAULTS adds per-dimension values (6 dims: penalty zones) for a NEW run.
+from src.hparams import ALL_DEFAULTS, DEFAULT_HPARAMS, DEFAULT_HPARAMS_PROVENANCE, DIM_DEFAULTS
 
 
 # ── synthetic-run helpers ─────────────────────────────────────────────────────
@@ -1150,24 +1154,10 @@ class ConvergencePlotFrame(PlotFrame):
                 labeled = True
             ax.plot(idx[start:end], seg_best, **kw)
 
-        # Each needle gets two vlines (as in run_mobo.plot_convergence): red dashed
-        # where its point was first sampled, green dotted where it was declared.
-        # The gap is how long the point sat measured before the search confirmed it.
-        if rd.needle_indices is not None and len(rd.needle_indices) > 0:
-            labeled = False
-            for ni in rd.needle_indices:
-                if 0 <= ni < len(Y):
-                    kw = dict(color="crimson", alpha=0.55, lw=0.9, ls="--")
-                    if not labeled:
-                        kw["label"] = "needle point sampled"
-                        labeled = True
-                    ax.axvline(float(ni), **kw)
-
-        if rd.declared_samples is not None:
-            # +0.5: the declaration happens after the last sample of its line.
-            for k, ds in enumerate(rd.declared_samples):
-                ax.axvline(float(ds) + 0.5, color="green", alpha=0.5, lw=1.1, ls=":",
-                           zorder=5, label="needle declared" if k == 0 else None)
+        # Each needle: a numbered star on its sampled point, leashed horizontally
+        # to a diamond where it was declared — the leash length is how long the
+        # point sat measured before the search confirmed it.
+        draw_needle_leashes(ax, Y, rd.needle_indices, rd.declared_samples, act_starts)
 
         ax.set_xlabel("Sample index")
         ax.set_ylabel("Objective Y")
@@ -4541,7 +4531,7 @@ class NewRunDialog(tk.Toplevel):
 
         row += 1
         ttk.Label(tf, text="(trial.json-style file. If blank, the tuned defaults "
-                           f"from {DEFAULT_HPARAMS_PROVENANCE} are used.)",
+                           f"from {DEFAULT_HPARAMS_PROVENANCE} are used,\nplus the 6-d penalty-zone defaults for a 6-dim run.)",
                   foreground="gray").grid(row=row, column=0, columnspan=3,
                                           sticky="w", padx=8)
 
@@ -4592,7 +4582,7 @@ class NewRunDialog(tk.Toplevel):
 
         hrow += 1
         ttk.Label(hw, text="(trial.json-style file. If blank, the tuned defaults "
-                           f"from {DEFAULT_HPARAMS_PROVENANCE} are used.)",
+                           f"from {DEFAULT_HPARAMS_PROVENANCE} are used,\nplus the 6-d penalty-zone defaults for a 6-dim run.)",
                   foreground="gray").grid(
             row=hrow, column=0, columnspan=2, sticky="w", padx=8)
 
@@ -4654,18 +4644,6 @@ class NewRunDialog(tk.Toplevel):
 
     def _start(self):
         try:
-            # Hyperparameters: defaults (4d trial_10) unless a JSON file is given.
-            hp = dict(DEFAULT_HPARAMS)
-            syn_path = self._syn_hparams_var.get().strip()
-            if syn_path:
-                loaded = load_hparams_json(syn_path)
-                if not loaded:
-                    raise ValueError(f"No recognised hyperparameters in {syn_path}.")
-                hp.update(loaded)
-            problems = hparam_conflicts(hp)
-            if problems:
-                raise ValueError("These hyperparameters make needles impossible:\n  - "
-                                 + "\n  - ".join(problems))
             max_act  = float("inf")   # hardcoded: run until stopped
             outdir   = self._outdir_var.get()
             # Dim selection + per-dim search box. d = number of checked dims; the
@@ -4674,6 +4652,19 @@ class NewRunDialog(tk.Toplevel):
             sel_dims       = self._syn_dims.selected_dims()
             bounds_lo, bounds_hi = self._syn_dims.bounds_for_selected()
             d              = len(sel_dims)
+            # Hyperparameters: shipped defaults, then this dimension's defaults
+            # (DIM_DEFAULTS — same as a hardware run of d dims), then the JSON file.
+            hp = {**DEFAULT_HPARAMS, **DIM_DEFAULTS.get(d, {})}
+            syn_path = self._syn_hparams_var.get().strip()
+            if syn_path:
+                loaded = load_hparams_json(syn_path)
+                if not loaded:
+                    raise ValueError(f"No recognised hyperparameters in {syn_path}.")
+                hp.update(loaded)
+            problems = hparam_conflicts({**ALL_DEFAULTS, **hp})
+            if problems:
+                raise ValueError("These hyperparameters make needles impossible:\n  - "
+                                 + "\n  - ".join(problems))
         except Exception as exc:
             messagebox.showerror("Config error", str(exc))
             return
@@ -4931,7 +4922,7 @@ class HardwareResumeDialog(tk.Toplevel):
 
         row += 1
         ttk.Label(f, text="(trial.json-style file. If blank, the tuned defaults "
-                          f"from {DEFAULT_HPARAMS_PROVENANCE} are used.)",
+                          f"from {DEFAULT_HPARAMS_PROVENANCE} are used;\nthe run's own config.json values still win.)",
                   foreground="gray").grid(row=row, column=0, columnspan=2,
                                           sticky="w", padx=8)
 
@@ -5711,8 +5702,11 @@ class ZoMBIApp(tk.Tk):
         # Refuse to start hardware on a configuration that can never declare a
         # needle (the runner checks too, but only after spawning).
         try:
+            new_dim = (len([t for t in dims_raw.split(",") if t.strip()])
+                       if (dims_raw and not uuid) else None)
             problems = hardware_hparam_problems(
-                hparams_path, Path(ckpt_dir) / f"run_{uuid}" if uuid else None)
+                hparams_path, Path(ckpt_dir) / f"run_{uuid}" if uuid else None,
+                dim=new_dim)
         except Exception as exc:
             problems = [f"could not read hyperparameters: {exc}"]
         if problems:

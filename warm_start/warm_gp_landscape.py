@@ -422,6 +422,158 @@ def fullgp_objective(dim: int, *, seed: int = SEED) -> dict:
     }
 
 
+# ── GP fit to a ZoMBI-Hop run directory (any d) ──────────────────────────────
+#
+# The campaigns above are DBs at d=3/4, where a simplex lattice is dense enough for
+# detect_peaks. A 6-d hardware run is not: a lattice fine enough for a 0.05 length
+# scale has billions of points. Peaks are found instead by projected gradient
+# ascent on the GP mean, started from every measured point. With a short fixed
+# length scale every bump of the mean sits next to data, so those starts reach
+# every peak, and the same min-sep / prominence rules as detect_peaks thin them.
+
+_ASCENT_STEPS = 400
+_ASCENT_STEP0 = 0.01
+_ASCENT_CHUNK = 256          # query rows per kernel block (chunk x N x d floats)
+_BACKGROUND_SAMPLES = 20000  # uniform simplex draws for the background level
+
+
+def _project_simplex(V: np.ndarray) -> np.ndarray:
+    """Row-wise Euclidean projection onto the probability simplex."""
+    n, d = V.shape
+    U = -np.sort(-V, axis=1)
+    css = np.cumsum(U, axis=1) - 1.0
+    k = np.arange(1, d + 1)
+    rho = (U - css / k > 0).sum(axis=1)
+    theta = css[np.arange(n), rho - 1] / rho
+    return np.maximum(V - theta[:, None], 0.0)
+
+
+def _gp_mean_grad(predict, Xq: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """GP mean and its gradient at ``Xq`` for a :func:`build_gp_landscape` predictor.
+
+    Uses the fitted Constant x Matern(nu=2.5) part only; the White term adds nothing
+    off the training points.
+    """
+    gp = predict.gp
+    c = float(gp.kernel_.k1.k1.constant_value)
+    ls = float(gp.kernel_.k1.k2.length_scale)
+    Xt, alpha = gp.X_train_, gp.alpha_.ravel()
+    mean = np.empty(len(Xq))
+    grad = np.empty_like(Xq)
+    for i in range(0, len(Xq), _ASCENT_CHUNK):
+        diff = Xq[i:i + _ASCENT_CHUNK, None, :] - Xt[None, :, :]       # (b, N, d)
+        s = np.sqrt(5.0) * np.sqrt((diff ** 2).sum(-1)) / ls           # (b, N)
+        e = np.exp(-s)
+        mean[i:i + _ASCENT_CHUNK] = (c * (1.0 + s + s ** 2 / 3.0) * e) @ alpha
+        dk = -c * (5.0 / (3.0 * ls ** 2)) * (1.0 + s) * e              # dk/dx / diff
+        grad[i:i + _ASCENT_CHUNK] = np.einsum("bn,bnd->bd", dk * alpha, diff)
+    return mean * predict.y_std + predict.y_mean, grad * predict.y_std
+
+
+def ascend_peaks(predict, starts: np.ndarray, *,
+                 min_sep: float = _PEAK_MIN_SEP,
+                 prominence_frac: float = _PEAK_PROMINENCE_FRAC,
+                 seed: int = SEED) -> tuple[np.ndarray, np.ndarray]:
+    """Local maxima of the GP mean on the simplex, by ascent from ``starts``.
+
+    Each start takes projected gradient steps with its own step size (grown 1.2x on
+    an improving step, halved and the step rejected otherwise). The converged points
+    are then filtered exactly as :func:`detect_peaks` filters lattice maxima: the
+    background is the median mean over uniform simplex draws, a peak must rise
+    ``prominence_frac`` of the way from it to the global max, and peaks are kept in
+    descending value at least ``min_sep`` apart.
+
+    Returns ``(peaks, values)`` sorted by descending GP value.
+    """
+    X = _project_simplex(np.asarray(starts, dtype=float))
+    f, g = _gp_mean_grad(predict, X)
+    eta = np.full(len(X), _ASCENT_STEP0)
+    for _ in range(_ASCENT_STEPS):
+        g_t = g - g.mean(axis=1, keepdims=True)                 # tangent to the simplex
+        X_new = _project_simplex(X + eta[:, None] * g_t)
+        f_new, g_new = _gp_mean_grad(predict, X_new)
+        up = f_new > f
+        X[up], f[up], g[up] = X_new[up], f_new[up], g_new[up]
+        eta = np.where(up, eta * 1.2, eta * 0.5)
+        if eta.max() < 1e-7:
+            break
+
+    rng = np.random.default_rng(seed)
+    background = float(np.median(predict(rng.dirichlet(np.ones(X.shape[1]),
+                                                       _BACKGROUND_SAMPLES))))
+    floor = background + prominence_frac * (float(f.max()) - background)
+    kept: list[int] = []
+    for idx in np.argsort(f)[::-1]:
+        if f[idx] < floor:
+            break
+        if all(np.linalg.norm(X[idx] - X[k]) >= min_sep for k in kept):
+            kept.append(idx)
+    kept_arr = np.array(kept, dtype=int)
+    return X[kept_arr], f[kept_arr]
+
+
+def _fit_run_gp(run_dir: Path, length_scale: float, snapshot: str | None):
+    """``(predict, X, Y, snapshot)`` for the GP over a run dir's scored points."""
+    from visualization.plot_run import _default_snapshot, load_run_dataset
+
+    snapshot = snapshot or _default_snapshot(run_dir)
+    X, Y = load_run_dataset(run_dir, snapshot)
+    ok = np.isfinite(Y) & np.isfinite(X).all(axis=1)
+    X, Y = X[ok], Y[ok]
+    return build_gp_landscape(X, Y, float(length_scale)), X, Y, snapshot
+
+
+class RunGPSurface:
+    """A rungp landscape with the ``Ensemble`` interface ``visualization/paired_conet``
+    uses: batched ``predict(X)`` and ``centers`` (the reference optima).
+
+    Rebuilt from the ``rungp_config.json`` evaluate.py writes into each rungp run dir.
+    The GP is refit (deterministic) but the peaks are taken from the config rather than
+    re-ascended, so they are exactly the optima the run was scored against.
+    """
+
+    def __init__(self, cfg: dict):
+        self.dim = int(cfg["dim"])
+        self.centers = np.asarray(cfg["centers"], dtype=float)
+        self._predict, _, _, _ = _fit_run_gp(
+            Path(cfg["gp_run"]), float(cfg["length_scale"]), cfg["snapshot"])
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        return self._predict(X)
+
+
+def rungp_objective(run_dir: str | Path, *, length_scale: float = GP_LENGTH_SCALE,
+                    snapshot: str | None = None) -> dict:
+    """GP landscape fit to every measured point of a ZoMBI-Hop run directory.
+
+    The run-directory counterpart of :func:`fullgp_objective` for campaigns that
+    live in ``runs/run_*`` (e.g. the 6-d hardware run_69af) rather than a DB. The
+    surface is the same fixed-length-scale Matern GP; its reference optima come from
+    :func:`ascend_peaks`. Composition columns stay in the run's own dimension order.
+    The run's hardware bounds are NOT carried over: off the measured region the GP
+    relaxes to the mean of Y, which is what a simulated search there will see.
+    """
+    run_dir = Path(run_dir).resolve()
+    predict, X, Y, snapshot = _fit_run_gp(run_dir, length_scale, snapshot)
+    peaks, peak_vals = ascend_peaks(predict, X)
+
+    def fn(x: np.ndarray) -> float:
+        return float(predict(np.asarray(x, dtype=float).reshape(1, -1))[0])
+
+    return {
+        "dim": int(X.shape[1]),
+        "fn": fn,
+        "predict": predict,
+        "peaks": peaks,
+        "peak_values": peak_vals,
+        "n_points": int(X.shape[0]),
+        "run_dir": str(run_dir),
+        "snapshot": snapshot,
+        "length_scale": float(length_scale),
+        "y_max": float(Y.max()),
+    }
+
+
 # ── figures ──────────────────────────────────────────────────────────────────
 
 _SQRT3_2 = np.sqrt(3) / 2

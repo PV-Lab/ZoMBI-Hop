@@ -97,6 +97,9 @@ def build_gp_landscape(X: np.ndarray, Y: np.ndarray, length_scale: float):
         comp = np.atleast_2d(np.asarray(comp, dtype=float))
         return gp.predict(comp) * y_std + y_mean
 
+    # The fitted model and Y scaling, for callers that need more than the mean
+    # (warm_gp_landscape.ascend_peaks differentiates it).
+    predict.gp, predict.y_mean, predict.y_std = gp, y_mean, y_std
     return predict
 
 

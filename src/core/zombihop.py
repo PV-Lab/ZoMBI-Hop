@@ -98,6 +98,8 @@ class ZoMBIHop:
                  ellipsoid_eigenvalue_floor: float = _HP["ellipsoid_eigenvalue_floor"],
                  max_penalty_radius: float = _HP["max_penalty_radius"],
                  max_penalty_fraction: float = _HP["max_penalty_fraction"],
+                 repulsion_profile: str = _HP["repulsion_profile"],
+                 repulsion_edge_value: float = _HP["repulsion_edge_value"],
                  paring_spatial_halfnoise: float = _HP["paring_spatial_halfnoise"],
                  paring_y_noise_multiplier: float = _HP["paring_y_noise_multiplier"],
                  input_noise: float = _HP["input_noise"],
@@ -190,6 +192,10 @@ class ZoMBIHop:
         self.ellipsoid_eigenvalue_floor = ellipsoid_eigenvalue_floor
         self.max_penalty_radius = max_penalty_radius
         self.max_penalty_fraction = float(max_penalty_fraction)
+        # Zone penalty shape. Kept here (not only on the GP handler) so config.json
+        # records it and a resume restores it; GPSimplex gets the restored value.
+        self.repulsion_profile = str(repulsion_profile)
+        self.repulsion_edge_value = float(repulsion_edge_value)
         self.needle_shrink_factor = float(needle_shrink_factor)
         self.needle_stop_noise_multiplier = float(needle_stop_noise_multiplier)
         self.zoom_jaccard_threshold = float(zoom_jaccard_threshold)
@@ -346,6 +352,8 @@ class ZoMBIHop:
             ucb_beta=self.data_handler.ucb_beta,
             nat_grad_step=self.data_handler.nat_grad_step,
             nat_grad_max_steps=self.data_handler.nat_grad_max_steps,
+            repulsion_profile=self.repulsion_profile,
+            repulsion_edge_value=self.repulsion_edge_value,
             device=str(self.device),
             dtype=self.dtype,
             verbose=self.verbose,

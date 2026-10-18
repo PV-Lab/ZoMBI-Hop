@@ -203,6 +203,10 @@ WARMGP_DATASETS = {"warmgp"}
 # the honest evaluation ground truth — the tuner sees the warm-start GP, deployed
 # hparams are scored here. Deterministic (no seed dependence).
 FULLGP_DATASETS = {"fullgp"}
+# Run-directory GP landscape (warm_gp_landscape.rungp_objective): the same fixed-
+# length-scale GP fit to every measured point of a ZoMBI-Hop run dir (--gp-run,
+# --gp-length-scale), any dimension; e.g. the 6-d hardware run_69af. Deterministic.
+RUNGP_DATASETS = {"rungp"}
 # ``newRF``: RF surrogate trained on live measurements pulled straight from a
 # ``results`` SQLite DB (same source as visualization/plot_run.py).  Its reference
 # optima are picked interactively (interactive_test_zombi.ExtremaPicker) the first
@@ -215,7 +219,7 @@ NEWRF_DATASETS = {"newRF"}
 ACCORDION_DATASETS = {"accordion"}
 BUILTIN_DATASETS = {"RF", *ACKLEY_BENCHMARKS.keys(), *GAUSSIAN_BENCHMARKS.keys(),
                     *ORACLE_CHOICES, *ENSEMBLE_DATASETS, *WARMGP_DATASETS,
-                    *FULLGP_DATASETS, *ACCORDION_DATASETS,
+                    *FULLGP_DATASETS, *RUNGP_DATASETS, *ACCORDION_DATASETS,
                     *NEWRF_DATASETS}
 
 # ─── newRF database source (mirrors visualization/plot_run.py) ──────────────────
@@ -453,6 +457,8 @@ def resolve_dataset(
     optima_json: str | None = None,
     out_dir: str | None = None,
     warmgp_seed: int = 0,
+    gp_run: str | None = None,
+    gp_length_scale: float = 0.05,
 ) -> dict:
     """Build the objective + reference optima for ``dataset``."""
     if dataset == "accordion":
@@ -494,6 +500,30 @@ def resolve_dataset(
         print(f"  [dataset] fullgp: full-run GP landscape dim={dim} "
               f"— maximize, {len(spec.true_optima)} GP peak(s)")
         return _landscape_to_ds(spec, "fullgp")
+
+    if dataset == "rungp":
+        # GP fit to a run directory's measured points; reference optima are its
+        # peaks found by gradient ascent (warm_gp_landscape.ascend_peaks).
+        if not gp_run:
+            sys.exit("--dataset rungp needs --gp-run RUN_DIR")
+        from warm_start.warm_gp_landscape import rungp_objective
+        o = rungp_objective(gp_run, length_scale=gp_length_scale)
+        spec = rm.LandscapeSpec(
+            landscape="synthetic", dim=o["dim"], maximize=True,
+            true_optima=[np.asarray(p, dtype=float) for p in o["peaks"]],
+            fn_callable=o["fn"], grid_pts=None, grid_vals=None,
+            time_limit_hours=time_limit_hours, max_activations=float("inf"),
+            oracle="rungp", synthetic_seed=0,
+        )
+        print(f"  [dataset] rungp: GP (length scale {o['length_scale']:g}) fit to "
+              f"{o['n_points']} pts of {o['run_dir']} ({o['snapshot']}), dim={o['dim']} "
+              f"— maximize, {len(spec.true_optima)} peak(s), values "
+              f"{', '.join(f'{v:.3f}' for v in o['peak_values'])} (data max {o['y_max']:.3f})")
+        ds = _landscape_to_ds(spec, "rungp")
+        ds["gp_run"] = {"run_dir": o["run_dir"], "snapshot": o["snapshot"],
+                        "length_scale": o["length_scale"], "n_points": o["n_points"],
+                        "peak_values": [float(v) for v in o["peak_values"]]}
+        return ds
 
     if dataset == "newRF":
         from sklearn.ensemble import RandomForestRegressor
@@ -1392,15 +1422,17 @@ def run_single_eval(
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
 
-    # CoNet pair, ensemble runs only: the uniform baseline that defines the shared UMAP
-    # frame is rebuilt from ensemble_config.json, which the caller wrote into this run
-    # dir. Same helper run_mobo uses, so both produce the same artifact set.
+    # CoNet pair, ensemble and rungp runs: the uniform baseline that defines the shared
+    # UMAP frame is rebuilt from ensemble_config.json / rungp_config.json, which the
+    # caller wrote into this run dir. Same helper run_mobo uses, so both produce the
+    # same artifact set.
     #
     # Deliberately AFTER metrics.json: the render is an isolated subprocess with a
     # 30-minute timeout on an N×N UMAP, so it is the most likely thing to blow the job's
     # wall-time. Writing the metrics first means a lost render costs a plot, not the
     # measurement the run existed to produce.
-    if not no_plots and os.path.isfile(os.path.join(out_dir, "ensemble_config.json")):
+    if not no_plots and any(os.path.isfile(os.path.join(out_dir, f))
+                            for f in ("ensemble_config.json", "rungp_config.json")):
         rm._render_conet_artifacts(out_dir)
 
     if interrupted:
@@ -1468,6 +1500,8 @@ def _build_rerun_config(
         "true_optima": [list(map(float, t.ravel())) for t in ds["true_optima"]],
         "landscape_config": ds.get("landscape_config"),
     }
+    if ds.get("gp_run"):
+        cfg["gp_run"] = ds["gp_run"]
     if config_meta:
         cfg["batch_config"] = config_meta.get("name")
         cfg["batch_config_path"] = config_meta.get("path")
@@ -1589,6 +1623,8 @@ def evaluate_dataset(
             optima_json=args.optima_json,
             out_dir=out_dir,
             warmgp_seed=args.warmgp_seed,
+            gp_run=args.gp_run,
+            gp_length_scale=args.gp_length_scale,
         )
         rerun_cfg = _build_rerun_config(
             dataset, ds, runs_path=runs_path, trial_nums=trial_nums,
@@ -1652,6 +1688,16 @@ def evaluate_dataset(
                 os.makedirs(run_dir, exist_ok=True)
                 with open(os.path.join(run_dir, "ensemble_config.json"), "w") as f:
                     json.dump(ens_cfg, f, indent=2)
+            elif ds.get("gp_run"):
+                # rungp's counterpart of ensemble_config.json: what paired_conet needs
+                # to rebuild the surface (warm_gp_landscape.RunGPSurface).
+                os.makedirs(run_dir, exist_ok=True)
+                g = ds["gp_run"]
+                with open(os.path.join(run_dir, "rungp_config.json"), "w") as f:
+                    json.dump({"dim": ds["dim"], "gp_run": g["run_dir"],
+                               "snapshot": g["snapshot"], "length_scale": g["length_scale"],
+                               "centers": [list(map(float, np.ravel(t)))
+                                           for t in ds["true_optima"]]}, f, indent=2)
             try:
                 eval_kwargs = dict(
                     top_k=args.top_k,
@@ -1740,6 +1786,11 @@ def main() -> None:
     parser.add_argument("--warmgp-seed", type=int, default=0,
                         help="Seed for the warmgp dataset's warm-start GP landscape "
                              "(default: 0; matches the tuning jobs).")
+    parser.add_argument("--gp-run", default=None, metavar="RUN_DIR",
+                        help="rungp dataset: the run directory whose measured points the "
+                             "GP is fit to (e.g. runs/run_69af).")
+    parser.add_argument("--gp-length-scale", type=float, default=0.05,
+                        help="rungp dataset: fixed Matern length scale (default: 0.05).")
     parser.add_argument("--dynamic-alt-hparams-json", default=None, metavar="PATH",
                         help="DYNAMIC method: alternate the trial's (WARM-tuned) "
                              "hparams with the hparams in this JSON every "

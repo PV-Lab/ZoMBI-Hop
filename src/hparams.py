@@ -108,6 +108,13 @@ def _acq_type(v: Any) -> str:
     return s
 
 
+def _repulsion_profile(v: Any) -> str:
+    s = str(v).strip().lower()
+    if s not in ("quadratic", "linear"):
+        raise ValueError(f"must be 'quadratic' or 'linear', got {v!r}")
+    return s
+
+
 def _optional(cast: Callable[[Any], Any]) -> Callable[[Any], Any]:
     def _cast(v: Any) -> Any:
         if v is None or (isinstance(v, str) and v.strip().lower() in ("", "none", "auto")):
@@ -265,6 +272,19 @@ _REGISTRY: tuple[HParam, ...] = (
            "max_penalty_radius if that is smaller.",
            (("zombi", "max_penalty_fraction"),),
            default=0.10),
+    HParam("repulsion_profile", "str", _repulsion_profile, _NEEDLE, "Zone penalty shape",
+           "How a penalty zone's acquisition penalty falls off from its centre, in "
+           "normalised distance rho (1 = zone edge):\n"
+           "  quadratic – (1 - rho^2)^2: flat near the centre, ~0 over the outer shell\n"
+           "  linear    – 1 - rho: falls evenly to the edge (default)",
+           (("zombi", "repulsion_profile"), ("gp", "repulsion_profile")),
+           default="linear"),
+    HParam("repulsion_edge_value", "float", _closed_unit, _NEEDLE, "Zone edge penalty",
+           "Penalty at a zone's edge as a fraction of its centre value; the shape is "
+           "rescaled to run from 1 at the centre to this at the edge, then drops to 0 "
+           "outside. 0 with 'quadratic' is the original (pre-2026-10-18) penalty.",
+           (("zombi", "repulsion_edge_value"), ("gp", "repulsion_edge_value")),
+           default=0.0),
     HParam("ellipsoid_drop_fraction", "float", _open_unit, _NEEDLE,
            "Ellipsoid drop frac",
            "Penalty ellipsoid boundary: where the acquisition has dropped by this "
@@ -436,6 +456,35 @@ DEFAULT_HPARAMS: dict[str, Any] = _load_shipped()
 # Every knob — what a ZoMBIHop constructed with no hyperparameter arguments uses.
 ALL_DEFAULTS: dict[str, Any] = {**FIXED_DEFAULTS, **DEFAULT_HPARAMS}
 
+# Per-dimension defaults layered over ALL_DEFAULTS when a NEW run is started from the
+# GUI or scripts/main.py (a hyperparameter file still wins over them; a resume keeps
+# its own config.json). MOBO, evaluate.py and showdowns do NOT use these.
+#
+# 6: penalty zones hand-tuned 2026-10-15 for 6 dims (showdown
+#    optimize/runs/showdown_6d_dup1c_pen6d_axial_bw22_opt15, mean dist 0.316 vs
+#    0.346 on the same landscapes, one run each). A new zone covers an optimum's
+#    whole basin (0.25, ~p75 nearest-optimum spacing of those landscapes) and is
+#    shrunk ×0.75 when the search stalls, down to a floor of 0.4 × input_noise
+#    (0.051 at 0.128), just under the closest spacing (~0.066):
+#    0.25 → 0.19 → 0.14 → 0.11 → 0.079 → 0.059 → 0.044. Penalty falls linearly to
+#    0 at the zone edge. max_penalty_fraction 0.9 (cap 0.322 in 6-d) keeps the
+#    0.25 radius the binding cap.
+DIM_DEFAULTS: dict[int, dict[str, Any]] = {
+    6: {
+        "repulsion_profile": "linear",
+        "repulsion_edge_value": 0.0,
+        "max_penalty_radius": 0.25,
+        "max_penalty_fraction": 0.9,
+        "needle_shrink_factor": 0.75,
+        "needle_stop_noise_multiplier": 0.4,
+    },
+}
+
+
+def defaults_for_dim(dim: Optional[int]) -> dict[str, Any]:
+    """Every knob's default for a new run with *dim* optimizing dims."""
+    return {**ALL_DEFAULTS, **DIM_DEFAULTS.get(int(dim) if dim else -1, {})}
+
 
 # ─── Validation ───────────────────────────────────────────────────────────────
 
@@ -506,15 +555,17 @@ def check_conflicts(hp: dict, *, context: str = "") -> None:
             f"Hyperparameter conflict{where}:\n  - " + "\n  - ".join(problems))
 
 
-def resolve_for_run(passed: dict, run_config: Optional[dict] = None) -> dict:
+def resolve_for_run(passed: dict, run_config: Optional[dict] = None,
+                    dim: Optional[int] = None) -> dict:
     """The configuration a ZoMBIHop built with ``passed`` would actually run.
 
     For a resume, ``run_config`` is the run's config.json: its recorded knobs win
     over ``passed`` (that is what the resume does), except ``input_noise``, a
     calibration of the apparatus for which the current measurement wins. Lets a
-    launcher check for conflicts BEFORE committing hardware to a run.
+    launcher check for conflicts BEFORE committing hardware to a run. *dim* adds
+    ``DIM_DEFAULTS`` under ``passed`` for a NEW run; pass None for a resume.
     """
-    out = {**ALL_DEFAULTS, **passed}
+    out = {**defaults_for_dim(dim), **passed}
     if run_config:
         out.update({k: v for k, v in run_config.items()
                     if k in KNOWN_NAMES and k != "input_noise"})
@@ -595,3 +646,12 @@ def ui_categories() -> dict[str, list[tuple]]:
         out.setdefault(p.category, []).append(
             (p.name, p.kind, ALL_DEFAULTS[p.name], p.label, p.help))
     return out
+
+
+# DIM_DEFAULTS must be valid values and a needle-capable configuration.
+for _d, _over in DIM_DEFAULTS.items():
+    for _k, _v in _over.items():
+        HPARAMS[_k].cast(_v)
+    _bad = conflicts(defaults_for_dim(_d))
+    if _bad:
+        raise RuntimeError(f"DIM_DEFAULTS[{_d}] conflicts: {_bad}")

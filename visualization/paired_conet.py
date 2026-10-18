@@ -124,8 +124,17 @@ def _count_csv_rows(path: Path) -> int:
 
 
 def build_ensemble(run_dir: Path) -> tuple[Ensemble, dict]:
-    """Reconstruct the run's ensemble landscape from its ``ensemble_config.json``."""
+    """Reconstruct the run's ensemble landscape from its ``ensemble_config.json``.
+
+    A ``rungp`` run (GP fit to a real run dir) has a ``rungp_config.json`` instead; it
+    is rebuilt as a ``RunGPSurface``, which offers the same ``predict`` / ``centers``.
+    """
     cfg_path = Path(run_dir) / "ensemble_config.json"
+    gp_path = Path(run_dir) / "rungp_config.json"
+    if not cfg_path.exists() and gp_path.exists():
+        from warm_start.warm_gp_landscape import RunGPSurface
+        cfg = json.loads(gp_path.read_text())
+        return RunGPSurface(cfg), cfg
     if not cfg_path.exists():
         raise FileNotFoundError(
             f"no ensemble_config.json in {run_dir} — is this an ensemble run?")

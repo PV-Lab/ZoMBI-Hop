@@ -5,8 +5,9 @@ Static-PNG export of the ZoMBI-Hop convergence plot for a *real* run directory.
 
 This is the standalone/offline twin of the GUI's ``ConvergencePlotFrame`` in
 ``interface/app.py``: objective Y vs. sample index, the running-best envelope,
-penalized-vs-valid point colouring, and a dashed marker at every sample index
-where a needle was declared. It reconstructs the dataset from the run's delta
+penalized-vs-valid point colouring, and a lollipop-and-leash marker per needle
+(``draw_needle_leashes``): a numbered star on the sampled point, joined by a
+horizontal leash to a diamond at the sample index where it was declared. It reconstructs the dataset from the run's delta
 snapshots (``reconstruct_snapshot_tensors``) — the same source the GUI and
 ``visualization/plot_run.py`` use — so no live Tk session is needed.
 
@@ -86,25 +87,37 @@ class _ConvData:
         self.penalty_mask: np.ndarray | None = None  # (n,) bool
         self.needle_indices: np.ndarray | None = None  # (k,) int
         self.activation_starts: np.ndarray | None = None  # (a,) int sample idx
+        self.declared_samples: np.ndarray | None = None   # (k,) sample idx per needle declaration
         self.n_points = 0
         self.n_needles = 0
 
 
-def load_activation_starts(run_dir: Path, snapshot: str) -> np.ndarray:
-    """Sample indices at which each *new* activation's points begin.
+def load_activation_timeline(run_dir: Path, snapshot: str) -> tuple[np.ndarray, np.ndarray]:
+    """Activation start indices and needle-declaration sample indices.
 
     Replays the delta snapshots up to ``snapshot`` (the same traversal
-    ``reconstruct_snapshot_tensors`` uses) and, each time the ``actN`` number in
-    the snapshot-dir name changes, records the cumulative point count as that
-    activation's first sample index. The leading 0 (init / activation 0) is
-    dropped so callers get only the interior reset boundaries.
-    Empty for legacy full-copy runs with no per-snapshot deltas."""
+    ``reconstruct_snapshot_tensors`` uses); a port of the GUI's
+    ``interface/app.py:_activation_timeline``.
+
+    ``starts``: the cumulative point count each time the ``actN`` number in the
+    snapshot-dir name changes. The leading 0 (init / activation 0) is dropped so
+    callers get only the interior reset boundaries.
+
+    ``declared``: one entry per needle, in needle-stack order (so entry k pairs
+    with ``needle_indices[k]``) — the last sample index measured before the
+    snapshot whose needle stack first grew. When the stack is rebuilt rather than
+    appended to, earlier declarations are dropped and every rebuilt needle counts
+    as declared at that snapshot.
+
+    Both empty for legacy full-copy runs with no per-snapshot deltas."""
     snap_dir = run_dir / "snapshots"
     if not snap_dir.is_dir():
-        return np.array([], dtype=int)
+        return np.array([], dtype=int), np.array([], dtype=int)
 
     starts: list[int] = []
+    declared: list[int] = []
     n_seen = 0
+    stack: list[int] = []   # needle_indices of the current needle stack
     cur_act: int | None = None
     for sdir in sorted(s for s in snap_dir.iterdir() if s.is_dir()):
         delta_path = sdir / "delta.pt"
@@ -112,19 +125,27 @@ def load_activation_starts(run_dir: Path, snapshot: str) -> np.ndarray:
             d = torch.load(str(delta_path), map_location="cpu", weights_only=False)
             x_new = d.get("X_new")
             n_new = int(x_new.shape[0]) if isinstance(x_new, torch.Tensor) else 0
+            ni = d.get("needle_indices")
+            new_stack = (ni.long().ravel().tolist() if isinstance(ni, torch.Tensor)
+                         else stack)
         else:
-            n_new = 0
+            n_new, new_stack = 0, stack
         m = _ACT_RE.search(sdir.name)
         act = int(m.group(1)) if m else cur_act
         if act is not None and act != cur_act and n_new > 0:
             starts.append(n_seen)
             cur_act = act
         n_seen += n_new
+        if new_stack != stack:
+            if new_stack[:len(stack)] != stack:   # rebuilt, not appended to
+                declared = []
+            declared.extend([n_seen - 1] * (len(new_stack) - len(declared)))
+            stack = new_stack
         if sdir.name == snapshot:
             break
 
-    starts = [s for s in starts if s > 0]
-    return np.array(sorted(set(starts)), dtype=int)
+    return (np.array(sorted({s for s in starts if s > 0}), dtype=int),
+            np.array(declared, dtype=int))
 
 
 def load_conv_data(run_dir: Path, snapshot: str | None) -> _ConvData:
@@ -149,12 +170,66 @@ def load_conv_data(run_dir: Path, snapshot: str | None) -> _ConvData:
         cd.needle_indices = ni.long().numpy().ravel()
         cd.n_needles = len(cd.needle_indices)
 
-    cd.activation_starts = load_activation_starts(run_dir, snapshot)
+    cd.activation_starts, cd.declared_samples = load_activation_timeline(run_dir, snapshot)
 
     return cd
 
 
 # ── plotting (mirrors interface/app.py ConvergencePlotFrame.update) ────────────
+
+def draw_needle_leashes(ax, Y, needle_indices, declared_samples=None,
+                        activation_starts=None) -> None:
+    """Lollipop-and-leash needle markers, shared with the GUI's convergence plot.
+
+    Needle k gets a numbered crimson star on its sampled point
+    ``(needle_indices[k], Y[needle_indices[k]])`` and, when its declaration is
+    known, a horizontal leash at that height out to a green diamond at
+    ``declared_samples[k] + 0.5`` (+0.5: the declaration happens after the last
+    sample of its line). The leash length is how long the point sat measured
+    before the search confirmed it. The leash is lifted a few points so it stays
+    visible where it coincides with the running-best envelope (the needle is
+    usually its activation's best point). A needle declared in a later activation
+    than the one that sampled it (a retro declaration on resume, or a rebuilt
+    stack) gets a dashed leash and a hollow diamond."""
+    if needle_indices is None or len(needle_indices) == 0:
+        return
+    from matplotlib.transforms import offset_copy
+
+    lifted = offset_copy(ax.transData, fig=ax.figure, y=3, units="points")
+    starts = (np.asarray(activation_starts) if activation_starts is not None
+              else np.array([], dtype=int))
+    n_decl = len(declared_samples) if declared_samples is not None else 0
+
+    labeled: set[str] = set()
+
+    def _label(name):
+        if name in labeled:
+            return None
+        labeled.add(name)
+        return name
+
+    for k, ni in enumerate(needle_indices):
+        if not 0 <= ni < len(Y):
+            continue
+        y = float(Y[ni])
+        ax.scatter([ni], [y], marker="*", s=110, color="crimson", edgecolors="black",
+                   linewidths=0.4, zorder=7, label=_label("needle point sampled"))
+        ax.annotate(f"N{k + 1}", (ni, y), xytext=(0, 7), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=7, color="crimson", zorder=8)
+        if k >= n_decl:
+            continue
+        ds = int(declared_samples[k])
+        retro = (np.searchsorted(starts, ds, side="right")
+                 != np.searchsorted(starts, ni, side="right"))
+        x_end = ds + 0.5
+        ax.plot([ni, x_end], [y, y], transform=lifted, color="crimson", lw=1.1,
+                ls="--" if retro else "-", alpha=0.8, zorder=6)
+        ax.scatter([x_end], [y], transform=lifted, marker="D", s=26, zorder=7,
+                   facecolors="none" if retro else "seagreen", edgecolors="seagreen",
+                   linewidths=1.1,
+                   label=_label("declared in a later activation" if retro
+                                else "needle declared"))
+
 
 def build_convergence_figure(cd: _ConvData, plt):
     """Draw the convergence plot for one run; returns the matplotlib Figure."""
@@ -188,15 +263,7 @@ def build_convergence_figure(cd: _ConvData, plt):
             labeled = True
         ax.plot(idx[start:end], seg_best, **kw)
 
-    if cd.needle_indices is not None and len(cd.needle_indices) > 0:
-        labeled = False
-        for ni in cd.needle_indices:
-            if 0 <= ni < len(Y):
-                kw = dict(color="crimson", alpha=0.55, lw=0.9, ls="--")
-                if not labeled:
-                    kw["label"] = "needle found"
-                    labeled = True
-                ax.axvline(float(ni), **kw)
+    draw_needle_leashes(ax, Y, cd.needle_indices, cd.declared_samples, act_starts)
 
     ax.set_xlabel("Sample index")
     ax.set_ylabel("Objective Y")

@@ -205,12 +205,20 @@ _OPTIMA_CACHE: dict[str, object] = {}
 def _true_optima_for(run_dir: str):
     """True optima of a run's landscape, rebuilt from its ``ensemble_config.json``.
 
+    A non-ensemble landscape (e.g. ``rungp``) has no config to rebuild from; its optima
+    are read from the ``true_optima`` evaluate.py records in ``rerun_config.json``,
+    two levels up (``<out>/trial_<k>/run_<j>``).
+
     Returns an ``(n_optima, d)`` array, or None when the landscape cannot be rebuilt
     (no config file, or the scientific stack is unavailable).
     """
     cfg = _read_json(os.path.join(run_dir, "ensemble_config.json"))
     if not cfg:
-        return None
+        rerun = _read_json(os.path.join(run_dir, os.pardir, os.pardir, "rerun_config.json"))
+        if not rerun or rerun.get("dataset") == "ensemble" or not rerun.get("true_optima"):
+            return None
+        import numpy as np
+        return np.array(rerun["true_optima"], dtype=float)
     key = json.dumps(cfg, sort_keys=True)
     if key in _OPTIMA_CACHE:
         return _OPTIMA_CACHE[key]
@@ -761,7 +769,7 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
 
     L: list[str] = []
     A = L.append
-    A(f"# Showdown — {manifest['dim']}D ensemble, "
+    A(f"# Showdown — {manifest['dim']}D {manifest.get('dataset') or 'ensemble'}, "
       f"{len(configs)} configs × {len(landscapes)} landscapes")
     A("")
     setup = [f"init design: **{manifest.get('init_design') or 'random'}**"]
@@ -772,6 +780,9 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
     if manifest.get("ensemble_overrides"):
         setup.append("landscape overrides: " + ", ".join(
             f"`{k}={v}`" for k, v in manifest["ensemble_overrides"].items()))
+    if manifest.get("gp_run"):
+        setup.append(f"GP of `{manifest['gp_run']}` "
+                     f"(length scale {manifest.get('gp_length_scale')})")
     A(" · ".join(setup))
     A("")
 

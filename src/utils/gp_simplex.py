@@ -45,6 +45,9 @@ class CompWrappedAcquisition(nn.Module):
         return self.base(x_flat.reshape(*shape))
 
 
+REPULSION_PROFILES = ("quadratic", "linear")
+
+
 class RepulsiveAcquisition(nn.Module):
     """
     Acquisition function with smooth repulsion away from discovered needles.
@@ -79,6 +82,16 @@ class RepulsiveAcquisition(nn.Module):
     boundary_fn : Callable, optional
         ``(X_flat, eps) -> (B,)`` boundary penalty; the search domain's
         ``boundary_penalty``. None keeps the simplex law above.
+    profile : {"quadratic", "linear"}
+        Shape of each zone's penalty against the normalised distance
+        rho = sqrt(u^T M u) (or ||x - needle|| / r): "quadratic" = (1 - rho^2)^2,
+        "linear" = 1 - rho. Both are 1 at the centre and 0 outside the zone.
+    edge_value : float
+        Penalty at the zone's edge as a fraction of the centre value; the shape
+        is rescaled to edge + (1 - edge) * shape inside the zone, so the zone
+        ends in a step of this height. With "quadratic" and 0.0 the penalty is
+        exactly the original ``(1 - u^T M u)^2`` (and ``(r - dist)^2`` for radius-
+        only zones).
     """
 
     def __init__(
@@ -92,8 +105,14 @@ class RepulsiveAcquisition(nn.Module):
         needle_B: Optional[torch.Tensor] = None,
         boundary_epsilon: float = 0.0,
         boundary_fn: Optional[Callable] = None,
+        profile: str = "linear",
+        edge_value: float = 0.0,
     ):
         super().__init__()
+        if profile not in REPULSION_PROFILES:
+            raise ValueError(f"profile must be one of {REPULSION_PROFILES}, got {profile!r}")
+        self.profile = profile
+        self.edge_value = float(edge_value)
         self.base = base
         self.proj_fn = proj_fn
         self.needles = needles  # (M, d)
@@ -143,14 +162,15 @@ class RepulsiveAcquisition(nn.Module):
 
                 if M is not None and self.needle_B is not None:
                     u = diff @ self.needle_B
-                    quad = (u @ M * u).sum(dim=-1)
-                    violation = torch.clamp(1.0 - quad, min=0.0)
+                    rho_sq = (u @ M * u).sum(dim=-1)
+                    legacy = torch.clamp(1.0 - rho_sq, min=0.0) ** 2
                 else:
                     r = self.penalty_radii[idx]
                     dist = torch.norm(diff, dim=-1)
-                    violation = torch.clamp(r - dist, min=0.0)
+                    rho_sq = (dist / r.clamp(min=1e-12)) ** 2
+                    legacy = torch.clamp(r - dist, min=0.0) ** 2
 
-                total_violation = total_violation + violation ** 2
+                total_violation = total_violation + self._zone_term(rho_sq, legacy)
 
         # Boundary repulsion: exp-decay from the domain's faces (simplex: x_i = 0)
         if has_boundary:
@@ -162,6 +182,19 @@ class RepulsiveAcquisition(nn.Module):
 
         penalty = (-self.repulsion_lambda * total_violation).view(base_acq.shape)
         return base_acq + penalty
+
+    def _zone_term(self, rho_sq: torch.Tensor, legacy: torch.Tensor) -> torch.Tensor:
+        """One zone's penalty (before lambda) from the squared normalised distance."""
+        if self.profile == "quadratic" and self.edge_value == 0.0:
+            return legacy                     # the original law, bit-for-bit
+        if self.profile == "linear":
+            # sqrt is non-differentiable at 0; the epsilon only matters at the centre.
+            shape = 1.0 - torch.sqrt(rho_sq + 1e-12)
+        else:
+            shape = (1.0 - rho_sq) ** 2
+        inside = rho_sq <= 1.0
+        term = self.edge_value + (1.0 - self.edge_value) * shape
+        return torch.where(inside, term, torch.zeros_like(term))
 
 
 class GPSimplex:
@@ -223,8 +256,14 @@ class GPSimplex:
         dtype: torch.dtype = torch.float64,
         verbose: bool = True,
         domain: Optional[Domain] = None,
+        repulsion_profile: str = "linear",
+        repulsion_edge_value: float = 0.0,
     ):
         self.data_handler = data_handler
+        # Zone penalty shape (RepulsiveAcquisition profile / edge_value); read at
+        # every create_acquisition, so a live edit applies from the next line.
+        self.repulsion_profile = repulsion_profile
+        self.repulsion_edge_value = float(repulsion_edge_value)
         self.domain = make_domain(domain)
         self.proj_fn = proj_fn if proj_fn is not None else self.domain.project
         self.random_sampler = random_sampler if random_sampler is not None else self.domain.sample
@@ -578,6 +617,8 @@ class GPSimplex:
             boundary_epsilon=(self.data_handler.input_noise
                               if self.domain.boundary_repulsion else 0.0),
             boundary_fn=self.domain.boundary_penalty,
+            profile=self.repulsion_profile,
+            edge_value=self.repulsion_edge_value,
         )
 
         return self.acq_fn
