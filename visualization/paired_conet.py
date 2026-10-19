@@ -72,6 +72,12 @@ Usage
 ``<RUN_DIR>`` must hold an ``ensemble_config.json`` (to rebuild the landscape)
 plus ``points.csv`` / ``needles.csv``. Writes ``conet.png`` and
 ``conet_uniform.png`` into the run directory.
+
+Markers: the landscape's TRUE optima are blue stars on both PNGs, placed at their
+exact compositions by the same out-of-sample interpolation as the real samples, so
+they sit at identical coordinates in the pair. The run's discovered needles are red
+stars on ``conet.png`` (drawn on top, so a needle on an optimum is red-inside-blue).
+Each panel carries a key for the markers it shows.
 """
 
 from __future__ import annotations
@@ -110,6 +116,9 @@ DEFAULT_UNIFORM_N = 15000
 
 # Bump when a change alters the fitted frame, to invalidate stale cache entries.
 FRAME_CACHE_VERSION = 1
+# Bump when only the uniform PNG's DRAWING changes (markers, legend): the cached
+# frame stays valid and the PNG is re-rendered from it, with no UMAP refit.
+UNIFORM_PNG_VERSION = 3
 DEFAULT_FRAME_CACHE = _REPO / "optimize" / "runs" / ".conet_frames"
 
 
@@ -184,8 +193,18 @@ def _cooccurrence(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     return S
 
 
+def fit_denominator(comp_fit: np.ndarray) -> float:
+    """Max off-diagonal co-occurrence of the fitted set: the normaliser the
+    embedding was built under. N×N in the landmark count, so compute it once and
+    pass it to every ``embed_out_of_sample`` call against the same landmarks."""
+    S_fit = _cooccurrence(comp_fit, comp_fit)
+    np.fill_diagonal(S_fit, 0.0)
+    return float(S_fit.max()) + 1e-12
+
+
 def embed_out_of_sample(comp_new: np.ndarray, comp_fit: np.ndarray,
-                        E_fit_raw: np.ndarray, k: int = DEFAULT_K) -> np.ndarray:
+                        E_fit_raw: np.ndarray, k: int = DEFAULT_K,
+                        denom: float | None = None) -> np.ndarray:
     """Place *comp_new* into the map fitted on *comp_fit* by k-nearest-landmark interpolation.
 
     ``E_fit_raw`` is the fitted set's RAW embedding (pre gap/purity warp) — the
@@ -194,12 +213,11 @@ def embed_out_of_sample(comp_new: np.ndarray, comp_fit: np.ndarray,
     transform chain the fitted points went through.
     """
     S_cross = _cooccurrence(comp_new, comp_fit)
-    S_fit = _cooccurrence(comp_fit, comp_fit)
-    np.fill_diagonal(S_fit, 0.0)
     # The fitted block's maximum is the normaliser the embedding was built under;
     # reusing it (rather than the cross block's own max) keeps the new points'
     # distances on the fit's scale.
-    denom = S_fit.max() + 1e-12
+    if denom is None:
+        denom = fit_denominator(comp_fit)
     D = 1.0 - (S_cross / denom) ** p10.CN_BETA
 
     k = int(max(1, min(k, len(comp_fit))))
@@ -211,6 +229,32 @@ def embed_out_of_sample(comp_new: np.ndarray, comp_fit: np.ndarray,
     w = 1.0 / (d + 1e-9)
     w /= w.sum(axis=1, keepdims=True)
     return np.einsum("nk,nkd->nd", w, E_fit_raw[nn])
+
+
+def true_optima_comp(ens, active: np.ndarray) -> np.ndarray | None:
+    """The landscape's true optima, ranked best-first, in the reduced composition space."""
+    centers = np.asarray(ens.centers, dtype=float)
+    return p10._reduce_needles(centers[np.argsort(-ens.predict(centers))], active)
+
+
+def place_true_optima(opt_comp, comp_u, E_u_raw, frame_params, *, k: int,
+                      denom: float) -> np.ndarray | None:
+    """Final (warped) map coordinates of the true optima in the landscape frame.
+
+    Interpolated from the uniform landmarks exactly like the real samples, then put
+    through the frame's gap and purity warps — the same chain
+    ``build_conet_structure(frame=...)`` applies — so an optimum lands at the same
+    spot on both PNGs rather than snapping to whichever sample happens to be nearest.
+    """
+    if opt_comp is None or len(opt_comp) == 0:
+        return None
+    E_raw = embed_out_of_sample(opt_comp, comp_u, E_u_raw, k=k, denom=denom)
+    E_gap = p10.apply_gap_layout(E_raw, frame_params["gap"])
+    return p10.apply_purity_layout(E_gap, opt_comp, frame_params["purity"])
+
+
+def _uniform_png_path(cache_path: Path) -> Path:
+    return cache_path.with_suffix(f".uniform_v{UNIFORM_PNG_VERSION}.png")
 
 
 # ── per-landscape frame cache ───────────────────────────────────────────────────
@@ -265,14 +309,17 @@ def _save_frame(path: Path, *, comp_u, E_raw, frame, limits, bounds, png: Path) 
     shutil.copyfile(png, tmp_png)
     # PNG first: _load_frame requires BOTH, so publishing the npz last means a
     # concurrent reader never sees an npz whose PNG has not landed yet.
-    os.replace(tmp_png, path.with_suffix(".uniform.png"))
+    os.replace(tmp_png, _uniform_png_path(path))
     os.replace(tmp_npz, path)
 
 
 def _load_frame(path: Path) -> dict | None:
-    """Load a cached frame, or None if absent/unreadable (a miss simply refits)."""
-    png = path.with_suffix(".uniform.png")
-    if not path.is_file() or not png.is_file():
+    """Load a cached frame, or None if absent/unreadable (a miss simply refits).
+
+    ``uniform_png`` is None when the frame is cached but its PNG predates
+    ``UNIFORM_PNG_VERSION``; the caller then re-renders the PNG from the frame."""
+    png = _uniform_png_path(path)
+    if not path.is_file():
         return None
     try:
         z = np.load(path, allow_pickle=False)
@@ -289,7 +336,7 @@ def _load_frame(path: Path) -> dict | None:
                       "E_raw": z["E_raw"]},
             "limits": (tuple(meta["limits"][0]), tuple(meta["limits"][1])),
             "bounds": {k: tuple(v) for k, v in meta["bounds"].items()},
-            "uniform_png": png,
+            "uniform_png": png if png.is_file() else None,
         }
     except Exception as exc:
         print(f"[paired-conet] cached frame {path.name} unreadable ({exc}); refitting.")
@@ -298,40 +345,73 @@ def _load_frame(path: Path) -> dict | None:
 
 # ── main render ─────────────────────────────────────────────────────────────────
 
-def build_landscape_frame(ens, cfg, dim, names, *, uniform_n: int, seed: int,
-                          purity, spread, gap_reach) -> dict:
-    """Fit the map on this landscape's uniform baseline and render its PNG.
+def _save_uniform_png(cache_path: Path, png: Path) -> None:
+    """Publish a re-rendered uniform PNG beside an already-cached frame (atomic rename,
+    for the same concurrent-writer reason as ``_save_frame``)."""
+    import os
+    tmp_png = cache_path.with_suffix(f".{os.getpid()}.tmp.png")
+    shutil.copyfile(png, tmp_png)
+    os.replace(tmp_png, _uniform_png_path(cache_path))
 
-    Everything returned depends only on the landscape and the fit parameters — never
-    on any run — so every run of this landscape can share it verbatim.
+
+def _mark_uniform(M, opt_E) -> None:
+    """Uniform-panel markers: blue true optima plus the key — no red stars. The true
+    optima stay in ``M['needles']`` (they steer which region labels get placed first)
+    but are not drawn as needles, and there is no incumbent: the best uniform sample
+    is not a result of anything, and no latest-line rim: the draw has no measurement order."""
+    M["show_needles"] = False
+    M["show_incumbent"] = False
+    M["show_latest"] = False
+    M["true_optima_E"] = opt_E
+    M["star_legend"] = True
+
+
+def render_uniform_png(ens, cfg, dim, names, out_path, *, uniform_n: int, seed: int,
+                       k: int, purity, spread, gap_reach, frame_params=None, E_u_raw=None,
+                       limits=None) -> dict:
+    """Render this landscape's uniform-baseline PNG, fitting the frame unless one is given.
+
+    With ``frame_params``/``E_u_raw``/``limits`` (a cached frame) the UMAP fit is
+    skipped and the map is replayed verbatim, so a drawing-only change re-renders
+    without moving anything. Everything returned depends only on the landscape and the
+    fit parameters — never on any run — so every run of this landscape can share it.
     """
     Xu = uniform_samples(dim, uniform_n, seed)
     Yu = ens.predict(Xu)
     comp_u, active = p10._reduce_comp(Xu)
     resp_u = np.asarray(Yu, float).reshape(-1, 1)
     iters_u = np.arange(len(comp_u), dtype=float)
-    # The landscape's TRUE optima, ranked best-first, in the same reduced space.
-    centers = np.asarray(ens.centers, dtype=float)
-    needles_u = p10._reduce_needles(centers[np.argsort(-ens.predict(centers))], active)
+    opt_comp = true_optima_comp(ens, active)
 
+    frame = None if frame_params is None else dict(frame_params, E_raw=E_u_raw)
     t0 = time.time()
     Mu, Fu = p10.build_conet(
         comp_u, names, resp_u, iters_u,
         umap_md=spread if spread is not None else p10.CN_UMAP_MD,
         gap_reach=gap_reach if gap_reach is not None else p10.CN_GAP_REACH,
         purity_thr=purity if purity is not None else p10.CN_PURITY_THR,
-        needles_comp=needles_u, show_needles=True,
+        needles_comp=opt_comp, frame=frame, limits=limits,
     )
-    # Limits and colour bounds from the UNIFORM baseline only. Using the uniform+real
-    # union would make both vary per run, which is exactly what has to stop.
-    limits = p10._cn_view_limits(Mu["E"])
+    if frame is None:
+        # Limits and colour bounds from the UNIFORM baseline only. Using the uniform+real
+        # union would make both vary per run, which is exactly what has to stop.
+        limits = p10._cn_view_limits(Mu["E"])
     bounds = p10.conet_bounds(resp_u)
-    print(f"[paired-conet] landscape frame fitted: {len(comp_u)} uniform samples, "
-          f"{len(Mu['needles'])} true optima ({time.time() - t0:.0f}s)")
-    return {"comp_u": comp_u, "active": active, "M": Mu, "F": Fu,
-            "frame": Mu["frame"], "E_raw": Mu["E_raw"],
-            "limits": limits, "bounds": bounds, "resp_u": resp_u,
-            "seed_tag": cfg.get("seed"), "n_uniform": len(comp_u)}
+    denom = fit_denominator(comp_u)
+    opt_E = place_true_optima(opt_comp, comp_u, Mu["E_raw"], Mu["frame"], k=k, denom=denom)
+    _mark_uniform(Mu, opt_E)
+    print(f"[paired-conet] landscape frame {'fitted' if frame is None else 'replayed'}: "
+          f"{len(comp_u)} uniform samples, "
+          f"{0 if opt_E is None else len(opt_E)} true optima ({time.time() - t0:.0f}s)")
+    # The uniform PNG is a property of the landscape, so its title names the
+    # landscape (config seed), never the run that happened to trigger the render.
+    p10.save_png(
+        Mu, Fu, bounds,
+        f"UNIFORM baseline — landscape seed {cfg.get('seed')} · "
+        f"{len(comp_u)} samples · shared UMAP frame",
+        str(out_path))
+    return {"comp_u": comp_u, "active": active, "frame": Mu["frame"], "E_raw": Mu["E_raw"],
+            "limits": limits, "bounds": bounds, "denom": denom, "opt_comp": opt_comp}
 
 
 def render_paired_conets(run_dir, *, k: int = DEFAULT_K,
@@ -363,29 +443,38 @@ def render_paired_conets(run_dir, *, k: int = DEFAULT_K,
         cache_path = Path(frame_cache) / f"{key}.npz"
         cached = _load_frame(cache_path)
 
-    if cached is not None:
+    fit_kw = dict(uniform_n=uniform_n, seed=seed, k=k, purity=purity, spread=spread,
+                  gap_reach=gap_reach)
+    if cached is not None and cached["uniform_png"] is not None:
         comp_u = cached["comp_u"]
         frame_params = cached["frame"]
         E_u_raw = frame_params.pop("E_raw")
         limits, bounds = cached["limits"], cached["bounds"]
         shutil.copyfile(cached["uniform_png"], uniform_path)
+        _, active = p10._reduce_comp(uniform_samples(dim, uniform_n, seed))
+        opt_comp = true_optima_comp(ens, active)
+        denom = fit_denominator(comp_u)
         print(f"[paired-conet] reusing cached landscape frame {cache_path.name} "
               f"({len(comp_u)} uniform samples)")
+    elif cached is not None:
+        # Frame cached, PNG from an older drawing version: replay the frame to redraw.
+        frame_params = cached["frame"]
+        E_u_raw = frame_params.pop("E_raw")
+        built = render_uniform_png(ens, cfg, dim, names, uniform_path, frame_params=frame_params,
+                                   E_u_raw=E_u_raw, limits=cached["limits"], **fit_kw)
+        comp_u, opt_comp, denom = built["comp_u"], built["opt_comp"], built["denom"]
+        limits, bounds = cached["limits"], cached["bounds"]
+        try:
+            _save_uniform_png(cache_path, uniform_path)
+            print(f"[paired-conet] re-rendered uniform PNG for cached frame {cache_path.name}")
+        except Exception as exc:
+            print(f"[paired-conet] could not cache uniform PNG ({exc}); continuing.")
     else:
-        built = build_landscape_frame(ens, cfg, dim, names, uniform_n=uniform_n,
-                                      seed=seed, purity=purity, spread=spread,
-                                      gap_reach=gap_reach)
-        comp_u = built["comp_u"]
+        built = render_uniform_png(ens, cfg, dim, names, uniform_path, **fit_kw)
+        comp_u, opt_comp, denom = built["comp_u"], built["opt_comp"], built["denom"]
         frame_params = built["frame"]
         E_u_raw = built["E_raw"]
         limits, bounds = built["limits"], built["bounds"]
-        # The uniform PNG is a property of the landscape, so its title names the
-        # landscape (config seed), never the run that happened to trigger the fit.
-        p10.save_png(
-            built["M"], built["F"], bounds,
-            f"UNIFORM baseline — landscape seed {built['seed_tag']} · "
-            f"{built['n_uniform']} samples · shared UMAP frame",
-            str(uniform_path))
         if cache_path is not None:
             try:
                 _save_frame(cache_path, comp_u=comp_u, E_raw=E_u_raw,
@@ -403,7 +492,7 @@ def render_paired_conets(run_dir, *, k: int = DEFAULT_K,
 
     # --- 2. place the real samples into that same map -------------------------
     t0 = time.time()
-    E_r_raw = embed_out_of_sample(comp_r, comp_u, E_u_raw, k=k)
+    E_r_raw = embed_out_of_sample(comp_r, comp_u, E_u_raw, k=k, denom=denom)
     frame = dict(frame_params)
     frame["E_raw"] = E_r_raw
     Mr, _ = p10.build_conet(
@@ -414,6 +503,9 @@ def render_paired_conets(run_dir, *, k: int = DEFAULT_K,
         needles_comp=needles_r, show_needles=show_needles,
         frame=frame, limits=limits,
     )
+    Mr["true_optima_E"] = place_true_optima(opt_comp, comp_u, E_u_raw, frame_params,
+                                            k=k, denom=denom)
+    Mr["star_legend"] = True
     print(f"[paired-conet] real samples placed into the landscape frame: "
           f"{len(comp_r)} samples, k={k} ({time.time() - t0:.0f}s)")
 
