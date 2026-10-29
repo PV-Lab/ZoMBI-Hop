@@ -435,6 +435,10 @@ _ASCENT_STEPS = 400
 _ASCENT_STEP0 = 0.01
 _ASCENT_CHUNK = 256          # query rows per kernel block (chunk x N x d floats)
 _BACKGROUND_SAMPLES = 20000  # uniform simplex draws for the background level
+# runrf: trees in the forest (visualization/plot_run.RF_N_ESTIMATORS) and the
+# training-point neighbourhood a peak candidate must top (rf_peaks).
+RF_N_ESTIMATORS = 500
+_RF_PEAK_K = 10
 
 
 def _project_simplex(V: np.ndarray) -> np.ndarray:
@@ -512,31 +516,108 @@ def ascend_peaks(predict, starts: np.ndarray, *,
     return X[kept_arr], f[kept_arr]
 
 
+def _load_points(run_dir: Path, snapshot: str | None):
+    """``(X, Y, snapshot)``: the finite scored points of a run dir, or of a points file.
+
+    ``run_dir`` may also be an ``.npz`` with ``X`` (N, d) and ``Y`` (N,) arrays — e.g.
+    uniform samples of a synthetic landscape (optimize/scripts/needles_rf_points.py) —
+    which the surrogate is then fit to exactly as to a run's measurements. Its
+    "snapshot" is the file name.
+    """
+    run_dir = Path(run_dir)
+    if run_dir.suffix == ".npz":
+        z = np.load(run_dir)
+        X, Y, snapshot = np.asarray(z["X"], float), np.asarray(z["Y"], float).ravel(), run_dir.name
+    else:
+        from visualization.plot_run import _default_snapshot, load_run_dataset
+
+        snapshot = snapshot or _default_snapshot(run_dir)
+        X, Y = load_run_dataset(run_dir, snapshot)
+    ok = np.isfinite(Y) & np.isfinite(X).all(axis=1)
+    return X[ok], Y[ok], snapshot
+
+
 def _fit_run_gp(run_dir: Path, length_scale: float, snapshot: str | None):
     """``(predict, X, Y, snapshot)`` for the GP over a run dir's scored points."""
-    from visualization.plot_run import _default_snapshot, load_run_dataset
-
-    snapshot = snapshot or _default_snapshot(run_dir)
-    X, Y = load_run_dataset(run_dir, snapshot)
-    ok = np.isfinite(Y) & np.isfinite(X).all(axis=1)
-    X, Y = X[ok], Y[ok]
+    X, Y, snapshot = _load_points(run_dir, snapshot)
     return build_gp_landscape(X, Y, float(length_scale)), X, Y, snapshot
 
 
-class RunGPSurface:
-    """A rungp landscape with the ``Ensemble`` interface ``visualization/paired_conet``
-    uses: batched ``predict(X)`` and ``centers`` (the reference optima).
+def _fit_run_rf(run_dir: Path, n_estimators: int, snapshot: str | None):
+    """``(predict, X, Y, snapshot)`` for a random forest over a run dir's scored points.
 
-    Rebuilt from the ``rungp_config.json`` evaluate.py writes into each rungp run dir.
-    The GP is refit (deterministic) but the peaks are taken from the config rather than
-    re-ascended, so they are exactly the optima the run was scored against.
+    Same forest ``visualization/plot_run.py`` draws its RF backgrounds with
+    (``RandomForestRegressor(n_estimators, random_state=42)``, sklearn defaults
+    otherwise), so the surface is deterministic and refittable from the config.
+    """
+    from sklearn.ensemble import RandomForestRegressor
+
+    X, Y, snapshot = _load_points(run_dir, snapshot)
+    rf = RandomForestRegressor(n_estimators=int(n_estimators), n_jobs=-1, random_state=42)
+    rf.fit(X, Y)
+    # Single-point queries dominate a simulated run; thread fan-out only costs there.
+    rf.set_params(n_jobs=1)
+
+    def predict(Xq: np.ndarray) -> np.ndarray:
+        return rf.predict(np.atleast_2d(np.asarray(Xq, dtype=float)))
+
+    predict.rf = rf
+    return predict, X, Y, snapshot
+
+
+def rf_peaks(predict, X: np.ndarray, *, k: int = _RF_PEAK_K,
+             min_sep: float = _PEAK_MIN_SEP,
+             prominence_frac: float = _PEAK_PROMINENCE_FRAC,
+             seed: int = SEED) -> tuple[np.ndarray, np.ndarray]:
+    """Local maxima of a random-forest surface, taken among the training points.
+
+    A forest is piecewise constant, so there is no gradient to ascend
+    (:func:`ascend_peaks`); its maxima sit where the data does. A training point is a
+    candidate when its prediction is at least that of its ``k`` nearest training
+    neighbours, and candidates are filtered exactly as :func:`ascend_peaks` filters
+    its converged points (prominence over the uniform-draw median, ``min_sep`` apart).
+
+    Returns ``(peaks, values)`` sorted by descending prediction.
+    """
+    from scipy.spatial import cKDTree
+
+    z = predict(X)
+    _, nb = cKDTree(X).query(X, k=k + 1)
+    is_max = z >= z[nb[:, 1:]].max(axis=1)
+
+    rng = np.random.default_rng(seed)
+    background = float(np.median(predict(rng.dirichlet(np.ones(X.shape[1]),
+                                                       _BACKGROUND_SAMPLES))))
+    floor = background + prominence_frac * (float(z.max()) - background)
+    cand = np.where(is_max & (z >= floor))[0]
+    kept: list[int] = []
+    for idx in cand[np.argsort(z[cand])[::-1]]:
+        if all(np.linalg.norm(X[idx] - X[j]) >= min_sep for j in kept):
+            kept.append(idx)
+    kept_arr = np.array(kept, dtype=int)
+    return X[kept_arr], z[kept_arr]
+
+
+class RunGPSurface:
+    """A rungp / runrf landscape with the ``Ensemble`` interface
+    ``visualization/paired_conet`` uses: batched ``predict(X)`` and ``centers`` (the
+    reference optima).
+
+    Rebuilt from the ``rungp_config.json`` evaluate.py writes into each rungp / runrf
+    run dir (``surrogate`` says which; absent means GP). The surrogate is refit
+    (deterministic) but the peaks are taken from the config rather than re-detected,
+    so they are exactly the optima the run was scored against.
     """
 
     def __init__(self, cfg: dict):
         self.dim = int(cfg["dim"])
         self.centers = np.asarray(cfg["centers"], dtype=float)
-        self._predict, _, _, _ = _fit_run_gp(
-            Path(cfg["gp_run"]), float(cfg["length_scale"]), cfg["snapshot"])
+        if cfg.get("surrogate") == "rf":
+            self._predict, _, _, _ = _fit_run_rf(
+                Path(cfg["gp_run"]), int(cfg["n_estimators"]), cfg["snapshot"])
+        else:
+            self._predict, _, _, _ = _fit_run_gp(
+                Path(cfg["gp_run"]), float(cfg["length_scale"]), cfg["snapshot"])
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         return self._predict(X)
@@ -570,6 +651,35 @@ def rungp_objective(run_dir: str | Path, *, length_scale: float = GP_LENGTH_SCAL
         "run_dir": str(run_dir),
         "snapshot": snapshot,
         "length_scale": float(length_scale),
+        "y_max": float(Y.max()),
+    }
+
+
+def runrf_objective(run_dir: str | Path, *, n_estimators: int = RF_N_ESTIMATORS,
+                    snapshot: str | None = None) -> dict:
+    """:func:`rungp_objective` with a random forest in place of the GP.
+
+    Off the measured region a forest does not relax to the mean the way the GP does:
+    it extends the nearest leaves' values, so the unmeasured simplex inherits the
+    edge of the data. Peaks come from :func:`rf_peaks`.
+    """
+    run_dir = Path(run_dir).resolve()
+    predict, X, Y, snapshot = _fit_run_rf(run_dir, n_estimators, snapshot)
+    peaks, peak_vals = rf_peaks(predict, X)
+
+    def fn(x: np.ndarray) -> float:
+        return float(predict(np.asarray(x, dtype=float).reshape(1, -1))[0])
+
+    return {
+        "dim": int(X.shape[1]),
+        "fn": fn,
+        "predict": predict,
+        "peaks": peaks,
+        "peak_values": peak_vals,
+        "n_points": int(X.shape[0]),
+        "run_dir": str(run_dir),
+        "snapshot": snapshot,
+        "n_estimators": int(n_estimators),
         "y_max": float(Y.max()),
     }
 

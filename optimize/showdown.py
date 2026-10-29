@@ -92,6 +92,12 @@ Usage
 
   # Summarise a finished showdown (also runs automatically via --summary-only).
   python optimize/showdown.py --summary-only --out optimize/runs/showdown_6d
+
+  # Same, one results row per repeat instead of the per-cell mean. The --no-plots
+  # repeats need their CoNet pair rendered first (a UMAP fit, so via SLURM).
+  python optimize/showdown.py --backfill-conet --out optimize/runs/showdown_6d_reps
+  sbatch optimize/runs/showdown_6d_reps/conet_backfill.sbatch
+  python optimize/showdown.py --summary-only --unfold-repeats --out optimize/runs/showdown_6d_reps
 """
 
 from __future__ import annotations
@@ -380,7 +386,7 @@ while [ "$out_of_time" -eq 0 ]; do
         # UMAP render costs as much as the run itself.
         PLOTFLAG=""
         [ "$NOPLOTS" = "1" ] && PLOTFLAG="--no-plots"
-
+{landscape_case}
         uv run python optimize/evaluate.py \\
             --hparams-json "{out_dir}/configs/$CFG.json" \\
             {dataset_flags}--num-runs 1 \\
@@ -427,11 +433,21 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
             for n, probs in bad.items()))
 
     # Reject a mistyped override key now rather than in every worker.
-    if args.dataset != "ensemble" and args.ensemble_overrides:
-        sys.exit("--ensemble-override only applies to --dataset ensemble")
-    if args.dataset == "rungp" and not args.gp_run:
-        sys.exit("--dataset rungp needs --gp-run RUN_DIR")
-    if args.ensemble_overrides:
+    if args.dataset == "mixed":
+        if args.ensemble_overrides:
+            sys.exit("--ensemble-override does not apply with --mix; put the overrides "
+                     "in each --mix spec")
+    elif args.dataset in ("rungp", "runrf") and args.ensemble_overrides:
+        sys.exit("--ensemble-override only applies to --dataset ensemble / needles")
+    if args.dataset in ("rungp", "runrf") and not args.gp_run:
+        sys.exit(f"--dataset {args.dataset} needs --gp-run RUN_DIR")
+    if args.dataset == "needles":
+        keys = set(args.ensemble_overrides)
+        if not {"n_optima", "basin_width"} <= keys <= {"n_optima", "basin_width",
+                                                        "placement_width", "unit_range"}:
+            sys.exit("--dataset needles takes --ensemble-override "
+                     "'n_optima=N,basin_width=B[,placement_width=W,unit_range=true]'")
+    elif args.ensemble_overrides:
         from synthetic_data.ensemble import random_ensemble_config
         valid = random_ensemble_config(args.dim, landscapes[0], seed=args.landscape_seed)
         unknown = sorted(set(args.ensemble_overrides) - set(valid))
@@ -463,8 +479,9 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
         "generated": datetime.datetime.now().isoformat(timespec="seconds"),
         "dim": args.dim,
         "dataset": args.dataset,
-        "gp_run": os.path.abspath(args.gp_run) if args.dataset == "rungp" else None,
+        "gp_run": os.path.abspath(args.gp_run) if args.dataset in ("rungp", "runrf") else None,
         "gp_length_scale": args.gp_length_scale if args.dataset == "rungp" else None,
+        "rf_n_estimators": args.rf_n_estimators if args.dataset == "runrf" else None,
         "time_limit_hours": args.time_limit,
         "budget_points": args.budget_points if max_lines is not None else None,
         "max_lines": max_lines,
@@ -473,6 +490,8 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
         "ensemble_overrides": args.ensemble_overrides or None,
         "landscape_seed": args.landscape_seed,
         "landscapes": landscapes,
+        # --mix: landscape k of `landscapes` is built from landscape_specs[k].
+        "landscape_specs": args.mix_specs or None,
         "n_repeats": n_repeats,
         "n_rows": len(names) * len(landscapes),
         "configs": [
@@ -529,11 +548,26 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
     # A worker stops claiming once less than one task-reserve of wall-time is left,
     # so this — not the raw wall-time — is the budget the campaign has to drain in.
     claim_h = walltime_h - task_h
-    if args.dataset == "rungp":
+    landscape_case = ""
+    if args.dataset == "mixed":
+        # Each landscape id picks its own evaluate.py dataset flags.
+        arms = "\n".join(
+            f"            {ls}) DSFLAGS=({_mix_flags(sp, args.dim, args.landscape_seed)}) ;;"
+            for ls, sp in zip(landscapes, args.mix_specs))
+        landscape_case = (
+            "        # Mixed showdown (--mix): the landscape id selects the dataset.\n"
+            "        case \"$LS\" in\n" + arms + "\n"
+            "            *) echo \"unknown landscape $LS\"; continue ;;\n"
+            "        esac\n")
+        dataset_flags = "\"${DSFLAGS[@]}\" \\\n            "
+    elif args.dataset == "rungp":
         dataset_flags = (f"--dataset rungp --gp-run '{os.path.abspath(args.gp_run)}' "
                          f"--gp-length-scale {args.gp_length_scale:g} \\\n            ")
+    elif args.dataset == "runrf":
+        dataset_flags = (f"--dataset runrf --gp-run '{os.path.abspath(args.gp_run)}' "
+                         f"--rf-n-estimators {args.rf_n_estimators} \\\n            ")
     else:
-        dataset_flags = (f"--dataset ensemble --dim {args.dim} \\\n            "
+        dataset_flags = (f"--dataset {args.dataset} --dim {args.dim} \\\n            "
                          f"--ensemble-landscape-indices \"$LS\" \\\n            "
                          f"--ensemble-seed {args.landscape_seed} \\\n            ")
     extra_flags = ""
@@ -555,6 +589,7 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
         mem=args.mem,
         partition=args.partition,
         dataset_flags=dataset_flags,
+        landscape_case=landscape_case,
         time_limit_min=f"{time_limit_min:g}",
         max_lines_flag=(f"--max-lines {max_lines} \\\n            "
                         if max_lines is not None else ""),
@@ -569,6 +604,8 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
     print(f"    {len(names)} config(s) x {len(landscapes)} landscape(s) x "
           f"{n_repeats} repeat(s) = {len(tasks)} run(s)")
     print(f"    landscapes: {landscapes}")
+    for ls, sp in zip(landscapes, args.mix_specs or []):
+        print(f"      {ls}: {mix_label(sp)}")
     if args.ensemble_overrides:
         print(f"    landscape overrides: {args.ensemble_overrides}")
     if max_lines is not None:
@@ -593,6 +630,64 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
               "or re-submit (after --reset-stale) to finish the remainder.")
     print(f"    submit with:  sbatch {sbatch_path}")
     return sbatch_path
+
+
+CONET_BACKFILL_TEMPLATE = """#!/bin/bash
+#SBATCH --job-name=conet_backfill
+#SBATCH --output={out_dir}/logs/%x_%j.out
+#SBATCH --error={out_dir}/logs/%x_%j.err
+#SBATCH --time={walltime}
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=32G
+#SBATCH --partition=sched_mit_sloan_gpu_r8,mit_preemptable,mit_normal
+
+# Render the CoNet pair for every finished showdown run that has none — the repeats
+# that ran with --no-plots. paired_conet is CPU-only (UMAP), so no GPU is requested;
+# the job starts on whichever partition frees first. sched_mit_sloan_batch is left out
+# on purpose: its nodes are EL7, where the project .venv cannot load.
+# Already-rendered runs are skipped, so re-submitting only redoes what is missing.
+
+cd {repo}
+for d in {run_dirs}; do
+    [ -f "$d/conet.png" ] && [ -f "$d/conet_uniform.png" ] && continue
+    echo "[$(date)] conet -> $d"
+    MPLBACKEND=Agg timeout 1800 uv run python visualization/paired_conet.py \\
+        --run "$d" --save "$d/conet.png" --save-uniform "$d/conet_uniform.png" < /dev/null \\
+        || echo "[$(date)] FAILED rc=$? $d"
+done
+echo "[$(date)] done"
+"""
+
+
+def write_conet_backfill(out_dir: str) -> str | None:
+    """Write ``conet_backfill.sbatch`` for the finished runs that lack a CoNet pair.
+
+    The CoNet render is a UMAP fit, so it goes through SLURM rather than running on the
+    login node alongside --summary-only. Returns the sbatch path, or None when every
+    finished run already has both plots.
+    """
+    todo = sorted(
+        os.path.dirname(m) for m in glob.glob(os.path.join(
+            out_dir, "runs", "*", "trial_*", "run_*", "metrics.json"))
+        if not all(os.path.isfile(os.path.join(os.path.dirname(m), f))
+                   for f in ("conet.png", "conet_uniform.png")))
+    if not todo:
+        print("  every finished run already has its CoNet pair — nothing to backfill")
+        return None
+    # Each render is capped at 30 min, as in run_mobo; 12 h fits every partition.
+    hours = min(12, 1 + len(todo) // 2)
+    os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
+    path = os.path.join(out_dir, "conet_backfill.sbatch")
+    with open(path, "w") as f:
+        f.write(CONET_BACKFILL_TEMPLATE.format(
+            out_dir=out_dir, repo=_REPO, walltime=f"{hours}:00:00",
+            run_dirs=" ".join(f'"{d}"' for d in todo)))
+    os.chmod(path, 0o755)
+    print(f"  {len(todo)} run(s) need a CoNet pair -> {path}")
+    print(f"  submit with:  sbatch {path}")
+    print("  then re-run --summary-only --unfold-repeats to pick the plots up")
+    return path
 
 
 def print_status(out_dir: str) -> None:
@@ -701,6 +796,84 @@ def _parse_overrides(spec: str | None) -> dict:
     return out
 
 
+# Keys each --mix dataset accepts beyond its landscape overrides.
+_MIX_KEYS = {
+    "runrf": {"gp_run", "rf_n_estimators"},
+    "rungp": {"gp_run", "gp_length_scale"},
+    "needles": {"index", "n_optima", "basin_width", "placement_width", "unit_range"},
+    "ensemble": {"index"},
+}
+
+
+def _parse_mix(spec: str, dim: int, seed: int) -> dict:
+    """'needles:n_optima=2,basin_width=2.2' -> one landscape spec of a mixed showdown.
+
+    ``runrf`` / ``rungp`` need ``gp_run``; ``needles`` needs ``n_optima`` and
+    ``basin_width`` (``index`` = the sweep's draw, default 0); ``ensemble`` needs
+    ``index`` and takes any ensemble key as an override. Every landscape shares
+    ``--landscape-seed``.
+    """
+    dataset, _, rest = spec.partition(":")
+    dataset = dataset.strip()
+    if dataset not in _MIX_KEYS:
+        raise SystemExit(f"--mix {spec!r}: dataset must be one of {sorted(_MIX_KEYS)}")
+    kv = _parse_overrides(rest)
+    out: dict = {"dataset": dataset}
+    if dataset in ("runrf", "rungp"):
+        unknown = sorted(set(kv) - _MIX_KEYS[dataset])
+        if unknown or "gp_run" not in kv:
+            raise SystemExit(f"--mix {spec!r}: {dataset} takes gp_run=RUN_DIR"
+                             f"{',rf_n_estimators=N' if dataset == 'runrf' else ',gp_length_scale=L'}"
+                             + (f"; unknown key(s) {unknown}" if unknown else ""))
+        out["gp_run"] = os.path.abspath(str(kv["gp_run"]))
+        if dataset == "runrf":
+            out["rf_n_estimators"] = int(kv.get("rf_n_estimators", 500))
+        else:
+            out["gp_length_scale"] = float(kv.get("gp_length_scale", 0.05))
+        return out
+    out["index"] = int(kv.pop("index", 0 if dataset == "needles" else -1))
+    if out["index"] < 0:
+        raise SystemExit(f"--mix {spec!r}: ensemble needs index=IDX")
+    if dataset == "needles":
+        keys = set(kv)
+        if not {"n_optima", "basin_width"} <= keys <= _MIX_KEYS["needles"]:
+            raise SystemExit(f"--mix {spec!r}: needles takes n_optima=N,basin_width=B"
+                             "[,placement_width=W,unit_range=true,index=I]")
+    elif kv:
+        from synthetic_data.ensemble import random_ensemble_config
+        unknown = sorted(set(kv) - set(random_ensemble_config(dim, out["index"], seed=seed)))
+        if unknown:
+            raise SystemExit(f"--mix {spec!r}: unknown ensemble key(s) {unknown}")
+    out["overrides"] = kv
+    return out
+
+
+def mix_label(spec: dict) -> str:
+    """One-line description of a mixed-showdown landscape, for the summary."""
+    if spec["dataset"] == "runrf":
+        return f"RF of {os.path.basename(spec['gp_run'])} ({spec['rf_n_estimators']} trees)"
+    if spec["dataset"] == "rungp":
+        return f"GP of {os.path.basename(spec['gp_run'])} (length scale {spec['gp_length_scale']:g})"
+    knobs = ", ".join(f"{k}={v}" for k, v in spec.get("overrides", {}).items())
+    return f"{spec['dataset']} #{spec['index']}" + (f" ({knobs})" if knobs else "")
+
+
+def _mix_flags(spec: dict, dim: int, seed: int) -> str:
+    """evaluate.py dataset flags for one mixed-showdown landscape, as one shell line."""
+    if spec["dataset"] == "runrf":
+        return (f"--dataset runrf --gp-run '{spec['gp_run']}' "
+                f"--rf-n-estimators {spec['rf_n_estimators']}")
+    if spec["dataset"] == "rungp":
+        return (f"--dataset rungp --gp-run '{spec['gp_run']}' "
+                f"--gp-length-scale {spec['gp_length_scale']:g}")
+    flags = (f"--dataset {spec['dataset']} --dim {dim} "
+             f"--ensemble-landscape-indices {spec['index']} --ensemble-seed {seed}")
+    if spec.get("overrides"):
+        ov = ",".join(f"{k}={json.dumps(v)}" for k, v in spec["overrides"].items())
+        flags += f" --ensemble-override '{ov}'"
+    return flags
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -735,14 +908,29 @@ def main() -> None:
                     help="explicit ensemble landscape indices instead of a random "
                          "--n-landscapes draw, e.g. '9182,22358' to reuse an earlier "
                          "showdown's landscapes")
-    ap.add_argument("--dataset", choices=("ensemble", "rungp"), default="ensemble",
-                    help="'rungp': ONE fixed landscape, the GP fit to --gp-run's measured "
+    ap.add_argument("--dataset", choices=("ensemble", "needles", "rungp", "runrf"), default="ensemble",
+                    help="'needles': the benchmarks/sweeps bumps-only landscape (flat "
+                         "plain + Ackley bumps; needs --ensemble-override "
+                         "'n_optima=N,basin_width=B'; same index = same centers at every "
+                         "basin width). 'rungp': ONE fixed landscape, the GP fit to --gp-run's measured "
                          "points (evaluate.py --dataset rungp); its dimension comes from "
                          "the run, and the landscape list is just [0]")
+    ap.add_argument("--mix", action="append", default=None, metavar="DATASET:KEY=VAL[,...]",
+                    help="mixed showdown: one landscape per --mix (repeatable), numbered "
+                         "0, 1, ... in order, all in one queue and one summary. "
+                         "'runrf:gp_run=runs/run_69af' (gp_run may be a points .npz), "
+                         "'rungp:gp_run=DIR,gp_length_scale=L', "
+                         "'needles:n_optima=N,basin_width=B[,index=I]', "
+                         "'ensemble:index=IDX[,KEY=VAL...]'. Replaces --dataset / "
+                         "--landscapes; --dim and --landscape-seed apply to all")
     ap.add_argument("--gp-run", default=None, metavar="RUN_DIR",
-                    help="rungp: run directory to fit the GP to (e.g. runs/run_69af)")
+                    help="rungp / runrf: run directory to fit the GP / RF to (e.g. runs/run_69af)")
     ap.add_argument("--gp-length-scale", type=float, default=0.05,
                     help="rungp: fixed Matern length scale (default: %(default)s)")
+    ap.add_argument("--rf-n-estimators", type=int, default=500,
+                    help="runrf: trees in the random forest fit to --gp-run's points, the "
+                         "rungp landscape with an RF instead of the GP (default: %(default)s, "
+                         "as visualization/plot_run.py)")
     ap.add_argument("--n-per-objective", type=int, default=2,
                     help="configs taken from each of dist_to_needles / dup_fraction")
     ap.add_argument("--landscape-seed", type=int, default=0,
@@ -777,6 +965,16 @@ def main() -> None:
                     help="when --runs is a single run dir, do NOT pool its siblings")
     ap.add_argument("--summary-only", action="store_true",
                     help="skip planning; just write the summary for a finished showdown")
+    ap.add_argument("--unfold-repeats", action="store_true",
+                    help="with --summary-only: give every repeat its own row in the "
+                         "results table instead of one mean row per (config, landscape) "
+                         "cell. Repeats that ran --no-plots get their convergence and "
+                         "%% space penalised plots rebuilt from CSVs; their CoNet pair "
+                         "comes from --backfill-conet")
+    ap.add_argument("--backfill-conet", action="store_true",
+                    help="write conet_backfill.sbatch, which renders the CoNet pair for "
+                         "every finished run lacking one (the --no-plots repeats), then "
+                         "exit. Submit it, then re-run --summary-only --unfold-repeats")
     ap.add_argument("--reset-stale", action="store_true",
                     help="clear claims left by killed workers so those tasks are retried, "
                          "then exit. Run before RE-submitting; never while workers are up.")
@@ -784,6 +982,9 @@ def main() -> None:
                     help="print queue progress (done / claimed / pending) and exit")
     args = ap.parse_args()
     args.ensemble_overrides = _parse_overrides(args.ensemble_override)
+    args.mix_specs = [_parse_mix(m, args.dim, args.landscape_seed) for m in args.mix or []]
+    if args.mix_specs:
+        args.dataset = "mixed"
 
     out_dir = os.path.abspath(args.out)
 
@@ -795,8 +996,15 @@ def main() -> None:
         print_status(out_dir)
         return
 
+    if args.backfill_conet:
+        write_conet_backfill(out_dir)
+        return
+
+    if args.unfold_repeats and not args.summary_only:
+        ap.error("--unfold-repeats only applies with --summary-only")
+
     if args.summary_only:
-        write_landscape_summary(out_dir)
+        write_landscape_summary(out_dir, unfold_repeats=args.unfold_repeats)
         return
 
     if args.configs:
@@ -812,7 +1020,9 @@ def main() -> None:
         records = collect_pool(args.runs, shared_history=not args.no_shared_history)
         chosen = select_configs(records, n_per_objective=args.n_per_objective)
 
-    if args.dataset == "rungp":
+    if args.dataset == "mixed":
+        landscapes = list(range(len(args.mix_specs)))
+    elif args.dataset in ("rungp", "runrf"):
         landscapes = [0]
     elif args.landscapes:
         landscapes = sorted(int(t) for t in args.landscapes.split(",") if t.strip())

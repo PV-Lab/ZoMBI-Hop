@@ -135,6 +135,23 @@ def ensure_penalized_space_plot(run_dir: str | None) -> None:
         print(f"  penalized_space plot failed for {run_dir}: {exc}")
 
 
+def ensure_convergence_plot(run_dir: str | None) -> None:
+    """Generate ``convergence.png`` from ``points.csv`` / ``needles.csv`` if missing.
+
+    Repeats run with ``--no-plots`` skip it; regen_convergence rebuilds it with the
+    same ``plot_convergence`` the live run uses (best-effort).
+    """
+    if not run_dir or os.path.isfile(os.path.join(run_dir, "convergence.png")):
+        return
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from pathlib import Path
+        import regen_convergence
+        regen_convergence.regen_run(Path(run_dir))
+    except Exception as exc:
+        print(f"  convergence plot failed for {run_dir}: {exc}")
+
+
 def _read_json(path: str) -> dict:
     try:
         with open(path) as f:
@@ -739,15 +756,36 @@ def write_config_bar_chart(reps: dict[tuple[str, int], list[dict]],
     return CONFIG_BAR_PLOT, within
 
 
+def landscape_label(spec: dict | None) -> str:
+    """What a mixed showdown's landscape is (showdown.py --mix), for the tables."""
+    if not spec:
+        return ""
+    src = os.path.basename(str(spec.get("gp_run") or ""))
+    if spec["dataset"] == "runrf":
+        return f"RF of `{src}` ({spec.get('rf_n_estimators')} trees)"
+    if spec["dataset"] == "rungp":
+        return f"GP of `{src}` (length scale {spec.get('gp_length_scale')})"
+    knobs = ", ".join(f"{k}={v}" for k, v in (spec.get("overrides") or {}).items())
+    return f"{spec['dataset']} #{spec.get('index')}" + (f" ({knobs})" if knobs else "")
+
+
 def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
                             dist_cutoff: float = DEFAULT_DIST_CUTOFF,
-                            legacy_dist: bool = False) -> str:
+                            legacy_dist: bool = False,
+                            unfold_repeats: bool = False) -> str:
     """Write the landscape-grouped Markdown table for a finished showdown.
 
     Image paths are written relative to the Markdown file so it renders in place.
     Cells for runs that have not finished (or failed) show as ``—`` rather than
     being dropped, so a partially-complete campaign is still readable and the gaps
     are visible.
+
+    ``unfold_repeats=True`` gives every repeat its own row in the results table, with
+    its own values and plots, instead of one mean row per (config, landscape) cell.
+    Later repeats ran ``--no-plots``, so their convergence and % space penalised plots
+    are backfilled from their CSVs here; the CoNet pair needs a UMAP fit and is
+    backfilled by ``showdown.py --backfill-conet`` instead. The aggregate tables,
+    charts and CSVs are unchanged.
 
     ``dist_to_needles`` is recomputed per run with the optimal assignment and a cutoff
     on the scale of the distances (see ``recomputed_dist``) rather than read from
@@ -763,6 +801,10 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
 
     configs = manifest["configs"]
     landscapes = manifest["landscapes"]
+    specs = dict(zip(landscapes, manifest.get("landscape_specs") or []))
+    # Landscape id as shown in the tables; a mixed showdown also says what it is.
+    def ls_name(ls) -> str:
+        return f"**{ls}** {landscape_label(specs[ls])}" if ls in specs else f"**{ls}**"
     n_repeats = int(manifest.get("n_repeats", 1) or 1)
     out_path = out_path or os.path.join(showdown_dir, "showdown_summary.md")
     out_dir = os.path.dirname(out_path)
@@ -780,11 +822,23 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
     if manifest.get("ensemble_overrides"):
         setup.append("landscape overrides: " + ", ".join(
             f"`{k}={v}`" for k, v in manifest["ensemble_overrides"].items()))
-    if manifest.get("gp_run"):
+    if manifest.get("gp_run") and manifest.get("dataset") == "runrf":
+        setup.append(f"RF of `{manifest['gp_run']}` "
+                     f"({manifest.get('rf_n_estimators')} trees)")
+    elif manifest.get("gp_run"):
         setup.append(f"GP of `{manifest['gp_run']}` "
                      f"(length scale {manifest.get('gp_length_scale')})")
     A(" · ".join(setup))
     A("")
+    if specs:
+        A("## Landscapes")
+        A("")
+        A("| landscape | what | flags |")
+        A("|---|---|---|")
+        for ls, sp in specs.items():
+            extra = {k: v for k, v in sp.items() if k not in ("dataset",)}
+            A(f"| **{ls}** | {landscape_label(sp)} | `{json.dumps(extra)}` |")
+        A("")
 
     A("## Configurations")
     A("")
@@ -800,7 +854,8 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
 
     A("## Results")
     A("")
-    header = (["landscape", "config", "n", "dist to needles",
+    header = (["landscape", "config", "repeat" if unfold_repeats else "n",
+               "dist to needles",
                "median NN spacing (x10^-3)",
                "lines/activation", "activations", "runtime (s)"]
               + [h for _, h in SUMMARY_PLOTS])
@@ -821,9 +876,12 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
                 met = _read_json(os.path.join(run_dir, "metrics.json"))
                 if not met:
                     continue
-                # Only repeat 1 is rendered, so it is the only one worth backfilling.
-                if rep == 1:
+                # Only repeat 1 is rendered, so it is the only one worth backfilling —
+                # unless every repeat gets its own row.
+                if rep == 1 or unfold_repeats:
                     ensure_penalized_space_plot(run_dir)
+                if unfold_repeats:
+                    ensure_convergence_plot(run_dir)
                 act_lines = lines_per_activation(run_dir)
                 dist = met.get("dist_to_needles")
                 if not legacy_dist:
@@ -849,28 +907,39 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
             if len(rows) < n_repeats:
                 n_missing += n_repeats - len(rows)
 
-            # The Markdown carries the MEAN over repeats; the spread lives in the CSVs,
-            # because five statistics per cell in a table nobody can read is not a
-            # summary. `n` makes an under-filled cell visible at a glance.
-            st = {m: describe([r[m] for r in rows]) for m in STAT_METRICS}
-            plot_dir = next((rd for rp, rd in found if rp == 1),
-                            found[0][1] if found else None)
-            # Name the landscape once per block; repeating it on every row is what
-            # makes the grouping hard to see.
-            cells = [f"**{ls}**" if i == 0 else "",
-                     f"`{c['name']}`",
-                     f"{len(rows)}/{n_repeats}",
-                     _fmt(st["dist_to_needles"]["mean"]),
-                     _fmt_nn(st["median_nn_spacing"]["mean"]),
-                     _fmt(st["lines_per_activation"]["mean"], 1),
-                     _fmt(st["activations"]["mean"], 1),
-                     _fmt(st["runtime_s"]["mean"], 1)]
-            for fname, head in SUMMARY_PLOTS:
-                path = os.path.join(plot_dir, fname) if plot_dir else None
-                rel = (os.path.relpath(path, out_dir)
-                       if path and os.path.isfile(path) else None)
-                cells.append(_md_img(rel, f"{c['name']} ls{ls} {head}"))
-            A("| " + " | ".join(cells) + " |")
+            if unfold_repeats:
+                # One row per repeat with its own values and plots. A repeat that never
+                # finished keeps its row as dashes, so the gap stays visible.
+                dirs = dict(found)
+                by_rep = {r["repeat"]: r for r in rows}
+                shown = [(f"r{rep}", by_rep.get(rep, {}), dirs.get(rep), f" r{rep}")
+                         for rep in sorted(set(range(1, n_repeats + 1)) | set(dirs))]
+            else:
+                # The Markdown carries the MEAN over repeats; the spread lives in the
+                # CSVs, because five statistics per cell in a table nobody can read is
+                # not a summary. `n` makes an under-filled cell visible at a glance.
+                st = {m: describe([r[m] for r in rows]) for m in STAT_METRICS}
+                plot_dir = next((rd for rp, rd in found if rp == 1),
+                                found[0][1] if found else None)
+                shown = [(f"{len(rows)}/{n_repeats}",
+                          {m: st[m]["mean"] for m in STAT_METRICS}, plot_dir, "")]
+            for j, (n_cell, vals, plot_dir, alt_rep) in enumerate(shown):
+                # Name the landscape once per block; repeating it on every row is what
+                # makes the grouping hard to see.
+                cells = [ls_name(ls) if i == 0 and j == 0 else "",
+                         f"`{c['name']}`",
+                         n_cell,
+                         _fmt(vals.get("dist_to_needles")),
+                         _fmt_nn(vals.get("median_nn_spacing")),
+                         _fmt(vals.get("lines_per_activation"), 1),
+                         _fmt(vals.get("activations"), 1),
+                         _fmt(vals.get("runtime_s"), 1)]
+                for fname, head in SUMMARY_PLOTS:
+                    path = os.path.join(plot_dir, fname) if plot_dir else None
+                    rel = (os.path.relpath(path, out_dir)
+                           if path and os.path.isfile(path) else None)
+                    cells.append(_md_img(rel, f"{c['name']} ls{ls}{alt_rep} {head}"))
+                A("| " + " | ".join(cells) + " |")
             n_rows += 1
 
     # Mean-per-cell view, which is what the aggregate/winner tables consume: they
@@ -923,7 +992,7 @@ def write_landscape_summary(showdown_dir: str, out_path: str | None = None, *,
         A("")
 
     agg_table("Averages by landscape", "landscape",
-              [(f"**{ls}**", [cell[(c["name"], ls)] for c in configs])
+              [(ls_name(ls), [cell[(c["name"], ls)] for c in configs])
                for ls in landscapes])
 
     # The spread section. Imported here rather than at module scope because it needs
@@ -985,6 +1054,10 @@ if __name__ == "__main__":
     ap.add_argument("--legacy-dist", action="store_true",
                     help="report the greedy dist_to_needles stored in metrics.json "
                          "instead of recomputing it with an optimal assignment")
+    ap.add_argument("--unfold-repeats", action="store_true",
+                    help="one results-table row per repeat instead of one mean row "
+                         "per (config, landscape) cell")
     a = ap.parse_args()
     write_landscape_summary(a.showdown_dir, a.out,
-                            dist_cutoff=a.dist_cutoff, legacy_dist=a.legacy_dist)
+                            dist_cutoff=a.dist_cutoff, legacy_dist=a.legacy_dist,
+                            unfold_repeats=a.unfold_repeats)

@@ -194,7 +194,9 @@ except Exception:  # pragma: no cover
 ACKLEY_BENCHMARKS = {"ackley3d": 3, "ackley4d": 4, "ackley10d": 10}
 GAUSSIAN_BENCHMARKS = {"gaussian3d": 3, "gaussian4d": 4, "gaussian10d": 10}
 # Layered ``Ensemble`` objective: re-randomized per run (see random_ensemble_config).
-ENSEMBLE_DATASETS = {"ensemble"}
+# ``needles`` is the benchmarks/sweeps landscape instead: Ackley bumps on a flat plain,
+# every background family off, optima placed to be resolvable (needles_config).
+ENSEMBLE_DATASETS = {"ensemble", "needles"}
 # Fixed warm-start GP landscape (warm_start/warm_gp_landscape.py via
 # rm.build_warmgp_landscape): the same surface every run, seeded by --warmgp-seed.
 WARMGP_DATASETS = {"warmgp"}
@@ -206,7 +208,8 @@ FULLGP_DATASETS = {"fullgp"}
 # Run-directory GP landscape (warm_gp_landscape.rungp_objective): the same fixed-
 # length-scale GP fit to every measured point of a ZoMBI-Hop run dir (--gp-run,
 # --gp-length-scale), any dimension; e.g. the 6-d hardware run_69af. Deterministic.
-RUNGP_DATASETS = {"rungp"}
+# ``runrf`` is the same with a random forest (plot_run's settings) in place of the GP.
+RUNGP_DATASETS = {"rungp", "runrf"}
 # ``newRF``: RF surrogate trained on live measurements pulled straight from a
 # ``results`` SQLite DB (same source as visualization/plot_run.py).  Its reference
 # optima are picked interactively (interactive_test_zombi.ExtremaPicker) the first
@@ -459,6 +462,7 @@ def resolve_dataset(
     warmgp_seed: int = 0,
     gp_run: str | None = None,
     gp_length_scale: float = 0.05,
+    rf_n_estimators: int = 500,
 ) -> dict:
     """Build the objective + reference optima for ``dataset``."""
     if dataset == "accordion":
@@ -522,6 +526,31 @@ def resolve_dataset(
         ds = _landscape_to_ds(spec, "rungp")
         ds["gp_run"] = {"run_dir": o["run_dir"], "snapshot": o["snapshot"],
                         "length_scale": o["length_scale"], "n_points": o["n_points"],
+                        "peak_values": [float(v) for v in o["peak_values"]]}
+        return ds
+
+    if dataset == "runrf":
+        # rungp with a random forest surrogate; peaks are the forest's local maxima
+        # among the training points (warm_gp_landscape.rf_peaks).
+        if not gp_run:
+            sys.exit("--dataset runrf needs --gp-run RUN_DIR")
+        from warm_start.warm_gp_landscape import runrf_objective
+        o = runrf_objective(gp_run, n_estimators=rf_n_estimators)
+        spec = rm.LandscapeSpec(
+            landscape="synthetic", dim=o["dim"], maximize=True,
+            true_optima=[np.asarray(p, dtype=float) for p in o["peaks"]],
+            fn_callable=o["fn"], grid_pts=None, grid_vals=None,
+            time_limit_hours=time_limit_hours, max_activations=float("inf"),
+            oracle="runrf", synthetic_seed=0,
+        )
+        print(f"  [dataset] runrf: RF ({o['n_estimators']} trees) fit to "
+              f"{o['n_points']} pts of {o['run_dir']} ({o['snapshot']}), dim={o['dim']} "
+              f"— maximize, {len(spec.true_optima)} peak(s), values "
+              f"{', '.join(f'{v:.3f}' for v in o['peak_values'])} (data max {o['y_max']:.3f})")
+        ds = _landscape_to_ds(spec, "runrf")
+        ds["gp_run"] = {"run_dir": o["run_dir"], "snapshot": o["snapshot"],
+                        "surrogate": "rf", "n_estimators": o["n_estimators"],
+                        "length_scale": None, "n_points": o["n_points"],
                         "peak_values": [float(v) for v in o["peak_values"]]}
         return ds
 
@@ -883,6 +912,37 @@ def apply_ensemble_overrides(cfg: dict, overrides: dict) -> dict:
             v = int(v)
         out[k] = v
     return out
+
+
+NEEDLES_OVERRIDE_KEYS = {"n_optima", "basin_width", "placement_width", "unit_range"}
+
+
+def needles_config(dim: int, index: int, seed: int, overrides: dict) -> dict:
+    """``Ensemble`` kwargs for landscape ``index`` of the benchmarks/sweeps needles family.
+
+    *overrides* must give ``n_optima`` and ``basin_width``; ``placement_width`` is
+    optional and defaults to the sweep's (the strictest width on its grid, b=2.2), so
+    the same ``index`` lays out the SAME centers at every basin width — exactly as a
+    ``(dim, n, draw)`` row of the sweep does (NeedleFactory.placement_seed).
+    ``unit_range=true`` stretches the output from plain 0.75 .. peak 1.0 onto 0 .. 1
+    (Ensemble ``output_rescale``); the centers and basins are unchanged.
+    """
+    from benchmarks.sweeps import needles as nd
+
+    unknown = sorted(set(overrides) - NEEDLES_OVERRIDE_KEYS)
+    if unknown or not {"n_optima", "basin_width"} <= set(overrides):
+        raise SystemExit("--dataset needles takes --ensemble-override "
+                         "'n_optima=N,basin_width=B[,placement_width=W,unit_range=true]'"
+                         + (f"; unknown key(s) {unknown}" if unknown else ""))
+    fac = nd.NeedleFactory(dim=int(dim), n_needles=int(overrides["n_optima"]),
+                           basin_width=float(overrides["basin_width"]), seed=int(seed))
+    sep = float(overrides.get("placement_width", fac.placement_width))
+    built = nd.build_landscape(fac.dim, fac.n_needles, fac.basin_width,
+                               fac.placement_seed(index), separation_width=sep)
+    cfg = built["config"]
+    if overrides.get("unit_range"):
+        cfg["output_rescale"] = [nd.PLAIN_Y, nd.PEAK_Y]
+    return cfg
 
 
 def coord_cols(dim: int, dataset: str) -> list[str]:
@@ -1625,6 +1685,7 @@ def evaluate_dataset(
             warmgp_seed=args.warmgp_seed,
             gp_run=args.gp_run,
             gp_length_scale=args.gp_length_scale,
+            rf_n_estimators=args.rf_n_estimators,
         )
         rerun_cfg = _build_rerun_config(
             dataset, ds, runs_path=runs_path, trial_nums=trial_nums,
@@ -1678,11 +1739,15 @@ def evaluate_dataset(
                     # each being scored on its own draw (the default indexing above
                     # deliberately varies the landscape per trial).
                     idx = landscape_indices[(k - 1) % len(landscape_indices)]
-                ens_cfg = random_ensemble_config(
-                    ens_dim, idx, seed=int(args.ensemble_seed),
-                    optima_margin=args.ensemble_margin)
-                if ens_overrides:
-                    ens_cfg = apply_ensemble_overrides(ens_cfg, ens_overrides)
+                if dataset == "needles":
+                    ens_cfg = needles_config(ens_dim, idx, int(args.ensemble_seed),
+                                             ens_overrides)
+                else:
+                    ens_cfg = random_ensemble_config(
+                        ens_dim, idx, seed=int(args.ensemble_seed),
+                        optima_margin=args.ensemble_margin)
+                    if ens_overrides:
+                        ens_cfg = apply_ensemble_overrides(ens_cfg, ens_overrides)
                 run_ds = build_ensemble_ds(
                     ens_cfg, dataset, time_limit_hours=time_limit_min / 60.0)
                 os.makedirs(run_dir, exist_ok=True)
@@ -1696,6 +1761,8 @@ def evaluate_dataset(
                 with open(os.path.join(run_dir, "rungp_config.json"), "w") as f:
                     json.dump({"dim": ds["dim"], "gp_run": g["run_dir"],
                                "snapshot": g["snapshot"], "length_scale": g["length_scale"],
+                               "surrogate": g.get("surrogate", "gp"),
+                               "n_estimators": g.get("n_estimators"),
                                "centers": [list(map(float, np.ravel(t)))
                                            for t in ds["true_optima"]]}, f, indent=2)
             try:
@@ -1787,10 +1854,13 @@ def main() -> None:
                         help="Seed for the warmgp dataset's warm-start GP landscape "
                              "(default: 0; matches the tuning jobs).")
     parser.add_argument("--gp-run", default=None, metavar="RUN_DIR",
-                        help="rungp dataset: the run directory whose measured points the "
+                        help="rungp / runrf dataset: the run directory whose measured points the "
                              "GP is fit to (e.g. runs/run_69af).")
     parser.add_argument("--gp-length-scale", type=float, default=0.05,
                         help="rungp dataset: fixed Matern length scale (default: 0.05).")
+    parser.add_argument("--rf-n-estimators", type=int, default=500,
+                        help="runrf dataset: trees in the random forest fit to --gp-run "
+                             "(default: 500, as visualization/plot_run.py).")
     parser.add_argument("--dynamic-alt-hparams-json", default=None, metavar="PATH",
                         help="DYNAMIC method: alternate the trial's (WARM-tuned) "
                              "hparams with the hparams in this JSON every "

@@ -492,6 +492,10 @@ class Ensemble:
         ever advertise mutually-separated optima.  ``0`` disables paring (every
         basin is a true optimum).  Defaults to :data:`_DEFAULT_INPUT_NOISE`.
     seed : single master seed driving every random placement and sign.
+    output_rescale : optional ``[lo, hi]``; the output is mapped linearly so ``lo``
+        becomes 0 and ``hi`` becomes 1, applied after the ``[0.5, 1]`` squish.
+        ``None`` (default) leaves the output as is. The needles landscape uses
+        ``[0.75, 1]`` to stretch its plain..peak span onto ``[0, 1]``.
     """
 
     domain = "simplex"
@@ -550,6 +554,7 @@ class Ensemble:
         domain: str | None = None,
         # global
         seed: int = 0,
+        output_rescale: list | None = None,
     ) -> None:
         if domain is not None and domain != type(self).domain:
             raise ValueError(
@@ -559,6 +564,8 @@ class Ensemble:
             raise ValueError(f"dim must be >= 2 (got {dim}).")
         self.dim = dim
         self.seed = int(seed)
+        self.output_rescale = (None if output_rescale is None
+                               else (float(output_rescale[0]), float(output_rescale[1])))
 
         self.optima_margin = float(np.clip(optima_margin, 0.0, 0.5))
         self.basin_width = float(basin_width)
@@ -910,7 +917,11 @@ class Ensemble:
         # Squish the full [0, 1] span into the upper half [0.5, 1].  This
         # deliberately deflates the optima margin (everything is compressed by
         # 2x) so the surface only ever ranges across the top half of the output.
-        return 0.5 + 0.5 * y
+        y = 0.5 + 0.5 * y
+        if self.output_rescale is not None:
+            lo, hi = self.output_rescale
+            y = (y - lo) / (hi - lo)
+        return y
 
     def __call__(self, x: np.ndarray) -> float:
         return float(self.predict(np.asarray(x, dtype=float).reshape(1, -1))[0])
