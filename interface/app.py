@@ -79,6 +79,7 @@ from src.hparams import (
 )
 from src.utils.simplex import add_composition_noise, proj_simplex, get_tangent_basis
 from src.utils.datahandler import reconstruct_snapshot_tensors
+from src.utils.gp_simplex import zone_penalty
 from optimize.composition_prediction import physics_simulate_line
 
 # ── constants ─────────────────────────────────────────────────────────────────
@@ -1839,17 +1840,18 @@ def _needle_ellipsoid_comp(needle_comp, M, B, n: int = 200):
         return None
 
 
-def _needle_penalty_bands(needle_comp, M, B, *, n_bands: int = 18, n_ang: int = 160):
-    """Non-overlapping annular rings coloured by the smooth repulsion penalty.
+def _needle_penalty_bands(needle_comp, M, B, *, n_bands: int = 18, n_ang: int = 160,
+                          profile: str = "linear", edge_value: float = 0.0):
+    """Non-overlapping annular rings coloured by the repulsion penalty.
 
-    The acquisition repulsion is ``violation**2 = clamp(1 - quad, 0)**2`` with
-    ``quad = delta_z^T M delta_z``: strongest (1.0) at the needle centre, fading
-    smoothly to 0 at the boundary (``quad = 1``).  Each ring between contours
-    ``quad = s_out**2`` and ``quad = s_in**2`` carries penalty ``(1 - s_mid**2)**2``
-    at its mid-radius.  Because the rings don't overlap, filling each with
-    ``alpha = base * penalty`` makes the rendered opacity *exactly proportional* to
-    the true penalty at every radius.  Returns ``[(ring_comp, penalty), ...]`` or
-    ``None`` on failure.
+    With ``rho = sqrt(delta_z^T M delta_z)`` (1 at the boundary), the acquisition
+    penalty is ``zone_penalty(rho, profile, edge_value)``: strongest (1.0) at the
+    needle centre, falling to ``edge_value`` at the boundary.  Each ring between
+    contours ``rho = s_out`` and ``rho = s_in`` carries the penalty at its
+    mid-radius.  Because the rings don't overlap, filling each with
+    ``alpha = base * penalty`` makes the rendered opacity proportional to the true
+    penalty at every radius.  Returns ``[(ring_comp, penalty), ...]`` or ``None``
+    on failure.
     """
     if M is None:
         return None
@@ -1882,7 +1884,7 @@ def _needle_penalty_bands(needle_comp, M, B, *, n_bands: int = 18, n_ang: int = 
         bands = []
         for k in range(n_bands):
             s_mid = 0.5 * (scales[k] + scales[k + 1])
-            penalty = float((1.0 - s_mid ** 2) ** 2)
+            penalty = zone_penalty(s_mid, profile, edge_value)
             if scales[k + 1] <= 1e-9:
                 ring = contours[k]                      # innermost: filled centre disk
             else:
@@ -1891,6 +1893,17 @@ def _needle_penalty_bands(needle_comp, M, B, *, n_bands: int = 18, n_ang: int = 
         return bands
     except Exception:
         return None
+
+
+def _run_penalty_falloff(rd: "RunData | None") -> dict:
+    """The run's zone-penalty falloff as ``_needle_penalty_bands`` kwargs.
+
+    Read from the run's config.json. Runs that predate the knob (2026-10-18)
+    recorded none and used the original law: quadratic, 0 at the edge.
+    """
+    cfg = rd.config if rd is not None else {}
+    return dict(profile=str(cfg.get("repulsion_profile", "quadratic")),
+                edge_value=float(cfg.get("repulsion_edge_value", 0.0)))
 
 
 def _draw_penalty_gradient(ax, bands, proj) -> None:
@@ -2570,12 +2583,13 @@ class TernaryPlotFrame(ttk.Frame):
         # snapshot's true ellipsoid (needle M + B); fall back to live isotropic
         # spheres (radius_ilr) when no snapshot ellipsoid is available.
         penalty_drawn = False
+        falloff = _run_penalty_falloff(rd)
         if self._show_penalty.get() and n_cols == 3 and rd is not None \
                 and rd.needles is not None \
                 and rd.needles.shape[0] > 0 and rd.needle_M_list:
             for i, ncomp in enumerate(rd.needles):
                 M = rd.needle_M_list[i] if i < len(rd.needle_M_list) else None
-                bands = _needle_penalty_bands(ncomp, M, rd.needle_B)
+                bands = _needle_penalty_bands(ncomp, M, rd.needle_B, **falloff)
                 if bands is None:
                     continue
                 _draw_penalty_gradient(ax, bands, _proj)
@@ -2589,7 +2603,8 @@ class TernaryPlotFrame(ttk.Frame):
                     if cpt.shape[0] != 3 or rad <= 0:
                         continue
                     # isotropic ILR sphere of radius rad ⇒ M = I / rad²
-                    bands = _needle_penalty_bands(cpt, np.eye(2) / (rad ** 2), None)
+                    bands = _needle_penalty_bands(cpt, np.eye(2) / (rad ** 2), None,
+                                                  **falloff)
                     if bands is None:
                         continue
                     _draw_penalty_gradient(ax, bands, _proj)
