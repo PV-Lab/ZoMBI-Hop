@@ -161,6 +161,7 @@ from src.hparams import ALL_DEFAULTS, extract_hparams
 from src.core.linebo import batch_line_bounds_segments, line_simplex_segment, zero_sum_dirs
 from src.utils.domain import BoxDomain, SimplexDomain
 from src.utils.simplex import Ellipsoid, composition_to_ilr, ilr_to_composition
+from src.utils.gp_simplex import zone_penalty
 from synthetic_data.ackley import Ackley
 from synthetic_data.ensemble import Ensemble, random_ensemble_config
 from optimize.composition_prediction import physics_simulate_line
@@ -774,6 +775,8 @@ def make_plotting_wrapper(
             pared_X = None
             pared_Y = None
 
+        gp = gp_ref[0] if gp_ref else None
+
         def _clone(t):
             return t.clone() if isinstance(t, torch.Tensor) else t
 
@@ -794,10 +797,13 @@ def make_plotting_wrapper(
             sampling_lines=plot_state.get("sampling_lines") if show_sampling else None,
             iteration_num=plot_state["iter"],
             save_dir=save_dir,
-            gp_grid_vals=_gp_landscape_vals(
-                gp_ref[0] if gp_ref else None, grid_pts, maximize),
+            gp_grid_vals=_gp_landscape_vals(gp, grid_pts, maximize),
             domain=domain,
             landscape_name=landscape_name,
+            # Penalty falloff the acquisition actually uses, so the needle
+            # gradients are shaded with the same law.
+            repulsion_profile=getattr(gp, "repulsion_profile", "linear"),
+            repulsion_edge_value=float(getattr(gp, "repulsion_edge_value", 0.0)),
         )
         plot_queue.put(payload)
         return x_requested, x_actual, y
@@ -861,16 +867,19 @@ def _needle_penalty_bands(
     n_bands: int = 18,
     n_ang: int = 160,
     domain: str = "simplex",
+    profile: str = "linear",
+    edge_value: float = 0.0,
 ) -> list[tuple[np.ndarray, float]]:
-    """Non-overlapping annular rings coloured by the smooth repulsion penalty.
+    """Non-overlapping annular rings coloured by the repulsion penalty.
 
-    The acquisition repulsion is ``violation**2 = clamp(1 - quad, 0)**2`` with
-    ``quad = delta_z^T M delta_z``: strongest (1.0) at the needle centre, fading
-    smoothly to 0 at the boundary (``quad = 1``).  Each ring between contours
-    ``quad = s_out**2`` and ``quad = s_in**2`` carries penalty ``(1 - s_mid**2)**2``
-    at its mid-radius.  Because the rings don't overlap, filling each with
-    ``alpha = base * penalty`` yields a rendered opacity *exactly proportional* to
-    the true penalty at every radius.
+    With ``rho = sqrt(delta_z^T M delta_z)`` (1 at the zone boundary), the
+    acquisition penalty is ``zone_penalty(rho, profile, edge_value)`` — the same
+    law as ``RepulsiveAcquisition._zone_term``: strongest (1.0) at the needle
+    centre, falling to ``edge_value`` at the boundary and 0 outside.  Each ring
+    between contours ``rho = s_out`` and ``rho = s_in`` carries the penalty at its
+    mid-radius.  Because the rings don't overlap, filling each with
+    ``alpha = base * penalty`` yields a rendered opacity proportional to the true
+    penalty at every radius.
 
     Tangent-space mode (B is not None):  boundary {x* + B @ u : u^T M u = 1}
     ILR mode (B is None):                boundary {ilr⁻¹(ilr(x*) + u) : u^T M u = 1}
@@ -910,7 +919,7 @@ def _needle_penalty_bands(
     bands: list[tuple[np.ndarray, float]] = []
     for k in range(n_bands):
         s_mid = 0.5 * (scales[k] + scales[k + 1])
-        penalty = float((1.0 - s_mid ** 2) ** 2)
+        penalty = zone_penalty(s_mid, profile, edge_value)
         if scales[k + 1] <= 1e-9:
             ring = contours[k]                          # innermost: filled centre disk
         else:
@@ -925,12 +934,14 @@ def _draw_needle_ellipsoid(
     M: torch.Tensor | None,
     B: torch.Tensor | None,
     domain: str = "simplex",
+    profile: str = "linear",
+    edge_value: float = 0.0,
 ) -> None:
     """
     Plot a red star for the needle and, if ellipsoid parameters are available, a
     red penalty gradient over the penalization ellipsoid: opaque red at the needle
-    centre (where the repulsion is strongest) fading to fully transparent at the
-    boundary (where the penalty vanishes).  Opacity is proportional to the penalty.
+    centre (where the repulsion is strongest) fading toward the boundary along the
+    optimizer's falloff ``profile``.  Opacity is proportional to the penalty.
     """
     xy = to_xy(needle_x.reshape(1, -1), domain)
     ax.scatter(
@@ -941,7 +952,8 @@ def _draw_needle_ellipsoid(
     if M is None:
         return
     try:
-        for ring, penalty in _needle_penalty_bands(needle_x, M, B, domain=domain):
+        for ring, penalty in _needle_penalty_bands(
+                needle_x, M, B, domain=domain, profile=profile, edge_value=edge_value):
             ax.add_patch(MplPolygon(
                 to_xy(ring, domain), closed=True,
                 facecolor="red", edgecolor="none",
@@ -988,6 +1000,8 @@ def _plot_iteration(
     domain: str = "simplex",
     landscape_name: str = "RF",
     point: np.ndarray | None = None,
+    repulsion_profile: str = "linear",
+    repulsion_edge_value: float = 0.0,
 ) -> plt.Figure:
     """
     Generate the two-panel figure for one iteration and optionally save it —
@@ -1078,7 +1092,9 @@ def _plot_iteration(
         M_list = needle_M_list or [None] * len(nx_np)
         for i, nx in enumerate(nx_np):
             Mi = M_list[i] if i < len(M_list) else None
-            _draw_needle_ellipsoid(ax_exp, nx, Mi, needle_B, domain=domain)
+            _draw_needle_ellipsoid(ax_exp, nx, Mi, needle_B, domain=domain,
+                                   profile=repulsion_profile,
+                                   edge_value=repulsion_edge_value)
 
     # Sampling overlay: every candidate line the acquisition was integrated over.
     # Thin and semi-transparent so the chosen main/cache lines remain readable.

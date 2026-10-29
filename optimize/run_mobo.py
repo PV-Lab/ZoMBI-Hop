@@ -231,6 +231,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from src import ZoMBIHop, LineBO
 from src.core.linebo import line_simplex_segment, zero_sum_dirs
+from src.utils.gp_simplex import zone_penalty
 from src.utils.simplex import (
     Ellipsoid,
     random_simplex,
@@ -1853,17 +1854,17 @@ def _draw_bounds_region(ax, bounds, n_sample: int = 5000) -> None:
         pass
 
 
-def _needle_penalty_bands(needle_x, M, B, *, n_bands: int = 18, n_ang: int = 160):
-    """Non-overlapping annular rings coloured by the smooth repulsion penalty.
+def _needle_penalty_bands(needle_x, M, B, *, n_bands: int = 18, n_ang: int = 160,
+                          profile: str = "linear", edge_value: float = 0.0):
+    """Non-overlapping annular rings coloured by the repulsion penalty.
 
-    The acquisition repulsion is ``violation**2 = clamp(1 - quad, 0)**2`` with
-    ``quad = delta_z^T M delta_z``: strongest (1.0) at the needle centre, fading
-    smoothly to 0 at the ellipsoid boundary (``quad = 1``).  Each ring between the
-    contours ``quad = s_out**2`` and ``quad = s_in**2`` carries penalty
-    ``(1 - s_mid**2)**2`` evaluated at its mid-radius.  Because the rings do not
-    overlap, a caller that fills each ring with ``alpha = base * penalty`` gets a
-    rendered opacity that is *exactly proportional* to the true penalty at every
-    radius (transparent at the edge → opaque at the centre).
+    With ``rho = sqrt(delta_z^T M delta_z)`` (1 at the ellipsoid boundary), the
+    acquisition penalty is ``zone_penalty(rho, profile, edge_value)``: strongest
+    (1.0) at the needle centre, falling to ``edge_value`` at the boundary.  Each
+    ring between the contours ``rho = s_out`` and ``rho = s_in`` carries the
+    penalty at its mid-radius.  Because the rings do not overlap, a caller that
+    fills each ring with ``alpha = base * penalty`` gets a rendered opacity that is
+    proportional to the true penalty at every radius.
     """
     d = needle_x.shape[0]
     M_np = as_numpy(M, dtype=float)
@@ -1893,7 +1894,7 @@ def _needle_penalty_bands(needle_x, M, B, *, n_bands: int = 18, n_ang: int = 160
     bands = []
     for k in range(n_bands):
         s_mid = 0.5 * (scales[k] + scales[k + 1])
-        penalty = float((1.0 - s_mid ** 2) ** 2)
+        penalty = zone_penalty(s_mid, profile, edge_value)
         if scales[k + 1] <= 1e-9:
             ring = contours[k]                          # innermost: filled centre disk
         else:
@@ -1902,7 +1903,8 @@ def _needle_penalty_bands(needle_x, M, B, *, n_bands: int = 18, n_ang: int = 160
     return bands
 
 
-def _draw_needle_ellipsoid(ax, needle_x, M, B) -> None:
+def _draw_needle_ellipsoid(ax, needle_x, M, B, *, profile: str = "linear",
+                           edge_value: float = 0.0) -> None:
     """Red star for the needle + red penalty gradient (centre → transparent edge)."""
     xy = comp_to_xy(needle_x.reshape(1, 3))
     ax.scatter(xy[0, 0], xy[0, 1], marker="*", s=280, c="red", alpha=0.8,
@@ -1910,7 +1912,8 @@ def _draw_needle_ellipsoid(ax, needle_x, M, B) -> None:
     if M is None:
         return
     try:
-        for ring, penalty in _needle_penalty_bands(needle_x, M, B):
+        for ring, penalty in _needle_penalty_bands(needle_x, M, B, profile=profile,
+                                                   edge_value=edge_value):
             ax.add_patch(MplPolygon(comp_to_xy(ring), closed=True,
                                     facecolor="red", edgecolor="none",
                                     alpha=0.5 * penalty, linewidth=0, zorder=6))
@@ -1999,7 +2002,9 @@ def render_frame(payload: dict, grid_pts, grid_vals, true_optima, maximize: bool
         B = payload.get("needle_B")
         for i, nx in enumerate(needles):
             Mi = M_list[i] if i < len(M_list) else None
-            _draw_needle_ellipsoid(ax_exp, nx, Mi, B)
+            _draw_needle_ellipsoid(ax_exp, nx, Mi, B,
+                                   profile=payload.get("repulsion_profile", "linear"),
+                                   edge_value=payload.get("repulsion_edge_value", 0.0))
 
     if payload.get("line_0") is not None:
         ll = comp_to_xy(_line_endpoints_array(payload["line_0"]))
@@ -2796,6 +2801,9 @@ def run_single_trial(
                 bounds=(as_numpy(dh.bounds) if dh.bounds is not None else None),
                 gp_grid_vals=(gp_landscape_vals(gp_ref[0], grid_pts, maximize)
                               if dim == 3 else None),
+                # Falloff the acquisition uses, so the needle gradients match it.
+                repulsion_profile=getattr(gp_ref[0], "repulsion_profile", "linear"),
+                repulsion_edge_value=float(getattr(gp_ref[0], "repulsion_edge_value", 0.0)),
             )
         payloads.append(payload)
         # Sample memory inside the timed loop so a mid-run RAM spike (which can

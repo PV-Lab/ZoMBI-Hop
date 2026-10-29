@@ -48,6 +48,18 @@ class CompWrappedAcquisition(nn.Module):
 REPULSION_PROFILES = ("quadratic", "linear")
 
 
+def zone_penalty(rho: float, profile: str = "linear", edge_value: float = 0.0) -> float:
+    """Scalar zone penalty (before lambda) at normalised distance ``rho`` (1 = zone edge).
+
+    Same law as ``RepulsiveAcquisition._zone_term``, for plotting the gradient a
+    zone actually applies.
+    """
+    if rho > 1.0:
+        return 0.0
+    shape = 1.0 - rho if profile == "linear" else (1.0 - rho ** 2) ** 2
+    return float(edge_value + (1.0 - edge_value) * shape)
+
+
 class RepulsiveAcquisition(nn.Module):
     """
     Acquisition function with smooth repulsion away from discovered needles.
