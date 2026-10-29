@@ -273,6 +273,10 @@ class ZoMBIHop:
             if self.verbose:
                 print(f"Resuming from saved run: {run_uuid}")
             activation, zoom, iteration, _ = self.data_handler.load_state()
+            # Snapshots older than activation_start_idx: the resumed activation
+            # sees the whole history, as it did before; later ones are restricted.
+            if self.data_handler.activation_start_idx is None:
+                self.data_handler.activation_start_idx = 0
             if self.verbose:
                 print(f"Loaded state: activation={activation}, zoom={zoom}, iteration={iteration}")
             self._restore_own_hparams(self.data_handler.loaded_config)
@@ -558,7 +562,9 @@ class ZoMBIHop:
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[int], str]:
         """Pick the point a declaration would land on, or say why it cannot.
 
-        Two rules, in order:
+        Only points measured in the current activation
+        (``dh.activation_start_idx`` onward) are considered, for the candidate and
+        its repeats alike. Two rules, in order:
 
         1. **In-bounds argmax.** The candidate is the best unpenalised point
            *inside* ``bounds``, never the global argmax. Convergence is judged on
@@ -584,6 +590,15 @@ class ZoMBIHop:
         mask = dh.get_penalty_mask()
         if mask is None or not mask.any():
             return None, None, None, "no_points"
+        # Current activation only: the candidate, its repeats and the median pick
+        # all come from rows this activation measured, so a needle is never
+        # declared on (or confirmed by) an earlier activation's points.
+        act_start = getattr(dh, "activation_start_idx", None)
+        if act_start is not None:
+            mask = mask.clone()
+            mask[:act_start] = False
+            if not mask.any():
+                return None, None, None, "no_points"
         idx = torch.where(mask)[0]
         X_unpen = dh.X_all_actual[idx]
         Y_unpen = dh.Y_all[idx].reshape(-1)
@@ -597,11 +612,11 @@ class ZoMBIHop:
 
         best_X = X_unpen[int(Y_unpen.argmax().item())]
 
-        # Repeats are searched over ALL unpenalised points, not only the in-bounds
-        # ones: a measurement sitting just outside the box edge is still a repeat of
-        # the same composition. Penalised points are excluded — they belong to an
-        # already-declared needle, and confirming a new needle with them would
-        # re-declare that one.
+        # Repeats are searched over all of this activation's unpenalised points, not
+        # only the in-bounds ones: a measurement sitting just outside the box edge is
+        # still a repeat of the same composition. Penalised points are excluded —
+        # they belong to an already-declared needle, and confirming a new needle with
+        # them would re-declare that one.
         all_unpen = torch.where(mask)[0]
         dist = torch.norm(dh.X_all_actual[all_unpen] - best_X.unsqueeze(0), dim=1)
         radius = self._repeat_radius(bounds)
@@ -1513,6 +1528,14 @@ class ZoMBIHop:
             # stop when all axes fall below the noise floor.
             first_failure_handled: bool = False
             data_added_since_last_failure: bool = False
+
+            # Rows measured from here on belong to this activation (zoom windows and
+            # needle declarations see only these). A resumed activation keeps the
+            # start its snapshot recorded.
+            if not (activation == start_activation
+                    and getattr(dh, "activation_start_idx", None) is not None):
+                dh.activation_start_idx = (dh.X_all_actual.shape[0]
+                                           if dh.X_all_actual is not None else 0)
 
             needle = None
             # First attempt: resume from checkpoint zoom; fresh activations start at zoom 0.

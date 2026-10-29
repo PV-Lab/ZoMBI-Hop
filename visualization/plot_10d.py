@@ -187,6 +187,7 @@ CN_FILL_BLUR = 5.0         # extra Gaussian blur (grid cells) on the fill alpha
 CN_MIN_CELLS, CN_MIN_NODES = 30, 4
 CN_PCT = (10.0, 90.0)      # CoNet colour bounds: 10th-90th percentile of the response
 CN_STAR = "#ff2d2d"        # discovered-needle / incumbent (best Objective) marker (red)
+CN_TRUE_OPT = "#2f9bff"    # synthetic landscape's true optimum marker (blue; drawn under, and larger than, red)
 # ---- two LIVE, user-tunable layout knobs (persist across new samples / timeline; see the UI) --------
 # CLUSTER DIST (self.gap_reach): when the campaign repeatedly samples one composition (e.g. near-pure
 # CsPbI3), that clique's UMAP neighbourhoods become self-contained and repulsion exiles it many main-mass
@@ -1242,6 +1243,8 @@ def _conet_panel(fig, rect, cbrect, M, F, resp, bounds, view, target_eg, pal=Non
     else:
         cur_it = None
     cur = m & (np.abs(iters - cur_it) < 0.5) if cur_it is not None else np.zeros(len(iters), bool)
+    if not M.get("show_latest", True):           # e.g. a uniform baseline: no measurement order
+        cur = np.zeros(len(iters), bool)
     non = m & ~cur
     ax.scatter(E[(~np.isfinite(y)) & vis, 0], E[(~np.isfinite(y)) & vis, 1], s=6,
                facecolors="none", edgecolors=pal["faint"], linewidths=0.5, zorder=3, alpha=0.5)
@@ -1272,7 +1275,7 @@ def _conet_panel(fig, rect, cbrect, M, F, resp, bounds, view, target_eg, pal=Non
                        edgecolors=pal["red"] if sel else "#1a1200", linewidths=1.6 if sel else 1.0,
                        alpha=max(a, 0.9) if sel else a, zorder=8,
                        path_effects=[pe.withStroke(linewidth=2.0, foreground=star_halo)] if ni == 0 else None)
-    else:
+    elif M.get("show_incumbent", True):
         ocol = M.get("resp_raw", M["resp"])[:, M["resp_names"].index("Objective")]  # RAW -> true incumbent
         ov = np.where(vis & np.isfinite(ocol), ocol, -np.inf)  # best MEASURED Objective SO FAR
         if np.max(ov) > -np.inf or len(E):
@@ -1283,6 +1286,17 @@ def _conet_panel(fig, rect, cbrect, M, F, resp, bounds, view, target_eg, pal=Non
                        edgecolors=pal["red"] if sel else "#1a1200", linewidths=1.6 if sel else 1.0,
                        alpha=0.9 if sel else 0.85, zorder=8,
                        path_effects=[pe.withStroke(linewidth=2.0, foreground=star_halo)])
+    # True optima of a synthetic landscape (``M['true_optima_E']``, explicit map coordinates set by
+    # paired_conet). Larger than and UNDER the red stars, so a needle that found an optimum reads as a
+    # red star inside a blue one.
+    topt = M.get("true_optima_E")
+    if topt is not None and len(topt):
+        topt = np.asarray(topt, float)
+        ax.scatter(topt[:, 0], topt[:, 1], marker="*", s=620, c=CN_TRUE_OPT, edgecolors="#ffffff",
+                   linewidths=0.9, zorder=7.8)
+    if M.get("star_legend"):
+        _conet_star_legend(ax, M, pal, needles_drawn=bool(needles), incumbent_drawn=(
+            not needles and M.get("show_incumbent", True)), latest_drawn=bool(cur.any()))
     # click-to-inspect selection glow. For a STAR the glow RADIATES IN THE STAR SHAPE (scaled-up star
     # markers underneath, no circle) and the red lives on the star's own edge; nodes keep the circular
     # glow + ring.
@@ -1377,6 +1391,35 @@ def _grid2x2(fig, data_aspect, y0=0.23, y1=0.985, row_gap=0.033, cb_w=0.011, cb_
             rects.append([xx, yy, w, h])
             cbs.append([xx + w + cb_pad, yy, cb_w, h])
     return rects, cbs
+
+
+def _conet_star_legend(ax, M, pal, *, needles_drawn, incumbent_drawn, latest_drawn):
+    """One-row key for the markers drawn by ``_conet_panel`` (opt-in via ``M['star_legend']``), in
+    the strip just ABOVE the panel so it never covers data or region labels: only the markers
+    actually on this panel get an entry. Node colour is keyed by the colourbar."""
+    from matplotlib.lines import Line2D
+    handles = []
+    topt = M.get("true_optima_E")
+    if topt is not None and len(topt):
+        handles.append(Line2D([], [], ls="none", marker="*", ms=15, mfc=CN_TRUE_OPT, mec="#ffffff",
+                              mew=0.9, label=f"True optimum ({len(topt)})"))
+    if needles_drawn:
+        handles.append(Line2D([], [], ls="none", marker="*", ms=13, mfc=CN_STAR, mec="#1a1200",
+                              mew=1.0, label=f"Discovered needle ({len(M.get('needles', []))})"))
+    elif incumbent_drawn:
+        handles.append(Line2D([], [], ls="none", marker="*", ms=13, mfc=CN_STAR, mec="#1a1200",
+                              mew=1.0, label="Best sample"))
+    if latest_drawn:
+        handles.append(Line2D([], [], ls="none", marker="o", ms=7, mfc="#c2cad6", mec=pal["red"],
+                              mew=1.2, label="Latest measured line"))
+    handles.append(Line2D([], [], ls="none", marker="o", ms=7, mfc="#c2cad6", mec=pal["node_edge"],
+                          mew=0.4, label="Sample (colour = Objective)"))
+    leg = ax.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.0, 1.0), ncol=len(handles),
+                    fontsize=10.5, frameon=False, borderaxespad=0.15, borderpad=0.0,
+                    handletextpad=0.4, columnspacing=1.8)
+    for t in leg.get_texts():
+        t.set_color(pal["text"])
+    leg.set_zorder(20)
 
 
 CONET_LEGEND_X = 0.865   # grid occupies [~0, CONET_LEGEND_X]; the (narrow) legend sits to its right

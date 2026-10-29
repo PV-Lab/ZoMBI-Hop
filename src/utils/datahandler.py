@@ -253,6 +253,12 @@ class DataHandler:
         self.current_zoom: int = 0
         self.current_iteration: int = 0
         self.no_improvements: int = 0  # kept for backward compat
+        # Row of X_all_actual where the current activation's first measurement
+        # lands. Zoom windows (determine_new_bounds) and needle declarations
+        # (ZoMBIHop._select_needle_point) see only rows >= this, so an activation
+        # cannot zoom onto or declare a point an earlier activation measured.
+        # None = unset (fresh run before activation 0 starts): every row counts.
+        self.activation_start_idx: Optional[int] = None
 
         # Logging
         self.log_ei_history: List[float] = []
@@ -501,6 +507,7 @@ class DataHandler:
             'activation': self.current_activation,
             'zoom': self.current_zoom,
             'iteration': self.current_iteration,
+            'activation_start_idx': self.activation_start_idx,
             'n_points': self.X_all_actual.shape[0] if self.X_all_actual is not None else 0,
             'n_needles': self.needles.shape[0] if self.needles is not None else 0,
             'best_y': self.Y_all.max().item() if self.Y_all is not None and self.Y_all.numel() > 0 else None,
@@ -627,6 +634,7 @@ class DataHandler:
             self.current_activation = summary.get('activation', 0)
             self.current_zoom = summary.get('zoom', 0)
             self.current_iteration = summary.get('iteration', 0)
+            self.activation_start_idx = summary.get('activation_start_idx')
 
         self._load_needles_json(snapshot_dir / 'needles.json')
 
@@ -734,6 +742,7 @@ class DataHandler:
             self.current_activation = summary.get('activation', 0)
             self.current_zoom = summary.get('zoom', 0)
             self.current_iteration = summary.get('iteration', 0)
+            self.activation_start_idx = summary.get('activation_start_idx')
 
         self._load_needles_json(self.run_dir / 'snapshots' / snapshot_name / 'needles.json')
         return self.current_activation, self.current_zoom, self.current_iteration, self.no_improvements
@@ -1736,8 +1745,23 @@ class DataHandler:
         hi = hi - shift_dn
         return torch.stack([lo.clamp(min=g_lo), hi.clamp(max=g_hi)], dim=0)
 
+    def current_activation_mask(self) -> torch.Tensor:
+        """(n,) bool over X_all_actual: True for rows the current activation measured.
+
+        All True while ``activation_start_idx`` is unset."""
+        n = self.X_all_actual.shape[0] if self.X_all_actual is not None else 0
+        mask = torch.ones(n, dtype=torch.bool, device=self.device)
+        if self.activation_start_idx is not None:
+            mask[:self.activation_start_idx] = False
+        return mask
+
     def determine_new_bounds(self, add_to_history: bool = True) -> torch.Tensor:
         """Compute new bounds via a Jaccard-aware sliding window over unpenalized points.
+
+        Only the current activation's points are candidates
+        (``current_activation_mask``): taking the top points of the whole run let
+        one high, never-penalised point from an early activation pull every later
+        activation's zoom back to the same place.
 
         Slides a window of top_m_points along the Y-sorted unpenalized set.  For
         each candidate AABB, widens any axis below the input-noise floor
@@ -1747,11 +1771,12 @@ class DataHandler:
         similar window found.  Appends to bounds_history only when
         add_to_history=True.
         """
-        if not self._penalty_mask.any():
+        mask = self._penalty_mask & self.current_activation_mask()
+        if not mask.any():
             return self.bounds.clone()
 
-        Y_masked = self.Y_all[self._penalty_mask].reshape(-1)
-        X_masked = self.X_all_actual[self._penalty_mask]
+        Y_masked = self.Y_all[mask].reshape(-1)
+        X_masked = self.X_all_actual[mask]
         n = Y_masked.numel()
         k = min(self.top_m_points, n)
         if k == 0:
