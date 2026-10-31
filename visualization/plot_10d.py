@@ -187,6 +187,7 @@ CN_FILL_BLUR = 5.0         # extra Gaussian blur (grid cells) on the fill alpha
 CN_MIN_CELLS, CN_MIN_NODES = 30, 4
 CN_PCT = (10.0, 90.0)      # CoNet colour bounds: 10th-90th percentile of the response
 CN_STAR = "#ff2d2d"        # discovered-needle / incumbent (best Objective) marker (red)
+CN_ZONE = "#ff4fd8"        # optimizer penalty zones: hatch, dashed outline, centre ring (magenta)
 CN_TRUE_OPT = "#2f9bff"    # synthetic landscape's true optimum marker (blue; drawn under, and larger than, red)
 # ---- two LIVE, user-tunable layout knobs (persist across new samples / timeline; see the UI) --------
 # CLUSTER DIST (self.gap_reach): when the campaign repeatedly samples one composition (e.g. near-pure
@@ -778,10 +779,16 @@ def conet_dominance_fields(M, limits=None):
     G = np.column_stack([gx.ravel(), gy.ravel()])
     h = np.median(cKDTree(E).query(E, k=2)[0][:, 1]) * CN_H_FACTOR
     field = np.zeros((G.shape[0], comp.shape[1])); dens = np.zeros(G.shape[0])
+    # penalty-zone membership smoothed with the SAME kernel: the fraction of nearby samples inside each
+    # zone, so a zone's shaded area follows the map exactly the way the composition regions do
+    zmem = M["zones"]["member"].T.astype(float) if M.get("zones") else None   # (N, Z)
+    zfield = np.zeros((G.shape[0], zmem.shape[1])) if zmem is not None else None
     for s in range(0, G.shape[0], 6000):
         W = np.exp(-cdist(G[s:s + 6000], E, "sqeuclidean") / (2 * h * h))
         field[s:s + 6000] = (W @ comp) / (W.sum(1)[:, None] + 1e-12)
         dens[s:s + 6000] = W.sum(1)
+        if zfield is not None:
+            zfield[s:s + 6000] = (W @ zmem) / (W.sum(1)[:, None] + 1e-12)
     dens /= dens.max()
     dnn = cKDTree(E).query(G)[0]
     argf = field.argmax(1)
@@ -791,7 +798,8 @@ def conet_dominance_fields(M, limits=None):
                 core_span=core_span,
                 field=field.reshape(sh + (comp.shape[1],)), argf=argf.reshape(sh),
                 margin=margin.reshape(sh), dens=dens.reshape(sh), dnn=dnn.reshape(sh),
-                mask=(dens > CN_DENS_THR).reshape(sh))
+                mask=(dens > CN_DENS_THR).reshape(sh),
+                zone_field=None if zfield is None else np.moveaxis(zfield.reshape(sh + (-1,)), -1, 0))
 
 
 def _cn_place_labels(ax, cands, names, F, iy, ix, border_mask):
@@ -1217,12 +1225,52 @@ def _conet_underlay(ax, M, F, pal=None, labels=True):
                   r["hh"] / abs(ddy) if abs(ddy) > 1e-12 else np.inf]
             t0 = min(min(tt), 1.0)
             ax.plot([r["lx"] + ddx * t0, r["lx"] + ddx * 0.92], [r["ly"] + ddy * t0, r["ly"] + ddy * 0.92],
-                    color="white", lw=3.0, alpha=0.9, zorder=5.5,       # leader: white, thick
+                    color="white", lw=3.0, alpha=0.3, zorder=5.5,       # leader: white, faint
                     clip_on=False,                                      # labels may sit outside the panel
                     path_effects=[pe.withStroke(linewidth=5.4, foreground="black")])  # black outline
         _draw_blend_label(ax, r["lx"], r["ly"],
                           [CN_PRETTY.get(names[c], names[c]) for c in r["comps"]],
                           r["color"], alpha=r["alpha"], stroke_col=pal["stroke"])
+
+
+def _conet_zones(ax, M, F):
+    """Optimizer penalty zones (``M['zones']``), drawn from which SAMPLES each zone contains.
+
+    The map cannot place an ellipsoid (UMAP on a precomputed distance matrix has no out-of-sample
+    transform), so a zone is shown where its member samples are: ``F['zone_field']`` is the kernel-
+    smoothed fraction of nearby samples inside it, and the zone is wherever most of them are -- clipped to
+    the data mask, since a zone says nothing about empty map. The UNION is hatched once (overlapping
+    zones would otherwise stack into a solid wash), each zone gets its own dashed outline so overlaps stay
+    readable, and a ring marks the sample nearest each zone's centre."""
+    zf = F.get("zone_field")
+    if zf is None or not M.get("zones"):
+        return
+    import matplotlib as mpl
+    import matplotlib.patheffects as pe
+    from scipy.ndimage import gaussian_filter
+    gx, gy = F["gx"], F["gy"]
+    inds = [gaussian_filter(((z >= 0.5) & F["mask"]).astype(float), sigma=2.0) for z in zf]
+    union = np.max(inds, axis=0)
+    if union.max() > 0.5:
+        ax.contourf(gx, gy, union, [0.5, 2.0], colors=[CN_ZONE], alpha=0.10, zorder=2.6)
+        with mpl.rc_context({"hatch.color": CN_ZONE, "hatch.linewidth": 0.7}):
+            ax.contourf(gx, gy, union, [0.5, 2.0], colors="none", hatches=["//"], zorder=2.7)
+    eff = [pe.withStroke(linewidth=3.4, foreground="black")]
+    for ind in inds:
+        if ind.max() <= 0.5:
+            continue
+        cs = ax.contour(gx, gy, ind, [0.5], colors=[CN_ZONE], linewidths=1.5,
+                        linestyles=[(0, (5, 3))], alpha=0.9, zorder=6.3)
+        try:
+            cs.set_path_effects(eff)                      # mpl>=3.8: ContourSet is a Collection
+        except AttributeError:
+            for c in cs.collections:
+                c.set_path_effects(eff)
+    E = M["E"]
+    cen = [c for c in M["zones"]["centers"] if 0 <= c < len(E)]
+    if cen:
+        ax.scatter(E[cen, 0], E[cen, 1], s=520, facecolors="none", edgecolors=CN_ZONE,
+                   linewidths=2.0, zorder=7.5, path_effects=eff)
 
 
 def _conet_panel(fig, rect, cbrect, M, F, resp, bounds, view, target_eg, pal=None, labels=True):
@@ -1231,6 +1279,7 @@ def _conet_panel(fig, rect, cbrect, M, F, resp, bounds, view, target_eg, pal=Non
     pal = pal or CN_PAL_DARK
     ax = fig.add_axes(rect); ax.set_facecolor("none")
     _conet_underlay(ax, M, F, pal=pal, labels=labels)
+    _conet_zones(ax, M, F)
     E = M["E"]; iters = M["iters"]
     vis = np.ones(len(iters), bool) if view is None else (iters <= view + 0.5)   # time-travel
     y = M["resp"][:, M["resp_names"].index(resp)]
@@ -1675,19 +1724,25 @@ def load_run_conet_data(run_dir, snapshot=None):
 
 def build_conet(comp, names, resp, iters, umap_md=CN_UMAP_MD, gap_reach=CN_GAP_REACH,
                 purity_thr=CN_PURITY_THR, needles_comp=None, show_needles=False, frame=None,
-                limits=None):
+                limits=None, zones=None):
     """Build the CoNet structure (UMAP) + dominance fields for a single-objective run. Ranked needle
     optima (if any) are anchored to their nearest sample node and stored as ``M['needles']``; whether
     their stars are drawn is gated by ``M['show_needles']`` (the UI toggle / --needles flag).
 
     *frame*: reuse an already-fitted map frame instead of fitting a new UMAP — see
-    ``build_conet_structure``."""
+    ``build_conet_structure``.
+
+    *zones*: optional optimizer penalty zones as ``(member (Z, N) bool, centers (Z,) int)`` — which
+    samples each zone contains, and the sample nearest each zone's centre (-1 = none). Drawn by
+    ``_conet_zones`` from that membership, never by projecting the ellipsoid itself."""
     M = build_conet_structure(comp, names, resp, iters, list(VALUE_COLUMNS),
                               min_dist=umap_md, gap_reach=gap_reach, purity_thr=purity_thr,
                               frame=frame)
     M["iters"] = np.asarray(iters, float)
     M["needles"] = _needle_rows(M["comp"], needles_comp)
     M["show_needles"] = bool(show_needles)
+    if zones is not None and len(zones[0]):
+        M["zones"] = dict(member=np.asarray(zones[0], bool), centers=np.asarray(zones[1], int))
     with _Progress("dominance fields"):
         F = conet_dominance_fields(M, limits=limits)
     return M, F

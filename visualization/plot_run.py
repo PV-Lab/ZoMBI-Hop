@@ -66,7 +66,7 @@ columns' own units otherwise — and overlays every measured datapoint coloured 
 its value on the same viridis scale, with a black outline so individual
 measurements stay legible.
 
-Two optional panels, each behind a checkbox in the left panel:
+Three optional panels, each behind a checkbox in the left panel:
 
   * **Time slider** — replays the run in *line* increments. A line is one
     deposition line of (nominally) 24 points; because some points are culled, the
@@ -81,6 +81,11 @@ Two optional panels, each behind a checkbox in the left panel:
     a crimson dashed rule at each declared needle. With the time slider on, it
     fills in alongside the main plot and keeps fixed axes, so points appear
     rather than the whole plot rescaling.
+  * **% space penalised** — run directories only: the share of the simplex inside
+    a penalty zone at each snapshot, split into needle zones and exclusion zones
+    (the ``penalized_space.png`` view of ``optimize/plot_metrics.py``). It sits
+    below the window-high column, so it is reached by scrolling, and shares the
+    convergence plot's width and sample-index axis.
 
 For the CoNet + time slider, the UMAP map is fitted **once on the full dataset**
 and every intermediate step replays that fitted frame (``build_conet(frame=...)``)
@@ -135,7 +140,9 @@ Flags
   --labels A,B,C    Corner labels for [bottom-left,bottom-right,top]
                     (default: FAPbI3,MAPbI3,MAPbBr3).
   --show            (export only) Display the matplotlib figure as well as saving.
-  --cache-dir PATH  Where rendered slider steps are cached (kept between runs).
+  --cache-dir PATH  Where rendered slider steps are cached (kept between runs;
+                    default: %LOCALAPPDATA%/zombi-hop/plot_run_cache, or
+                    ~/.cache/zombi-hop/plot_run_cache off Windows).
   --no-precompute   Render time-slider steps on demand instead of ahead of time.
 """
 from __future__ import annotations
@@ -151,7 +158,6 @@ import re
 import shutil
 import sqlite3
 import sys
-import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -347,6 +353,14 @@ class Dataset:
     ``goal`` is ``"minimize"`` or ``"maximize"``. The convergence panel's
     best-so-far envelope follows it; a hard-coded ``max`` would draw a rising
     curve for a dataset whose objective is a degradation to be minimised.
+
+    ``zones`` is the run's penalty-zone history (needle ellipsoids plus
+    exclusion zones), or None when the source keeps no optimizer state — see
+    ``run_penalty_zones``. Each entry is ``(n_points, member, centers)``: the
+    zones in force once ``n_points`` samples had been collected, as a ``(Z, N)``
+    bool matrix saying which samples each zone contains, plus each zone's
+    centre as the index of its nearest sample. ``zones_at`` picks the entry for
+    a time-slider step.
     """
 
     X: np.ndarray
@@ -360,6 +374,7 @@ class Dataset:
     simplex: bool = True
     bounds: np.ndarray | None = None
     goal: str = "maximize"
+    zones: list | None = None
 
     def __iter__(self):
         """Unpack as the legacy ``(X, Y, labels, title)`` tuple.
@@ -462,6 +477,29 @@ class Dataset:
         keep = [(pos[i], when) for i, when in self.needles
                 if 0 <= i < len(pos) and pos[i] >= 0 and when <= len(rows)]
         return np.asarray(keep, dtype=int).reshape(-1, 2)
+
+    def zones_at(self, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+        """Penalty zones in force once ``rows`` had been collected, re-indexed into it.
+
+        Returns ``(member (Z, len(rows)) bool, centers (Z,) int)`` with each centre
+        an index into ``rows`` (-1 when its nearest sample is not among them), or
+        None when the source records no zones or none existed yet. Like
+        ``needles_within``, a zone appears only from the snapshot that created it:
+        the state shown is the last one recorded at or before ``len(rows)`` points.
+        """
+        if not self.zones:
+            return None
+        state = None
+        for n_points, member, centers in self.zones:
+            if n_points > len(rows):
+                break
+            state = (member, centers)
+        if state is None or not len(state[0]):
+            return None
+        member, centers = state
+        pos = np.full(len(self.Y), -1, dtype=int)
+        pos[rows] = np.arange(len(rows))
+        return member[:, rows], pos[centers]
 
 
 def line_index(iteration: np.ndarray | None, n: int) -> np.ndarray:
@@ -634,6 +672,151 @@ def run_needles(run_dir: Path, snapshot: str, X: np.ndarray,
     return np.asarray(out, dtype=int).reshape(-1, 2)
 
 
+def _zone_regions(d: dict) -> tuple[np.ndarray, list, np.ndarray]:
+    """``(centers (Z, d), M_list, radii (Z,))`` of every penalised region in a delta.
+
+    Needles first, then exclusion zones — the order
+    ``DataHandler._penalty_regions`` uses. An entry of ``M_list`` is None when
+    that region has no ellipsoid and falls back to its sphere radius.
+    """
+    centers, M_list, radii = [], [], []
+    for pts, Ms, has_M, rad in (("needles", "needle_M_stack", "needle_has_M",
+                                 "needle_penalty_radii"),
+                                ("exclusions", "exclusion_M_stack", "exclusion_has_M",
+                                 "exclusion_radii")):
+        c = d.get(pts)
+        if c is None or not len(c):
+            continue
+        c = c.detach().cpu().numpy().astype(float)
+        Mst, hM, r = d.get(Ms), d.get(has_M), d.get(rad)
+        for i in range(len(c)):
+            ok = (Mst is not None and hM is not None and i < len(hM) and bool(hM[i]))
+            M_list.append(Mst[i].detach().cpu().numpy().astype(float) if ok else None)
+            radii.append(float(r[i].reshape(-1)[0]) if r is not None and i < len(r) else 0.0)
+        centers.append(c)
+    if not centers:
+        return np.zeros((0, 0)), [], np.zeros(0)
+    return np.concatenate(centers), M_list, np.asarray(radii)
+
+
+def run_penalty_zones(run_dir: Path, snapshot: str, X: np.ndarray) -> list | None:
+    """The run's penalty-zone history, for ``Dataset.zones``.
+
+    Every snapshot's ``delta.pt`` carries the complete needle + exclusion state
+    (ellipsoid centre, precision M, shared tangent basis B), and that state
+    changes far more often than the needle count: zones are refit and shrunk
+    between declarations, and retro/corrected-needle passes replace the whole
+    list. So each snapshot is read, and an entry is kept whenever its membership
+    differs from the previous one.
+
+    Membership is the optimizer's own test (``DataHandler._inside_region``):
+    ``u^T M u <= 1`` with ``u = B^T (x - c)``, or the sphere radius when a zone
+    has no ellipsoid. ``X`` must be in the run's own column order — the one B
+    was built in — so this runs before ``_reorder_columns``.
+
+    Returns None when there is no snapshot record (the caller then has nothing
+    to draw, the same as a ``.db``/``.csv``).
+    """
+    import torch
+
+    snaps_dir = run_dir / "snapshots"
+    if not snaps_dir.is_dir():
+        return None
+    out: list = []
+    prev = None
+    for snap in sorted(p for p in snaps_dir.iterdir() if p.is_dir()):
+        try:
+            n_points = int(json.loads((snap / "summary.json").read_text())["n_points"])
+            d = torch.load(str(snap / "delta.pt"), map_location="cpu", weights_only=False)
+        except Exception:
+            continue                      # a partial/unreadable snapshot is skipped
+        centers, M_list, radii = _zone_regions(d)
+        B = d.get("needle_B")
+        B = None if B is None else B.detach().cpu().numpy().astype(float)
+        member = np.zeros((len(centers), len(X)), dtype=bool)
+        for z, (c, M) in enumerate(zip(centers, M_list)):
+            diff = X - c
+            if M is not None and B is not None:
+                u = diff @ B
+                member[z] = np.einsum("ni,ij,nj->n", u, M, u) <= 1.0
+            else:
+                member[z] = np.linalg.norm(diff, axis=1) <= radii[z]
+        centers_idx = (np.abs(X[None, :, :] - centers[:, None, :]).max(axis=2).argmin(axis=1)
+                       if len(centers) else np.zeros(0, dtype=int))
+        sig = (member.tobytes(), member.shape, centers_idx.tobytes())
+        if sig != prev:
+            out.append((n_points, member, centers_idx))
+            prev = sig
+        if snap.name == snapshot:
+            break                         # the view is reconstructed only this far
+    return out
+
+
+# Uniform simplex sample behind the % space penalised panel: the same size and
+# seed as optimize/evaluate.py's PENALTY_COVERAGE_SAMPLES estimate, so a run that
+# also wrote metrics_over_time.csv reads the same numbers here (~0.2 pp MC error).
+PENALTY_COVERAGE_SAMPLES = 50_000
+_COVERAGE_CACHE: dict[tuple, tuple | None] = {}
+
+
+def run_penalty_coverage(run_dir: Path, snapshot: str | None = None) -> tuple | None:
+    """``(n_points, pct_any, pct_needle)`` arrays, one entry per snapshot.
+
+    The percentage of the simplex inside any penalty zone, and inside needle
+    zones alone (the rest is exclusion zones), at each snapshot. Runs do not
+    store the percentage itself (only ``evaluate.py`` reruns write it, to
+    ``metrics_over_time.csv``), but every ``delta.pt`` stores the complete zone
+    state, so it is re-estimated here the way ``DataHandler.penalty_coverage``
+    does: the fraction of a fixed uniform Dirichlet sample that falls inside a
+    zone. Overlapping zones count once. Returns None when there are no snapshots.
+    """
+    import torch
+
+    run_dir = Path(run_dir)
+    snaps_dir = run_dir / "snapshots"
+    if not snaps_dir.is_dir():
+        return None
+    snapshot = snapshot or _default_snapshot(run_dir)
+    U = None
+    n_pts, pct_any, pct_needle = [], [], []
+    for snap in sorted(p for p in snaps_dir.iterdir() if p.is_dir()):
+        try:
+            n_points = int(json.loads((snap / "summary.json").read_text())["n_points"])
+            d = torch.load(str(snap / "delta.pt"), map_location="cpu", weights_only=False)
+        except Exception:
+            continue                      # a partial/unreadable snapshot is skipped
+        centers, M_list, radii = _zone_regions(d)
+        needles = d.get("needles")
+        n_needle = 0 if needles is None else len(needles)
+        B = d.get("needle_B")
+        B = None if B is None else B.detach().cpu().numpy().astype(float)
+        in_any = in_needle = None
+        if len(centers):
+            if U is None or U.shape[1] != centers.shape[1]:
+                U = np.random.default_rng(0).dirichlet(
+                    np.ones(centers.shape[1]), size=PENALTY_COVERAGE_SAMPLES)
+            in_any = np.zeros(len(U), dtype=bool)
+            in_needle = np.zeros(len(U), dtype=bool)
+            for z, (c, M) in enumerate(zip(centers, M_list)):
+                diff = U - c
+                if M is not None and B is not None:
+                    u = diff @ B
+                    inside = np.einsum("ni,ij,nj->n", u, M, u) <= 1.0
+                else:
+                    inside = np.linalg.norm(diff, axis=1) <= radii[z]
+                in_any |= inside
+                if z < n_needle:
+                    in_needle |= inside
+        n_pts.append(n_points)
+        pct_any.append(0.0 if in_any is None else 100.0 * in_any.mean())
+        pct_needle.append(0.0 if in_needle is None else 100.0 * in_needle.mean())
+        if snap.name == snapshot:
+            break
+    if not n_pts:
+        return None
+    return np.asarray(n_pts), np.asarray(pct_any), np.asarray(pct_needle)
+
+
 def _corner_config(
     run_dir: Path,
     corner_dims_override: str | None,
@@ -723,6 +906,7 @@ def load_run_source(
     # Matched before the columns are reordered for the diagram: needles.json
     # records a composition in the run's own dimension order.
     needles = run_needles(run_dir, snapshot, X, Y)
+    zones = run_penalty_zones(run_dir, snapshot, X)   # also needs the run's own order
     X = _reorder_columns(X, run_dims, corner_dims)
     if len(labels) != X.shape[1]:      # d>=5: _corner_config's triple-oriented default
         dims = corner_dims or run_dims or list(range(X.shape[1]))
@@ -734,6 +918,7 @@ def load_run_source(
         lines=line_index(None, len(X)),
         activations=run_activations(run_dir, snapshot, len(X)),
         needles=needles,
+        zones=zones,
     )
 
 
@@ -1919,12 +2104,16 @@ def conet_png_bytes(ds: Dataset, *, key: tuple, rows: np.ndarray | None = None) 
 
     frame = dict(fit["frame"])
     frame["E_raw"] = fit["E_raw"][sel]
+    # Penalty zones in force at this step, drawn from which samples each contains
+    # (exact) rather than by projecting the ellipsoids, which this map cannot do.
+    zones = ds.zones_at(sel)
     M, F = p10.build_conet(
         fit["comp"][sel], fit["names"], fit["resp"][sel], fit["iters"][sel],
-        frame=frame, limits=fit["limits"],
+        frame=frame, limits=fit["limits"], zones=zones,
     )
     title = f"{ds.title} · CoNet (d={ds.d}"
-    title += ")" if rows is None else f", {len(sel)}/{total} samples)"
+    title += "" if rows is None else f", {len(sel)}/{total} samples"
+    title += ")" if zones is None else f", {len(zones[0])} penalty zones)"
 
     buf = io.BytesIO()
     p10.save_png(M, F, fit["bounds"], title, buf)
@@ -1966,15 +2155,28 @@ def conet_png_src(ds: Dataset, *, key: tuple, rows: np.ndarray | None = None) ->
 # keeps it in its own cache afterwards. Inlining them as base64 data URIs meant
 # pushing ~2MB of JSON through the callback on every single step.
 
-CACHE_DIR = Path(os.environ.get("PLOT_RUN_CACHE_DIR")
-                 or Path(tempfile.gettempdir()) / "zombi_plot_run_cache")
+#
+# The cache lives in the per-user cache directory, NOT the system temp dir:
+# Windows Storage Sense / Disk Cleanup empties %TEMP% of old files on its own
+# schedule, which silently threw every rendered step away between sessions.
+
+
+def _default_cache_dir() -> Path:
+    env = os.environ.get("PLOT_RUN_CACHE_DIR")
+    if env:
+        return Path(env)
+    base = os.environ.get("LOCALAPPDATA" if os.name == "nt" else "XDG_CACHE_HOME")
+    return (Path(base) if base else Path.home() / ".cache") / "zombi-hop" / "plot_run_cache"
+
+
+CACHE_DIR = _default_cache_dir()
 CACHE_MAX_BYTES = 4 * 1024 ** 3   # least-recently-used signatures pruned past this
 # Part of every on-disk name. A signature covers the data and the render knobs,
 # but not the renderers themselves, so a change to what a panel *draws* would
 # otherwise be masked by steps cached before it. Bump this whenever that happens
 # (adding the needle rules did): old steps are then simply never looked up, and
 # age out with the prune, instead of being served stale.
-STEP_FORMAT = 3
+STEP_FORMAT = 5
 PRECOMPUTE = True                 # --no-precompute renders steps on demand instead
 STEP_URL_PREFIX = "/plot-run-step"
 
@@ -2463,12 +2665,82 @@ def build_convergence_figure(
         title=dict(text=f"Convergence  ({len(sel)}/{n_total} pts{needle_note})",
                    x=0.5, y=0.97,
                    yanchor="top", font=dict(size=13)),
-        showlegend=True,
-        legend=dict(x=0.99, y=0.02, xanchor="right", yanchor="bottom",
-                    font=dict(size=10), bgcolor="rgba(255,255,255,0.7)"),
+        showlegend=False,
         margin=dict(l=60, r=40, t=40, b=45),
         height=height,
         plot_bgcolor="white", paper_bgcolor="white",
+    )
+    return fig
+
+
+def build_penalized_space_figure(
+    ds: Dataset,
+    coverage: tuple | None,
+    *,
+    rows: np.ndarray | None = None,
+    height: int = 300,
+):
+    """Plotly % space penalised panel in the style of ``plot_metrics.plot_penalized_space``.
+
+    Needle zones stacked under the extra volume that only exclusion zones cover, so
+    the top edge is the total, against the *sample index* at each snapshot. That is
+    the convergence panel's x axis, with the same range and margins, so the two
+    line up when stacked. ``rows`` (the time slider) keeps the snapshots recorded by
+    then, inside the same fixed frame. ``coverage`` is ``run_penalty_coverage``'s
+    result; None draws a note that the source records no penalty zones.
+    """
+    import plotly.graph_objects as go
+
+    n_total = len(ds.Y)
+    fig = go.Figure()
+    layout = dict(
+        xaxis=dict(title="Sample index", range=[-0.02 * n_total, n_total * 1.02],
+                   showgrid=True, gridcolor="#eee", zeroline=False,
+                   linecolor="black", showline=True, mirror=False),
+        yaxis=dict(title="% of simplex penalised", showgrid=True, gridcolor="#eee",
+                   zeroline=False, linecolor="black", showline=True),
+        margin=dict(l=60, r=40, t=40, b=45),
+        height=height,
+        plot_bgcolor="white", paper_bgcolor="white",
+    )
+    if coverage is None:
+        fig.update_layout(**layout, title=dict(
+            text="% space penalised: no penalty zones recorded for this source "
+                 "(run directories only)", x=0.5, y=0.97, yanchor="top",
+            font=dict(size=13)))
+        return fig
+
+    n_pts, total, needle = coverage
+    n_shown = n_total if rows is None else len(rows)
+    keep = n_pts <= n_shown
+    x, tot, ndl = n_pts[keep], total[keep], needle[keep]
+    # Needle rules at the DECLARATION, not at the needle's own sample as on the
+    # convergence plot: declaration is when its zone starts to count here.
+    if ds.needles is not None:
+        for when in sorted({int(w) for _, w in ds.needles if w <= n_shown}):
+            fig.add_vline(x=float(when), line=dict(color="crimson", width=1, dash="dash"),
+                          opacity=0.45, layer="below")
+    common = dict(mode="lines", stackgroup="pen", line=dict(shape="hv", width=0))
+    fig.add_trace(go.Scatter(
+        x=x, y=ndl, name="needle zones", fillcolor="rgba(70,130,180,0.75)", **common,
+        hovertemplate="sample %{x}<br>needle zones %{y:.2f}%<extra></extra>"))
+    fig.add_trace(go.Scatter(
+        x=x, y=tot - ndl, name="exclusion zones (capped activations)",
+        fillcolor="rgba(255,140,0,0.75)", **common,
+        hovertemplate="sample %{x}<br>exclusion-only %{y:.2f}%<extra></extra>"))
+    fig.add_trace(go.Scatter(
+        x=x, y=tot, mode="lines", name="total", line=dict(color="#333333", width=1.2,
+                                                          shape="hv"),
+        hovertemplate="sample %{x}<br>total %{y:.2f}%<extra></extra>"))
+    final = f", final {tot[-1]:.1f}%" if len(tot) else ""
+    fig.update_layout(**layout)
+    fig.update_layout(
+        # Pinned to the FULL run, so the frame does not rescale under the slider.
+        yaxis_range=[0, max(1.0, float(total.max()) * 1.1)],
+        title=dict(text=f"% space penalised  ({len(x)}/{len(n_pts)} snapshots{final})",
+                   x=0.5, y=0.97, yanchor="top", font=dict(size=13)),
+        legend=dict(x=0.01, y=0.98, xanchor="left", yanchor="top", font=dict(size=10),
+                    bgcolor="rgba(255,255,255,0.7)"),
     )
     return fig
 
@@ -2566,7 +2838,10 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
     app = Dash(__name__, update_title=None)
     app.title = "ZoMBI-Hop Run Plot"
 
-    app.layout = html.Div(style={"display": "flex", "fontFamily": "system-ui, sans-serif"}, children=[
+    # Pinned to the viewport (position: fixed), so the page never scrolls and the
+    # main column below can split exactly the window height between its panels.
+    app.layout = html.Div(style={"display": "flex", "fontFamily": "system-ui, sans-serif",
+                                 "position": "fixed", "inset": 0}, children=[
         html.Div(style=panel_style, children=[
             html.H3("ZoMBI-Hop ternary", style={"marginTop": 0}),
 
@@ -2684,6 +2959,14 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
                 value=[],
                 style={"marginTop": "12px"},
             ),
+            # Below the window-high column, so it is reached by scrolling.
+            dcc.Checklist(
+                id="penalized-on",
+                options=[{"label": " Show % space penalised (scroll down)",
+                          "value": "on"}],
+                value=[],
+                style={"marginTop": "6px"},
+            ),
             html.Hr(style={"marginTop": "12px", "border": "none",
                            "borderTop": "1px solid #e3e3e3"}),
 
@@ -2772,20 +3055,43 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         # CoNet <img> (plot_10d draws with matplotlib, so it arrives as a PNG,
         # streamed from the step cache by URL); exactly one of the two is ever
         # visible. The convergence panel sits below whichever is showing.
-        html.Div(style={"flex": 1, "padding": "10px", "minWidth": 0}, children=[
-            dcc.Loading(children=[
-                html.Div(id="simplex-container", children=[
-                    dcc.Graph(id="ternary-graph", style={"height": "90vh"}),
+        #
+        # The column is exactly the window height: the main diagram takes whatever
+        # the convergence panel leaves (the CoNet PNG letterboxed to fit), so both
+        # are always on screen together at any zoom level.
+        #
+        # No dcc.Loading here on purpose: it blanked both panels behind a spinner
+        # on every slider step. Without it the previous step stays up until the
+        # next one is ready, so consecutive frames swap with no gap between them.
+        #
+        # The column scrolls, but those panels live in a wrapper exactly one
+        # column-height tall, so they lay out as before; the % space penalised
+        # panel follows the wrapper and only appears by scrolling down.
+        html.Div(id="plot-column", style={"flex": 1, "padding": "10px", "minWidth": 0,
+                        "boxSizing": "border-box", "display": "flex",
+                        "flexDirection": "column", "gap": "6px",
+                        "overflowY": "auto"}, children=[
+            html.Div(style={"flex": "0 0 100%", "minHeight": 0, "display": "flex",
+                            "flexDirection": "column", "gap": "6px"}, children=[
+                html.Div(id="simplex-container", style=MAIN_PANEL_STYLE, children=[
+                    dcc.Graph(id="ternary-graph", responsive=True,
+                              style={"height": "100%"}),
                 ]),
                 html.Div(id="conet-container", style={"display": "none"}, children=[
                     html.Img(id="conet-image",
-                             style={"width": "100%", "height": "auto",
-                                    "display": "block"}),
+                             style={"width": "100%", "height": "100%",
+                                    "objectFit": "contain", "display": "block"}),
                 ]),
                 html.Div(id="convergence-container", style={"display": "none"}, children=[
-                    dcc.Graph(id="convergence-graph", style={"height": "300px"}),
+                    dcc.Graph(id="convergence-graph", responsive=True,
+                              style={"height": "100%"}),
                 ]),
             ]),
+            html.Div(id="penalized-container", style={"display": "none"}, children=[
+                dcc.Graph(id="penalized-graph", responsive=True,
+                          style={"height": "100%"}),
+            ]),
+            dcc.Store(id="conet-fit-sink"),
         ]),
     ])
 
@@ -2905,6 +3211,41 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         Input("conet-prefetch", "data"),
     )
 
+    # Size the convergence panel to the CoNet image's DRAWN width. The <img> box
+    # fills its panel and object-fit letterboxes the PNG inside it, so the drawn
+    # width is min(box width, box height x aspect). Published as --conet-w on the
+    # plot column, which CONVERGENCE_PANEL_STYLE reads; cleared while the CoNet is
+    # hidden so the simplex diagrams keep a full-width convergence plot. A
+    # ResizeObserver keeps it right across window resizes and zoom.
+    app.clientside_callback(
+        """
+        function (src, style) {
+            if (!window._plotRunConetFit) {
+                const img = document.getElementById('conet-image');
+                if (!img) { return window.dash_clientside.no_update; }
+                window._plotRunConetFit = function () {
+                    const col = document.getElementById('plot-column');
+                    if (!col) { return; }
+                    if (img.offsetParent === null || !img.naturalWidth) {
+                        col.style.removeProperty('--conet-w');
+                        return;
+                    }
+                    const w = Math.min(img.clientWidth,
+                        img.clientHeight * img.naturalWidth / img.naturalHeight);
+                    col.style.setProperty('--conet-w', w + 'px');
+                };
+                new ResizeObserver(window._plotRunConetFit).observe(img);
+                img.addEventListener('load', window._plotRunConetFit);
+            }
+            window._plotRunConetFit();
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("conet-fit-sink", "data"),
+        Input("conet-image", "src"),
+        Input("conet-container", "style"),
+    )
+
     # Show/hide the time-slider controls with its checkbox.
     @app.callback(
         Output("timeline-controls", "style"),
@@ -3011,10 +3352,60 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
     def _render(*args):
         return render_state(*args, no_update=no_update)
 
+    # The % space penalised panel. Its own callback rather than more render_state
+    # outputs: it is one cheap figure off a cached estimate, so it needs none of
+    # the step cache, and toggling it never re-renders the panels above.
+    @app.callback(
+        Output("penalized-graph", "figure"),
+        Output("penalized-container", "style"),
+        Input("penalized-on", "value"),
+        Input("source-type", "value"),
+        Input("run-dropdown", "value"),
+        Input("db-dropdown", "value"),
+        Input("db-value-dropdown", "value"),
+        Input("public-dropdown", "value"),
+        Input("timeline-on", "value"),
+        Input("timeline", "value"),
+    )
+    def _render_penalized(penalized_on, source_type, run_name, db_name, db_value,
+                          public_name, timeline_on, timeline):
+        if not penalized_on:
+            return no_update, {"display": "none"}
+        try:
+            key = _source_key(source_type, run_name, db_name, db_value, public_name)
+            full = load_source(key)
+        except Exception:
+            return no_update, {"display": "none"}
+        coverage = None
+        if key[0] == "run":
+            if key not in _COVERAGE_CACHE:
+                _COVERAGE_CACHE[key] = run_penalty_coverage(Path(key[1]))
+            coverage = _COVERAGE_CACHE[key]
+        rows = (full.prefix_rows(int(timeline)) if timeline_on and timeline is not None
+                else None)
+        return (build_penalized_space_figure(full, coverage, rows=rows),
+                PENALIZED_PANEL_STYLE)
+
     return app
 
 
-_SIMPLEX_DIAGRAMS = {3: "ternary triangle (d=3, simplex)",
+# Visible-panel styles for the main column (a viewport-tall flex column): the
+# diagram grows into whatever height the fixed-share convergence panel leaves.
+MAIN_PANEL_STYLE = {"display": "block", "flex": "1 1 0", "minHeight": 0}
+# Its width tracks the CoNet image actually drawn above it (--conet-w, set by a
+# clientside callback): the PNG is letterboxed, so 100% would overhang it.
+CONVERGENCE_PANEL_STYLE = {"display": "block", "flex": "0 0 28%", "minHeight": "180px",
+                           "width": "var(--conet-w, 100%)", "maxWidth": "100%",
+                           "alignSelf": "center"}
+# Below the window-high wrapper (so reached by scrolling), at the convergence
+# panel's size: 28% of the column's content height, the same --conet-w width.
+PENALIZED_PANEL_STYLE = {"display": "block", "flex": "0 0 auto",
+                         "height": "calc(0.28 * (100vh - 20px))", "minHeight": "180px",
+                         "width": "var(--conet-w, 100%)", "maxWidth": "100%",
+                         "alignSelf": "center"}
+
+
+_SIMPLEX_DIAGRAMS = {3:"ternary triangle (d=3, simplex)",
                      4: "tetrahedron (d=4, simplex)"}
 _BOX_DIAGRAMS = {2: "axes heatmap (d=2, non-simplex)",
                  3: "3-D box scatter (d=3, non-simplex)",
@@ -3051,7 +3442,7 @@ def render_state(source_type, run_name, db_name, db_value, background, show_poin
     """
     precompute = PRECOMPUTE if precompute is None else bool(precompute)
     hide = {"display": "none"}
-    show_block = {"display": "block"}
+    show_block = MAIN_PANEL_STYLE
     try:
         if source_type == "run" and not run_name:
             return (no_update,) * 7 + ("No run selected.", no_update)
@@ -3137,10 +3528,13 @@ def render_state(source_type, run_name, db_name, db_value, background, show_poin
         conv_fig = no_update
         conv_style = hide
         if convergence_on:
-            conv_style = show_block
+            conv_style = CONVERGENCE_PANEL_STYLE
             # Its own signature: the convergence panel depends on the source and
             # on whether the line marks are drawn, not on any surrogate knob.
-            conv_sig = ("convergence", key, bool(timeline_on))
+            # The trailing int is this panel's own format version (bumped when
+            # the legend was dropped): it re-renders only the cheap convergence
+            # steps, where bumping STEP_FORMAT would also discard every CoNet PNG.
+            conv_sig = ("convergence", key, bool(timeline_on), 2)
             conv_render = convergence_step_renderer(
                 full, show_line_marks=bool(timeline_on))
             tracks.append((conv_sig, conv_render, FIGURE_STEP))
@@ -3176,6 +3570,9 @@ def render_state(source_type, run_name, db_name, db_value, background, show_poin
             act_note += "\nneedles: none recorded"
         else:
             act_note += f"\nneedles: {len(full.needles)} (marked on the convergence plot)"
+        if full.zones:
+            act_note += (f"\npenalty zones: {len(full.zones[-1][1])} at the end"
+                         + (" (shaded on the CoNet)" if conet else ""))
         # The background knobs do nothing on a CoNet, and nothing on the d=4
         # scatter-plot matrix either (which deliberately fits no surrogate), so
         # say 'n/a' rather than naming a mode that is not being applied.
