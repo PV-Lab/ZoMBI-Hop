@@ -198,11 +198,6 @@ def test_no_zoom_arm_pins_bounds_to_the_global_box():
         out = DataHandler.determine_new_bounds(_Stub())
         assert torch.allclose(out, _Stub._full_bounds_ref), \
             "the no-zoom arm must hand back the global box, not a contracted one"
-        # The failure-retry path calls it with add_to_history=False; that signature
-        # has to keep working or A2 dies partway through a run.
-        assert torch.allclose(
-            DataHandler.determine_new_bounds(_Stub(), add_to_history=False),
-            _Stub._full_bounds_ref)
     assert DataHandler.determine_new_bounds is original, "patch leaked"
 
 

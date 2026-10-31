@@ -83,8 +83,7 @@ def _bounds_jaccard_simplex(
 def _bounds_jaccard_box(bounds_a: torch.Tensor, bounds_b: torch.Tensor) -> float:
     """Exact volume Jaccard of two (2, d) axis-aligned boxes.
 
-    Axes where both boxes are zero-width are projected out, as in
-    ``DataHandler._jaccard_box``.
+    Axes where both boxes are zero-width are projected out.
     """
     a = bounds_a.to(torch.float64)
     b = bounds_b.to(torch.float64)

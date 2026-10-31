@@ -130,7 +130,7 @@ def patch_no_zoom_bounds() -> Iterator[None]:
 
     ``max_zooms=1`` already stops the zoom LOOP advancing, but it is not the only
     caller: ``ZoMBIHop._handle_failure_retry`` case 2 calls
-    ``determine_new_bounds(add_to_history=False)`` directly, and the failure path is
+    ``determine_new_bounds()`` directly, and the failure path is
     common (it fires whenever acquisition ascent lands in a penalised region).
     Without this, the "no zooming" arm would still spend much of an activation
     inside a contracted box — the very thing the arm is supposed to remove.
@@ -143,7 +143,7 @@ def patch_no_zoom_bounds() -> Iterator[None]:
 
     original = DataHandler.determine_new_bounds
 
-    def never_zoom(self, add_to_history: bool = True) -> torch.Tensor:
+    def never_zoom(self) -> torch.Tensor:
         ref = getattr(self, "_full_bounds_ref", None)
         if ref is None:
             ref = self.bounds

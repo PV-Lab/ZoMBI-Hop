@@ -106,8 +106,6 @@ class ZoMBIHop:
                  needle_shrink_factor: float = _HP["needle_shrink_factor"],
                  needle_stop_noise_multiplier: float = _HP["needle_stop_noise_multiplier"],
                  zoom_jaccard_threshold: float = _HP["zoom_jaccard_threshold"],
-                 jaccard_window: int = _HP["jaccard_window"],
-                 jaccard_threshold: float = _HP["jaccard_threshold"],
                  min_zoom_for_needle: int = _HP["min_zoom_for_needle"],
                  min_iters_per_zoom: int = _HP["min_iters_per_zoom"],
                  needle_min_repeats: int = _HP["needle_min_repeats"],
@@ -259,8 +257,6 @@ class ZoMBIHop:
             paring_spatial_halfnoise=paring_spatial_halfnoise,
             paring_y_noise_multiplier=paring_y_noise_multiplier,
             input_noise=input_noise,
-            jaccard_window=jaccard_window,
-            jaccard_threshold=jaccard_threshold,
             verbose=verbose,
         )
         # config.json records ZoMBIHop's own hyperparameters too, so a resume (and a
@@ -472,7 +468,7 @@ class ZoMBIHop:
         Case 1 — first failure: recompute all ellipsoids using clean local GP
           (gp_handler.recompute_all_ellipsoids).
         Case 2 — subsequent failure after objective was called: recompute zoom
-          bounds with Jaccard-aware determine_new_bounds(add_to_history=False).
+          bounds with determine_new_bounds().
         Case 3 — subsequent failure with no new data: shrink radii; terminate
           when all axes fall below needle_stop_noise_multiplier × input_noise.
         """
@@ -515,8 +511,8 @@ class ZoMBIHop:
             return False, True
 
         elif data_added_since_last_failure:
-            self._log("  [failure] subsequent failure with new data — recomputing zoom bounds (Jaccard-aware) ...")
-            new_bounds = dh.determine_new_bounds(add_to_history=False)
+            self._log("  [failure] subsequent failure with new data — recomputing zoom bounds ...")
+            new_bounds = dh.determine_new_bounds()
             self._log(f"  [failure] new bounds: [{new_bounds[0].cpu().numpy()}] – [{new_bounds[1].cpu().numpy()}]")
             dh.current_zoom_bounds = new_bounds.clone()
             dh.bounds = new_bounds.clone()
@@ -1882,12 +1878,11 @@ class ZoMBIHop:
                 # No needle, no failure: advance to next zoom level.
                 if zoom < dh.max_zooms - 1:
                     _t0 = time.time()
-                    new_bounds = dh.determine_new_bounds()  # Jaccard-aware sliding window
+                    new_bounds = dh.determine_new_bounds()
                     self._log(f"  [time] determine_new_bounds: {time.time()-_t0:.2f}s")
 
                     # MC Jaccard guard: the next zoom box still heavily overlaps one
-                    # this activation already searched (determine_new_bounds may have
-                    # exhausted all its windows), so there is NO NOVEL WINDOW left.
+                    # this activation already searched, so there is NO NOVEL WINDOW left.
                     # Zooming into it again just re-measures the same region, and it
                     # was previously a licence to FORCE-declare a needle there — which
                     # manufactured a needle out of "I have nowhere else to go", the
