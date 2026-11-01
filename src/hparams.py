@@ -244,16 +244,6 @@ _REGISTRY: tuple[HParam, ...] = (
            "activation ends and its region is penalised.",
            (("zombi", "zoom_jaccard_threshold"),),
            tune=(0.5, 0.95, "linear")),
-    HParam("jaccard_window", "int", _pos_int, _ZOOM, "Jaccard window",
-           "How many recent zoom boxes a candidate box is compared against when "
-           "sliding the top-M window.",
-           (("dh", "jaccard_window"),),
-           tune=(1, 5, "int")),
-    HParam("jaccard_threshold", "float", _closed_unit, _ZOOM, "Jaccard slide thresh",
-           "A candidate zoom box overlapping a recent one by more than this is "
-           "rejected and the top-M window slides to the next-best points.",
-           (("dh", "jaccard_threshold"),),
-           tune=(0.5, 0.99, "linear")),
     HParam("max_gp_points", "int", _pos_int, _ZOOM, "Max GP points",
            "Cap on points passed to the GP fit (compute budget).",
            (("dh", "max_gp_points"),),
@@ -381,8 +371,6 @@ LEGACY_EFFECTIVE: dict[str, Any] = {
     # (the values older records carry were inert at the time).
     "input_noise_threshold_mult": 3.0,
     "zoom_jaccard_threshold": 0.75,
-    "jaccard_window": 3,
-    "jaccard_threshold": 0.9,
     "ellipsoid_drop_fraction": 0.25,
     "min_zoom_for_needle": 2,
     "min_iters_per_zoom": 3,

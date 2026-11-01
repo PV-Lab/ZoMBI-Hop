@@ -51,7 +51,7 @@ class DataHandler:
     input_noise_threshold_mult, output_noise_threshold_mult,
     n_consecutive_converged, max_gp_points, repulsion_lambda, acquisition_type,
     ucb_beta, nat_grad_step, nat_grad_max_steps, paring_spatial_halfnoise,
-    paring_y_noise_multiplier, input_noise, jaccard_window, jaccard_threshold :
+    paring_y_noise_multiplier, input_noise :
         hyperparameters; see src/hparams.py. Defaults are the shipped values.
     directory : str, optional
         Base directory for snapshots. If None, no saving occurs.
@@ -97,9 +97,6 @@ class DataHandler:
         paring_spatial_halfnoise: float = _HP["paring_spatial_halfnoise"],
         paring_y_noise_multiplier: float = _HP["paring_y_noise_multiplier"],
         input_noise: float = _HP["input_noise"],
-        # --- Jaccard sliding-window bounds ---
-        jaccard_window: int = _HP["jaccard_window"],
-        jaccard_threshold: float = _HP["jaccard_threshold"],
         # --- Logging ---
         verbose: bool = False,
     ):
@@ -123,10 +120,6 @@ class DataHandler:
         self.paring_spatial_halfnoise = float(paring_spatial_halfnoise)
         self.paring_y_noise_multiplier = float(paring_y_noise_multiplier)
         self.input_noise = float(input_noise)
-
-        # Jaccard sliding-window
-        self.jaccard_window = int(jaccard_window)
-        self.jaccard_threshold = float(jaccard_threshold)
 
         self.verbose = verbose
 
@@ -263,12 +256,8 @@ class DataHandler:
         # Logging
         self.log_ei_history: List[float] = []
 
-        # Jaccard sliding-window bounds history
-        self.bounds_history: List[torch.Tensor] = []
-
         # DP delta tracking (reset when load_state is called)
         self._last_snap_n_points: int = 0
-        self._last_snap_n_bounds_history: int = 0
 
     def save_init(
         self,
@@ -428,16 +417,6 @@ class DataHandler:
         Y_new = (self.Y_all[n_prev:].to(device=self.device, dtype=self.dtype)
                  if n_curr > n_prev else _empty_y)
 
-        # Bounds-history delta
-        n_bh_curr = len(self.bounds_history)
-        n_bh_prev = self._last_snap_n_bounds_history
-        bh_new = self.bounds_history[n_bh_prev:]
-        bounds_history_new = (
-            torch.stack([b.to(self.device, self.dtype) for b in bh_new])
-            if bh_new
-            else torch.zeros(0, 2, _d, device=self.device, dtype=self.dtype)
-        )
-
         _t0 = time.time()
         torch.save({
             'delta_version': 1,
@@ -469,9 +448,6 @@ class DataHandler:
             'exclusion_M_stack': excl_M_stack,
             'exclusion_has_M': excl_has_M,
             'penalty_mask': self._penalty_mask,
-            # Bounds-history delta
-            'bounds_history_new': bounds_history_new,
-            'n_prev_bounds_history': n_bh_prev,
         }, snapshot_dir / 'delta.pt')
 
         if self.verbose:
@@ -479,7 +455,6 @@ class DataHandler:
 
         # Advance delta tracking
         self._last_snap_n_points = n_curr
-        self._last_snap_n_bounds_history = n_bh_curr
 
         # Needle results as JSON
         import math as _math
@@ -658,7 +633,6 @@ class DataHandler:
         X_parts: List[torch.Tensor] = []
         X_exp_parts: List[torch.Tensor] = []
         Y_parts: List[torch.Tensor] = []
-        bh_parts: List[torch.Tensor] = []
         last_delta: Optional[dict] = None
 
         for name in all_snap_names:
@@ -676,11 +650,6 @@ class DataHandler:
                 y_new = d.get('Y_new')
                 if isinstance(y_new, torch.Tensor):
                     Y_parts.append(y_new.to(self.device, self.dtype))
-
-            bh_new = d.get('bounds_history_new')
-            if isinstance(bh_new, torch.Tensor) and bh_new.shape[0] > 0:
-                for i in range(bh_new.shape[0]):
-                    bh_parts.append(bh_new[i].to(self.device, self.dtype))
 
             last_delta = d
             if name == snapshot_name:
@@ -703,8 +672,6 @@ class DataHandler:
             self.X_all_expected = torch.zeros(0, _d, device=self.device, dtype=self.dtype)
             self.Y_all = torch.zeros(0, 1, device=self.device, dtype=self.dtype)
 
-        self.bounds_history = bh_parts
-
         # Restore X_init from first delta's n_init_points marker
         n_init = last_delta.get('n_init_points', 0)
         if n_init > 0 and self.X_all_actual.shape[0] >= n_init:
@@ -720,7 +687,6 @@ class DataHandler:
 
         # Update delta tracking for any future snapshots
         self._last_snap_n_points = self.X_all_actual.shape[0] if self.X_all_actual is not None else 0
-        self._last_snap_n_bounds_history = len(self.bounds_history)
 
         # Restore snapshot counter
         existing = sorted(snap_dir.iterdir())
@@ -910,13 +876,6 @@ class DataHandler:
                                 else torch.empty(0, 1, device=self.device, dtype=self.dtype))
         self.exclusion_M_list = self._unstack_optional_M(
             tensors, 'exclusion_M_stack', 'exclusion_has_M')
-
-        # Restore bounds_history (absent in old checkpoints → empty)
-        bhs = tensors.get('bounds_history_stack', None)
-        if bhs is not None and bhs.shape[0] > 0:
-            self.bounds_history = [bhs[i].to(device=self.device, dtype=self.dtype) for i in range(bhs.shape[0])]
-        else:
-            self.bounds_history = []
 
     def _load_needles_json(self, path: Path):
         """Load needle results from a JSON file (handles both old and new key names)."""
@@ -1671,29 +1630,6 @@ class DataHandler:
         global_idx = unpenalized_indices[max_idx]
         return self.X_all_actual[global_idx], self.Y_all[global_idx], global_idx.item()
 
-    @staticmethod
-    def _jaccard_box(a: torch.Tensor, b: torch.Tensor) -> float:
-        """Volume-Jaccard of two (2, d) axis-aligned boxes.
-
-        Dimensions where *both* boxes are zero-width are projected out (factor 1).
-        """
-        a_np = a.cpu().float().numpy()
-        b_np = b.cpu().float().numpy()
-        w_a = a_np[1] - a_np[0]
-        w_b = b_np[1] - b_np[0]
-        both_zero = (w_a < 1e-12) & (w_b < 1e-12)
-        active = ~both_zero
-        if not active.any():
-            return 1.0
-        lo_i = np.maximum(a_np[0, active], b_np[0, active])
-        hi_i = np.minimum(a_np[1, active], b_np[1, active])
-        inter_w = np.maximum(0.0, hi_i - lo_i)
-        vol_inter = float(np.prod(inter_w))
-        vol_a = float(np.prod(np.maximum(w_a[active], 1e-30)))
-        vol_b = float(np.prod(np.maximum(w_b[active], 1e-30)))
-        vol_union = vol_a + vol_b - vol_inter
-        return 0.0 if vol_union < 1e-30 else vol_inter / vol_union
-
     def min_box_width(self) -> float:
         """Smallest per-axis zoom-box width the input noise makes meaningful.
 
@@ -1755,21 +1691,16 @@ class DataHandler:
             mask[:self.activation_start_idx] = False
         return mask
 
-    def determine_new_bounds(self, add_to_history: bool = True) -> torch.Tensor:
-        """Compute new bounds via a Jaccard-aware sliding window over unpenalized points.
+    def determine_new_bounds(self) -> torch.Tensor:
+        """Next zoom box: the AABB of the top_m_points unpenalized points.
 
         Only the current activation's points are candidates
         (``current_activation_mask``): taking the top points of the whole run let
         one high, never-penalised point from an early activation pull every later
         activation's zoom back to the same place.
 
-        Slides a window of top_m_points along the Y-sorted unpenalized set.  For
-        each candidate AABB, widens any axis below the input-noise floor
-        (:meth:`_apply_min_box_width`) and computes the max Jaccard overlap against
-        the last jaccard_window entries in bounds_history.  Returns the first window
-        whose max Jaccard ≤ jaccard_threshold; if none qualifies, returns the least-
-        similar window found.  Appends to bounds_history only when
-        add_to_history=True.
+        The box is widened on any axis below the input-noise floor
+        (:meth:`_apply_min_box_width`).
         """
         mask = self._penalty_mask & self.current_activation_mask()
         if not mask.any():
@@ -1777,47 +1708,13 @@ class DataHandler:
 
         Y_masked = self.Y_all[mask].reshape(-1)
         X_masked = self.X_all_actual[mask]
-        n = Y_masked.numel()
-        k = min(self.top_m_points, n)
+        k = min(self.top_m_points, Y_masked.numel())
         if k == 0:
             return self.bounds.clone()
 
-        order = torch.argsort(Y_masked, descending=True)
-        X_sorted = X_masked[order]
-
-        recent = self.bounds_history[-self.jaccard_window:]
-
-        best_bounds: Optional[torch.Tensor] = None
-        best_max_jac = float('inf')
-
-        max_start = max(n - k, 0)
-        for start in range(max_start + 1):
-            window = X_sorted[start:start + k]
-            cand = torch.stack([window.min(dim=0).values, window.max(dim=0).values], dim=0)
-            # Floor the box at the input-noise resolution BEFORE the novelty test, so
-            # the Jaccard comparison sees the box the optimiser will actually search.
-            cand = self._apply_min_box_width(cand)
-            max_jac = 0.0
-            for prev in recent:
-                jac = self._jaccard_box(cand, prev)
-                if jac > max_jac:
-                    max_jac = jac
-            if max_jac <= self.jaccard_threshold:
-                if add_to_history:
-                    self.bounds_history.append(cand.clone())
-                    if len(self.bounds_history) > self.jaccard_window:
-                        self.bounds_history.pop(0)
-                return cand
-            if max_jac < best_max_jac:
-                best_max_jac = max_jac
-                best_bounds = cand.clone()
-
-        result = best_bounds if best_bounds is not None else self.bounds.clone()
-        if add_to_history:
-            self.bounds_history.append(result.clone())
-            if len(self.bounds_history) > self.jaccard_window:
-                self.bounds_history.pop(0)
-        return result
+        top = X_masked[torch.topk(Y_masked, k).indices]
+        box = torch.stack([top.min(dim=0).values, top.max(dim=0).values], dim=0)
+        return self._apply_min_box_width(box)
 
     # =========================================================================
     # Needle radius helpers
@@ -1978,7 +1875,6 @@ def reconstruct_snapshot_tensors(run_dir: Path, snapshot_name: str, device: str 
     X_parts: list = []
     X_exp_parts: list = []
     Y_parts: list = []
-    bh_parts: list = []
     last_d: Optional[dict] = None
 
     for sdir in all_snap_dirs:
@@ -1997,10 +1893,6 @@ def reconstruct_snapshot_tensors(run_dir: Path, snapshot_name: str, device: str 
             if isinstance(y_new, torch.Tensor):
                 Y_parts.append(y_new)
 
-        bh_new = d.get("bounds_history_new")
-        if isinstance(bh_new, torch.Tensor) and bh_new.shape[0] > 0:
-            bh_parts.append(bh_new)
-
         last_d = d
         if sdir.name == snapshot_name:
             break
@@ -2012,8 +1904,6 @@ def reconstruct_snapshot_tensors(run_dir: Path, snapshot_name: str, device: str 
     X_exp_all = torch.cat(X_exp_parts, dim=0) if X_exp_parts else X_all.clone()
     Y_all = (torch.cat(Y_parts, dim=0) if Y_parts
              else torch.zeros(X_all.shape[0], 1))
-    bh_stack = (torch.cat(bh_parts, dim=0) if bh_parts
-                else torch.zeros(0, 2, max(X_all.shape[-1], 1)))
 
     n_init = last_d.get("n_init_points", 0)
 
@@ -2036,5 +1926,4 @@ def reconstruct_snapshot_tensors(run_dir: Path, snapshot_name: str, device: str 
         "needle_has_M": last_d.get("needle_has_M"),
         "needle_B": last_d.get("needle_B"),
         "penalty_mask": last_d.get("penalty_mask"),
-        "bounds_history_stack": bh_stack,
     }

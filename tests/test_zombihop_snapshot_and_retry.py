@@ -207,7 +207,7 @@ def test_successive_demotion_stops_when_needles_exhausted(torch):
         def take_snapshot(self, *args, **kwargs):
             return None
 
-        def determine_new_bounds(self, add_to_history=True):
+        def determine_new_bounds(self):
             return self.bounds.clone()
 
         def update_all_needle_radii(self, M_list):

@@ -60,7 +60,7 @@ Each activation attempts to find and declare one new local optimum ("needle"). O
 3. Run **LineBO** to propose a candidate: sample random chords through the current bounds, score each chord by integrating the acquisition function along it (mean, not max), pick the best chord, and have the physical experiment evaluate that line.
 4. After each evaluation, check **convergence**: EI (expected improvement) is computed against the **local best** (best unpenalized point within the current zoom bounds, and `best_f` from the local GP training set). If EI drops below the output-noise floor AND the Y improvement since the previous local best is within output noise, increment a consecutive-converged counter.
 5. After `n_consecutive_converged` consecutive converged iterations, declare a needle.
-6. Before the next zoom: **Jaccard-aware sliding-window bounds selection** (`determine_new_bounds`) slides over windows of top-M points ranked by Y, picking the first candidate AABB whose Jaccard overlap against the last `jaccard_window` entries in `bounds_history` is ≤ `jaccard_threshold`. If all windows exceed the threshold, the least-overlapping window is used.
+6. Before the next zoom: **`determine_new_bounds`** takes the AABB of the current activation's top-M unpenalized points by Y, widened on any axis below the input-noise floor.
 7. **Secondary Jaccard guard (MC):** if the selected AABB still has Monte Carlo Jaccard > `zoom_jaccard_threshold` with any entry in `zoom_bounds_history`, the algorithm **force-declares a needle** at the current best unpenalized point — repeated zooms to the same region are taken as evidence the optimum is there even if PI hasn't formally converged.
 8. Otherwise, zoom in on the new AABB and continue.
 
@@ -86,7 +86,7 @@ When an activation fails (candidate is None, all points penalized, or force-decl
 | Condition | Action |
 |-----------|--------|
 | **First failure** (`not first_failure_handled`) | Recompute all needle ellipsoids using the clean local GP (`recompute_all_ellipsoids`): for each needle, `fit_with_locality` → `create_clean_acquisition` → `determine_penalty_ellipsoid`. Update `dh.needle_M_list`. Retry same zoom. |
-| **Subsequent failure, data was added** (`first_failure_handled AND data_added_since_last_failure`) | Recompute zoom bounds Jaccard-aware: `dh.determine_new_bounds(add_to_history=False)`. The `add_to_history=False` prevents failure-retry bounds from contaminating the history used by success-path zooms. Retry same zoom. |
+| **Subsequent failure, data was added** (`first_failure_handled AND data_added_since_last_failure`) | Recompute zoom bounds: `dh.determine_new_bounds()`. Retry same zoom. |
 | **Subsequent failure, no new data** (`first_failure_handled AND NOT data_added_since_last_failure`) | Shrink all ellipsoid semi-axes: `dh.shrink_all_needle_radii(needle_shrink_factor)`. If every semi-axis < `needle_stop_noise_multiplier × input_noise`, all exclusion zones are at noise scale → stop. Otherwise retry same zoom. |
 
 `data_added_since_last_failure` is set `True` immediately after `_objective_wrapper` returns (regardless of whether points are penalized), and reset to `False` after each failure dispatch.
@@ -169,7 +169,7 @@ Before any point enters the GP training set, it is checked against the **pared d
 ║  │  │        recompute_all_ellipsoids (clean local GP each)      │ │   ║
 ║  │  │        update needle_M_list  → retry same zoom             │ │   ║
 ║  │  │      Case 2 (subsequent, data added):                      │ │   ║
-║  │  │        determine_new_bounds(add_to_history=False)          │ │   ║
+║  │  │        determine_new_bounds()                              │ │   ║
 ║  │  │        update bounds  → retry same zoom                    │ │   ║
 ║  │  │      Case 3 (subsequent, no data):                         │ │   ║
 ║  │  │        shrink_all_needle_radii(needle_shrink_factor)       │ │   ║
@@ -180,9 +180,9 @@ Before any point enters the GP training set, it is checked against the **pared d
 ║  │  │    continue  ← same current_zoom, retry zoom body         │ │   ║
 ║  │  │                                                             │ │   ║
 ║  │  │  if no needle AND no failure AND zoom < max_zooms-1:        │ │   ║
-║  │  │    [9a] determine_new_bounds() ← Jaccard sliding window    │ │   ║
-║  │  │         slides over Y-sorted unpenalized; picks AABB with  │ │   ║
-║  │  │         Jaccard ≤ jaccard_threshold vs bounds_history      │ │   ║
+║  │  │    [9a] determine_new_bounds() ← top-M AABB                │ │   ║
+║  │  │         of current activation's unpenalized points         │ │   ║
+║  │  │         (floored at the input-noise width)                 │ │   ║
 ║  │  │    [9b] MC Jaccard guard vs zoom_bounds_history:           │ │   ║
 ║  │  │         if Jaccard > zoom_jaccard_threshold:               │ │   ║
 ║  │  │           → _declare_needle_at_best() ← force-declare      │ │   ║
@@ -213,8 +213,7 @@ ZoMBIHop
   │     ├── needles, needle_M_list, needle_B    (discovered optima + ellipsoids)
   │     ├── needles_results                     (value + median_value per needle)
   │     ├── _penalty_mask                       (True = not penalized)
-  │     ├── bounds, current_zoom_bounds         (trust region)
-  │     └── bounds_history                      (recent AABB tensors for Jaccard)
+  │     └── bounds, current_zoom_bounds         (trust region)
   │
   ├─ GPSimplex ── wraps BoTorch GP
   │     ├── fit(X, Y)              ILR + std-normalize → SingleTaskGP
@@ -324,7 +323,7 @@ Key methods:
 | `get_gp_data()` | Returns global GP training set (pared → raw unpenalized → init fallback). |
 | `get_zoom_gp_data(bounds)` | Local variant restricted to bounds (pared within bounds first, then raw fill). |
 | `get_best_in_bounds(bounds)` | Best unpenalized point within axis-aligned bounds. |
-| `determine_new_bounds(...)` | Jaccard sliding-window AABB selection. |
+| `determine_new_bounds()` | Top-M AABB of the current activation's unpenalized points. |
 | `_relabel_pared_with_medians()` | Post-activation smoothing: replaces each pared Y with local median. |
 | `shrink_all_needle_radii(factor)` | Multiplies each needle M by 1/factor² (failure-retry Case 3). |
 | `update_all_needle_radii(new_M_list)` | Replaces needle M matrices (failure-retry Case 1). |
@@ -487,11 +486,10 @@ where f* = `best_f_local` = max Y from `get_zoom_gp_data(B)`. Two locality effec
 | **Simplex fidelity** | ILR + CFS + natural gradient ascent all respect the simplex geometry exactly. |
 | **Noise-robustness** | Point paring prevents noise spikes from poisoning the GP. Pared Y values are relabeled with local medians after each activation. Needle records store both peak and median values. |
 | **Adaptive exclusion zones** | Hessian ellipsoids adapt to local curvature — narrow along flat directions, tight along steep ones. |
-| **Failure recovery** | Three-way in-place failure dispatch (clean ellipsoid refit → Jaccard-aware bounds update → radius shrink) handles both transient and persistent failures without restarting the zoom sequence. |
+| **Failure recovery** | Three-way in-place failure dispatch (clean ellipsoid refit → bounds update → radius shrink) handles both transient and persistent failures without restarting the zoom sequence. |
 | **Reproducibility** | Full state snapshots at every iteration enable exact restart. |
 | **Local GP for zoom** | Fitting only within-bounds data makes the posterior tight in the active region, causing PI to drop quickly on genuine convergence. |
 | **Clean local GP for ellipsoids** | Needle ellipsoids are computed from a local, penalty-free GP fit, giving curvature estimates that reflect only the local landscape. |
-| **Jaccard sliding window** | `determine_new_bounds` slides over Y-ranked windows to find a genuinely different AABB before the MC Jaccard guard runs. |
 
 ### Drawbacks
 
@@ -510,7 +508,7 @@ where f* = `best_f_local` = max Y from `get_zoom_gp_data(B)`. Two locality effec
 
 **Pared set contamination:** `_update_penalty_mask()` purges the pared set after every needle addition/refit.
 
-**Zoom loop stagnation:** Fixed by (1) `determine_new_bounds` sliding window to find dissimilar AABB, (2) MC Jaccard guard force-declares needle rather than triggering failure, (3) Edit 2B failure retry at same zoom level.
+**Zoom loop stagnation:** Fixed by (1) MC Jaccard guard force-declares needle rather than triggering failure, (3) Edit 2B failure retry at same zoom level.
 
 **Spurious PI convergence:** Fixed by local GP + local `best_f_ref` + local `prev_best`. PI is computed against the best observation *within current zoom bounds*.
 
@@ -528,13 +526,7 @@ where f* = `best_f_local` = max Y from `get_zoom_gp_data(B)`. Two locality effec
 
 ### Edit 2A — Jaccard Sliding-Window Bounds Selection
 
-**Problem:** `determine_new_bounds` always returned the AABB of the top-M points by Y, producing nearly-identical boxes on successive zooms and triggering immediate force-declare.
-
-**Fix:** Sliding-window search over Y-ranked unpenalized points finds the first AABB with Jaccard ≤ `jaccard_threshold` vs recent `bounds_history`. Falls back to the least-similar window if none qualifies.
-
-New parameters: `jaccard_window` (default 3), `jaccard_threshold` (default 0.9).
-
-`_jaccard_box(a, b)`: volume-Jaccard of two axis-aligned boxes; zero-width dimensions in both boxes are projected out to avoid division by zero.
+**Removed 2026-10-29.** The sliding window, `bounds_history`, `_jaccard_box` and the `jaccard_window` / `jaccard_threshold` knobs are gone: `determine_new_bounds()` again returns the AABB of the current activation's top-M unpenalized points (floored at the input-noise width). The MC Jaccard guard (`zoom_jaccard_threshold`) is unchanged.
 
 ---
 
@@ -549,7 +541,7 @@ Case 1 (first failure):
     recompute_all_ellipsoids → update_all_needle_radii → retry same zoom
 
 Case 2 (repeated failure, new data since last failure):
-    determine_new_bounds(add_to_history=False) → retry same zoom
+    determine_new_bounds() → retry same zoom
 
 Case 3 (repeated failure, no new data):
     shrink_all_needle_radii(needle_shrink_factor)
