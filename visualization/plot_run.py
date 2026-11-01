@@ -37,7 +37,7 @@ triangle would assert a sum-to-one relationship they do not have:
     (``Dataset.embed_X``) — on raw ``hplc`` units one column would otherwise be
     94% of every row and the map would describe that column alone.
 
-Three data sources are supported, selectable in the app:
+Four data sources are supported, selectable in the app:
 
   * **Run directory** (e.g. ``runs/run_7eb9``) — the full measured dataset
     ``(X, Y)`` is reconstructed from the run's delta snapshots
@@ -58,6 +58,14 @@ Three data sources are supported, selectable in the app:
     (CoNet). ``crossed_barrel`` against the ``photo_*`` pair is the clearest
     case for detecting the constraint rather than assuming it: same ``d=4``,
     different diagram entirely.
+  * **Showdown run** (e.g. ``dup1c__ls0__r1`` under
+    ``optimize/runs/showdown_6d_dup1c_mix_rf69af_needles_rf_unit``) — one
+    synthetic-landscape rerun from ``optimize/showdown.py``. These keep no
+    snapshots, so ``(X, Y)``, activations, needles and the % space penalised
+    curve are read from evaluate.py's ``points.csv`` / ``needles.csv`` /
+    ``metrics_over_time.csv`` instead (see ``load_showdown_run``), and the
+    penalty zones from its ``zones.pt`` (written by evaluate.py since 2026-10-31;
+    older showdowns have no zone shading).
 
 Where a background applies (every diagram but the d=4 scatter-plot matrix and the
 CoNet) the app trains a Random-Forest (or GP) surrogate on ``(X, Y)``, evaluates
@@ -733,16 +741,7 @@ def run_penalty_zones(run_dir: Path, snapshot: str, X: np.ndarray) -> list | Non
         centers, M_list, radii = _zone_regions(d)
         B = d.get("needle_B")
         B = None if B is None else B.detach().cpu().numpy().astype(float)
-        member = np.zeros((len(centers), len(X)), dtype=bool)
-        for z, (c, M) in enumerate(zip(centers, M_list)):
-            diff = X - c
-            if M is not None and B is not None:
-                u = diff @ B
-                member[z] = np.einsum("ni,ij,nj->n", u, M, u) <= 1.0
-            else:
-                member[z] = np.linalg.norm(diff, axis=1) <= radii[z]
-        centers_idx = (np.abs(X[None, :, :] - centers[:, None, :]).max(axis=2).argmin(axis=1)
-                       if len(centers) else np.zeros(0, dtype=int))
+        member, centers_idx = _zone_membership(X, centers, M_list, radii, B)
         sig = (member.tobytes(), member.shape, centers_idx.tobytes())
         if sig != prev:
             out.append((n_points, member, centers_idx))
@@ -750,6 +749,26 @@ def run_penalty_zones(run_dir: Path, snapshot: str, X: np.ndarray) -> list | Non
         if snap.name == snapshot:
             break                         # the view is reconstructed only this far
     return out
+
+
+def _zone_membership(X: np.ndarray, centers: np.ndarray, M_list: list,
+                     radii: np.ndarray, B: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
+    """``(member (Z, N) bool, centre sample index (Z,))`` of the zones over ``X``.
+
+    The optimizer's own test (``DataHandler._inside_region``): ``u^T M u <= 1``
+    with ``u = B^T (x - c)``, or the sphere radius when a zone has no ellipsoid.
+    """
+    member = np.zeros((len(centers), len(X)), dtype=bool)
+    for z, (c, M) in enumerate(zip(centers, M_list)):
+        diff = X - c
+        if M is not None and B is not None:
+            u = diff @ B
+            member[z] = np.einsum("ni,ij,nj->n", u, M, u) <= 1.0
+        else:
+            member[z] = np.linalg.norm(diff, axis=1) <= radii[z]
+    centers_idx = (np.abs(X[None, :, :] - centers[:, None, :]).max(axis=2).argmin(axis=1)
+                   if len(centers) else np.zeros(0, dtype=int))
+    return member, centers_idx
 
 
 # Uniform simplex sample behind the % space penalised panel: the same size and
@@ -920,6 +939,210 @@ def load_run_source(
         needles=needles,
         zones=zones,
     )
+
+
+# ── data loading: showdown runs ───────────────────────────────────────────────
+#
+# optimize/showdown.py writes one directory per sweep, ``optimize/runs/showdown_*``,
+# holding one ``runs/<config>__ls<landscape>__r<repeat>`` per row of its grid. Each
+# of those is an evaluate.py rerun, whose per-run artifacts land in
+# ``trial_<t>/run_<r>/``. That run keeps no snapshots, so everything here comes
+# from the CSVs evaluate.py writes instead: ``points.csv`` (every sample, with its
+# activation), ``needles.csv`` (declarations) and ``metrics_over_time.csv`` (one row
+# per measured line, with the % space penalised).
+
+SHOWDOWN_ROOT = ROOT / "optimize" / "runs"
+# points.csv columns that are not composition coordinates.
+_SHOWDOWN_META_COLS = ("sample_idx", "Y", "penalized", "activation", "zoom")
+
+
+def _showdown_layout(n_points: int, n_iters: int) -> tuple[int, int] | None:
+    """``(n_init, points_per_line)`` of a showdown run, or None if it does not fit.
+
+    evaluate.py's line wrapper measures a fixed ``NOMINAL_LINE_POINTS`` per line and
+    ``metrics_over_time.csv`` has one row per measured line, so the samples that row
+    count leaves over are the initial design. Row ``i`` (1-based) is the line at
+    ``[n_init + (i-1)*k, n_init + i*k)``; its metrics were taken *before* that line
+    was added (``n_points_before``).
+    """
+    k = NOMINAL_LINE_POINTS
+    n_init = n_points - n_iters * k
+    if n_iters <= 0 or n_init < 0:
+        return None
+    return n_init, k
+
+
+def _showdown_csvs(run_dir: Path):
+    """``(points, metrics or None, needles or None)`` DataFrames of a showdown run."""
+    import pandas as pd
+
+    pts = pd.read_csv(run_dir / "points.csv")
+    mot = (pd.read_csv(run_dir / "metrics_over_time.csv")
+           if (run_dir / "metrics_over_time.csv").exists() else None)
+    ndl = (pd.read_csv(run_dir / "needles.csv")
+           if (run_dir / "needles.csv").exists() else None)
+    return pts, mot, ndl
+
+
+def load_showdown_run(run_dir: Path) -> Dataset:
+    """Load one showdown run's ``trial_*/run_*`` artifact directory into a ``Dataset``.
+
+    * **lines** — ``NOMINAL_LINE_POINTS``-point blocks laid out by
+      ``_showdown_layout``: the initial design chunked at the same size, then one
+      line per ``metrics_over_time.csv`` row. Falls back to plain fixed blocks when
+      the counts do not fit that layout.
+    * **activations** — straight from ``points.csv``.
+    * **needles** — each ``needles.csv`` point is a stored sample verbatim, matched
+      exactly; it is declared once its ``iteration``'th line has been measured
+      (``metrics_over_time`` first counts it on the next row, whose
+      ``n_points_before`` is ``n_init + iteration*k``).
+    * **zones** — from ``zones.pt`` (``showdown_penalty_zones``), which evaluate.py
+      writes from 2026-10-31 on; None for older runs, which kept only the end state.
+      The % space penalised panel reads its curve from ``metrics_over_time.csv``
+      either way (``showdown_penalty_coverage``).
+
+    ``Y`` is stored in the optimizer's maximise convention (``make_sim_obj`` negates
+    a minimised objective), so for a ``maximize: false`` rerun it is negated back
+    and the goal set to minimise.
+    """
+    run_dir = Path(run_dir)
+    pts, mot, ndl = _showdown_csvs(run_dir)
+    cols = [c for c in pts.columns if c not in _SHOWDOWN_META_COLS]
+    X = pts[cols].to_numpy(dtype=float)
+    Y = pts["Y"].to_numpy(dtype=float)
+    n = len(X)
+
+    maximize = True
+    rerun_cfg = run_dir.parents[1] / "rerun_config.json"
+    if rerun_cfg.exists():
+        try:
+            maximize = bool(json.loads(rerun_cfg.read_text()).get("maximize", True))
+        except Exception:
+            pass
+    if not maximize:
+        Y = -Y
+
+    layout = _showdown_layout(n, 0 if mot is None else len(mot))
+    if layout is None:
+        lines = line_index(None, n)
+        n_init, k = 0, NOMINAL_LINE_POINTS
+    else:
+        n_init, k = layout
+        idx = np.arange(n)
+        n_init_lines = -(-n_init // k)          # ceil: a short init tail is its own line
+        lines = np.where(idx < n_init, idx // k, n_init_lines + (idx - n_init) // k)
+
+    needles = None
+    if ndl is not None and all(c in ndl.columns for c in cols):
+        out = []
+        for _, rec in ndl.iterrows():
+            dist = np.abs(X - rec[cols].to_numpy(dtype=float)).max(axis=1)
+            i = int(np.argmin(dist))
+            if dist[i] > 1e-9:
+                continue                    # not a stored sample: no line beats a wrong one
+            it = rec.get("iteration")
+            when = (n if it is None or not np.isfinite(it) or layout is None
+                    else n_init + int(it) * k)
+            # needles.csv holds each needle's FINAL point, and a later correction
+            # pass can move it onto a sample measured after the declaration; it is
+            # then shown from that sample on rather than before it existed.
+            out.append((i, max(i + 1, min(when, n))))
+        needles = np.asarray(out, dtype=int).reshape(-1, 2)
+
+    simplex = bool(n) and bool(np.allclose(X.sum(axis=1), 1.0, atol=1e-6))
+    trial_run = f"{run_dir.parent.name}/{run_dir.name}"
+    return Dataset(
+        X=X, Y=Y, labels=tuple(cols),
+        title=f"{run_dir.parents[3].name} / {run_dir.parents[1].name} ({trial_run})",
+        lines=lines.astype(int),
+        value_name="Y",
+        activations=(pts["activation"].to_numpy(dtype=int)
+                     if "activation" in pts.columns else None),
+        needles=needles,
+        simplex=simplex,
+        goal="maximize" if maximize else "minimize",
+        zones=showdown_penalty_zones(run_dir, X),
+    )
+
+
+def showdown_penalty_zones(run_dir: Path, X: np.ndarray) -> list | None:
+    """``run_penalty_zones``'s history for a showdown run, from its ``zones.pt``.
+
+    evaluate.py saves the complete zone state as each line is chosen, plus the
+    state the run ended in (``evaluate.zone_state``); each is tested against every
+    sample with the optimizer's membership rule and, as for a run directory, kept
+    only when the membership changed. ``X`` is points.csv's, which is the data
+    handler's own column order. None when the run predates zones.pt.
+    """
+    import torch
+
+    path = Path(run_dir) / "zones.pt"
+    if not path.exists():
+        return None
+    np_ = lambda t: None if t is None else t.detach().cpu().numpy().astype(float)
+    out: list = []
+    prev = None
+    for st in torch.load(str(path), map_location="cpu", weights_only=True):
+        centers = np_(st["centers"]).reshape(-1, X.shape[1])
+        member, centers_idx = _zone_membership(
+            X, centers, [np_(m) for m in st["M"]], np_(st["radii"]).reshape(-1),
+            np_(st["B"]))
+        sig = (member.tobytes(), member.shape, centers_idx.tobytes())
+        if sig != prev:
+            out.append((int(st["n_points"]), member, centers_idx))
+            prev = sig
+    return out
+
+
+def showdown_penalty_coverage(run_dir: Path) -> tuple | None:
+    """``run_penalty_coverage``'s ``(n_points, pct_any, pct_needle)``, off the CSVs.
+
+    evaluate.py already estimated the coverage per line (same Dirichlet sample size
+    and seed as ``run_penalty_coverage``) into ``metrics_over_time.csv``; row ``i``
+    was measured with ``n_init + (i-1)*k`` points collected. None when the run did
+    not record it.
+    """
+    run_dir = Path(run_dir)
+    pts, mot, _ = _showdown_csvs(run_dir)
+    if mot is None or "pct_space_penalized" not in mot.columns:
+        return None
+    layout = _showdown_layout(len(pts), len(mot))
+    if layout is None:
+        return None
+    n_init, k = layout
+    n_pts = n_init + (mot["iteration"].to_numpy(dtype=int) - 1) * k
+    total = mot["pct_space_penalized"].fillna(0.0).to_numpy(dtype=float)
+    needle = (mot["pct_space_penalized_needles"].fillna(0.0).to_numpy(dtype=float)
+              if "pct_space_penalized_needles" in mot.columns else np.zeros_like(total))
+    return n_pts, total, needle
+
+
+def _list_showdowns() -> list[str]:
+    """Names of ``optimize/runs/showdown_*`` sweeps with a ``runs/`` dir, newest first."""
+    if not SHOWDOWN_ROOT.is_dir():
+        return []
+    dirs = [p for p in SHOWDOWN_ROOT.glob("showdown_*") if (p / "runs").is_dir()]
+    dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return [p.name for p in dirs]
+
+
+def _list_showdown_runs(showdown: str) -> list[tuple[str, str]]:
+    """``(label, artifact dir relative to SHOWDOWN_ROOT)`` for each run of a sweep.
+
+    A run directory normally holds a single ``trial_0/run_1``; the label is then just
+    the run's name (``dup1c__ls0__r1``), and only grows a ``trial/run`` suffix when
+    there is more than one to tell apart.
+    """
+    runs_dir = SHOWDOWN_ROOT / showdown / "runs"
+    if not runs_dir.is_dir():
+        return []
+    out = []
+    for rd in sorted(p for p in runs_dir.iterdir() if p.is_dir()):
+        arts = sorted(p.parent for p in rd.glob("trial_*/run_*/points.csv"))
+        for a in arts:
+            label = rd.name if len(arts) == 1 else f"{rd.name}  ({a.parent.name}/{a.name})"
+            out.append((label, a.relative_to(SHOWDOWN_ROOT).as_posix()))
+    return out
 
 
 # ── data loading: database / csv ──────────────────────────────────────────────
@@ -2706,7 +2929,7 @@ def build_penalized_space_figure(
     if coverage is None:
         fig.update_layout(**layout, title=dict(
             text="% space penalised: no penalty zones recorded for this source "
-                 "(run directories only)", x=0.5, y=0.97, yanchor="top",
+                 "(run directories and showdown runs only)", x=0.5, y=0.97, yanchor="top",
             font=dict(size=13)))
         return fig
 
@@ -2772,8 +2995,14 @@ _DATA_CACHE_MAX = 8
 
 
 def _source_key(source_type: str, run_name: str | None, db_name: str | None,
-                db_value: str | None, public_name: str | None = None) -> tuple:
+                db_value: str | None, public_name: str | None = None,
+                showdown_run: str | None = None) -> tuple:
     """Cache key identifying a source, including its mtime so edits are picked up."""
+    if source_type == "showdown":
+        # showdown_run is the artifact dir relative to SHOWDOWN_ROOT (see
+        # _list_showdown_runs); keyed on points.csv, the file every view reads.
+        p = (SHOWDOWN_ROOT / (showdown_run or "")).resolve()
+        return ("showdown", str(p), (p / "points.csv").stat().st_mtime)
     if source_type == "run":
         p = _resolve_run_dir(run_name or "")
         return ("run", str(p), p.stat().st_mtime)
@@ -2794,6 +3023,8 @@ def load_source(key: tuple) -> Dataset:
         return hit
     if key[0] == "run":
         ds = load_run_source(Path(key[1]), None)
+    elif key[0] == "showdown":
+        ds = load_showdown_run(Path(key[1]))
     elif key[0] == "public":
         ds = load_public_dataset(key[1])
     else:
@@ -2811,6 +3042,7 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
     run_names = _list_run_dirs()
     db_names = _list_db_files()
     public_names = _list_public_datasets()
+    showdown_names = _list_showdowns()
 
     step_btn_style = {
         "flex": "0 0 auto", "width": "28px", "height": "28px", "padding": "0",
@@ -2852,6 +3084,7 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
                     {"label": " Run directory", "value": "run"},
                     {"label": " Data file (.db/.csv)", "value": "db"},
                     {"label": " Public dataset (Olympus)", "value": "public"},
+                    {"label": " Showdown run", "value": "showdown"},
                 ],
                 value="db" if default_db else "run",
                 labelStyle={"display": "block"},
@@ -2889,6 +3122,25 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
                     "benchmarks/public_db/data. Run "
                     "`python benchmarks/public_db/olympus.py --fetch all` "
                     "to populate.",
+                    style={"fontSize": "11px", "color": "#777", "marginTop": "6px"},
+                ),
+            ]),
+
+            html.Div(id="showdown-controls", children=[
+                html.Label("Showdown", style=label_style),
+                dcc.Dropdown(
+                    id="showdown-dropdown",
+                    options=[{"label": n, "value": n} for n in showdown_names],
+                    value=showdown_names[0] if showdown_names else None,
+                    clearable=False,
+                    # The sweep names are long; let the open menu show them whole.
+                    optionHeight=50,
+                ),
+                html.Label("Run", style=label_style),
+                dcc.Dropdown(id="showdown-run-dropdown", clearable=False),
+                html.Div(
+                    "optimize/runs/showdown_*/runs/<config>__ls<landscape>__r<repeat>, "
+                    "read from its points.csv / needles.csv / metrics_over_time.csv.",
                     style={"fontSize": "11px", "color": "#777", "marginTop": "6px"},
                 ),
             ]),
@@ -3095,17 +3347,29 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         ]),
     ])
 
-    # Show/hide the run vs db vs public control groups.
+    # Show/hide the run vs db vs public vs showdown control groups.
     @app.callback(
         Output("run-controls", "style"),
         Output("db-controls", "style"),
         Output("public-controls", "style"),
+        Output("showdown-controls", "style"),
         Input("source-type", "value"),
     )
     def _toggle(source_type):
         show, hide = {}, {"display": "none"}
         return tuple(show if source_type == t else hide
-                     for t in ("run", "db", "public"))
+                     for t in ("run", "db", "public", "showdown"))
+
+    # Populate the showdown run dropdown when the showdown sweep changes.
+    @app.callback(
+        Output("showdown-run-dropdown", "options"),
+        Output("showdown-run-dropdown", "value"),
+        Input("showdown-dropdown", "value"),
+    )
+    def _showdown_runs(showdown):
+        runs = _list_showdown_runs(showdown) if showdown else []
+        return ([{"label": label, "value": rel} for label, rel in runs],
+                runs[0][1] if runs else None)
 
     # Start/stop auto-rotation: flip the stored on/off state, relabel the button,
     # and enable/disable the interval that drives the camera spin.
@@ -3266,11 +3530,13 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         Input("db-dropdown", "value"),
         Input("db-value-dropdown", "value"),
         Input("public-dropdown", "value"),
+        Input("showdown-run-dropdown", "value"),
     )
-    def _timeline_range(source_type, run_name, db_name, db_value, public_name):
+    def _timeline_range(source_type, run_name, db_name, db_value, public_name,
+                        showdown_run):
         try:
             ds = load_source(_source_key(source_type, run_name, db_name,
-                                         db_value, public_name))
+                                         db_value, public_name, showdown_run))
         except Exception:
             return 1, 1, None
         n = max(ds.n_lines, 1)
@@ -3348,6 +3614,7 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         # Appended last so render_state's existing positional signature — which
         # several tests and sibling scripts call directly — keeps its meaning.
         Input("public-dropdown", "value"),
+        Input("showdown-run-dropdown", "value"),
     )
     def _render(*args):
         return render_state(*args, no_update=no_update)
@@ -3366,20 +3633,23 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         Input("public-dropdown", "value"),
         Input("timeline-on", "value"),
         Input("timeline", "value"),
+        Input("showdown-run-dropdown", "value"),
     )
     def _render_penalized(penalized_on, source_type, run_name, db_name, db_value,
-                          public_name, timeline_on, timeline):
+                          public_name, timeline_on, timeline, showdown_run):
         if not penalized_on:
             return no_update, {"display": "none"}
         try:
-            key = _source_key(source_type, run_name, db_name, db_value, public_name)
+            key = _source_key(source_type, run_name, db_name, db_value, public_name,
+                              showdown_run)
             full = load_source(key)
         except Exception:
             return no_update, {"display": "none"}
         coverage = None
-        if key[0] == "run":
+        if key[0] in ("run", "showdown"):
             if key not in _COVERAGE_CACHE:
-                _COVERAGE_CACHE[key] = run_penalty_coverage(Path(key[1]))
+                _COVERAGE_CACHE[key] = (run_penalty_coverage if key[0] == "run"
+                                        else showdown_penalty_coverage)(Path(key[1]))
             coverage = _COVERAGE_CACHE[key]
         rows = (full.prefix_rows(int(timeline)) if timeline_on and timeline is not None
                 else None)
@@ -3429,7 +3699,7 @@ def _diagram_name(ds: Dataset) -> str:
 def render_state(source_type, run_name, db_name, db_value, background, show_points,
                  gn, ntrees, gp_ls, scale, plot_size, color_override, color_min,
                  color_max, timeline_on, timeline, convergence_on, public_name=None,
-                 *, no_update=None, precompute=None):
+                 showdown_run=None, *, no_update=None, precompute=None):
     """Everything the main Dash callback renders, as a plain function.
 
     Split out of the callback body so it can be exercised (and its eight outputs
@@ -3454,8 +3724,13 @@ def render_state(source_type, run_name, db_name, db_value, background, show_poin
                     + ("No public dataset selected — fetch one with "
                        "`python benchmarks/public_db/olympus.py --fetch all`.",
                        no_update))
+        if source_type == "showdown" and not showdown_run:
+            return ((no_update,) * 7
+                    + ("No showdown run selected — none found under optimize/runs/"
+                       "showdown_*/runs.", no_update))
 
-        key = _source_key(source_type, run_name, db_name, db_value, public_name)
+        key = _source_key(source_type, run_name, db_name, db_value, public_name,
+                          showdown_run)
         full = load_source(key)
 
         # The time slider cuts the dataset to its first N deposition lines.

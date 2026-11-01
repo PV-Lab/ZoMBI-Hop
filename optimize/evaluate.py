@@ -994,6 +994,41 @@ def write_needles_csv(path: str, dh, cols: list[str], dim: int) -> None:
     pd.DataFrame(rows, columns=columns).to_csv(path, index=False)
 
 
+def zone_state(dh) -> dict:
+    """The data handler's complete penalty-zone state, as plain CPU tensors.
+
+    Everything ``DataHandler._inside_region`` needs to test membership: every
+    region's centre, sphere radius and ellipsoid M (None = sphere fallback), the
+    shared tangent basis B, needles first and then exclusion zones (the
+    ``_penalty_regions`` order, with ``n_needles`` marking the boundary).
+    ``n_points`` is the samples collected when it was taken.
+    """
+    centers, radii, M_list = dh._penalty_regions()
+    cpu = lambda t: None if t is None else t.detach().cpu().clone()
+    n = 0 if centers is None else int(centers.shape[0])
+    return dict(
+        n_points=int(dh.X_all_actual.shape[0]) if dh.X_all_actual is not None else 0,
+        n_needles=int(dh.needles.shape[0]) if dh.needles is not None else 0,
+        centers=cpu(centers) if n else torch.zeros(0, dh.d),
+        radii=cpu(radii).reshape(-1) if n else torch.zeros(0),
+        M=[cpu(m) for m in M_list[:n]],
+        B=cpu(dh.needle_B),
+    )
+
+
+def write_zones_pt(path: str, states: list[dict]) -> None:
+    """Penalty-zone history: one ``zone_state`` per measured line, plus the final one.
+
+    The CSVs only keep the END state (points.csv's ``penalized`` column) and the
+    volume fraction per line, but zones are refit, shrunk and replaced as the run
+    goes, so which samples a zone held at an earlier line cannot be recovered from
+    them. This is what lets ``visualization/plot_run.py`` shade the zones at every
+    time-slider step of a showdown run. Only tensors, ints, lists and None, so it
+    loads with ``torch.load(..., weights_only=True)``.
+    """
+    torch.save(states, path)
+
+
 def write_point_cloud_html(path: str, predict_fn, peaks, dh, last_payload: dict) -> None:
     """Render the final ZoMBI state over the 4-simplex objective cloud (one HTML).
 
@@ -1170,6 +1205,7 @@ def run_single_eval(
     plot_state: dict = {"line_0": None, "line_1": None}
     payloads: list[dict] = []
     snap_records: list[tuple] = []
+    zone_states: list[dict] = []     # penalty-zone state per measured line -> zones.pt
     call_counter = [0]
     dh_ref = [None]
     gp_ref = [None]
@@ -1198,6 +1234,7 @@ def run_single_eval(
             pared_X = pared_Y = None
         needles = dh.needles
         pen_any, pen_needle = dh.penalty_coverage(coverage_X)
+        zone_states.append(zone_state(dh))
         payloads.append(dict(
             iter_num=call_counter[0],
             pared_X=pared_X, pared_Y=pared_Y,
@@ -1322,6 +1359,12 @@ def run_single_eval(
         )
     except Exception as exc:
         print(f"      [run] CSV write failed: {exc}")
+    try:
+        # Plus the state the run ended in: zones keep changing after the last line
+        # is chosen (that line's needle check, the final shrink).
+        write_zones_pt(os.path.join(out_dir, "zones.pt"), zone_states + [zone_state(dh)])
+    except Exception as exc:
+        print(f"      [run] zones.pt write failed: {exc}")
 
     # --no-plots keeps every CSV and metrics.json but skips all rendering. Meant for
     # the repeats of a showdown cell: the numbers are what the statistics are computed
