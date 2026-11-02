@@ -158,6 +158,7 @@ import json
 import os
 import random
 import re
+import shutil
 import sys
 import time
 import traceback
@@ -1016,6 +1017,59 @@ def zone_state(dh) -> dict:
     )
 
 
+# ─── Checkpoint / resume (--checkpoint) ──────────────────────────────────────────
+#
+# Layout under <run_dir>/checkpoint/:
+#   run_sim/     ZoMBIHop's own DataHandler snapshots (points, needles, zones, pared set)
+#   lines/       one file per measured line: this script's per-line payload + zone state
+#   eval_state.pt  overwritten at every ZoMBIHop snapshot: snapshot records, elapsed
+#                  optimizer time, and RNG states
+# A run dir with run_sim/latest.txt resumes from it instead of starting over.
+CKPT_SUBDIR = "checkpoint"
+CKPT_UUID = "sim"
+
+
+def _atomic_torch_save(obj, path: str) -> None:
+    """torch.save via a temp file + rename, so a kill mid-write never leaves a torn file."""
+    tmp = f"{path}.tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def _rng_states() -> dict:
+    """Every global RNG the simulated run draws from (line directions, output noise)."""
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _set_rng_states(st: dict) -> None:
+    random.setstate(st["python"])
+    np.random.set_state(st["numpy"])
+    torch.set_rng_state(st["torch"])
+    if st.get("cuda") is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(st["cuda"])
+        except RuntimeError as exc:   # different GPU count on the resuming node
+            print(f"      [ckpt] CUDA RNG state not restored ({exc})")
+
+
+def _light_payload(p: dict, dim: int) -> dict:
+    """The part of a line payload worth persisting.
+
+    pared_X / pared_Y / gp_grid_vals are only read by the 3d ternary frames. Above
+    3d they are a full copy of the pared set PER LINE (gigabytes over a 20k-point
+    run), so they are dropped from the saved copy. The in-memory payloads of lines
+    measured in THIS process keep them.
+    """
+    if dim == 3:
+        return p
+    return {k: v for k, v in p.items() if k not in ("pared_X", "pared_Y", "gp_grid_vals")}
+
+
 def write_zones_pt(path: str, states: list[dict]) -> None:
     """Penalty-zone history: one ``zone_state`` per measured line, plus the final one.
 
@@ -1194,8 +1248,22 @@ def run_single_eval(
     no_plots: bool = False,
     log_x: bool = False,
     log_y: bool = False,
+    checkpoint: bool = False,
 ) -> dict:
     os.makedirs(out_dir, exist_ok=True)
+    # --checkpoint: snapshot as the run goes, and resume from a previous attempt's
+    # snapshots if this run dir has any (a preempted / killed worker).
+    ckpt_root = os.path.join(out_dir, CKPT_SUBDIR) if checkpoint else None
+    ckpt_lines = os.path.join(ckpt_root, "lines") if checkpoint else None
+    ckpt_state = os.path.join(ckpt_root, "eval_state.pt") if checkpoint else None
+    resuming = bool(checkpoint and os.path.isfile(
+        os.path.join(ckpt_root, f"run_{CKPT_UUID}", "latest.txt")))
+    if checkpoint:
+        if not resuming and os.path.isdir(ckpt_root):
+            # An attempt that died before its first snapshot: nothing to resume, and
+            # its half-written files must not leak into this fresh start.
+            shutil.rmtree(ckpt_root)
+        os.makedirs(ckpt_lines, exist_ok=True)
     dim = ds["dim"]
     fn = ds["fn"]
     maximize = ds["maximize"]
@@ -1256,6 +1324,12 @@ def run_single_eval(
             gp_grid_vals=(rm.gp_landscape_vals(gp_ref[0], grid_pts, maximize)
                           if dim == 3 else None),
         ))
+        if checkpoint:
+            # One file per line. A resume keeps the lines its ZoMBIHop snapshot holds
+            # (n_points_before < the restored point count) and re-measures the rest.
+            _atomic_torch_save(
+                {"payload": _light_payload(payloads[-1], dim), "zone_state": zone_states[-1]},
+                os.path.join(ckpt_lines, f"{call_counter[0]:06d}.pt"))
         if top_k is not None:
             n_needles = needles.shape[0] if needles is not None else 0
             if n_needles >= top_k:
@@ -1293,31 +1367,94 @@ def run_single_eval(
         X_init_actual=X_a, X_init_expected=X_e, Y_init=Y,
         **zombi_fixed, **hp,
         device=str(rm.DEVICE), dtype=rm.DTYPE,
-        run_uuid=None, checkpoint_dir=None,
+        # A fresh checkpointed run uses a fixed UUID so a retry finds it at a known path.
+        run_uuid=CKPT_UUID if checkpoint else None,
+        resume=resuming if checkpoint else None,
+        checkpoint_dir=ckpt_root,
     )
     dh = optimizer.data_handler
     dh_ref[0] = dh
     gp_ref[0] = optimizer.gp_handler
 
+    def _snap_record() -> tuple:
+        # Capture the current zoom zone's linear size (relative to the full
+        # [0,1]^d domain) as the 4th element, exactly as run_mobo does, so the
+        # duplicate metric can shrink its radius for points sampled inside a zoom
+        # — i.e. so eval scores dup on the SAME definition the tuner optimised.
+        czb = dh.current_zoom_bounds if dh.current_zoom_bounds is not None else dh.bounds
+        zoom_size = rm.zoom_size_fraction(czb) if czb is not None else 1.0
+        return (dh.X_all_actual.shape[0], dh.current_activation, dh.current_zoom, zoom_size)
+
+    # Optimizer time spent by earlier attempts of this run (resume only); the time
+    # limit and runtime_s both count it.
+    prev_elapsed = 0.0
+    t0 = time.time()
+
     orig_snap = dh.take_snapshot
     def snap_wrap(*a, **k):
         orig_snap(*a, **k)
         if dh.X_all_actual is not None:
-            # Capture the current zoom zone's linear size (relative to the full
-            # [0,1]^d domain) as the 4th element, exactly as run_mobo does, so the
-            # duplicate metric can shrink its radius for points sampled inside a zoom
-            # — i.e. so eval scores dup on the SAME definition the tuner optimised.
-            czb = dh.current_zoom_bounds if dh.current_zoom_bounds is not None else dh.bounds
-            zoom_size = rm.zoom_size_fraction(czb) if czb is not None else 1.0
-            snap_records.append((dh.X_all_actual.shape[0], dh.current_activation,
-                                 dh.current_zoom, zoom_size))
+            snap_records.append(_snap_record())
+        if checkpoint:
+            # Written right after the snapshot, so on resume it matches the state
+            # ZoMBIHop restores (or is one snapshot behind, which the resume handles).
+            _atomic_torch_save({
+                "snapshot": (dh.run_dir / "latest.txt").read_text().strip(),
+                "snap_records": list(snap_records),
+                "elapsed_s": prev_elapsed + (time.time() - t0),
+                "rng": _rng_states(),
+            }, ckpt_state)
     dh.take_snapshot = snap_wrap
+
+    budget_spent = False
+    if resuming:
+        n_restored = int(dh.X_all_actual.shape[0]) if dh.X_all_actual is not None else 0
+        st = (torch.load(ckpt_state, map_location="cpu", weights_only=False)
+              if os.path.isfile(ckpt_state) else {})
+        prev_elapsed = float(st.get("elapsed_s", 0.0))
+        # Lines the restored snapshot contains, in order. Lines measured after it are
+        # gone from ZoMBIHop's state and will be measured again, so their files go too.
+        kept, dropped = [], 0
+        for name in sorted(os.listdir(ckpt_lines)):
+            path = os.path.join(ckpt_lines, name)
+            if not name.endswith(".pt"):
+                os.remove(path)          # a torn .tmp from the kill
+                continue
+            rec = torch.load(path, map_location="cpu", weights_only=False)
+            if (rec["payload"]["n_points_before"] < n_restored
+                    and rec["payload"]["iter_num"] == len(kept) + 1):
+                kept.append(rec)
+            else:
+                os.remove(path)
+                dropped += 1
+        payloads.extend(r["payload"] for r in kept)
+        zone_states.extend(r["zone_state"] for r in kept)
+        call_counter[0] = len(kept)
+        snap_records.extend(r for r in st.get("snap_records", []) if r[0] <= n_restored)
+        if not snap_records or snap_records[-1][0] != n_restored:
+            snap_records.append(_snap_record())
+        if st.get("rng") is not None:
+            _set_rng_states(st["rng"])
+        print(f"      [ckpt] resumed: {n_restored} point(s), {len(kept)} line(s) kept, "
+              f"{dropped} re-measured, {prev_elapsed / 60:.1f} min already spent "
+              f"(snapshot {st.get('snapshot', '?')})")
+        if max_lines is not None and call_counter[0] >= max_lines:
+            budget_spent = True
+            print(f"      [ckpt] line budget already spent ({call_counter[0]}) — "
+                  "writing artifacts only")
+        if top_k is not None and dh.needles is not None and dh.needles.shape[0] >= top_k:
+            budget_spent = True
+    remaining_min = time_limit_min - prev_elapsed / 60.0
+    if remaining_min <= 0:
+        budget_spent = True
+        print("      [ckpt] time limit already spent — writing artifacts only")
 
     interrupted = False
     t0 = time.time()
     try:
-        optimizer.run(max_activations=float("inf"), time_limit_hours=time_limit_min / 60.0,
-                      never_terminate=True)
+        if not budget_spent:
+            optimizer.run(max_activations=float("inf"), time_limit_hours=remaining_min / 60.0,
+                          never_terminate=True)
     except _TopKReached as stop:
         print(f"      [run] top-k reached: {int(stop.args[0])} needle(s) found — stopping early")
     except _LineBudgetReached as stop:
@@ -1328,7 +1465,7 @@ def run_single_eval(
     except Exception as exc:
         print(f"      [run] ZoMBI crashed: {exc}")
         traceback.print_exc()
-    runtime = time.time() - t0
+    runtime = prev_elapsed + (time.time() - t0)
 
     needle_t = dh.get_all_needle_locations()
     discovered = needle_t.detach().cpu().numpy() if needle_t.numel() > 0 else np.empty((0, dim))
@@ -1819,6 +1956,7 @@ def evaluate_dataset(
                     no_plots=args.no_plots,
                     log_x=args.log_x,
                     log_y=args.log_y,
+                    checkpoint=getattr(args, "checkpoint", False),
                 )
                 if dynamic_alt is not None:
                     from warm_start import dynamic_hparams as dyn
@@ -1956,6 +2094,13 @@ def main() -> None:
                              "coverage, CoNet) while still writing every CSV and "
                              "metrics.json. Used for the extra repeats of a showdown "
                              "cell, where only one repeat needs pictures.")
+    parser.add_argument("--checkpoint", action="store_true",
+                        help="Snapshot each run under <run_dir>/checkpoint/ as it goes, and "
+                             "RESUME from those snapshots if the run dir already has them "
+                             "(a preempted or killed attempt): the measured points, needles, "
+                             "per-line metrics, elapsed time and RNG state carry over, so "
+                             "--max-lines and --time-limit-min count the whole run. Used by "
+                             "showdown workers.")
     parser.add_argument("--no-convergence-plot", action="store_true",
                         help="Skip convergence_metrics.png panel plot.")
     parser.add_argument("--log-x", action="store_true", help="Log x-axis on convergence_metrics.png.")

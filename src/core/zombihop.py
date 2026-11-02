@@ -20,7 +20,7 @@ from ..utils.simplex import (
     Ellipsoid,
 )
 from ..utils.datahandler import DataHandler
-from ..utils.domain import Domain, make_domain, _bounds_jaccard_simplex  # noqa: F401 — re-exported
+from ..utils.domain import Domain, make_domain  # noqa: F401 — re-exported
 from ..utils.gp_simplex import GPSimplex
 from .hparam_live import (
     apply_pending as apply_pending_hparams,
@@ -105,7 +105,6 @@ class ZoMBIHop:
                  input_noise: float = _HP["input_noise"],
                  needle_shrink_factor: float = _HP["needle_shrink_factor"],
                  needle_stop_noise_multiplier: float = _HP["needle_stop_noise_multiplier"],
-                 zoom_jaccard_threshold: float = _HP["zoom_jaccard_threshold"],
                  min_zoom_for_needle: int = _HP["min_zoom_for_needle"],
                  min_iters_per_zoom: int = _HP["min_iters_per_zoom"],
                  needle_min_repeats: int = _HP["needle_min_repeats"],
@@ -157,10 +156,9 @@ class ZoMBIHop:
         The failure-retry path re-enters a zoom without advancing it, which used
         to let single activations run to 130+ lines (~3200 measurements) on one
         unfruitful region; the budget stops that. An activation that spends its
-        budget, runs out of zoom levels, or runs out of novel zoom windows without
-        declaring a needle has its region penalised (``_penalize_capped_zone``),
-        so the next activation is repelled from it rather than converging
-        straight back in.
+        budget or runs out of zoom levels without declaring a needle has its
+        region penalised (``_penalize_capped_zone``), so the next activation is
+        repelled from it rather than converging straight back in.
         """
         self.device = torch.device(device)
         self.dtype = dtype
@@ -196,7 +194,6 @@ class ZoMBIHop:
         self.repulsion_edge_value = float(repulsion_edge_value)
         self.needle_shrink_factor = float(needle_shrink_factor)
         self.needle_stop_noise_multiplier = float(needle_stop_noise_multiplier)
-        self.zoom_jaccard_threshold = float(zoom_jaccard_threshold)
         self.min_zoom_for_needle = int(min_zoom_for_needle)
         self.min_iters_per_zoom = int(min_iters_per_zoom)
         self.needle_min_repeats = int(needle_min_repeats)
@@ -326,6 +323,11 @@ class ZoMBIHop:
         # case — including a caller-tightened box such as [0, 0.3] on one axis — so
         # set it unconditionally rather than relying on the checkpoint.
         self.data_handler._full_bounds_ref = self.full_bounds.clone()
+        # Same for the paring radius's zoom-size reference: save_init sets it, a resume
+        # did not. Left None, the radius assumes the unit box.
+        if self.data_handler._full_extent is None:
+            self.data_handler._full_extent = (
+                self.full_bounds[1] - self.full_bounds[0]).clamp(min=1e-12)
         self.data_handler.domain = self.domain
 
         # A checkpoint's ellipsoids are expressed in its domain's tangent basis —
@@ -1162,7 +1164,7 @@ class ZoMBIHop:
 
         Counterpart to ``_declare_needle_at_best``: same ellipsoid machinery, but
         recorded as an *exclusion zone* rather than a needle. Ending an activation
-        this way (line budget spent, zoom levels exhausted, or no novel zoom window)
+        this way (line budget spent or zoom levels exhausted)
         means the search kept working one region without ever satisfying the needle
         criteria — that is a statement about where NOT to look again, not a
         discovered optimum, so it must not enter the needle record (``needles.csv``
@@ -1544,14 +1546,10 @@ class ZoMBIHop:
                 dh.bounds = bounds.clone()
             activation_failed = False
             activation_capped = False
-            # Set when the zoom loop runs out of unsearched territory (see the MC
-            # Jaccard guard). Ends the activation on the same terms as the line cap.
-            no_novel_window = False
             # Set when the deepest zoom level finishes its lines without a needle.
             zooms_exhausted = False
             consecutive_converged = 0
             best_f_local: float = float('-inf')
-            zoom_bounds_history: List[torch.Tensor] = []
             lines_this_activation = 0
 
             start_zoom = zoom if activation == start_activation else 0
@@ -1881,52 +1879,6 @@ class ZoMBIHop:
                     new_bounds = dh.determine_new_bounds()
                     self._log(f"  [time] determine_new_bounds: {time.time()-_t0:.2f}s")
 
-                    # MC Jaccard guard: the next zoom box still heavily overlaps one
-                    # this activation already searched, so there is NO NOVEL WINDOW left.
-                    # Zooming into it again just re-measures the same region, and it
-                    # was previously a licence to FORCE-declare a needle there — which
-                    # manufactured a needle out of "I have nowhere else to go", the
-                    # weakest possible evidence. Now the activation simply ends and
-                    # the region is penalised, exactly as a line-capped activation is,
-                    # so the next activation is repelled from it instead of grinding
-                    # back in. A genuine optimum here still gets declared: it goes
-                    # through EI convergence and the repeatability gate like any other.
-                    #
-                    # The one exception is a zoom too shallow to declare in at all
-                    # (``min_zoom_for_needle``): ending there would abandon the region
-                    # before the forced zoom-in that is the only way it could ever
-                    # produce a needle, so the search advances the zoom instead.
-                    if not self._is_global_bounds(new_bounds):
-                        repeated_jac = 0.0
-                        for prev_bounds in zoom_bounds_history:
-                            jac = self.domain.region_jaccard(
-                                new_bounds, prev_bounds, device=self.device, dtype=self.dtype
-                            )
-                            if jac > self.zoom_jaccard_threshold:
-                                repeated_jac = jac
-                                break
-                        if (repeated_jac > self.zoom_jaccard_threshold
-                                and zoom >= self.min_zoom_for_needle):
-                            self._log(
-                                f"  → no novel zoom window (Jaccard={repeated_jac:.3f} vs "
-                                f"an already-searched box) — ending the activation."
-                            )
-                            self._record_convergence(activation=activation, zoom=zoom,
-                                                     event="no_novel_window")
-                            no_novel_window = True
-                            break
-                        elif repeated_jac > self.zoom_jaccard_threshold:
-                            # Repeated region but too shallow to declare a needle
-                            # (min_zoom_for_needle) — advance the zoom anyway.
-                            self._log(
-                                f"  → repeated zoom (Jaccard={repeated_jac:.3f}) but zoom "
-                                f"{zoom+1} < minimum zoom {self.min_zoom_for_needle+1} "
-                                f"for needle — advancing zoom."
-                            )
-                        zoom_bounds_history.append(new_bounds.clone())
-                        if len(zoom_bounds_history) > dh.max_zooms:
-                            zoom_bounds_history.pop(0)
-
                     dh.current_zoom_bounds = new_bounds.clone()
                     dh.bounds = new_bounds.clone()
                     bounds = new_bounds.clone()
@@ -1946,20 +1898,17 @@ class ZoMBIHop:
                     zooms_exhausted = True
 
             # Activation ended without a needle — it spent its whole line budget
-            # circling a region it never localised, ran out of novel zoom windows
-            # there, or ran every zoom level to completion without the needle
-            # criteria ever passing. All three mean the same thing: this region
+            # circling a region it never localised, or ran every zoom level to
+            # completion without the needle criteria ever passing. Both mean the
+            # same thing: this region
             # absorbed measurements and produced nothing. Penalise it so the next
             # activation is repelled from it instead of converging straight back
             # in, and hand that activation the full simplex.
-            if ((activation_capped or no_novel_window or zooms_exhausted)
+            if ((activation_capped or zooms_exhausted)
                     and needle is None and not finished):
                 if activation_capped:
                     why = (f"hit the {self.max_lines_per_activation}-line budget "
                            f"({lines_this_activation} measured)")
-                elif no_novel_window:
-                    why = (f"ran out of novel zoom windows after "
-                           f"{lines_this_activation} line(s)")
                 else:
                     why = (f"finished all {dh.max_zooms} zoom level(s) "
                            f"({lines_this_activation} line(s))")

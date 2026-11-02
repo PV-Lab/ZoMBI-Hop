@@ -283,7 +283,6 @@ def test_successive_demotion_stops_when_needles_exhausted(torch):
     z.needle_shrink_factor = 0.8
     z.needle_stop_noise_multiplier = 2.0
     z.max_penalty_radius = 1.0
-    z.zoom_jaccard_threshold = 0.75
     z.random_sampler = lambda n, a, b, **kwargs: torch.rand((n, 3), dtype=dtype, device=device)
     z.proj_fn = lambda X: X
     z.data_handler = FakeDH()
