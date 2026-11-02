@@ -209,6 +209,18 @@ class RepulsiveAcquisition(nn.Module):
         return torch.where(inside, term, torch.zeros_like(term))
 
 
+#: Values of ``GPSimplex.last_candidate_failure`` — why get_candidate returned None.
+CANDIDATE_FAILURE_REASONS = (
+    "no_unpenalized_samples",   # every random sample in the bounds is inside a zone
+    "unpenalized_below_floor",  # fewer than 0.1 x num_restarts unpenalised samples
+    "all_restarts_degenerate",  # every ascent restart collapsed (zero mass / non-finite)
+    "final_eval_error",         # RuntimeError evaluating the acquisition after ascent
+    "ascent_empty",             # ascent returned nothing, cause not reported
+    "best_restart_penalized",   # top restart after ascent ended inside a zone
+    "numerical",                # singular GP / Cholesky / NotPSDError
+)
+
+
 class GPSimplex:
     """
     Gaussian Process handler for simplex-constrained optimization.
@@ -304,6 +316,12 @@ class GPSimplex:
         self._last_computed_lambda = None  # Track auto-computed lambda for logging
         self._tangent_basis: Optional[torch.Tensor] = None  # cached (d, d-1)
         self.comp_std: Optional[torch.Tensor] = None  # per-dimension composition std from last fit
+        # Why the last get_candidate returned None (None after a success). One of
+        # CANDIDATE_FAILURE_REASONS; read by ZoMBIHop to log the activation failure.
+        self.last_candidate_failure: Optional[str] = None
+        # Set by _optimize_acquisition when it returns no restarts, so get_candidate
+        # can tell "every restart degenerated" from "final evaluation raised".
+        self._ascent_failure: Optional[str] = None
 
     _JITTER_SCHEDULE = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2]
 
@@ -728,16 +746,28 @@ class GPSimplex:
         bounds = bounds.to(device=self.device, dtype=self.dtype)
 
         _t_total = time.time()
+        self.last_candidate_failure = None
 
         try:
-            return self._get_candidate_inner(bounds, best_f, max_attempts,
-                                             exclude_near, exclude_near_tol,
-                                             _t_total)
+            candidate = self._get_candidate_inner(bounds, best_f, max_attempts,
+                                                  exclude_near, exclude_near_tol,
+                                                  _t_total)
         except (NotPSDError, RuntimeError) as exc:
             if "singular" in str(exc).lower() or "cholesky" in str(exc).lower() or isinstance(exc, NotPSDError):
                 print(f"  [GP] get_candidate: numerical failure ({type(exc).__name__}), skipping iteration")
+                self.last_candidate_failure = "numerical"
                 return None
             raise
+        if candidate is None:
+            # Unconditional, like the numerical-failure print: runs without a
+            # run.log (evaluate.py, showdowns) keep only stdout.
+            print(f"  [GP] get_candidate: None (reason={self.last_candidate_failure})")
+        return candidate
+
+    def _fail(self, reason: str) -> None:
+        """Record why get_candidate is about to return None."""
+        self.last_candidate_failure = reason
+        return None
 
     def _get_candidate_inner(self, bounds, best_f, max_attempts,
                              exclude_near, exclude_near_tol, _t_total):
@@ -797,7 +827,7 @@ class GPSimplex:
 
         # Check if we have enough unpenalized candidates
         if len(current_unpenalized_indices) == 0:
-            return None  # No valid candidates found
+            return self._fail("no_unpenalized_samples")
 
         # Quality gate: bail when too few unpenalized candidates remain relative
         # to num_restarts — i.e. needles have penalized most of the explorable
@@ -813,7 +843,7 @@ class GPSimplex:
         floor = 0.1 * self.num_restarts
         total_sampled = current_candidates.shape[0]
         if total_sampled >= floor and len(current_unpenalized_indices) < floor:
-            return None  # Not enough unpenalized area
+            return self._fail("unpenalized_below_floor")
 
         num_restarts_to_use = min(self.num_restarts, len(current_unpenalized_indices))
 
@@ -829,6 +859,7 @@ class GPSimplex:
         initial_conditions = current_candidates_3d[selected_indices]  # (num_restarts, 1, d)
 
         _t_ng = time.time()
+        self._ascent_failure = None
         candidates, values = self._optimize_acquisition(
             acq=acq,
             bounds=bounds,
@@ -838,7 +869,8 @@ class GPSimplex:
             print(f"  [GP] nat_grad done ({initial_conditions.shape[0]} restarts × {self.nat_grad_max_steps} steps)  {time.time()-_t_ng:.2f}s")
 
         if candidates.shape[0] == 0:
-            return None
+            # A subclass override of _optimize_acquisition may not set the reason.
+            return self._fail(self._ascent_failure or "ascent_empty")
 
         # Sort by acquisition value descending (best first)
         order = torch.argsort(values, descending=True)
@@ -874,7 +906,7 @@ class GPSimplex:
         # Verify the candidate is not penalized
         is_valid = self.data_handler.get_penalty_mask(best_candidate.unsqueeze(0))
         if not is_valid.any():
-            return None
+            return self._fail("best_restart_penalized")
 
         return best_candidate
 
@@ -954,6 +986,7 @@ class GPSimplex:
 
         alive_idx = torch.where(alive)[0]
         if alive_idx.numel() == 0:
+            self._ascent_failure = "all_restarts_degenerate"
             return (
                 torch.empty(0, d, device=self.device, dtype=self.dtype),
                 torch.empty(0, device=self.device, dtype=self.dtype),
@@ -963,6 +996,7 @@ class GPSimplex:
             try:
                 final_vals = acq(x[alive_idx].unsqueeze(1))  # (A,)
             except RuntimeError:
+                self._ascent_failure = "final_eval_error"
                 return (
                     torch.empty(0, d, device=self.device, dtype=self.dtype),
                     torch.empty(0, device=self.device, dtype=self.dtype),
