@@ -56,12 +56,11 @@ Each activation attempts to find and declare one new local optimum ("needle"). O
 4. After each evaluation, check **convergence**: EI (expected improvement) is computed against the **local best** (best unpenalized point within the current zoom bounds, and `best_f` from the local GP training set). If EI drops below the output-noise floor AND the Y improvement since the previous local best is within output noise, increment a consecutive-converged counter.
 5. After `n_consecutive_converged` consecutive converged iterations, declare a needle.
 6. Before the next zoom: **`determine_new_bounds`** takes the AABB of the current activation's top-M unpenalized points by Y, widened on any axis below the input-noise floor.
-7. **Secondary Jaccard guard (MC):** if the selected AABB still has Monte Carlo Jaccard > `zoom_jaccard_threshold` with any entry in `zoom_bounds_history`, the algorithm **force-declares a needle** at the current best unpenalized point — repeated zooms to the same region are taken as evidence the optimum is there even if PI hasn't formally converged.
-8. Otherwise, zoom in on the new AABB and continue.
+7. Zoom in on the new AABB and continue.
 
 ### Needle Declaration
 
-On needle declaration (either via PI convergence or Jaccard force-declare):
+On needle declaration:
 1. Fit a **clean local GP** using `fit_with_locality`: selects only data within `max_radius` of the needle first, then fills to `max_gp_points` with remaining points. This gives a locally-accurate Hessian uncontaminated by far-away observations.
 2. Compute the **Hessian of the clean base acquisition** (no repulsive penalties) at the needle in ILR space via `create_clean_acquisition`. The penalty-free acquisition gives the true local curvature rather than one distorted by proximity to other needles.
 3. Derive an **ellipsoidal exclusion zone** M from the Hessian: the region where the acquisition has dropped by a specified fraction from its peak.
@@ -76,7 +75,7 @@ After every activation completes (needle found or failed), each entry in the par
 
 The zoom loop is a `while current_zoom < max_zooms` loop rather than a fixed `for zoom` loop, which allows retrying the **same zoom level** on failure without advancing. Two per-activation flags track state: `first_failure_handled` and `data_added_since_last_failure`.
 
-When an activation fails (candidate is None, all points penalized, or force-declare returned None):
+When an activation fails (candidate is None, or all points penalized):
 
 | Condition | Action |
 |-----------|--------|
@@ -106,7 +105,6 @@ Before any point enters the GP training set, it is checked against the **pared d
 ║  │                                                                  │    ║
 ║  │  first_failure_handled = False                                   │    ║
 ║  │  data_added_since_last_failure = False                           │    ║
-║  │  zoom_bounds_history = []                                        │    ║
 ║  │                                                                  │    ║
 ║  │  ┌──────── ZOOM LOOP: while current_zoom < max_zooms ──────────┐ │    ║
 ║  │  │  zoom = current_zoom                                        │ │    ║
@@ -178,11 +176,6 @@ Before any point enters the GP training set, it is checked against the **pared d
 ║  │  │    [9a] determine_new_bounds() ← top-M AABB                │ │    ║
 ║  │  │         of current activation's unpenalized points         │ │    ║
 ║  │  │         (floored at the input-noise width)                 │ │    ║
-║  │  │    [9b] MC Jaccard guard vs zoom_bounds_history:           │ │    ║
-║  │  │         if Jaccard > zoom_jaccard_threshold:               │ │    ║
-║  │  │           → _declare_needle_at_best() ← force-declare      │ │    ║
-║  │  │           (if no unpenalized pts → activation_failed)      │ │    ║
-║  │  │         else: append to zoom_bounds_history; zoom in       │ │    ║
 ║  │  │    current_zoom += 1  ← advance only on clean success      │ │    ║
 ║  │  │                                                             │ │    ║
 ║  │  └─────────────────────────────────────────────────────────── ┘ │    ║
@@ -241,8 +234,8 @@ python -c "import src.hparams as H; [print(f'{p.name:30s} {H.ALL_DEFAULTS[p.name
 ```
 
 **Derived, not set:** the activation line budget is `max_zooms × max_iterations`.
-An activation that spends it, runs every zoom level without declaring a needle,
-or runs out of novel zoom windows gets an exclusion zone over its region.
+An activation that spends it or runs every zoom level without declaring a needle
+gets an exclusion zone over its region.
 
 **Conflicts** (`src.hparams.conflicts`). These make needles impossible, so
 `ZoMBIHop` refuses to construct with them, the live-override channel refuses to
@@ -874,7 +867,7 @@ Returns (x_requested, x_actual, y). The `ZoMBIHop._objective_wrapper` uses x_req
 
 ### 5.6 `core/zombihop.py`
 
-**Role:** Top-level orchestrator. Owns the activation/zoom/iteration loops, needle declaration, failure handling, convergence checking, and Jaccard-based repeated-zoom detection. Delegates storage to DataHandler and GP operations to GPSimplex.
+**Role:** Top-level orchestrator. Owns the activation/zoom/iteration loops, needle declaration, failure handling, and convergence checking. Delegates storage to DataHandler and GP operations to GPSimplex.
 
 ---
 
@@ -882,16 +875,7 @@ Returns (x_requested, x_actual, y). The `ZoMBIHop._objective_wrapper` uses x_req
 
 ##### `_is_global_bounds(bounds, eps=0.01)` → `bool`
 
-True when bounds cover essentially the entire simplex: `bounds[0].max() < eps` AND `bounds[1].min() > 1 − eps`. Global bounds trivially overlap everything, so they are excluded from Jaccard checks. Also used to decide between global vs local GP data selection throughout `run()`.
-
-##### `_bounds_jaccard_simplex(bounds_a, bounds_b, n_samples, device, dtype)` → `float`
-
-Monte Carlo Jaccard overlap restricted to the simplex:
-1. Sample n=500 Dirichlet-uniform points on the simplex.
-2. Count points in each box: n_A, n_B, n_AB.
-3. Return n_AB / (n_A + n_B − n_AB).
-
-**Why Monte Carlo on simplex (not full hypercube):** The simplex is a proper subset of [0,1]^d. Two boxes that look very similar in ambient space might overlap very little within the simplex (e.g. a box near a corner). Restricting samples to the simplex gives the physically correct overlap fraction.
+True when bounds cover essentially the entire simplex: `bounds[0].max() < eps` AND `bounds[1].min() > 1 − eps`. Used to decide between global vs local GP data selection throughout `run()`.
 
 ---
 
@@ -920,7 +904,7 @@ After the call, the caller resets `data_added_since_last_failure = False`, `acti
 
 #### `ZoMBIHop._declare_needle_at_best(dh, activation, zoom, iteration, reason)` → `Optional[Tensor]`
 
-Shared needle declaration logic called by both the PI convergence path and the Jaccard force-declare path.
+Shared needle declaration logic called on PI convergence.
 
 1. Get current best unpenalized point (globally via `get_best_unpenalized()`).
 2. Compute **needle median value**: median Y of all `X_all_actual` points within `paring_spatial_halfnoise × input_noise` in ILR space of the needle.
@@ -932,7 +916,7 @@ Shared needle declaration logic called by both the PI convergence path and the J
 8. Reset bounds to full simplex for the next activation.
 9. Returns the needle tensor, or `None` if no unpenalized points exist.
 
-The `reason` string (`"PI convergence"` or `"Jaccard convergence"`) appears in log output so the trigger path is visible.
+The `reason` string (e.g. `"PI convergence"`) appears in log output so the trigger path is visible.
 
 ---
 
@@ -967,7 +951,6 @@ The nested loop structure (Edit 2B — no outer demotion-retry loop):
 while activation < max_activations:
     first_failure_handled = False
     data_added_since_last_failure = False
-    zoom_bounds_history = []      # MC Jaccard guard history (per activation)
     current_zoom = start_zoom
 
     while current_zoom < max_zooms and not finished:
@@ -1004,12 +987,7 @@ while activation < max_activations:
 
         if zoom < max_zooms-1:  # advance to next zoom level
             new_bounds = determine_new_bounds()   # top-M AABB
-            # Secondary MC Jaccard guard
-            if not global and MC_Jaccard(new_bounds, zoom_bounds_history) > threshold:
-                _declare_needle_at_best(reason="Jaccard convergence")
-            else:
-                append new_bounds to zoom_bounds_history
-                current_zoom += 1          # advance only on clean success
+            current_zoom += 1              # advance only on clean success
 
     _relabel_pared_with_medians()   # smooth pared Y after activation
     activation++
@@ -1017,8 +995,7 @@ while activation < max_activations:
 
 **Key structural changes vs the old code:**
 - The outer `while True` demotion-retry loop is **gone**. Failure is handled in-place at the current zoom level via `_handle_failure_retry` + `continue`.
-- `current_zoom` is **only incremented on clean success** (no failure, no force-declare). Retries repeat the exact same zoom body with updated bounds/ellipsoids.
-- `zoom_bounds_history` is initialized **per activation** (not per demotion retry), since there is no longer an outer retry loop to reset it.
+- `current_zoom` is **only incremented on clean success** (no failure, no needle). Retries repeat the exact same zoom body with updated bounds/ellipsoids.
 
 **Over-penalization guard (after needle found, before advancing activation):**  
 If > 90% of the simplex is penalized: either reset to full simplex (infinite-activation mode) or stop.
@@ -1144,7 +1121,6 @@ Without locality (global GP, global f*), PI can stay elevated indefinitely (glob
 | **AABB zoom bounds** | Axis-aligned bounding box ignores simplex geometry — can straddle inactive corners or enclose empty space. |
 | **Natural gradient pathology** | The multiplicative update can get stuck at simplex vertices (x_i = 0 makes coordinate frozen). |
 | **Single-point needle** | Each activation converges to one needle; if the landscape has two very close optima, one may be missed. |
-| **Jaccard is approximate** | Monte Carlo Jaccard (n=500) has sampling noise; the 0.75 threshold is a heuristic. A very tight zoom may legitimately have high Jaccard with its parent zoom — force-declare fires somewhat conservatively in this case. |
 | **Pared relabeling cost** | O(n_pared × n_all) ILR distance computation per activation. Scales quadratically with dataset size. |
 
 ### Known Failure Modes
@@ -1159,10 +1135,7 @@ Without locality (global GP, global f*), PI can stay elevated indefinitely (glob
 
 **Zoom loop stagnation (repeated AABB):**  
 *Cause:* Top-M points converge to the same region across successive zooms, so naively selected AABB overlaps prior bounds heavily.  
-*Fix (layered):*  
-  1. `determine_new_bounds` (Edit 2A) slides over Y-ranked windows to find a dissimilar AABB before the MC guard runs. Only if all windows exceed the threshold does the guard see an overlapping box.  
-  2. MC Jaccard guard force-declares the needle rather than triggering `activation_failed`. Repeated zooms to the same region are taken as convergence evidence.  
-  3. Edit 2B failure retry handles the residual case where even force-declare fails (no unpenalized points): clean ellipsoid refit → bounds update → shrink, each retrying at the same zoom level.
+*Bound:* the activation line budget (`max_zooms × max_iterations`) ends an activation that keeps re-zooming into the same region and penalises that region. (The sliding window, Edit 2A, was removed 2026-10-29; the MC Jaccard guard was removed 2026-10-31.)
 
 **Spurious PI convergence (global GP, global f*):**  
 *Cause:* With global GP training data, a high-value observation from a previous activation (in a different region) keeps `f*` high and makes PI near zero everywhere in the current zoom, triggering premature needle declaration or preventing convergence detection at the right point.  
@@ -1202,7 +1175,7 @@ These methods are called in `_declare_needle_at_best()` instead of the standard 
 
 ### Edit 2A — Jaccard Sliding-Window Bounds Selection (`datahandler.py`)
 
-**Removed 2026-10-29.** The sliding window, `bounds_history`, `_jaccard_box` and the `jaccard_window` / `jaccard_threshold` knobs are gone: `determine_new_bounds()` again returns the AABB of the current activation's top-M unpenalized points (floored at the input-noise width). The MC Jaccard guard (`zoom_jaccard_threshold`) is unchanged.
+**Removed 2026-10-29.** The sliding window, `bounds_history`, `_jaccard_box` and the `jaccard_window` / `jaccard_threshold` knobs are gone: `determine_new_bounds()` again returns the AABB of the current activation's top-M unpenalized points (floored at the input-noise width). The MC Jaccard guard (`zoom_jaccard_threshold`, `Domain.region_jaccard`) was removed 2026-10-31: an activation that keeps re-zooming into the same region now simply runs until its line budget or zoom levels are exhausted.
 
 #### New DataHandler Helpers
 
@@ -1279,10 +1252,6 @@ Case 3 (repeated failure, no new data):
 #### `_all_needle_axes_below_min(dh)`
 
 Helper that returns `True` when `dh.max_needle_radius() < self.needle_stop_noise_multiplier × dh.input_noise`. Called inside `_handle_failure_retry` to decide whether to stop.
-
-#### Secondary Jaccard Guard
-
-The MC Jaccard check (`_bounds_jaccard_simplex`) is retained at zoom transition (before advancing `current_zoom`) as a secondary force-declare guard: if the new AABB has Jaccard > threshold with recent history, the algorithm declares a needle at the current best unpenalized point rather than entering another zoom.
 
 ---
 

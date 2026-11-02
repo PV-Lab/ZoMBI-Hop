@@ -23,7 +23,6 @@ The optimiser only ever sees the domain through these methods:
     tangent_basis(d, ...)          orthonormal basis of the domain's affine hull
     ascent_step(x, g, step, lo, hi)  one acquisition-ascent step inside [lo, hi]
     boundary_penalty(X, eps)       repulsion from the domain's faces
-    region_jaccard(a, b, ...)      overlap of two zoom boxes *within the domain*
     check_point(x)                 is x a valid LineBO anchor?
     default_bounds(d, ...)         the full search box
 """
@@ -40,64 +39,6 @@ from .simplex import (
     random_simplex_direction,
     get_tangent_basis,
 )
-
-
-def _bounds_jaccard_simplex(
-    bounds_a: torch.Tensor,
-    bounds_b: torch.Tensor,
-    n_samples: int = 500,
-    device: torch.device = None,
-    dtype: torch.dtype = None,
-) -> float:
-    """
-    Jaccard overlap of two AABB boxes restricted to the simplex, estimated via Monte Carlo.
-
-    Samples from the simplex; counts what fraction fall inside each box;
-    returns  |A ∩ B| / |A ∪ B|  (both sets restricted to the simplex).
-
-    Note: normalised i.i.d. uniforms are NOT uniform on the simplex (they are
-    biased toward the barycentre). Kept as-is because the zoom guard's thresholds
-    were tuned against this estimator.
-    """
-    d = bounds_a.shape[1]
-    kw: dict = {}
-    if device is not None:
-        kw["device"] = device
-    if dtype is not None:
-        kw["dtype"] = dtype
-    u = torch.rand(n_samples, d, **kw).clamp(min=1e-9)
-    u = u / u.sum(dim=1, keepdim=True)
-
-    def _in_box(pts, lo, hi):
-        return ((pts >= lo.unsqueeze(0)) & (pts <= hi.unsqueeze(0))).all(dim=1)
-
-    in_a = _in_box(u, bounds_a[0], bounds_a[1])
-    in_b = _in_box(u, bounds_b[0], bounds_b[1])
-    n_a = in_a.sum().item()
-    n_b = in_b.sum().item()
-    n_ab = (in_a & in_b).sum().item()
-    denom = n_a + n_b - n_ab
-    return 0.0 if denom == 0 else n_ab / denom
-
-
-def _bounds_jaccard_box(bounds_a: torch.Tensor, bounds_b: torch.Tensor) -> float:
-    """Exact volume Jaccard of two (2, d) axis-aligned boxes.
-
-    Axes where both boxes are zero-width are projected out.
-    """
-    a = bounds_a.to(torch.float64)
-    b = bounds_b.to(torch.float64)
-    w_a = a[1] - a[0]
-    w_b = b[1] - b[0]
-    active = ~((w_a < 1e-12) & (w_b < 1e-12))
-    if not bool(active.any()):
-        return 1.0
-    inter = (torch.minimum(a[1], b[1]) - torch.maximum(a[0], b[0])).clamp(min=0.0)[active]
-    vol_inter = float(inter.prod())
-    vol_a = float(w_a[active].clamp(min=1e-30).prod())
-    vol_b = float(w_b[active].clamp(min=1e-30).prod())
-    vol_union = vol_a + vol_b - vol_inter
-    return 0.0 if vol_union < 1e-30 else vol_inter / vol_union
 
 
 class Domain:
@@ -126,10 +67,6 @@ class Domain:
         raise NotImplementedError
 
     def boundary_penalty(self, X: torch.Tensor, eps: float) -> torch.Tensor:
-        raise NotImplementedError
-
-    def region_jaccard(self, bounds_a: torch.Tensor, bounds_b: torch.Tensor,
-                       device=None, dtype=None) -> float:
         raise NotImplementedError
 
     def check_point(self, x: torch.Tensor) -> None:
@@ -182,9 +119,6 @@ class SimplexDomain(Domain):
     def boundary_penalty(self, X, eps):
         # exp-decay from each simplex face x_i = 0
         return torch.exp(-X / eps).sum(dim=-1)
-
-    def region_jaccard(self, bounds_a, bounds_b, device=None, dtype=None):
-        return _bounds_jaccard_simplex(bounds_a, bounds_b, device=device, dtype=dtype)
 
     def check_point(self, x):
         assert abs(x.sum().item() - 1.0) < 1e-12, f"x_tell must sum to 1, got {x.sum().item()}"
@@ -284,9 +218,6 @@ class BoxDomain(Domain):
     def boundary_penalty(self, X, eps):
         lo, hi = self._limits(X.shape[-1], X.device, X.dtype)
         return (torch.exp(-(X - lo) / eps) + torch.exp(-(hi - X) / eps)).sum(dim=-1)
-
-    def region_jaccard(self, bounds_a, bounds_b, device=None, dtype=None):
-        return _bounds_jaccard_box(bounds_a, bounds_b)
 
     def check_point(self, x):
         lo, hi = self._limits(x.shape[-1], x.device, x.dtype)

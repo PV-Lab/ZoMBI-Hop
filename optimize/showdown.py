@@ -377,8 +377,15 @@ while [ "$out_of_time" -eq 0 ]; do
         claimed_this_pass=$(( claimed_this_pass + 1 ))
 
         RUN_OUT="{out_dir}/runs/${{CFG}}__ls${{LS}}__r${{REP}}"
-        # A retried task must not inherit a killed attempt's partial files.
-        rm -rf "$RUN_OUT"
+        # A retried task (preempted / killed worker) RESUMES from the snapshots the
+        # earlier attempt left under checkpoint/ (evaluate.py --checkpoint), so the
+        # measurements already made are kept rather than redone. A dir with no
+        # snapshot to resume from is a stale partial and is wiped instead.
+        if compgen -G "$RUN_OUT/trial_*/run_*/checkpoint/run_sim/latest.txt" > /dev/null; then
+            echo "[$(date)] worker $SLURM_ARRAY_TASK_ID: task $TID has a checkpoint — resuming it"
+        else
+            rm -rf "$RUN_OUT"
+        fi
         echo "[$(date)] worker $SLURM_ARRAY_TASK_ID -> task $TID: config=$CFG landscape=$LS repeat=$REP"
 
         # Repeat 1 renders the full artifact set; the rest pass --no-plots and produce only
@@ -392,7 +399,7 @@ while [ "$out_of_time" -eq 0 ]; do
             {dataset_flags}--num-runs 1 \\
             {extra_flags}--time-limit-min {time_limit_min} \\
             {max_lines_flag}--device cuda \\
-            --no-video $PLOTFLAG \\
+            --no-video --checkpoint $PLOTFLAG \\
             --out-dir "$RUN_OUT" < /dev/null
         # `< /dev/null` matters: without it the child inherits this loop's stdin and can
         # swallow the rest of the queue, silently truncating it.
@@ -403,6 +410,9 @@ while [ "$out_of_time" -eq 0 ]; do
         if [ "$RC" -eq 0 ] && compgen -G "$RUN_OUT/trial_*/run_*/metrics.json" > /dev/null; then
             mkdir -p "$DONE/$TID"
             n_ran=$(( n_ran + 1 ))
+            # The snapshots are only for resuming; the results are in the CSVs, zones.pt
+            # and metrics.json. Thousands of small files per run otherwise stay on scratch.
+            rm -rf "$RUN_OUT"/trial_*/run_*/checkpoint
         else
             echo "[$(date)] worker $SLURM_ARRAY_TASK_ID: task $TID FAILED rc=$RC or no metrics.json (claim kept; --reset-stale requeues it)"
         fi

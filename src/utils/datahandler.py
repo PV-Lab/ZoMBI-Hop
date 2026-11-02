@@ -494,9 +494,27 @@ class DataHandler:
         with open(snapshot_dir / 'summary.json', 'w') as f:
             json.dump(summary, f, indent=2)
 
+        # The pared (noise-deduplicated) GP dataset. It cannot be rebuilt from X_all:
+        # paring keeps one of two near-duplicates by coin flip, and Y_pared may carry
+        # medians. So a resume needs the set itself. It is a full copy, so only the
+        # LATEST snapshot keeps one; the previous snapshot's copy is dropped below once
+        # latest.txt points past it.
+        torch.save({
+            'X_pared': self.X_pared,
+            'Y_pared': self.Y_pared,
+            'gp_output_noise': float(self._gp_output_noise),
+        }, snapshot_dir / 'pared.pt')
+
         # Track latest
         with open(self.run_dir / 'latest.txt', 'w') as f:
             f.write(name)
+        prev_pared = getattr(self, '_pared_snapshot_dir', None)
+        if prev_pared is not None and prev_pared != snapshot_dir:
+            try:
+                (prev_pared / 'pared.pt').unlink()
+            except FileNotFoundError:
+                pass
+        self._pared_snapshot_dir = snapshot_dir
 
         # Cleanup only applies to legacy full-copy snapshots. Delta format stores
         # incremental diffs, so every snapshot is needed for reconstruction.
@@ -630,6 +648,22 @@ class DataHandler:
         snap_dir = self.run_dir / 'snapshots'
         all_snap_names = sorted(s.name for s in snap_dir.iterdir() if s.is_dir())
 
+        # Snapshots numbered AFTER latest.txt were being written when the process
+        # died (latest.txt is updated last). This replay stops at snapshot_name, so
+        # they are skipped now. But if they stayed, new snapshots would be numbered
+        # after them and the NEXT resume would replay their points too. Move them
+        # aside rather than delete them.
+        orphans = [n for n in all_snap_names if n > snapshot_name]
+        if orphans:
+            orphan_dir = self.run_dir / 'snapshots_orphaned'
+            orphan_dir.mkdir(exist_ok=True)
+            for n in orphans:
+                shutil.move(str(snap_dir / n), str(orphan_dir / n))
+            all_snap_names = [n for n in all_snap_names if n <= snapshot_name]
+            if self.verbose:
+                print(f"  [DH.load] moved {len(orphans)} snapshot(s) newer than "
+                      f"{snapshot_name} to {orphan_dir.name}/")
+
         X_parts: List[torch.Tensor] = []
         X_exp_parts: List[torch.Tensor] = []
         Y_parts: List[torch.Tensor] = []
@@ -674,6 +708,9 @@ class DataHandler:
 
         # Restore X_init from first delta's n_init_points marker
         n_init = last_delta.get('n_init_points', 0)
+        # Kept so the snapshots this resumed run writes still record it. Without it
+        # they would say 0, and a SECOND resume would lose X_init.
+        self._n_init_points = int(n_init)
         if n_init > 0 and self.X_all_actual.shape[0] >= n_init:
             self.X_init_actual = self.X_all_actual[:n_init].clone()
             self.X_init_expected = self.X_all_expected[:n_init].clone()
@@ -711,7 +748,32 @@ class DataHandler:
             self.activation_start_idx = summary.get('activation_start_idx')
 
         self._load_needles_json(self.run_dir / 'snapshots' / snapshot_name / 'needles.json')
+        self._restore_pared(self.run_dir / 'snapshots' / snapshot_name / 'pared.pt')
         return self.current_activation, self.current_zoom, self.current_iteration, self.no_improvements
+
+    def _restore_pared(self, path: Path) -> None:
+        """Restore the pared GP dataset saved with the snapshot being resumed.
+
+        Snapshots written before pared.pt existed have no copy. Without one, the pared
+        set would start empty and the GP would train only on points measured after the
+        resume. So rebuild it the way the run built it: offer every unpenalized
+        measured row to ``_update_pared`` in order. The coin flips differ from the
+        original run, so this is a statistically equivalent rebuild, not an exact one.
+        """
+        self._pared_snapshot_dir = path.parent
+        if path.exists():
+            p = torch.load(str(path), map_location=self.device, weights_only=False)
+            xp, yp = p.get('X_pared'), p.get('Y_pared')
+            self.X_pared = xp.to(self.device, self.dtype) if isinstance(xp, torch.Tensor) else None
+            self.Y_pared = yp.to(self.device, self.dtype) if isinstance(yp, torch.Tensor) else None
+            self._gp_output_noise = float(p.get('gp_output_noise', self._gp_output_noise))
+        elif self.X_all_actual is not None and self.X_all_actual.shape[0] > 0:
+            if self.verbose:
+                print(f"  [DH.load] no pared.pt in {path.parent.name}; rebuilding the pared "
+                      f"set from {self.X_all_actual.shape[0]} measured row(s)")
+            self.X_pared = self.Y_pared = None
+            self._update_pared(self.X_all_actual, self.Y_all)
+        self._pared_version += 1
 
     def _load_tensors_from_delta(self, d: dict):
         """Restore non-accumulated tensors (bounds, needles, penalty mask) from a delta dict."""

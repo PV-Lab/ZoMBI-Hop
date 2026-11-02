@@ -237,13 +237,6 @@ _REGISTRY: tuple[HParam, ...] = (
            "(3 × 0.128 = 0.384). 0 disables the floor.",
            (("dh", "input_noise_threshold_mult"),),
            tune=(0.5, 4.0, "linear")),
-    HParam("zoom_jaccard_threshold", "float", _closed_unit, _ZOOM,
-           "Zoom Jaccard thresh",
-           "If the next zoom box overlaps a box this activation already searched by "
-           "more than this Jaccard fraction, there is no novel window left: the "
-           "activation ends and its region is penalised.",
-           (("zombi", "zoom_jaccard_threshold"),),
-           tune=(0.5, 0.95, "linear")),
     HParam("max_gp_points", "int", _pos_int, _ZOOM, "Max GP points",
            "Cap on points passed to the GP fit (compute budget).",
            (("dh", "max_gp_points"),),
@@ -370,7 +363,6 @@ LEGACY_EFFECTIVE: dict[str, Any] = {
     # Retired from the space in 56dd11d; every run since used the constructor's 3.0
     # (the values older records carry were inert at the time).
     "input_noise_threshold_mult": 3.0,
-    "zoom_jaccard_threshold": 0.75,
     "ellipsoid_drop_fraction": 0.25,
     "min_zoom_for_needle": 2,
     "min_iters_per_zoom": 3,
