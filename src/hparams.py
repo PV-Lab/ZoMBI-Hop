@@ -280,14 +280,16 @@ _REGISTRY: tuple[HParam, ...] = (
            (("zombi", "ellipsoid_eigenvalue_floor"),),
            default=1e-6),
     HParam("needle_shrink_factor", "float", _open_unit, _NEEDLE, "Needle shrink factor",
-           "When no candidate can be produced and no new data arrived, every needle "
-           "ellipsoid's radii are multiplied by this to hand territory back.",
+           "Inert: a failure with no new data now ends the activation with an "
+           "exclusion zone instead of shrinking needle ellipsoids. Kept so existing "
+           "configs and tuning records still load.",
            (("zombi", "needle_shrink_factor"),),
            tune=(0.5, 0.95, "linear")),
     HParam("needle_stop_noise_multiplier", "float", _pos_float, _NEEDLE,
            "Needle stop mult",
-           "Shrinking stops (and the run ends, unless never_terminate) once every "
-           "needle semi-axis is below mult × input_noise.",
+           "Inert: was the noise-floor stop for the retired failure-path shrink "
+           "(a stalled activation now ends with an exclusion zone). Kept so "
+           "existing configs and tuning records still load.",
            (("zombi", "needle_stop_noise_multiplier"),),
            tune=(1.0, 8.0, "linear")),
     HParam("min_zoom_for_needle", "int", _nonneg_int, _NEEDLE, "Min zoom for needle",
@@ -446,7 +448,9 @@ ALL_DEFAULTS: dict[str, Any] = {**FIXED_DEFAULTS, **DEFAULT_HPARAMS}
 #    whole basin (0.25, ~p75 nearest-optimum spacing of those landscapes) and is
 #    shrunk ×0.75 when the search stalls, down to a floor of 0.4 × input_noise
 #    (0.051 at 0.128), just under the closest spacing (~0.066):
-#    0.25 → 0.19 → 0.14 → 0.11 → 0.079 → 0.059 → 0.044. Penalty falls linearly to
+#    0.25 → 0.19 → 0.14 → 0.11 → 0.079 → 0.059 → 0.044. (That failure-path shrink
+#    was retired 2026-11-02: a stalled activation now ends with an exclusion zone,
+#    so the shrink/floor knobs below no longer act.) Penalty falls linearly to
 #    0 at the zone edge. max_penalty_fraction 0.9 (cap 0.322 in 6-d) keeps the
 #    0.25 radius the binding cap.
 DIM_DEFAULTS: dict[int, dict[str, Any]] = {

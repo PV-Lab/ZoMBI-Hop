@@ -148,12 +148,14 @@ def test_snapshot_called_once_per_objective_and_after_objective(torch):
     assert "act0_z0_i0" in label
 
 
-def test_successive_demotion_stops_when_needles_exhausted(torch):
+def test_stalled_activation_ends_with_exclusion_zone(torch):
     """
-    Verifies the three-way failure dispatch in _handle_failure_retry:
+    Verifies the failure dispatch when no candidate can ever be produced:
       - First failure (first_failure_handled=False): gp_handler.recompute_all_ellipsoids called.
-      - Second failure (first_failure_handled=True, data_added=False, needle_M_list empty):
-        _all_needle_axes_below_min returns True → stop immediately, no shrink.
+      - Second failure with no new data in between: the activation has stalled. It
+        ends, an exclusion zone is added, and the next activation starts — no
+        needle shrink and no space-filling measurement.
+    Two activations → two refits, two exclusion zones, zero objective calls.
     """
     from src.core.zombihop import ZoMBIHop
 
@@ -165,6 +167,9 @@ def test_successive_demotion_stops_when_needles_exhausted(torch):
 
     recompute_calls = []
     shrink_calls = []
+    exclusion_calls = []
+    snapshot_labels = []
+    objective_calls = []
 
     class FakeDH:
         def __init__(self):
@@ -182,7 +187,7 @@ def test_successive_demotion_stops_when_needles_exhausted(torch):
             self.needles_results = []
             self.needles = torch.tensor([[0.2, 0.3, 0.5]], dtype=dtype, device=device)
             self.needle_vals = torch.tensor([[1.0]], dtype=dtype, device=device)
-            # Empty M list → _all_needle_axes_below_min returns True immediately
+            # Empty M list: refits install nothing, so nothing could be shrunk anyway
             self.needle_M_list = []
             self.input_noise = 0.01
             self.max_gp_points = 100
@@ -204,11 +209,17 @@ def test_successive_demotion_stops_when_needles_exhausted(torch):
                 return torch.ones(self.Y_all.shape[0], dtype=torch.bool, device=self.Y_all.device)
             return torch.ones(X.shape[0], dtype=torch.bool, device=X.device)
 
-        def take_snapshot(self, *args, **kwargs):
-            return None
+        def take_snapshot(self, label="", *args, **kwargs):
+            snapshot_labels.append(label)
 
         def determine_new_bounds(self):
             return self.bounds.clone()
+
+        def get_best_in_bounds(self, bounds):
+            return self.X_all_actual[0], self.Y_all[0], 0
+
+        def add_exclusion(self, center, M=None, B=None, radius=0.0):
+            exclusion_calls.append((center.clone(), M, float(radius)))
 
         def update_all_needle_radii(self, M_list):
             self.needle_M_list = list(M_list)
@@ -269,7 +280,7 @@ def test_successive_demotion_stops_when_needles_exhausted(torch):
 
         def recompute_all_ellipsoids(self, needles, X, Y, **kwargs):
             recompute_calls.append(1)
-            return []  # empty → needle_M_list stays empty → _all_needle_axes_below_min → True
+            return []  # empty → needle_M_list stays empty
 
     z = ZoMBIHop.__new__(ZoMBIHop)
     z.device = device
@@ -277,12 +288,14 @@ def test_successive_demotion_stops_when_needles_exhausted(torch):
     z.verbose = False
     z._needle_plot_points_ref = None
     z.bounds = bounds0.clone()
+    z.full_bounds = bounds0.clone()
     z.d = 3
     z.ellipsoid_drop_fraction = 0.25
     z.ellipsoid_eigenvalue_floor = 1e-6
     z.needle_shrink_factor = 0.8
     z.needle_stop_noise_multiplier = 2.0
     z.max_penalty_radius = 1.0
+    z.max_penalty_fraction = 0.10
     z.random_sampler = lambda n, a, b, **kwargs: torch.rand((n, 3), dtype=dtype, device=device)
     z.proj_fn = lambda X: X
     z.data_handler = FakeDH()
@@ -291,15 +304,23 @@ def test_successive_demotion_stops_when_needles_exhausted(torch):
     z._log = lambda *args, **kwargs: None
     z._log_status = lambda *args, **kwargs: None
     z._check_convergence_to_needle = lambda *args, **kwargs: (False, None, None)
-    z._objective_wrapper = lambda *a, **kw: (
-        torch.tensor([[0.2, 0.3, 0.5]], dtype=dtype, device=device),
-        torch.tensor([[1.0]], dtype=dtype, device=device),
-    )
+    def _objective_wrapper(*a, **kw):
+        objective_calls.append(1)
+        return (torch.tensor([[0.2, 0.3, 0.5]], dtype=dtype, device=device),
+                torch.tensor([[1.0]], dtype=dtype, device=device))
 
-    z.run(max_activations=float("inf"), time_limit_hours=None)
+    z._objective_wrapper = _objective_wrapper
 
-    # Case 1: first failure → recompute_all_ellipsoids called exactly once
-    assert len(recompute_calls) == 1, f"expected 1 recompute call, got {len(recompute_calls)}"
-    # Case 3: second failure, no new data, needle_M_list empty → stop before shrink
+    z.run(max_activations=2, time_limit_hours=None)
+
+    # Case 1 once per activation: first failure → recompute_all_ellipsoids
+    assert len(recompute_calls) == 2, f"expected 2 recompute calls, got {len(recompute_calls)}"
+    # Second failure with no new data → stalled: exclusion zone, never a shrink
+    assert len(exclusion_calls) == 2, f"expected 2 exclusion zones, got {len(exclusion_calls)}"
     assert len(shrink_calls) == 0, f"expected 0 shrink calls, got {len(shrink_calls)}"
+    # ...and never a space-filling (or any other) measurement
+    assert not objective_calls, f"expected no objective calls, got {len(objective_calls)}"
+    assert sum("_stalled" in lbl for lbl in snapshot_labels) == 2, snapshot_labels
+    # The stalled activation hands the next one the full search box
+    assert torch.equal(z.bounds, bounds0)
 

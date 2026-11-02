@@ -86,7 +86,7 @@ When an activation fails (candidate is None, or all points penalized):
 |-----------|--------|
 | **First failure** (`not first_failure_handled`) | Recompute all needle ellipsoids using the clean local GP (`recompute_all_ellipsoids`): for each needle, `fit_with_locality` → `create_clean_acquisition` → `determine_penalty_ellipsoid`. Update `dh.needle_M_list`. Retry same zoom. |
 | **Subsequent failure, data was added** (`first_failure_handled AND data_added_since_last_failure`) | Recompute zoom bounds: `dh.determine_new_bounds()`. Retry same zoom. |
-| **Subsequent failure, no new data** (`first_failure_handled AND NOT data_added_since_last_failure`) | Shrink all ellipsoid semi-axes: `dh.shrink_all_needle_radii(needle_shrink_factor)`. If every semi-axis < `needle_stop_noise_multiplier × input_noise`, all exclusion zones are at noise scale → stop. Otherwise retry same zoom. |
+| **Subsequent failure, no new data** (`first_failure_handled AND NOT data_added_since_last_failure`) | The activation has **stalled**: it ends immediately, `_penalize_capped_zone` adds an exclusion zone at the best unpenalized point in the current bounds (as for a line-budget cap), and the next activation starts on the full simplex. Needle zones are not shrunk. Handled in `run`, not `_handle_failure_retry`. |
 
 `data_added_since_last_failure` is set `True` immediately after `_objective_wrapper` returns (regardless of whether points are penalized), and reset to `False` after each failure dispatch.
 
@@ -169,10 +169,9 @@ Before any point enters the GP training set, it is checked against the **pared d
 ║  │  │      Case 2 (subsequent, data added):                      │ │   ║
 ║  │  │        determine_new_bounds()                              │ │   ║
 ║  │  │        update bounds  → retry same zoom                    │ │   ║
-║  │  │      Case 3 (subsequent, no data):                         │ │   ║
-║  │  │        shrink_all_needle_radii(needle_shrink_factor)       │ │   ║
-║  │  │        if max_radius < needle_stop_mult×σ → finished      │ │   ║
-║  │  │        else → retry same zoom                              │ │   ║
+║  │  │      Case 3 (subsequent, no data): stalled                 │ │   ║
+║  │  │        end activation → exclusion zone                     │ │   ║
+║  │  │        → fresh activation on full simplex                 │ │   ║
 ║  │  │    data_added_since_last_failure = False                   │ │   ║
 ║  │  │    consecutive_converged = 0                               │ │   ║
 ║  │  │    continue  ← same current_zoom, retry zoom body         │ │   ║

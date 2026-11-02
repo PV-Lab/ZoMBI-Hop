@@ -444,35 +444,17 @@ class ZoMBIHop:
         return (torch.abs(bounds[0] - fb[0]).max().item() < eps and
                 torch.abs(bounds[1] - fb[1]).max().item() < eps)
 
-    def _all_needle_axes_below_min(self, dh) -> bool:
-        """True when every semi-axis is below needle_stop_noise_multiplier × input_noise."""
-        threshold = self.needle_stop_noise_multiplier * dh.input_noise
-        if threshold <= 0:
-            return False
-        for M in dh.needle_M_list:
-            if M is None:
-                continue
-            min_eig = torch.linalg.eigvalsh(M).clamp(min=1e-30).min()
-            if (1.0 / min_eig.sqrt()).item() > threshold:
-                return False
-        return True
-
-    def _handle_failure_retry(
-        self,
-        dh,
-        first_failure_handled: bool,
-        data_added_since_last_failure: bool,
-    ) -> Tuple[bool, bool]:
-        """Three-way failure dispatch.
-
-        Returns (should_stop, first_failure_handled_updated).
+    def _handle_failure_retry(self, dh, first_failure_handled: bool) -> None:
+        """Recovery for an activation failure that should retry the same zoom.
 
         Case 1 — first failure: recompute all ellipsoids using clean local GP
           (gp_handler.recompute_all_ellipsoids).
         Case 2 — subsequent failure after objective was called: recompute zoom
           bounds with determine_new_bounds().
-        Case 3 — subsequent failure with no new data: shrink radii; terminate
-          when all axes fall below needle_stop_noise_multiplier × input_noise.
+
+        A subsequent failure with NO new data since the last one is not handled
+        here: the run loop treats it as a stalled activation and ends it with an
+        exclusion zone (see ``run``). Needle zones are no longer shrunk on a stall.
         """
         n_needles = dh.needles.shape[0] if dh.needles is not None else 0
 
@@ -510,31 +492,14 @@ class ZoMBIHop:
                             except Exception as e2:
                                 self._log(f"  [failure] pared refit needle {i} failed: {e2}")
                         dh._update_penalty_mask()
-            return False, True
+            return
 
-        elif data_added_since_last_failure:
-            self._log("  [failure] subsequent failure with new data — recomputing zoom bounds ...")
-            new_bounds = dh.determine_new_bounds()
-            self._log(f"  [failure] new bounds: [{new_bounds[0].cpu().numpy()}] – [{new_bounds[1].cpu().numpy()}]")
-            dh.current_zoom_bounds = new_bounds.clone()
-            dh.bounds = new_bounds.clone()
-            self.bounds = new_bounds.clone()
-            return False, True
-
-        else:
-            if n_needles == 0 or self._all_needle_axes_below_min(dh):
-                self._log("  [failure] all needle axes below noise floor — stopping.")
-                return True, True
-            self._log(
-                f"  [failure] no new data — shrinking radii by factor {self.needle_shrink_factor:.2f} ..."
-            )
-            dh.shrink_all_needle_radii(self.needle_shrink_factor)
-            max_r = dh.max_needle_radius()
-            self._log(f"  [failure] max needle radius after shrink: {max_r:.4f}")
-            if self._all_needle_axes_below_min(dh):
-                self._log("  [failure] axes now below noise floor — stopping.")
-                return True, True
-            return False, True
+        self._log("  [failure] subsequent failure with new data — recomputing zoom bounds ...")
+        new_bounds = dh.determine_new_bounds()
+        self._log(f"  [failure] new bounds: [{new_bounds[0].cpu().numpy()}] – [{new_bounds[1].cpu().numpy()}]")
+        dh.current_zoom_bounds = new_bounds.clone()
+        dh.bounds = new_bounds.clone()
+        self.bounds = new_bounds.clone()
 
     def _repeat_radius(self, bounds: Optional[torch.Tensor]) -> float:
         """Radius, in composition L2, inside which measurements count as REPEATS.
@@ -1164,11 +1129,12 @@ class ZoMBIHop:
 
         Counterpart to ``_declare_needle_at_best``: same ellipsoid machinery, but
         recorded as an *exclusion zone* rather than a needle. Ending an activation
-        this way (line budget spent or zoom levels exhausted)
-        means the search kept working one region without ever satisfying the needle
-        criteria — that is a statement about where NOT to look again, not a
-        discovered optimum, so it must not enter the needle record (``needles.csv``
-        and every metric derived from it, e.g. dist_to_needles).
+        this way (line budget spent, zoom levels exhausted, or stalled on two
+        failures in a row with no new data) means the search kept working one
+        region without ever satisfying the needle criteria — that is a statement
+        about where NOT to look again, not a discovered optimum, so it must not
+        enter the needle record (``needles.csv`` and every metric derived from it,
+        e.g. dist_to_needles).
 
         The zone is centred on the best unpenalised point inside the active search
         bounds — the attractor the activation kept falling into. Returns True if a
@@ -1387,23 +1353,25 @@ class ZoMBIHop:
         """
         Run ZoMBI-Hop optimization.
 
+        An activation that fails twice in a row with no new measurement in between
+        (no candidate producible, or every measured point penalised) has *stalled*:
+        it ends there, its region is penalised with an exclusion zone
+        (``_penalize_capped_zone``, as for a line-budget cap), and a fresh
+        activation starts on the full simplex. This holds with or without
+        ``never_terminate``.
+
         When ``never_terminate`` is True the optimiser is prevented from stopping
         on its own through *any* internal pathway (over-penalisation, activation
-        failure with no needles, all-axes-below-noise-floor, or exhausting
-        ``max_activations``). For the *heuristic* stops (over-penalisation guess,
-        transient activation failure with no needles) it logs a ``[no-stop]`` note,
-        shrinks every needle penalty volume to 30% of its size (i.e. by 70%), resets
-        the search bounds to the full simplex, and keeps sampling. For the *terminal*
-        stop (recovery exhausted — penalty axes already below the noise floor and no
-        candidate producible) it instead falls back to **space-filling exploration**:
-        it measures a LineBO line through the point of the full simplex farthest from
-        everything measured so far (greedy maximin), so leftover budget/precursor is
-        spent on the emptiest region rather than idling, and repeated calls tile the
-        space roughly uniformly. The only ways to end such a run are the user Stop
-        button (``_StopRunRequested``) or the time limit, if one is set. (A bounded
-        stall counter is retained purely as a safety net for a genuinely un-measurable
-        state — e.g. a persistently singular GP with zero needles — so the process
-        can never hard-spin.)
+        failure with no needles, or exhausting ``max_activations``). For those
+        stops it logs a ``[no-stop]`` note, shrinks every penalty volume to 30% of
+        its size (i.e. by 70%), resets the search bounds to the full simplex, and
+        keeps sampling. The only ways to end such a run are the user Stop button
+        (``_StopRunRequested``) or the time limit, if one is set. (A bounded stall
+        counter is retained purely as a safety net for a genuinely un-measurable
+        state — e.g. a persistently singular GP — so the process can never
+        hard-spin; under never_terminate it falls back to **space-filling
+        exploration**: one LineBO line through the point of the full simplex
+        farthest from everything measured so far.)
 
         Returns
         -------
@@ -1484,16 +1452,16 @@ class ZoMBIHop:
         start_activation = activation
         global_iteration = 0
 
-        # Backstop counter for no-measurement loops. The main saturation case is
-        # handled directly below (should_stop → space-filling fallback), but
-        # never_terminate has a second no-measurement path: an activation failure with
-        # zero needles (e.g. a persistently singular GP makes get_candidate return
-        # None) loops through _keep_searching with nothing to shrink. A run only makes
+        # Backstop counter for no-measurement loops. A stalled activation (two
+        # failures in a row, nothing measured between) ends with an exclusion zone,
+        # but the next one can stall the same way without measuring anything, and an
+        # activation failure with zero needles (e.g. a persistently singular GP makes
+        # get_candidate return None) loops through _keep_searching. A run only makes
         # real progress when the objective is measured, so we count consecutive failure
-        # dispatches that gather no new measurement and reset to 0 on any objective
-        # call. If we rack up this many in a row, under never_terminate we force a
-        # space-filling measurement (keeping the "never stop" promise); otherwise we
-        # stop rather than spin.
+        # dispatches that gather no new measurement — across activations — and reset
+        # to 0 on any objective call. If we rack up this many in a row, under
+        # never_terminate we force a space-filling measurement (keeping the "never
+        # stop" promise); otherwise we stop rather than spin.
         MAX_STALLED_RETRIES = 40
         stalled_retries = 0
 
@@ -1522,8 +1490,9 @@ class ZoMBIHop:
                 torch.cuda.empty_cache()
 
             # Failure-handling loop: on activation failure, first refit needle ellipsoids
-            # with the updated pared GP; if no new data exists, shrink all needle ellipsoids;
-            # stop when all axes fall below the noise floor.
+            # with the updated pared GP; on a later failure after new measurements,
+            # recompute the zoom bounds; on a second failure in a row with no new
+            # data, end the activation as stalled (exclusion zone, fresh activation).
             first_failure_handled: bool = False
             data_added_since_last_failure: bool = False
 
@@ -1548,6 +1517,8 @@ class ZoMBIHop:
             activation_capped = False
             # Set when the deepest zoom level finishes its lines without a needle.
             zooms_exhausted = False
+            # Set when two failures in a row produce no measurement in between.
+            activation_stalled = False
             consecutive_converged = 0
             best_f_local: float = float('-inf')
             lines_this_activation = 0
@@ -1804,9 +1775,9 @@ class ZoMBIHop:
                     # Backstop (see MAX_STALLED_RETRIES above): reaching the failure
                     # dispatch means this zoom iteration produced no new measurement
                     # (get_candidate returned None). Count it; a real objective call
-                    # resets the counter. This catches no-measurement paths that don't
-                    # hit the should_stop fallback below — e.g. an activation failure
-                    # with zero needles (singular GP) that keeps retrying. Under
+                    # resets the counter. This catches no-measurement loops — e.g. an
+                    # activation failure with zero needles (singular GP) that keeps
+                    # retrying, or activation after activation stalling. Under
                     # never_terminate we honour "never stop" by forcing a space-filling
                     # measurement (progress) instead of terminating; only a genuinely
                     # un-measurable simplex (fallback returns 0) stops the run.
@@ -1822,7 +1793,7 @@ class ZoMBIHop:
                         )
                         finished = True
                         break
-                    # Three-way failure dispatch.
+                    # Failure dispatch.
                     n_needles = dh.needles.shape[0] if dh.needles is not None else 0
                     if n_needles == 0:
                         if never_terminate:
@@ -1842,26 +1813,25 @@ class ZoMBIHop:
                         self._log("Activation failed and no needles — stopping.")
                         finished = True
                         break
-                    should_stop, first_failure_handled = self._handle_failure_retry(
-                        dh, first_failure_handled, data_added_since_last_failure
-                    )
+                    if first_failure_handled and not data_added_since_last_failure:
+                        # Second failure in a row with nothing measured in between:
+                        # the refit/rebound recovery has had its chance and the
+                        # region still yields no candidate. End the activation here;
+                        # the block after the zoom loop penalises the region with an
+                        # exclusion zone and the next activation starts on the full
+                        # simplex.
+                        self._log("  [failure] second failure with no new data — "
+                                  "activation stalled; ending it.")
+                        self._record_convergence(activation=activation, zoom=zoom,
+                                                 iteration=iteration, measured=False,
+                                                 event="stalled")
+                        activation_stalled = True
+                        break
+                    self._handle_failure_retry(dh, first_failure_handled)
+                    first_failure_handled = True
                     data_added_since_last_failure = False
                     activation_failed = False
                     consecutive_converged = 0
-                    if should_stop:
-                        # Recovery is exhausted: penalty axes are already below the
-                        # noise floor and the normal search can no longer produce a
-                        # candidate (the simplex is saturated and acquisition ascent
-                        # keeps landing on already-declared needles). Under
-                        # never_terminate, spend leftover budget on space-filling
-                        # exploration instead of stopping; keeping
-                        # first_failure_handled True means the next dispatch is the
-                        # cheap Case-2/3 path, not the expensive ellipsoid recompute.
-                        if never_terminate and _spacefill_fallback(
-                                "simplex saturated (recovery exhausted)"):
-                            continue
-                        finished = True
-                        break
                     # Reload local GP data for the (possibly updated) bounds
                     bounds = dh.bounds.clone()
                     self.bounds = bounds.clone()
@@ -1900,15 +1870,18 @@ class ZoMBIHop:
                     zooms_exhausted = True
 
             # Activation ended without a needle — it spent its whole line budget
-            # circling a region it never localised, or ran every zoom level to
-            # completion without the needle criteria ever passing. Both mean the
-            # same thing: this region
-            # absorbed measurements and produced nothing. Penalise it so the next
-            # activation is repelled from it instead of converging straight back
-            # in, and hand that activation the full simplex.
-            if ((activation_capped or zooms_exhausted)
+            # circling a region it never localised, ran every zoom level to
+            # completion without the needle criteria ever passing, or stalled (two
+            # failures in a row with nothing measured between). All mean the same
+            # thing: this region absorbed effort and produced nothing. Penalise it
+            # so the next activation is repelled from it instead of converging
+            # straight back in, and hand that activation the full simplex.
+            if ((activation_capped or zooms_exhausted or activation_stalled)
                     and needle is None and not finished):
-                if activation_capped:
+                if activation_stalled:
+                    why = (f"stalled at zoom {zoom+1} (two failures in a row with "
+                           f"no new data; {lines_this_activation} line(s))")
+                elif activation_capped:
                     why = (f"hit the {self.max_lines_per_activation}-line budget "
                            f"({lines_this_activation} measured)")
                 else:
@@ -1918,7 +1891,7 @@ class ZoMBIHop:
                           f"declaring a needle — ending it and penalising the region.")
                 self._penalize_capped_zone(dh, bounds)
                 dh.take_snapshot(
-                    f"act{activation}_z{zoom}_capped",
+                    f"act{activation}_z{zoom}_{'stalled' if activation_stalled else 'capped'}",
                     activation=activation, zoom=zoom, iteration=iteration,
                     permanent=True,
                 )

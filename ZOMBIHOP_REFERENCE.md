@@ -81,7 +81,7 @@ When an activation fails (candidate is None, or all points penalized):
 |-----------|--------|
 | **First failure** (`not first_failure_handled`) | Recompute all needle ellipsoids using the clean local GP (`recompute_all_ellipsoids`): for each needle, `fit_with_locality` → `create_clean_acquisition` → `determine_penalty_ellipsoid`. Update `dh.needle_M_list`. Retry same zoom. |
 | **Subsequent failure, data was added** (`first_failure_handled AND data_added_since_last_failure`) | Recompute zoom bounds: `dh.determine_new_bounds()`. Retry same zoom. |
-| **Subsequent failure, no new data** (`first_failure_handled AND NOT data_added_since_last_failure`) | Shrink all ellipsoid semi-axes: `dh.shrink_all_needle_radii(needle_shrink_factor)`. If every semi-axis < `needle_stop_noise_multiplier × input_noise`, all exclusion zones are at noise scale → stop. Otherwise retry same zoom. |
+| **Subsequent failure, no new data** (`first_failure_handled AND NOT data_added_since_last_failure`) | The activation has **stalled**: it ends immediately, `_penalize_capped_zone` adds an exclusion zone at the best unpenalized point in the current bounds (as for a line-budget cap), and the next activation starts on the full simplex. Needle zones are not shrunk. Handled in `run`, not `_handle_failure_retry`. |
 
 `data_added_since_last_failure` is set `True` immediately after `_objective_wrapper` returns (regardless of whether points are penalized), and reset to `False` after each failure dispatch.
 
@@ -164,10 +164,9 @@ Before any point enters the GP training set, it is checked against the **pared d
 ║  │  │      Case 2 (subsequent, data added):                      │ │    ║
 ║  │  │        determine_new_bounds()                              │ │    ║
 ║  │  │        update bounds  → retry same zoom                    │ │    ║
-║  │  │      Case 3 (subsequent, no data):                         │ │    ║
-║  │  │        shrink_all_needle_radii(needle_shrink_factor)       │ │    ║
-║  │  │        if max_radius < needle_stop_mult×σ → finished      │ │    ║
-║  │  │        else → retry same zoom                              │ │    ║
+║  │  │      Case 3 (subsequent, no data): stalled                 │ │    ║
+║  │  │        end activation → exclusion zone                     │ │    ║
+║  │  │        → fresh activation on full simplex                 │ │    ║
 ║  │  │    data_added_since_last_failure = False                   │ │    ║
 ║  │  │    consecutive_converged = 0                               │ │    ║
 ║  │  │    continue  ← same current_zoom, retry zoom body         │ │    ║
@@ -562,7 +561,7 @@ Replaces each entry in `needle_M_list` with the corresponding M from `new_M_list
 ---
 
 #### `shrink_all_needle_radii(factor)`
-Multiplies every needle's M by `1/factor²` (semi-axis_new = factor × semi-axis_old). Calls `_update_penalty_mask()`. Called by `_handle_failure_retry` Case 3 when no new data has been observed since the last failure.
+Multiplies every needle's M by `1/factor²` (semi-axis_new = factor × semi-axis_old). Calls `_update_penalty_mask()`. Called by the never_terminate over-penalisation valve (`_keep_searching`, factor 0.30); the failure-retry path no longer shrinks zones.
 
 ---
 
@@ -885,20 +884,15 @@ Validates dimensions, sets defaults (e.g. `top_m_points = max(d+1, 4)` if not sp
 
 ---
 
-#### `ZoMBIHop._all_needle_axes_below_min(dh)` → `bool`
+#### `ZoMBIHop._handle_failure_retry(dh, first_failure_handled)` → `None`
+Recovery called from the while-zoom loop whenever `activation_failed` is set and the activation has not stalled:
 
-Returns True when `dh.max_needle_radius() < needle_stop_noise_multiplier × dh.input_noise`. Used inside `_handle_failure_retry` Case 3 to decide whether to stop after shrinking.
+- **Case 1** (`not first_failure_handled`): calls `gp_handler.recompute_all_ellipsoids(...)` then `dh.update_all_needle_radii(new_M_list)`. On exception, falls back to an inline pared-GP refit (fit global GP, create repulsive acquisition, recompute each needle's M).
+- **Case 2** (`first_failure_handled AND data_added_since_last_failure`): calls `dh.determine_new_bounds()` and updates `dh.bounds`/`self.bounds`.
 
----
+**Stall** (`first_failure_handled AND NOT data_added_since_last_failure`) is checked by the caller *before* this method: the activation ends, the post-zoom-loop block penalises the region with `_penalize_capped_zone` (an exclusion zone, as for a line-budget cap; snapshot label `act{N}_z{Z}_stalled`), and the next activation starts on the full simplex. Needle zones are not shrunk.
 
-#### `ZoMBIHop._handle_failure_retry(dh, first_failure_handled, data_added_since_last_failure)` → `(should_stop, first_failure_handled)`
-Three-way dispatch called from the while-zoom loop whenever `activation_failed` is set:
-
-- **Case 1** (`not first_failure_handled`): calls `gp_handler.recompute_all_ellipsoids(...)` then `dh.update_all_needle_radii(new_M_list)`. On exception, falls back to an inline pared-GP refit (fit global GP, create repulsive acquisition, recompute each needle's M). Returns `(False, True)`.
-- **Case 2** (`first_failure_handled AND data_added_since_last_failure`): calls `dh.determine_new_bounds()` and updates `dh.bounds`/`self.bounds`. Returns `(False, True)`.
-- **Case 3** (`first_failure_handled AND NOT data_added_since_last_failure`): calls `dh.shrink_all_needle_radii(needle_shrink_factor)`. If `_all_needle_axes_below_min(dh)`, returns `(True, True)` (stop). Otherwise returns `(False, True)`.
-
-After the call, the caller resets `data_added_since_last_failure = False`, `activation_failed = False`, `consecutive_converged = 0`, reloads GP data for the (possibly updated) bounds, and issues `continue` to retry the same `current_zoom` level.
+After the call, the caller sets `first_failure_handled = True`, resets `data_added_since_last_failure = False`, `activation_failed = False`, `consecutive_converged = 0`, reloads GP data for the (possibly updated) bounds, and issues `continue` to retry the same `current_zoom` level.
 
 ---
 
@@ -976,11 +970,12 @@ while activation < max_activations:
 
         if activation_failed:
             if no needles: finished = True; break
-            should_stop, first_failure_handled = _handle_failure_retry(
-                dh, first_failure_handled, data_added_since_last_failure)
+            if first_failure_handled and not data_added_since_last_failure:
+                activation_stalled = True; break   # → exclusion zone, next activation
+            _handle_failure_retry(dh, first_failure_handled)
+            first_failure_handled = True
             data_added_since_last_failure = False
             activation_failed = False
-            if should_stop: finished = True; break
             reload GP; continue  # retry SAME current_zoom — do NOT increment
 
         if needle: break zoom loop (advance activation)
@@ -1197,8 +1192,8 @@ These methods are called in `_declare_needle_at_best()` instead of the standard 
 
 | Parameter | Default | Controls |
 |-----------|---------|----------|
-| `needle_shrink_factor` | 0.8 | Radius shrink factor applied to all needle ellipsoids on a no-new-data failure. |
-| `needle_stop_noise_multiplier` | 2.0 | Stop condition: if `max_needle_radius() < needle_stop_noise_multiplier × input_noise`, all ellipsoids are at noise scale and shrinking further is pointless. |
+| `needle_shrink_factor` | 0.8 | Inert: the no-new-data failure now ends the activation instead of shrinking needle ellipsoids. Kept so existing configs and tuning records still load. |
+| `needle_stop_noise_multiplier` | 2.0 | Inert: was the noise-floor stop for the retired failure-path shrink. Kept so existing configs and tuning records still load. |
 
 #### Loop Restructure
 
@@ -1232,26 +1227,19 @@ Case 1 (first failure):
     → gp_handler.recompute_all_ellipsoids(...)
     → dh.update_all_needle_radii(new_M_list)
     → first_failure_handled = True
-    → return (should_stop=False, first_failure_handled=True)
 
 Case 2 (repeated failure, new data since last failure):
     first_failure_handled AND data_added_since_last_failure
     → dh.determine_new_bounds()
                                          ↑ don't contaminate history
     → update dh.bounds with new AABB
-    → return (should_stop=False, first_failure_handled=True)
 
-Case 3 (repeated failure, no new data):
+Stall (repeated failure, no new data) — checked in run(), before the call:
     first_failure_handled AND NOT data_added_since_last_failure
-    → dh.shrink_all_needle_radii(needle_shrink_factor)
-    → if dh.max_needle_radius() < needle_stop_noise_multiplier × input_noise:
-          return (should_stop=True, ...)   ← all ellipsoids at noise scale
-    → return (should_stop=False, first_failure_handled=True)
+    → activation_stalled = True; break out of the zoom loop
+    → _penalize_capped_zone(dh, bounds)   ← exclusion zone, bounds → full box
+    → next activation (needle zones are NOT shrunk)
 ```
-
-#### `_all_needle_axes_below_min(dh)`
-
-Helper that returns `True` when `dh.max_needle_radius() < self.needle_stop_noise_multiplier × dh.input_noise`. Called inside `_handle_failure_retry` to decide whether to stop.
 
 ---
 
