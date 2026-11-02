@@ -697,8 +697,9 @@ Full pipeline:
 5. Sort unpenalized seeds by acquisition, take top `n_restarts`
 6. Run `_optimize_acquisition` on seeds
 7. Sort results by final acquisition value
-8. If `exclude_near` set: skip candidates within `exclude_near_tol`
-9. Final penalty check on winner → return or None
+8. Drop restarts whose ascent ended inside a zone; if none remain → return None (`all_restarts_penalized`). The soft repulsion is ~0 just inside a zone's edge, so the top restart often stops there — checking only the winner used to fail the whole call (97% of None returns in the 6d showdown, 2026-11-02).
+9. If `exclude_near` set: skip candidates within `exclude_near_tol`
+10. Return the best remaining restart
 
 ---
 

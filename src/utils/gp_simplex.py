@@ -216,7 +216,7 @@ CANDIDATE_FAILURE_REASONS = (
     "all_restarts_degenerate",  # every ascent restart collapsed (zero mass / non-finite)
     "final_eval_error",         # RuntimeError evaluating the acquisition after ascent
     "ascent_empty",             # ascent returned nothing, cause not reported
-    "best_restart_penalized",   # top restart after ascent ended inside a zone
+    "all_restarts_penalized",   # every restart's ascent ended inside a zone
     "numerical",                # singular GP / Cholesky / NotPSDError
 )
 
@@ -877,6 +877,21 @@ class GPSimplex:
         candidates = candidates[order]
         values = values[order]
 
+        # Keep only restarts whose ascent ended outside every zone. The soft
+        # repulsion is ~0 just inside a zone's edge, so an ascent climbing
+        # toward a needle often stops there and still ranks first; rejecting the
+        # whole call for that wastes every other restart.
+        valid = self.data_handler.get_penalty_mask(candidates).reshape(-1)
+        if not valid.any():
+            return self._fail("all_restarts_penalized")
+        n_penalized = int((~valid).sum().item())
+        if not valid[0]:
+            # Unconditional, like the None print: showdowns keep only stdout.
+            print(f"  [GP] get_candidate: top restart penalized — using best valid "
+                  f"restart ({n_penalized}/{candidates.shape[0]} ended in a zone)")
+        candidates = candidates[valid]
+        values = values[valid]
+
         # If exclude_near set, pick first candidate not within tol of *any* excluded point
         if exclude_near is not None:
             exclude_near = exclude_near.to(device=candidates.device, dtype=candidates.dtype)
@@ -902,11 +917,6 @@ class GPSimplex:
 
         if best_candidate is not None and self.verbose:
             print(f"  [GP] get_candidate: best_candidate = {best_candidate.cpu().numpy()}, best_acq_value = {best_value.item():.6f}  total={time.time()-_t_total:.2f}s")
-
-        # Verify the candidate is not penalized
-        is_valid = self.data_handler.get_penalty_mask(best_candidate.unsqueeze(0))
-        if not is_valid.any():
-            return self._fail("best_restart_penalized")
 
         return best_candidate
 
