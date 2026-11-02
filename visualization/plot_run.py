@@ -242,6 +242,11 @@ _MODULE_RE = re.compile(r"module\d+$", re.IGNORECASE)
 # same threshold applies to non-simplex sources: d=2 gets real axes, d=3 a 3-D
 # box, d=4 a scatter-plot matrix, and d>=5 the CoNet.
 CONET_MIN_D = 5
+# Showdown runs at d>=7 (the 10d sweeps: ~20k points over ~800 lines) are shown as
+# the convergence panel alone. Their CoNet embedding and zones.pt replay (every
+# zone state tested against every sample) take far too long to be worth it there,
+# so neither is computed; 6d showdowns keep the full view.
+CONVERGENCE_ONLY_MIN_D = 7
 
 # Total points allowed in a non-simplex box background grid. A box grid is n**d,
 # so this caps the product rather than the per-axis resolution (see _box_grid_n):
@@ -1061,7 +1066,8 @@ def load_showdown_run(run_dir: Path) -> Dataset:
         needles=needles,
         simplex=simplex,
         goal="maximize" if maximize else "minimize",
-        zones=showdown_penalty_zones(run_dir, X),
+        zones=(None if X.shape[1] >= CONVERGENCE_ONLY_MIN_D
+               else showdown_penalty_zones(run_dir, X)),
     )
 
 
@@ -2746,12 +2752,14 @@ def simplex_step_renderer(ds: Dataset, **kw):
     return render
 
 
-def convergence_step_renderer(ds: Dataset, *, show_line_marks: bool):
+def convergence_step_renderer(ds: Dataset, *, show_line_marks: bool,
+                              height: int | None = 300):
     """``render(n)`` -> the convergence figure for the first ``n`` lines of ``ds``."""
     def render(n: int):
         rows = None if n == FULL_STEP else ds.prefix_rows(n)
         return build_convergence_figure(ds, rows=rows,
-                                        show_line_marks=show_line_marks)
+                                        show_line_marks=show_line_marks,
+                                        height=height)
     return render
 
 
@@ -2762,7 +2770,7 @@ def build_convergence_figure(
     *,
     rows: np.ndarray | None = None,
     show_line_marks: bool = False,
-    height: int = 300,
+    height: int | None = 300,
 ):
     """Plotly convergence panel in the style of ``run_mobo.plot_convergence``.
 
@@ -2818,9 +2826,15 @@ def build_convergence_figure(
         # Boundaries of the real (variably-sized) lines. Kept fainter than the
         # activation rules below: there are far more of them (109 lines vs ~14
         # activations in these runs), so they must read as a background scale.
-        for b in np.flatnonzero(np.diff(ds.lines)) + 1:
-            fig.add_vline(x=float(b) - 0.5, line=dict(color="#cccccc", width=0.6, dash="dot"),
-                          opacity=0.25, layer="below")
+        # One gapped trace rather than a shape per boundary: a 10d showdown has
+        # ~800 lines, and that many add_vline calls is seconds per step.
+        bx = np.flatnonzero(np.diff(ds.lines)) + 0.5
+        if len(bx) and y_range is not None:
+            fig.add_trace(go.Scatter(
+                x=np.repeat(bx, 3), y=np.tile([y_range[0], y_range[1], np.nan], len(bx)),
+                mode="lines", line=dict(color="#cccccc", width=0.6, dash="dot"),
+                opacity=0.25, hoverinfo="skip", showlegend=False,
+            ))
 
     # Activation boundaries, drawn over the FULL dataset so the frame is fixed.
     if acts is not None:
@@ -3768,8 +3782,13 @@ def render_state(source_type, run_name, db_name, db_value, background, show_poin
         fig = no_update
         conet_src = no_update
         prefetch = no_update
-        conet = full.d >= CONET_MIN_D
-        if conet:
+        conv_only = key[0] == "showdown" and full.d >= CONVERGENCE_ONLY_MIN_D
+        conet = full.d >= CONET_MIN_D and not conv_only
+        if conv_only:
+            simplex_style, conet_style = hide, hide
+            diagram = f"none (d={full.d} showdown: convergence only)"
+            convergence_on = True
+        elif conet:
             simplex_style, conet_style = hide, show_block
             diagram = _diagram_name(full)
             # None of the surrogate knobs feed the CoNet, so its signature is the
@@ -3803,15 +3822,18 @@ def render_state(source_type, run_name, db_name, db_value, background, show_poin
         conv_fig = no_update
         conv_style = hide
         if convergence_on:
-            conv_style = CONVERGENCE_PANEL_STYLE
+            # Alone in the column, it takes the main panel's place rather than
+            # its usual 28% strip under a diagram.
+            conv_style = MAIN_PANEL_STYLE if conv_only else CONVERGENCE_PANEL_STYLE
             # Its own signature: the convergence panel depends on the source and
             # on whether the line marks are drawn, not on any surrogate knob.
             # The trailing int is this panel's own format version (bumped when
             # the legend was dropped): it re-renders only the cheap convergence
             # steps, where bumping STEP_FORMAT would also discard every CoNet PNG.
-            conv_sig = ("convergence", key, bool(timeline_on), 2)
+            conv_sig = ("convergence", key, bool(timeline_on), 2, conv_only)
             conv_render = convergence_step_renderer(
-                full, show_line_marks=bool(timeline_on))
+                full, show_line_marks=bool(timeline_on),
+                height=None if conv_only else 300)
             tracks.append((conv_sig, conv_render, FIGURE_STEP))
 
         # Flagged as foreground so the background pass yields the render lock
@@ -3823,7 +3845,7 @@ def render_state(source_type, run_name, db_name, db_value, background, show_poin
                 cached_step(sig, step, render, codec=PNG_STEP, want_value=False)
                 conet_src = step_image_url(sig, step)
                 prefetch = prefetch_urls(sig, step, full.n_lines)
-            else:
+            elif not conv_only:
                 fig = cached_step(sig, step, render, codec=FIGURE_STEP)
             if convergence_on:
                 conv_fig = cached_step(conv_sig, step, conv_render,

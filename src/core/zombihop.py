@@ -1637,12 +1637,14 @@ class ZoMBIHop:
                         self._log(f"  [ZoMBIHop] GP suggested candidate: {candidate.cpu().numpy()}")
 
                     if candidate is None:
-                        self._log("No valid candidate found (all in penalized regions)")
+                        # Test doubles of the GP handler may not record a reason.
+                        reason = getattr(self.gp_handler, "last_candidate_failure", None)
+                        self._log(f"No valid candidate found (reason={reason})")
                         activation_failed = True
                         self._log_status(activation, zoom, iteration, None)
                         self._record_convergence(activation=activation, zoom=zoom,
                                                  iteration=iteration, measured=False,
-                                                 event="candidate_none")
+                                                 event="candidate_none", reason=reason)
                         break
 
                     # Local reference point: best unpenalized within the active
