@@ -119,8 +119,16 @@ class RepulsiveAcquisition(nn.Module):
         boundary_fn: Optional[Callable] = None,
         profile: str = "linear",
         edge_value: float = 0.0,
+        penalty_mask_fn: Optional[Callable] = None,
+        min_segment_length: float = 0.0,
     ):
         super().__init__()
+        # Not used by forward(). LineBO reads these to cut penalty zones out of
+        # candidate lines: penalty_mask_fn(X) -> True where X is outside every zone
+        # (the data handler's live mask, so it tracks zone shrinks and refits), and
+        # min_segment_length is the shortest trimmed segment worth measuring.
+        self.penalty_mask_fn = penalty_mask_fn
+        self.min_segment_length = float(min_segment_length)
         if profile not in REPULSION_PROFILES:
             raise ValueError(f"profile must be one of {REPULSION_PROFILES}, got {profile!r}")
         self.profile = profile
@@ -649,6 +657,11 @@ class GPSimplex:
             boundary_fn=self.domain.boundary_penalty,
             profile=self.repulsion_profile,
             edge_value=self.repulsion_edge_value,
+            # getattr: lightweight data-handler doubles may lack these; then LineBO
+            # simply does not trim.
+            penalty_mask_fn=getattr(self.data_handler, "get_penalty_mask", None),
+            min_segment_length=(self.data_handler.min_box_width()
+                                if hasattr(self.data_handler, "min_box_width") else 0.0),
         )
 
         return self.acq_fn

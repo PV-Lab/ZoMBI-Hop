@@ -27,12 +27,23 @@ from .hparam_live import (
     write_effective as write_effective_hparams,
 )
 from . import retro
+from .linebo import NoValidSegmentError
 from ..hparams import (
     ALL_DEFAULTS as _HP,
     check_conflicts,
     lines_per_activation,
     owned_by as _hparams_owned_by,
 )
+
+# When LineBO finds no unpenalised segment long enough to measure, every penalty zone
+# is shrunk by this factor (semi-axes x factor) and the line is retried. Shrinks are
+# permanent, like the never_terminate shrink. MAX_SEGMENT_SHRINKS only guards against
+# a spin: 0.8**50 leaves zones at ~1e-5 of their size, so reaching it means a bug.
+SEGMENT_SHRINK_FACTOR = 0.8
+MAX_SEGMENT_SHRINKS = 50
+# Zoom levels (0 = full search box) whose lines are trimmed around penalty zones.
+# Deeper levels rank whole untrimmed chords. Trial setting: zoom 0 only.
+LINE_TRIM_ZOOMS = (0,)
 
 
 # --- CUDA optimization settings (when CUDA is available) ---
@@ -1274,14 +1285,53 @@ class ZoMBIHop:
         return converged, ei, log_ei
 
     def _objective_wrapper(
-        self, X: torch.Tensor, bounds: torch.Tensor, acquisition_function
+        self, X: torch.Tensor, bounds: torch.Tensor, acquisition_function,
+        trim_lines: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Call objective and update data handler.
         Returns (unpenalized_X, unpenalized_Y) — points not in any penalty region.
+
+        With ``trim_lines`` LineBO trims penalty zones out of its candidate lines.
+        When no trimmed segment is long enough it raises NoValidSegmentError before
+        measuring; every penalty zone is then shrunk by SEGMENT_SHRINK_FACTOR, the
+        GP and acquisition are rebuilt on the freed data, and the line is retried,
+        until one succeeds (capped at MAX_SEGMENT_SHRINKS as a guard against a
+        spin). Without it the acquisition's ``penalty_mask_fn`` is cleared, so
+        LineBO ranks whole untrimmed chords as before.
         """
         assert X.shape == (self.d,)
-        X_expected, X_actual, Y = self.objective(X, bounds, acquisition_function)
+        dh = self.data_handler
+        shrinks = 0
+        while True:
+            if not trim_lines and hasattr(acquisition_function, "penalty_mask_fn"):
+                acquisition_function.penalty_mask_fn = None
+            try:
+                X_expected, X_actual, Y = self.objective(X, bounds, acquisition_function)
+                break
+            except NoValidSegmentError as exc:
+                if shrinks >= MAX_SEGMENT_SHRINKS:
+                    raise RuntimeError(
+                        f"no measurable line after {shrinks} penalty-zone shrinks "
+                        f"(x{SEGMENT_SHRINK_FACTOR} each): {exc}") from exc
+                shrinks += 1
+                dh.shrink_all_needle_radii(SEGMENT_SHRINK_FACTOR)
+                # Unconditional print as well as the log: evaluation runs have no run.log.
+                msg = (f"  [line-trim] {exc} — shrinking all penalty zones by "
+                       f"x{SEGMENT_SHRINK_FACTOR} (shrink {shrinks}) and retrying.")
+                print(msg)
+                try:
+                    dh.write_log(msg)
+                except Exception:
+                    pass
+                X_gp, Y_gp = (dh.get_gp_data() if self._is_global_bounds(bounds)
+                              else dh.get_zoom_gp_data(bounds))
+                if X_gp.shape[0] >= 2:
+                    self.gp_handler.fit(X_gp, Y_gp)
+                    acquisition_function = self.gp_handler.create_acquisition(
+                        best_f=Y_gp.max().item())
+                elif acquisition_function is not None:
+                    acquisition_function = self.gp_handler.create_acquisition()
 
         X_expected = X_expected.to(device=self.device, dtype=self.dtype)
         X_actual = X_actual.to(device=self.device, dtype=self.dtype)
@@ -1629,7 +1679,8 @@ class ZoMBIHop:
 
                     _t0 = time.time()
                     unpenalized_X, unpenalized_Y = self._objective_wrapper(
-                        candidate, bounds, self.gp_handler.acq_fn
+                        candidate, bounds, self.gp_handler.acq_fn,
+                        trim_lines=zoom in LINE_TRIM_ZOOMS,
                     )
                     global_iteration += 1
                     iters_this_zoom += 1

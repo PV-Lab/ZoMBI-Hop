@@ -34,6 +34,63 @@ zero_sum_dirs = random_simplex_direction
 SAMPLER_MAX_EXTRA_ATTEMPTS = 50  # max extra direction batches in LineBO.sampler when valid lines < num_lines (default: 50)
 MIN_DIRECTION_NORM = 1e-10        # directions with smaller norm (P ≈ x_tell) are dropped when using through-simplex sampling
 
+# Penalty-zone trimming (used when the acquisition carries a ``penalty_mask_fn``).
+DEFAULT_NUM_CANDIDATE_LINES = 100  # random chords drawn per measured line before trimming
+SEGMENT_DRAW_ATTEMPTS = 3          # chord batches tried before giving up with NoValidSegmentError
+# The minimum segment length is the acquisition's ``min_segment_length`` (the zoom-box
+# noise floor), but never more than this fraction of the longest untrimmed chord drawn:
+# deep zoom boxes are themselves only about one noise floor wide, so even a zone-free
+# chord there can be shorter than the floor.
+MIN_SEGMENT_CHORD_FRACTION = 0.5
+
+
+class NoValidSegmentError(RuntimeError):
+    """Every candidate chord, once its penalised stretches were cut out, left only
+    segments shorter than the minimum length. Raised before the objective is called,
+    so nothing was measured; ZoMBIHop responds by shrinking the penalty zones."""
+
+
+def free_segments(
+    points: torch.Tensor,
+    free: torch.Tensor,
+    acq_values: torch.Tensor,
+    chord_len: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split discretised chords into their maximal runs of unpenalised points.
+
+    Parameters
+    ----------
+    points : (k, P, d) points along each chord, evenly spaced from left to right end.
+    free : (k, P) bool, True where the point is outside every penalty zone.
+    acq_values : (k, P) acquisition value at each point.
+    chord_len : (k,) Euclidean length of each chord.
+
+    Returns
+    -------
+    (x_left, x_right, score, length) for every run: (s, d), (s, d), (s,), (s,).
+    A run's endpoints are its first and last free points, so the segment never
+    extends into a zone by more than the discretisation allows. ``score`` is the
+    mean acquisition over the run's points.
+    """
+    k, P, d = points.shape
+    empty = points.new_zeros((0, d))
+    if k == 0:
+        return empty, empty, points.new_zeros(0), points.new_zeros(0)
+    pad = torch.zeros((k, 1), dtype=torch.int8, device=free.device)
+    edges = torch.diff(torch.cat([pad, free.to(torch.int8), pad], dim=1), dim=1)  # (k, P+1)
+    # Row-major order pairs each run's start with its own end.
+    starts = torch.nonzero(edges == 1)   # (s, 2): (line, first free index)
+    ends = torch.nonzero(edges == -1)    # (s, 2): (line, one past last free index)
+    if starts.shape[0] == 0:
+        return empty, empty, points.new_zeros(0), points.new_zeros(0)
+    line = starts[:, 0]
+    i = starts[:, 1]
+    j = ends[:, 1] - 1
+    csum = torch.cat([acq_values.new_zeros((k, 1)), torch.cumsum(acq_values, dim=1)], dim=1)
+    score = (csum[line, j + 1] - csum[line, i]) / (j - i + 1).to(acq_values.dtype)
+    length = (j - i).to(points.dtype) / max(P - 1, 1) * chord_len[line]
+    return points[line, i], points[line, j], score, length
+
 
 def directions_through_simplex_points(x0: torch.Tensor, k: int, device=None, dtype=torch.float64,
                                      seed=None) -> torch.Tensor:
@@ -439,12 +496,26 @@ class LineBO:
     num_points_per_line : int
         Number of points to sample along each line for integration. Default: 100.
     num_lines : int or None
-        Number of candidate lines to generate and evaluate per iteration, used
-        verbatim. Default: None (legacy auto budget: 10*d).
+        Number of ranked lines returned per iteration (the objective measures the
+        first; hardware also sends the second to the cache rail). Default: None
+        (legacy auto budget: 10*d).
     device : str
         Device for computations. Default: 'cuda'.
     domain : Domain or str, optional
         Search domain ("simplex" / "box" or a ``Domain``). Default: the simplex.
+    num_candidate_lines : int or None
+        Random chords drawn per batch when trimming penalty zones out of lines
+        (only used when the acquisition carries ``penalty_mask_fn``). Default:
+        ``max(DEFAULT_NUM_CANDIDATE_LINES, num_lines)``.
+
+    Penalty-zone trimming
+    ---------------------
+    When the acquisition function has a ``penalty_mask_fn`` attribute (ZoMBI-Hop's
+    ``RepulsiveAcquisition`` does), chords are cut wherever they pass through a
+    penalty zone, and the surviving segments, not the chords, are ranked by mean
+    acquisition. Segments shorter than the minimum length are discarded; if none
+    survive ``SEGMENT_DRAW_ATTEMPTS`` batches, ``NoValidSegmentError`` is raised
+    before the objective is called.
     """
 
     def __init__(
@@ -455,6 +526,7 @@ class LineBO:
         num_lines: Optional[int] = None,
         device: str = "cuda",
         domain: Optional[Domain] = None,
+        num_candidate_lines: Optional[int] = None,
     ):
         """Initialize LineBO sampler: store objective, dimensions, line-discretization and device."""
         self.objective_function = objective_function
@@ -466,9 +538,20 @@ class LineBO:
             self.num_lines = 10 * dimensions
         else:
             self.num_lines = max(1, int(num_lines))
+        if num_candidate_lines is None:
+            self.num_candidate_lines = max(DEFAULT_NUM_CANDIDATE_LINES, self.num_lines)
+        else:
+            self.num_candidate_lines = max(1, int(num_candidate_lines))
         self.device = torch.device(device)
         self.dtype = torch.float64
         self.domain = make_domain(domain)
+
+    def _line_points(self, x_left: torch.Tensor, x_right: torch.Tensor) -> torch.Tensor:
+        """(k, num_points_per_line, d) evenly spaced points from each left to right end."""
+        t_values = torch.linspace(0, 1, self.num_points_per_line,
+                                  device=x_left.device, dtype=x_left.dtype)
+        return (x_left.unsqueeze(1) * (1 - t_values).view(1, -1, 1) +
+                x_right.unsqueeze(1) * t_values.view(1, -1, 1))
 
     def _integrate_acquisition_along_lines(self, x_left: torch.Tensor, x_right: torch.Tensor,
                                          acquisition_function: nn.Module) -> torch.Tensor:
@@ -489,16 +572,20 @@ class LineBO:
         torch.Tensor
             (k,) integrated acquisition values (mean over points per line).
         """
-        k = x_left.shape[0]  # number of lines
+        points = self._line_points(x_left, x_right)  # (k, num_points_per_line, d)
+        acquisition_values = self._acquisition_at_points(points, acquisition_function)
 
-        # Parameter along each segment: t in [0, 1], num_points_per_line values
-        t_values = torch.linspace(0, 1, self.num_points_per_line,
-                                device=self.device, dtype=torch.float64)  # (num_points_per_line,)
+        # Mean (not max) is critical: with max, a line that barely grazes the unpenalized
+        # fringe of an already-found needle still scores as high as the pure UCB at that
+        # fringe point, because the -lambda*violation^2 penalties on the rest of the line
+        # are never seen by argmax. Mean integrates penalties along the full line, so
+        # lines that spend most of their length in penalized regions score very negatively.
+        return acquisition_values.mean(dim=1)  # (k,) — mean acquisition along each line
 
-        # Interpolate: (1-t)*x_left + t*x_right for each line and each t
-        # x_left.unsqueeze(1) -> (k, 1, d), (1-t).view(1,-1,1) -> (1, num_points_per_line, 1); broadcast -> (k, num_points_per_line, d)
-        points = (x_left.unsqueeze(1) * (1 - t_values).view(1, -1, 1) +
-                 x_right.unsqueeze(1) * t_values.view(1, -1, 1))  # (k, num_points_per_line, d)
+    def _acquisition_at_points(self, points: torch.Tensor,
+                               acquisition_function: nn.Module) -> torch.Tensor:
+        """(k, P) acquisition values at the (k, P, d) points, evaluated in batches."""
+        k = points.shape[0]
 
         # Flatten to (k * num_points_per_line, 1, d) for acquisition (often expects batch with last dim d)
         points_flat = points.reshape(-1, 1, self.d)  # (k * num_points_per_line, 1, d)
@@ -529,16 +616,61 @@ class LineBO:
                 if self.device.type == 'cuda':
                     torch.cuda.empty_cache()
 
-        # Reshape to (k, num_points_per_line) and take mean acquisition per line.
-        # Mean (not max) is critical: with max, a line that barely grazes the unpenalized
-        # fringe of an already-found needle still scores as high as the pure UCB at that
-        # fringe point, because the -lambda*violation^2 penalties on the rest of the line
-        # are never seen by argmax. Mean integrates penalties along the full line, so
-        # lines that spend most of their length in penalized regions score very negatively.
-        acquisition_values = acquisition_values_flat.reshape(k, self.num_points_per_line)  # (k, num_points_per_line)
-        integrated = acquisition_values.mean(dim=1)  # (k,) — mean acquisition along each line
+        return acquisition_values_flat.reshape(k, points.shape[1])  # (k, num_points_per_line)
 
-        return integrated
+    def _ranked_free_segments(
+        self,
+        bounds_eff: torch.Tensor,
+        acquisition_function: nn.Module,
+        mask_fn,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Draw chords, cut out their penalised stretches, rank the pieces.
+
+        Returns the top ``num_lines`` segments by mean acquisition (best first),
+        padded by repeating the best when fewer than two survive so a two-rail
+        objective always gets a main and a cache line. Raises NoValidSegmentError
+        when no batch yields a segment of at least the minimum length.
+        """
+        min_len_cfg = float(getattr(acquisition_function, "min_segment_length", 0.0) or 0.0)
+        lefts, rights, scores, lengths = [], [], [], []
+        longest = 0.0
+        min_len = 0.0
+        n_chords = 0
+        for _ in range(SEGMENT_DRAW_ATTEMPTS):
+            xl, xr = random_chords_through_simplex(
+                self.num_candidate_lines, bounds_eff, self.device, self.dtype, domain=self.domain
+            )
+            if xl.shape[0] == 0:
+                continue
+            n_chords += xl.shape[0]
+            points = self._line_points(xl, xr)                                   # (k, P, d)
+            acq_values = self._acquisition_at_points(points, acquisition_function)  # (k, P)
+            free = mask_fn(points).to(device=points.device, dtype=torch.bool)     # (k, P)
+            chord_len = (xr - xl).norm(dim=1)
+            longest = max(longest, float(chord_len.max()))
+            sl, sr, sc, sL = free_segments(points, free, acq_values, chord_len)
+            lefts.append(sl); rights.append(sr); scores.append(sc); lengths.append(sL)
+
+            min_len = min(min_len_cfg, MIN_SEGMENT_CHORD_FRACTION * longest)
+            all_len = torch.cat(lengths)
+            if bool(((all_len >= min_len) & (all_len > 0)).any()):
+                break
+        else:
+            raise NoValidSegmentError(
+                f"no unpenalised segment of length >= {min_len:.4f} in {n_chords} chords "
+                f"({SEGMENT_DRAW_ATTEMPTS} batches; longest chord {longest:.4f})"
+            )
+
+        x_left = torch.cat(lefts)
+        x_right = torch.cat(rights)
+        score = torch.cat(scores)
+        length = torch.cat(lengths)
+        keep = (length >= min_len) & (length > 0)
+        x_left, x_right, score = x_left[keep], x_right[keep], score[keep]
+        order = torch.argsort(score, descending=True)[: self.num_lines]
+        if order.numel() < min(2, self.num_lines):
+            order = torch.cat([order, order[:1].repeat(min(2, self.num_lines) - order.numel())])
+        return x_left[order], x_right[order]
 
     def ranked_line_endpoints(
         self,
@@ -558,7 +690,9 @@ class LineBO:
             (2, d) tensor: bounds[0] = lower, bounds[1] = upper.
             If None, uses the domain's full box.
         acquisition_function : nn.Module, optional
-            Acquisition function to rank lines. If None, random order.
+            Acquisition function to rank lines. If None, random order. If it has a
+            ``penalty_mask_fn``, lines are trimmed around penalty zones and the
+            surviving segments are ranked instead (see the class docstring).
         """
         x_tell = x_tell.to(device=self.device, dtype=self.dtype)
 
@@ -570,6 +704,10 @@ class LineBO:
             bounds_eff = bounds.to(device=self.device, dtype=self.dtype)
         else:
             bounds_eff = self.domain.default_bounds(d, self.device, self.dtype)
+
+        mask_fn = getattr(acquisition_function, "penalty_mask_fn", None)
+        if mask_fn is not None:
+            return self._ranked_free_segments(bounds_eff, acquisition_function, mask_fn)
 
         x_left_parts: List[torch.Tensor] = []
         x_right_parts: List[torch.Tensor] = []
