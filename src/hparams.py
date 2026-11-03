@@ -16,9 +16,9 @@ its search range. Everything else derives from this table:
 
 Where values come from
 ----------------------
-Tuned knobs take their shipped value from ``optimize/hparams/6d_ensemble.json``
-(``DEFAULT_HPARAMS_PROVENANCE``); that file must set every tuned knob and nothing
-else. Untuned knobs (physical constants, compute budgets, numerical guards) take
+Tuned knobs take their shipped value from ``optimize/hparams/dup1c_custom.json``
+(``DEFAULT_HPARAMS_PROVENANCE``) — the configuration the showdowns benchmark — and
+that file must set every tuned knob and nothing else. Untuned knobs (physical constants, compute budgets, numerical guards) take
 the ``default`` declared below. There is no third place: if a value is not in one
 of those two, it does not exist.
 
@@ -46,7 +46,13 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # Shipped values for every TUNED knob. Used by the GUI, the hardware runner and the
 # ablation harness when no hyperparameter file is supplied, and as the ZoMBIHop
 # constructor defaults. To adopt a different trial, replace that file's "hparams".
-DEFAULT_HPARAMS_PROVENANCE = "optimize/hparams/6d_ensemble.json"
+#
+# Since 2026-11-02 this is the file the 6d showdowns benchmark (dup1c_custom, e.g.
+# optimize/runs/showdown_6d_dup1c_custom_needles_n2n3_bw22_reps2*), so a hardware
+# run with no --hparams file runs exactly the benchmarked configuration. Editing
+# that file changes every new hardware/GUI run's defaults. Before 2026-11-02 the
+# shipped file was optimize/hparams/6d_ensemble.json (kept for reference).
+DEFAULT_HPARAMS_PROVENANCE = "optimize/hparams/dup1c_custom.json"
 
 
 class HyperparameterConflict(ValueError):
@@ -453,21 +459,36 @@ ALL_DEFAULTS: dict[str, Any] = {**FIXED_DEFAULTS, **DEFAULT_HPARAMS}
 #    so the shrink/floor knobs below no longer act.) Penalty falls linearly to
 #    0 at the zone edge. max_penalty_fraction 0.9 (cap 0.322 in 6-d) keeps the
 #    0.25 radius the binding cap.
-DIM_DEFAULTS: dict[int, dict[str, Any]] = {
-    6: {
-        "repulsion_profile": "linear",
-        "repulsion_edge_value": 0.0,
-        "max_penalty_radius": 0.25,
-        "max_penalty_fraction": 0.9,
-        "needle_shrink_factor": 0.75,
-        "needle_stop_noise_multiplier": 0.4,
-    },
-}
+#
+# 2026-11-02: EMPTIED so hardware runs match the benchmarks. Showdowns/evaluate.py
+# never applied DIM_DEFAULTS, so every benchmarked 6-d run had max_penalty_radius
+# from the hparams file and max_penalty_fraction 0.10 (zones capped at 0.208 in
+# 6-d), not the 0.25 / 0.9 set above; hardware 6-d runs were the only place that
+# set was active. The former 6-d entry, for reference:
+#     6: {"repulsion_profile": "linear", "repulsion_edge_value": 0.0,
+#         "max_penalty_radius": 0.25, "max_penalty_fraction": 0.9,
+#         "needle_shrink_factor": 0.75, "needle_stop_noise_multiplier": 0.4}
+# Add an entry back only together with a showdown that runs it.
+DIM_DEFAULTS: dict[int, dict[str, Any]] = {}
 
 
 def defaults_for_dim(dim: Optional[int]) -> dict[str, Any]:
     """Every knob's default for a new run with *dim* optimizing dims."""
     return {**ALL_DEFAULTS, **DIM_DEFAULTS.get(int(dim) if dim else -1, {})}
+
+
+def apply_dim_rules(hp: dict, dim: int) -> dict:
+    """Dimension-dependent adjustments every run gets, benchmark or hardware.
+
+    ``top_m_points`` below ``dim + 1`` cannot span a ``dim``-dimensional zoom box,
+    so above 3 dims it is raised to ``max(dim + 1, 4)`` (8 -> 11 at 10 dims). This
+    is what optimize/evaluate.py (and so every showdown) does; the hardware runner
+    calls it too so a hardware run gets the benchmarked value. Returns a copy.
+    """
+    out = dict(hp)
+    if dim > 3 and (out.get("top_m_points") is None or out.get("top_m_points", 0) < dim + 1):
+        out["top_m_points"] = max(dim + 1, 4)
+    return out
 
 
 # ─── Validation ───────────────────────────────────────────────────────────────

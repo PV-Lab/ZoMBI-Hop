@@ -188,9 +188,45 @@ def hardware_hparam_problems(hparams_path: str | None,
     return hparam_conflicts(resolve_hparams_for_run(passed, run_cfg, dim=dim))
 
 
-# Default hyperparameters used when no JSON file is supplied (src/hparams.py).
-# DIM_DEFAULTS adds per-dimension values (6 dims: penalty zones) for a NEW run.
-from src.hparams import ALL_DEFAULTS, DEFAULT_HPARAMS, DEFAULT_HPARAMS_PROVENANCE, DIM_DEFAULTS
+# Default hyperparameters used when no JSON file is supplied (src/hparams.py):
+# the benchmarked configuration (DEFAULT_HPARAMS_PROVENANCE, dup1c_custom.json since
+# 2026-11-02). DIM_DEFAULTS adds per-dimension values for a NEW run (empty since
+# 2026-11-02, so hardware matches the showdowns); apply_dim_rules raises
+# top_m_points to dims + 1 exactly as evaluate.py does.
+from src.hparams import (ALL_DEFAULTS, DEFAULT_HPARAMS, DEFAULT_HPARAMS_PROVENANCE,
+                         DIM_DEFAULTS, apply_dim_rules)
+
+# Shown under every "Hyperparameters JSON" box of a NEW run.
+DEFAULT_HPARAMS_NOTE = (
+    "(trial.json-style file. If blank, the benchmarked defaults are used for every\n"
+    f"dimensionality: {DEFAULT_HPARAMS_PROVENANCE}, with top_m_points raised to\n"
+    "dims + 1 when below it — the same values the showdowns run.)")
+
+
+def default_hparams_for_new_run(dim: int | None) -> dict:
+    """Every knob a NEW run of *dim* dims starts with when no JSON file is given."""
+    full = {**ALL_DEFAULTS, **DIM_DEFAULTS.get(int(dim) if dim else -1, {})}
+    return apply_dim_rules(full, int(dim)) if dim else full
+
+
+def show_default_hparams(parent, dim: int | None) -> None:
+    """Pop up the default value of every hyperparameter for a new *dim*-dim run."""
+    hp = default_hparams_for_new_run(dim)
+    tuned = set(DEFAULT_HPARAMS)
+    win = tk.Toplevel(parent)
+    win.title(f"Default hyperparameters ({dim}-dim run)" if dim else "Default hyperparameters")
+    head = (f"Tuned values: {DEFAULT_HPARAMS_PROVENANCE}\n"
+            "Untuned values: src/hparams.py registry defaults (marked *)\n"
+            + (f"Shown for a new {dim}-dim run (top_m_points rule applied).\n" if dim else
+               "No dims selected: top_m_points shown before the dims + 1 rule.\n"))
+    ttk.Label(win, text=head, justify="left").pack(anchor="w", padx=8, pady=(8, 2))
+    txt = tk.Text(win, width=58, height=min(len(hp) + 1, 36), font=("Consolas", 9))
+    w = max(len(k) for k in hp)
+    for k in sorted(hp, key=lambda n: (n not in tuned, n)):
+        txt.insert("end", f"{'' if k in tuned else '*'}{k:<{w + 1}} {hp[k]!r}\n")
+    txt.configure(state="disabled")
+    txt.pack(fill="both", expand=True, padx=8, pady=4)
+    ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 8))
 
 
 # ── synthetic-run helpers ─────────────────────────────────────────────────────
@@ -4544,9 +4580,11 @@ class NewRunDialog(tk.Toplevel):
         ttk.Button(shp, text="…", width=3,
                    command=lambda: self._browse_hparams_into(self._syn_hparams_var)).pack(side="left")
 
+        ttk.Button(shp, text="Show defaults", command=lambda: show_default_hparams(
+            self, len(self._syn_dims.selected_dims()) or None)).pack(side="left", padx=4)
+
         row += 1
-        ttk.Label(tf, text="(trial.json-style file. If blank, the tuned defaults "
-                           f"from {DEFAULT_HPARAMS_PROVENANCE} are used,\nplus the 6-d penalty-zone defaults for a 6-dim run.)",
+        ttk.Label(tf, text=DEFAULT_HPARAMS_NOTE,
                   foreground="gray").grid(row=row, column=0, columnspan=3,
                                           sticky="w", padx=8)
 
@@ -4594,10 +4632,11 @@ class NewRunDialog(tk.Toplevel):
         ttk.Entry(hpf, textvariable=self._hw_hparams_var, width=30).pack(side="left")
         ttk.Button(hpf, text="…", width=3,
                    command=lambda: self._browse_hparams_into(self._hw_hparams_var)).pack(side="left")
+        ttk.Button(hpf, text="Show defaults", command=lambda: show_default_hparams(
+            self, len(self._hw_dims.selected_dims()) or None)).pack(side="left", padx=4)
 
         hrow += 1
-        ttk.Label(hw, text="(trial.json-style file. If blank, the tuned defaults "
-                           f"from {DEFAULT_HPARAMS_PROVENANCE} are used,\nplus the 6-d penalty-zone defaults for a 6-dim run.)",
+        ttk.Label(hw, text=DEFAULT_HPARAMS_NOTE,
                   foreground="gray").grid(
             row=hrow, column=0, columnspan=2, sticky="w", padx=8)
 
@@ -4668,7 +4707,8 @@ class NewRunDialog(tk.Toplevel):
             bounds_lo, bounds_hi = self._syn_dims.bounds_for_selected()
             d              = len(sel_dims)
             # Hyperparameters: shipped defaults, then this dimension's defaults
-            # (DIM_DEFAULTS — same as a hardware run of d dims), then the JSON file.
+            # (DIM_DEFAULTS — same as a hardware run of d dims), then the JSON file,
+            # then the dims + 1 top_m_points rule (as hardware and the showdowns).
             hp = {**DEFAULT_HPARAMS, **DIM_DEFAULTS.get(d, {})}
             syn_path = self._syn_hparams_var.get().strip()
             if syn_path:
@@ -4676,6 +4716,7 @@ class NewRunDialog(tk.Toplevel):
                 if not loaded:
                     raise ValueError(f"No recognised hyperparameters in {syn_path}.")
                 hp.update(loaded)
+            hp = apply_dim_rules(hp, d)
             problems = hparam_conflicts({**ALL_DEFAULTS, **hp})
             if problems:
                 raise ValueError("These hyperparameters make needles impossible:\n  - "

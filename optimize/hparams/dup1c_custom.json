@@ -1,4 +1,8 @@
 {
+  "notes": [
+    "Shipped ZoMBI-Hop configuration since 2026-11-02 (src/hparams.DEFAULT_HPARAMS_PROVENANCE): every new hardware/GUI run with no hyperparameter file uses these values, at every dimensionality. Editing this file changes those defaults. It must list exactly the tuned knobs.",
+    "Origin: dup1c (6d_ensemble.json lineage) with input_noise_threshold_mult 0.5 and no Jaccard keys; benchmarked in optimize/runs/showdown_6d_dup1c_custom_needles_n2n3_bw22_reps2* and the 10d custom needles showdowns."
+  ],
   "selected_for": "explicit",
   "rank": null,
   "source_run": "mobo_ensemble_6d_job19202376",

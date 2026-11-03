@@ -2,7 +2,7 @@
 Re-export of the shipped hyperparameter defaults, kept for existing imports.
 
 The values live in ``src/hparams.py`` (registry + untuned defaults) and
-``optimize/hparams/6d_ensemble.json`` (tuned values). Do not add values here.
+``optimize/hparams/dup1c_custom.json`` (tuned values; ``DEFAULT_HPARAMS_PROVENANCE``). Do not add values here.
 """
 
 from __future__ import annotations

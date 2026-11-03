@@ -1,8 +1,9 @@
 {
   "notes": [
-    "Shipped ZoMBI-Hop configuration: the value of every TUNED hyperparameter (src/hparams.py loads it as DEFAULT_HPARAMS, used by the GUI, the hardware runner and as ZoMBIHop's constructor defaults). It must list exactly the tuned knobs.",
+    "2026-11-02: NO LONGER the shipped configuration. src/hparams.DEFAULT_HPARAMS_PROVENANCE now points at optimize/hparams/dup1c_custom.json (the benchmarked config). Kept for reference.",
+    "Former shipped ZoMBI-Hop configuration (until 2026-11-02): the value of every TUNED hyperparameter (src/hparams.py loads it as DEFAULT_HPARAMS, used by the GUI, the hardware runner and as ZoMBIHop's constructor defaults). It must list exactly the tuned knobs.",
     "Origin: the 6D MOBO ensemble winner, with n_consecutive_converged 5->2 (2026-08-19) and max_iterations 2->3 (2026-08-27).",
-    "2026-10-12: needle_shrink_factor 0.99->0.8 and needle_stop_noise_multiplier 1.0->2.0 — the code used bounds_shrink_factor=0.8 / min_axis_noise_mult=2.0 instead, so these are the values every run actually had. The needle gates, Jaccard knobs, ellipsoid_drop_fraction and input_noise_threshold_mult were hidden constructor defaults and are listed at those defaults.",
+    "2026-10-12: needle_shrink_factor 0.99->0.8 and needle_stop_noise_multiplier 1.0->2.0 \u2014 the code used bounds_shrink_factor=0.8 / min_axis_noise_mult=2.0 instead, so these are the values every run actually had. The needle gates, Jaccard knobs, ellipsoid_drop_fraction and input_noise_threshold_mult were hidden constructor defaults and are listed at those defaults.",
     "2026-10-29: jaccard_window and jaccard_threshold removed along with the Jaccard sliding window in DataHandler.determine_new_bounds (the zoom box is now always the top_m_points AABB)."
   ],
   "hparams": {

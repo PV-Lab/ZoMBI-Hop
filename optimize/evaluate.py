@@ -174,7 +174,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_mobo as rm
-from src.hparams import KNOWN_NAMES as HPARAM_KNOWN_NAMES, check_conflicts, conflicts
+from src.hparams import KNOWN_NAMES as HPARAM_KNOWN_NAMES, apply_dim_rules, check_conflicts, conflicts
 from mobo_landscapes import build_synthetic_landscape, parse_synthetic_batch_fields, resolve_surrogate_csv_path
 
 # Analytic benchmark objectives (negated Ackley on the d-simplex).
@@ -1347,9 +1347,8 @@ def run_single_eval(
         return {"dist": rm.UNMATCHED_PENALTY, "dup": 1.0,
                 "nn_spacing": 0.0, "runtime": 0.0}
 
-    hp = dict(hparams)
-    if dim > 3 and (hp.get("top_m_points") is None or hp.get("top_m_points", 0) < dim + 1):
-        hp["top_m_points"] = max(dim + 1, 4)
+    # Same rule the hardware runner applies (src/hparams.apply_dim_rules).
+    hp = apply_dim_rules(hparams, dim)
 
     # Never re-evaluate a config other than the one asked for: a conflict (e.g.
     # n_consecutive_converged above max_iterations) is an error, not something to

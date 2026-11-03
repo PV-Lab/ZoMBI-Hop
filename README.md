@@ -228,7 +228,10 @@ ZoMBIHop
 Every hyperparameter is declared once, in **`src/hparams.py`**: its type, valid
 range, meaning (the GUI tooltip), where it lives on the running objects, and, if
 MOBO tunes it, its search range. Shipped values for the tuned knobs live in
-**`optimize/hparams/6d_ensemble.json`**; untuned knobs (`input_noise`,
+**`optimize/hparams/dup1c_custom.json`** — the configuration the showdowns
+benchmark, so a hardware run with no `--hparams` file runs exactly it, at every
+dimensionality (since 2026-11-02; before that `6d_ensemble.json`, plus a 6-d
+penalty-zone set in `DIM_DEFAULTS` that no showdown ran, now removed); untuned knobs (`input_noise`,
 `max_gp_points`, `acquisition_type`, `ellipsoid_eigenvalue_floor`,
 `repulsion_lambda`) carry their default in the registry. The GUI, the hardware
 runner, `run_mobo`/`evaluate`, interactive testing and the `ZoMBIHop` /

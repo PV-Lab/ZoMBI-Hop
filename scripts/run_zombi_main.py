@@ -210,12 +210,15 @@ def log_compositions(
 
 # ZoMBI-Hop hyperparameters used when no --hparams JSON file is supplied: the
 # shipped defaults from src/hparams.py (tuned values from
-# optimize/hparams/6d_ensemble.json, plus the measured physical input noise). A NEW
-# run also takes src/hparams.DIM_DEFAULTS for its number of optimizing dims (6 dims:
-# the hand-tuned penalty zones), under any --hparams file.
+# src/hparams.DEFAULT_HPARAMS_PROVENANCE = optimize/hparams/dup1c_custom.json, the
+# benchmarked configuration, plus the measured physical input noise). A NEW run
+# also takes src/hparams.DIM_DEFAULTS for its number of optimizing dims (empty since
+# 2026-11-02, so hardware matches the showdowns), under any --hparams file.
 from src.hparams import (
     ALL_DEFAULTS,
+    DEFAULT_HPARAMS_PROVENANCE,
     DIM_DEFAULTS,
+    apply_dim_rules,
     check_conflicts,
     defaults_for_dim,
     load_hparams_file,
@@ -1475,6 +1478,10 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
     new_run_dim = len(OPTIMIZING_DIMS) if resume_uuid is None else None
     hw_hparams: Dict[str, Any] = (dict(defaults_for_dim(new_run_dim))
                                   if new_run_dim else dict(DEFAULT_HW_HPARAMS))
+    if new_run_dim:
+        print(f"[ZoMBI] Default hyperparameters: {DEFAULT_HPARAMS_PROVENANCE} "
+              f"(benchmarked configuration)"
+              + (f"; overridden by {hparams_path}" if hparams_path else ""))
     if new_run_dim in DIM_DEFAULTS:
         print(f"[ZoMBI] {new_run_dim}-dim run: using the {new_run_dim}-d defaults "
               f"{DIM_DEFAULTS[new_run_dim]} (an --hparams file overrides them).")
@@ -1615,9 +1622,14 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
             list(X_init_actual.detach().cpu().numpy()),
         ))
 
-        # ZoMBI hyperparameters: DEFAULT_HW_HPARAMS, optionally overridden by --hparams.
-        new_hparams = dict(hw_hparams)
-        new_hparams.setdefault("top_m_points", max(dimensions + 1, 4))
+        # ZoMBI hyperparameters: DEFAULT_HW_HPARAMS, optionally overridden by --hparams,
+        # then the dimension rules evaluate.py applies to every showdown run
+        # (top_m_points raised to dim + 1 above 3 dims), so hardware matches them.
+        new_hparams = apply_dim_rules(hw_hparams, dimensions)
+        if new_hparams.get("top_m_points") != hw_hparams.get("top_m_points"):
+            print(f"[ZoMBI] {dimensions}-dim run: top_m_points "
+                  f"{hw_hparams.get('top_m_points')} -> {new_hparams['top_m_points']} "
+                  f"(must be >= dims + 1; same rule as the showdowns).")
         optimizer = ZoMBIHop(
             objective=objective_wrapper,
             X_init_actual=X_init_actual,
