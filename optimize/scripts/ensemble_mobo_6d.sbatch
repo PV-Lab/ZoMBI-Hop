@@ -78,10 +78,7 @@ uv run python optimize/run_mobo.py --dataset ensemble --dim 6 --time-limit 0.5 -
     --share-dirs "$OWN_RUNS_DIR" \
     --ensemble-seed "$ENSEMBLE_SEED" \
     --start-from-best \
-        optimize/runs/mobo_ensemble_4d_job17402635/trial_9 \
-        optimize/runs/mobo_ensemble_4d_job17402635/trial_6 \
-        optimize/runs/mobo_ensemble_10d_job17776000/trial_34 \
-        optimize/runs/mobo_ensemble_10d_job17775999/trial_13 \
+        optimize/hparams/dup1c_custom.json \
     --run-dir "$RUN_DIR" &
 wait $!
 rc=$?

@@ -53,9 +53,7 @@ ENSEMBLE_SEED=$(( SLURM_JOB_ID % 2147483647 ))
 uv run python optimize/run_mobo.py --dataset ensemble --dim 3 --time-limit 0.2 --init axial --budget-points 3000 --share-history \
     --ensemble-seed "$ENSEMBLE_SEED" \
     --start-from-best \
-        optimize/runs/archived_runs/mobo_3d_05_06_15_32/trial_112 \
-        /home/eve_lal/orcd/scratch/ZoMBI-Hop/optimize/runs/archived_runs/mobo_ensemble_3d_job16861902/trial_49 \
-        /home/eve_lal/orcd/scratch/ZoMBI-Hop/optimize/runs/archived_runs/mobo_ensemble_3d_job16954340/trial_63 \
+        optimize/hparams/dup1c_custom.json \
     --run-dir "$RUN_DIR" &
 wait $!
 rc=$?

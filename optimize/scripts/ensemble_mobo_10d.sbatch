@@ -65,14 +65,10 @@ ENSEMBLE_SEED=$(( SLURM_JOB_ID % 2147483647 ))
 # configuration (and the space has since lost an axis, so it is not even the same
 # dimension), and --share-history only globs one level (runs/mobo_*), so archiving
 # them is what keeps this pool clean. Do not move them back.
-uv run python optimize/run_mobo.py --dataset ensemble --dim 10 --time-limit 0.7 --init axial --budget-points 3000 --share-history \
+uv run python optimize/run_mobo.py --dataset ensemble --dim 10 --time-limit 2 --init axial --budget-points 3000 --share-history \
     --ensemble-seed "$ENSEMBLE_SEED" \
     --start-from-best \
-        optimize/hparams/tight_6d/dist1t.json \
-        optimize/hparams/tight_6d/dist2t.json \
-        optimize/hparams/tight_6d/dup1t.json \
-        optimize/hparams/tight_6d/dup2t.json \
-        optimize/hparams/tight_6d/merge1t.json \
+        optimize/hparams/dup1c_custom.json \
     --run-dir "$RUN_DIR" &
 wait $!
 rc=$?
