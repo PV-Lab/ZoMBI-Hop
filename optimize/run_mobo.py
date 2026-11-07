@@ -299,6 +299,18 @@ N_INIT_LINES    = 2
 # runs are stamped ``init_design`` in run_config.json and never pool with random ones.
 INIT_DESIGNS    = ("random", "axial")
 INIT_DESIGN     = "random"
+# Measured-point budget per simulated run (--budget-points), the same cap showdowns use
+# (showdown.DEFAULT_BUDGET_POINTS): converted to an optimizer-line cap after the init
+# lines, so every trial measures the same number of points and the time limit is only
+# a safety cap. None = no point cap (time budget only, every run before 2026-11-07).
+# Stamped as ``budget_points`` in run_config.json; a resumed run keeps its own.
+DEFAULT_BUDGET_POINTS = 3000
+BUDGET_POINTS: int | None = DEFAULT_BUDGET_POINTS
+# Run ZoMBIHop with never_terminate=True, as evaluate.py (every showdown) does: the run
+# ends only on the line budget or time limit, never on an internal stop. New runs stamp
+# ``never_terminate`` in run_config.json; a resumed run without it keeps the old
+# behaviour (False) so its own trials stay comparable.
+NEVER_TERMINATE = True
 
 # MOBO settings
 N_INIT_TRIALS    = 8       # Sobol initial designs before BO begins
@@ -738,6 +750,12 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
     # older run (and eve_lal's fork) has, and still pool with them.
     if INIT_DESIGN != "random":
         cfg["init_design"] = INIT_DESIGN
+    # Showdown-parity stamps (2026-11-07). Absent in older configs, so a run with
+    # either never pools with history scored under the old stopping/budget rules.
+    if NEVER_TERMINATE:
+        cfg["never_terminate"] = True
+    if BUDGET_POINTS is not None:
+        cfg["budget_points"] = int(BUDGET_POINTS)
     # Same rule for the zone penalty shape: not a tuned axis, so every trial runs the
     # registry default. That default became "linear" on 2026-10-18; history without the
     # key was scored under "quadratic" and must not pool with linear runs.
@@ -1388,6 +1406,8 @@ def _run_signature(cfg: dict) -> dict:
         "ensemble_repeats": cfg.get("ensemble_repeats"),
         "init_design": cfg.get("init_design"),
         "repulsion_profile": cfg.get("repulsion_profile"),
+        "never_terminate": cfg.get("never_terminate"),
+        "budget_points": cfg.get("budget_points"),
     }
 
 
@@ -1765,6 +1785,26 @@ def n_init_lines(dim: int, init_design: str | None = None) -> int:
         from src.utils.axial_init import n_traces_for
         return n_traces_for(int(dim))
     return N_INIT_LINES
+
+
+def max_lines_for(dim: int) -> int | None:
+    """Optimizer-line cap for one simulated run under ``BUDGET_POINTS``.
+
+    Same conversion as showdown.budget_to_max_lines: the init lines are a fixed
+    preamble that comes off the point budget, so an axial init (more lines) leaves
+    fewer optimizer lines and every run measures the same number of points.
+    """
+    if BUDGET_POINTS is None:
+        return None
+    n = int(BUDGET_POINTS) // NUM_EXPERIMENTS - n_init_lines(dim)
+    if n < 1:
+        raise ValueError(f"--budget-points {BUDGET_POINTS} leaves no optimizer lines "
+                         f"after {n_init_lines(dim)} init line(s) at dim {dim}")
+    return n
+
+
+class _LineBudgetReached(Exception):
+    """Internal signal: the trial's optimizer-line budget is spent (see max_lines_for)."""
 
 
 def _init_line_ends(dim: int, init_design: str):
@@ -2813,8 +2853,12 @@ def run_single_trial(
                 f"in-run {os.path.basename(trial_dir)} "
                 f"(iter={call_counter[0]}, "
                 f"n_points={payload['n_points_before']})")
+        # Hard line budget, as evaluate.py: each call is one measured line.
+        if max_lines is not None and call_counter[0] >= max_lines:
+            raise _LineBudgetReached(call_counter[0])
         return x_req, x_act, y
 
+    max_lines = max_lines_for(dim)
     try:
         X_a, X_e, Y = _gen_init_data(fn_callable, maximize, dim=dim)
     except Exception as exc:
@@ -2823,9 +2867,9 @@ def run_single_trial(
                 "avg_time_per_iter": 0.0, "n_iters": 0, "payloads": [],
                 "ackley_seed": ackley_seed}
 
-    hp = dict(hparams)
-    if dim > 3 and (hp.get("top_m_points") is None or hp.get("top_m_points", 0) < dim + 1):
-        hp["top_m_points"] = max(dim + 1, 4)
+    # Same rule evaluate.py and the hardware runner apply.
+    from src.hparams import apply_dim_rules
+    hp = apply_dim_rules(hparams, dim)
 
     try:
         optimizer = ZoMBIHop(
@@ -2860,18 +2904,26 @@ def run_single_trial(
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()  # per-run VRAM high-water mark
 
+    # never_terminate needs SOME external stop; with neither a time limit nor a line
+    # budget (activation-capped Ackley runs) the run would never end.
+    never_terminate = NEVER_TERMINATE and (
+        landscape.time_limit_hours is not None or max_lines is not None)
     t0 = time.time()
     try:
         if landscape.time_limit_hours is not None:
             optimizer.run(
                 max_activations=float("inf"),
                 time_limit_hours=landscape.time_limit_hours,
+                never_terminate=never_terminate,
             )
         else:
             optimizer.run(
                 max_activations=landscape.max_activations or float("inf"),
                 time_limit_hours=None,
+                never_terminate=never_terminate,
             )
+    except _LineBudgetReached as stop:
+        print(f"    [trial] line budget reached: {int(stop.args[0])} optimizer line(s)")
     except Exception as exc:
         print(f"    [trial] ZoMBI crashed: {exc}")
         traceback.print_exc()
@@ -3820,6 +3872,28 @@ def _set_init_design(cli_value: str | None, saved_cfg: dict | None = None) -> No
         print(f"  [init] initial design: {INIT_DESIGN}")
 
 
+def _set_run_rules(cli_budget: int | None, saved_cfg: dict | None = None) -> None:
+    """Set BUDGET_POINTS / NEVER_TERMINATE for a new run, or from a run being resumed.
+
+    A resumed run keeps the rules its stored trials were scored under (configs from
+    before 2026-11-07 have neither key: no point cap, never_terminate off). An
+    explicit --budget-points that contradicts the saved run is an error.
+    """
+    global BUDGET_POINTS, NEVER_TERMINATE
+    if saved_cfg is not None:
+        saved = saved_cfg.get("budget_points")
+        if cli_budget is not None and (cli_budget or None) != saved:
+            sys.exit(f"--budget-points {cli_budget} contradicts the resumed run, which "
+                     f"was started with budget_points={saved!r}.")
+        BUDGET_POINTS = saved
+        NEVER_TERMINATE = bool(saved_cfg.get("never_terminate", False))
+    else:
+        b = DEFAULT_BUDGET_POINTS if cli_budget is None else cli_budget
+        BUDGET_POINTS = int(b) if b and b > 0 else None
+        NEVER_TERMINATE = True
+    print(f"  [rules] budget_points={BUDGET_POINTS}  never_terminate={NEVER_TERMINATE}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="ZoMBI-Hop MOBO hyperparameter optimisation (RF or synthetic benchmarks).",
@@ -3874,6 +3948,12 @@ def main() -> None:
                              "rounded down to even). Axial runs only share history with "
                              "axial runs. On --resume/--resume-from the saved run's "
                              "design is used.")
+    parser.add_argument("--budget-points", type=int, default=None,
+                        help="measured-point budget per simulated run, converted to an "
+                             "optimizer-line cap after the init lines, as showdown.py "
+                             f"(default for a new run: {DEFAULT_BUDGET_POINTS}; 0 = no cap, "
+                             "time limit only). On --resume/--resume-from the saved "
+                             "run's budget is used.")
     parser.add_argument("--warmgp-seed", type=int, default=0,
                         help="seed for the warm-start GP landscape (--dataset "
                              "warmgp / mixture): selects which campaign lines form "
@@ -3970,6 +4050,7 @@ def main() -> None:
         sys.exit("Use only one of --time-limit / --time-limit-hours.")
     time_limit_override = args.time_limit_hours if args.time_limit_hours is not None else args.time_limit
     _set_init_design(args.init)
+    _set_run_rules(args.budget_points)
 
     max_trials = args.max_trials
     batch_name = None
@@ -4132,6 +4213,7 @@ def main() -> None:
     if args.resume:
         cfg = load_latest_run_config(runs_dir)
         _set_init_design(args.init, cfg)
+        _set_run_rules(args.budget_points, cfg)
         if cfg.get("hparam_names") != HPARAM_NAMES:
             print("  [resume] WARNING: latest run's hparam_names differ from the current "
                   "HPARAM_SPACE; only matching trials are collected.")
@@ -4277,6 +4359,7 @@ def main() -> None:
             sys.exit(f"--resume-from: directory not found: {run_path}")
         cfg = load_run_config_from_path(run_path)
         _set_init_design(args.init, cfg)
+        _set_run_rules(args.budget_points, cfg)
         if cfg.get("hparam_names") and cfg["hparam_names"] != HPARAM_NAMES:
             print("  [resume-from] WARNING: source run's hparam_names differ from the "
                   "current HPARAM_SPACE; only matching trials are collected.")

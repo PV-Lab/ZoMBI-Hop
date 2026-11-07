@@ -74,7 +74,7 @@ OWN_RUNS_DIR="/home/adewinmb/orcd/scratch/ZoMBI-Hop/optimize/runs"
 # --time-limit 0.5 h per trial sits between the 4d (0.3) and 10d (0.7) budgets.
 # Changing it changes the shared-history signature, so keep all three 6d jobs on
 # this one script — a job launched with a different budget will not pool.
-uv run python optimize/run_mobo.py --dataset ensemble --dim 6 --time-limit 0.5 --share-history \
+uv run python optimize/run_mobo.py --dataset ensemble --dim 6 --time-limit 0.5 --init axial --budget-points 3000 --share-history \
     --share-dirs "$OWN_RUNS_DIR" \
     --ensemble-seed "$ENSEMBLE_SEED" \
     --start-from-best \

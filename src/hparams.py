@@ -166,7 +166,9 @@ _REGISTRY: tuple[HParam, ...] = (
     HParam("nat_grad_max_steps", "int", _pos_int, _ACQ_OPT, "Nat-grad max steps",
            "Maximum natural-gradient steps per acquisition optimisation.",
            (("dh", "nat_grad_max_steps"), ("gp", "nat_grad_max_steps")),
-           tune=(10, 80, "int")),
+           # Widened 2026-11-07 from (10, 80) so the shipped/benchmarked
+           # dup1c_custom value (400) is inside the MOBO box.
+           tune=(10, 400, "int")),
     HParam("n_restarts", "int", _pos_int, _ACQ_OPT, "Restarts",
            "Random restarts for multi-start acquisition optimisation.",
            (("dh", "n_restarts"), ("gp", "num_restarts")),
@@ -288,16 +290,18 @@ _REGISTRY: tuple[HParam, ...] = (
     HParam("needle_shrink_factor", "float", _open_unit, _NEEDLE, "Needle shrink factor",
            "Inert: a failure with no new data now ends the activation with an "
            "exclusion zone instead of shrinking needle ellipsoids. Kept so existing "
-           "configs and tuning records still load.",
+           "configs and tuning records still load. Dropped from the MOBO space "
+           "2026-11-07 (was tune=(0.5, 0.95, linear)).",
            (("zombi", "needle_shrink_factor"),),
-           tune=(0.5, 0.95, "linear")),
+           default=0.8),
     HParam("needle_stop_noise_multiplier", "float", _pos_float, _NEEDLE,
            "Needle stop mult",
            "Inert: was the noise-floor stop for the retired failure-path shrink "
            "(a stalled activation now ends with an exclusion zone). Kept so "
-           "existing configs and tuning records still load.",
+           "existing configs and tuning records still load. Dropped from the MOBO "
+           "space 2026-11-07 (was tune=(1.0, 8.0, linear)).",
            (("zombi", "needle_stop_noise_multiplier"),),
-           tune=(1.0, 8.0, "linear")),
+           default=2.0),
     HParam("min_zoom_for_needle", "int", _nonneg_int, _NEEDLE, "Min zoom for needle",
            "A needle may only be declared at this 0-indexed zoom level or deeper "
            "(2 ⇒ after at least two zoom-ins). Must be < max_zooms.",

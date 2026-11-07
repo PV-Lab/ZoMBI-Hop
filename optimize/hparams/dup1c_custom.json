@@ -1,7 +1,8 @@
 {
   "notes": [
     "Shipped ZoMBI-Hop configuration since 2026-11-02 (src/hparams.DEFAULT_HPARAMS_PROVENANCE): every new hardware/GUI run with no hyperparameter file uses these values, at every dimensionality. Editing this file changes those defaults. It must list exactly the tuned knobs.",
-    "Origin: dup1c (6d_ensemble.json lineage) with input_noise_threshold_mult 0.5 and no Jaccard keys; benchmarked in optimize/runs/showdown_6d_dup1c_custom_needles_n2n3_bw22_reps2* and the 10d custom needles showdowns."
+    "Origin: dup1c (6d_ensemble.json lineage) with input_noise_threshold_mult 0.5 and no Jaccard keys; benchmarked in optimize/runs/showdown_6d_dup1c_custom_needles_n2n3_bw22_reps2* and the 10d custom needles showdowns.",
+    "2026-11-07: needle_shrink_factor (0.8) and needle_stop_noise_multiplier (2.0) removed \u2014 inert since 029b9c4 and no longer tuned; their registry defaults are the same values."
   ],
   "selected_for": "explicit",
   "rank": null,
@@ -22,8 +23,6 @@
     "input_noise_threshold_mult": 0.5,
     "max_penalty_radius": 0.5020402,
     "ellipsoid_drop_fraction": 0.25,
-    "needle_shrink_factor": 0.8,
-    "needle_stop_noise_multiplier": 2.0,
     "min_zoom_for_needle": 2,
     "min_iters_per_zoom": 2,
     "needle_min_repeats": 5,

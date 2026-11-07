@@ -239,6 +239,8 @@ def _run_signature(cfg: dict) -> dict:
         "ensemble_repeats": cfg.get("ensemble_repeats"),
         "init_design": cfg.get("init_design"),
         "repulsion_profile": cfg.get("repulsion_profile"),
+        "never_terminate": cfg.get("never_terminate"),
+        "budget_points": cfg.get("budget_points"),
     }
 
 

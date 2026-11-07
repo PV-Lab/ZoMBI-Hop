@@ -50,7 +50,7 @@ ENSEMBLE_SEED=$(( SLURM_JOB_ID % 2147483647 ))
 # runs are referenced under her archived_runs, matching this account's move.
 # NOTE: own job16948639/trial_33 and trial_19 were cleaned off scratch and dropped;
 # re-derive replacements with pareto.py from the current 4d pool to get back to 4 seeds.
-uv run python optimize/run_mobo.py --dataset ensemble --dim 4 --time-limit 0.3 --share-history \
+uv run python optimize/run_mobo.py --dataset ensemble --dim 4 --time-limit 0.3 --init axial --budget-points 3000 --share-history \
     --ensemble-seed "$ENSEMBLE_SEED" \
     --start-from-best \
         optimize/runs/archived_runs/mobo_3d_05_06_15_32/trial_112 \
