@@ -359,6 +359,14 @@ def _enable_share_history(dirs: list[str] | None) -> None:
 # on this many independently randomized landscapes per MOBO trial and average the
 # four metrics, to reduce the run-to-run landscape noise the MOBO model sees.
 ENSEMBLE_N_REPEATS = 5
+# Output rescale for the 'ensemble' dataset (Ensemble ``output_rescale``): maps the
+# Ensemble's whole possible output span [0.5, 1] onto [0, 1], so every landscape value
+# lies in [0, 1] (neutral level -> 0.5, true optima -> 1). Since 2026-11-07, the MOBO
+# counterpart of the showdowns' needles unit_range (which maps the bumps-only plain
+# 0.75 -> 0; random ensembles dip below 0.75, so their full span is used instead).
+# Stamped as ``ensemble_output_rescale`` in run_config.json and part of the run
+# signature; a resumed run without it keeps the unscaled output.
+ENSEMBLE_OUTPUT_RESCALE = [0.5, 1.0]
 
 # Per-trial wall-clock budget (hours) passed to ZoMBIHop.run(time_limit_hours=…).
 TIME_LIMIT_HOURS = 0.4
@@ -781,6 +789,8 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
         cfg["ensemble_seed"] = ensemble_spec["seed"]
         cfg["ensemble_optima_margin"] = ensemble_spec["optima_margin"]
         cfg["ensemble_repeats"] = ensemble_spec.get("n_repeats", ENSEMBLE_N_REPEATS)
+        if ensemble_spec.get("output_rescale") is not None:
+            cfg["ensemble_output_rescale"] = [float(v) for v in ensemble_spec["output_rescale"]]
     if batch_name:
         cfg["batch_name"] = batch_name
     if batch_config_path:
@@ -1408,6 +1418,7 @@ def _run_signature(cfg: dict) -> dict:
         "repulsion_profile": cfg.get("repulsion_profile"),
         "never_terminate": cfg.get("never_terminate"),
         "budget_points": cfg.get("budget_points"),
+        "ensemble_output_rescale": cfg.get("ensemble_output_rescale"),
     }
 
 
@@ -2566,6 +2577,7 @@ def reseed_ackley_dataset(ds: dict, seed: int) -> dict:
 
 def build_ensemble_landscape(
     dim: int, *, optima_margin: float, seed: int, time_limit_hours: float | None,
+    output_rescale: list | None = None,
 ) -> LandscapeSpec:
     """Base ``LandscapeSpec`` for the layered Ensemble objective.
 
@@ -2576,6 +2588,8 @@ def build_ensemble_landscape(
     """
     cfg = random_ensemble_config(dim, index=0, total=1, seed=int(seed),
                                  optima_margin=optima_margin)
+    if output_rescale is not None:
+        cfg["output_rescale"] = [float(v) for v in output_rescale]
     fn = Ensemble(**cfg)
     true_optima = [np.asarray(c, dtype=float) for c in fn.centers]
     grid_pts = grid_vals = None
@@ -3123,6 +3137,10 @@ def evaluate_hparams(
         cfg = random_ensemble_config(
             ensemble_spec["dim"], idx, seed=int(ensemble_spec["seed"]),
             optima_margin=ensemble_spec["optima_margin"])
+        if ensemble_spec.get("output_rescale") is not None:
+            # Saved with the trial's ensemble_config.json, so the CoNet render and
+            # any rebuild see the same rescaled landscape.
+            cfg["output_rescale"] = [float(v) for v in ensemble_spec["output_rescale"]]
         configs.append(cfg)
         run_dir = os.path.join(trial_dir, f"run_{k}")
         ckpt = os.path.join(run_dir, "metrics.json")
@@ -3733,6 +3751,8 @@ def _ensemble_spec_from_cfg(cfg: dict) -> dict | None:
             "optima_margin": float(cfg.get("ensemble_optima_margin", 0.2)),
             "seed": int(cfg.get("ensemble_seed", cfg.get("seed", 0))),
             "n_repeats": int(cfg.get("ensemble_repeats", ENSEMBLE_N_REPEATS)),
+            # Absent before 2026-11-07: a resumed old run keeps its unscaled output.
+            "output_rescale": cfg.get("ensemble_output_rescale"),
         }
     return None
 
@@ -3745,6 +3765,7 @@ def _landscape_from_run_config_legacy(cfg: dict) -> tuple[LandscapeSpec, str | N
         landscape = build_ensemble_landscape(
             ens["dim"], optima_margin=ens["optima_margin"], seed=ens["seed"],
             time_limit_hours=cfg.get("time_limit_hours"),
+            output_rescale=ens.get("output_rescale"),
         )
         return landscape, None
     ackley_variant = cfg.get("ackley_variant")
@@ -4476,10 +4497,11 @@ def main() -> None:
         print("=" * 70)
         landscape = build_ensemble_landscape(
             dim, optima_margin=args.ensemble_margin, seed=args.ensemble_seed,
-            time_limit_hours=TIME_LIMIT_HOURS)
+            time_limit_hours=TIME_LIMIT_HOURS, output_rescale=ENSEMBLE_OUTPUT_RESCALE)
         ensemble_spec = {
             "dim": dim, "optima_margin": args.ensemble_margin, "seed": args.ensemble_seed,
             "n_repeats": args.ensemble_repeats,
+            "output_rescale": list(ENSEMBLE_OUTPUT_RESCALE),
         }
         lo, hi = optima_count_range(dim)
         resolutions = [

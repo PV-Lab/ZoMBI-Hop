@@ -110,15 +110,27 @@ class ZoMBIHopMethod(Method):
     # ── hyperparameters ──
 
     def resolved_hparams(self, dim: int) -> dict:
-        from src.default_hparams import DEFAULT_HPARAMS
+        """The hyperparameters ZoMBIHop is constructed with at ``dim``.
 
-        hp = dict(self.config["hparams"] if self.config["hparams"] is not None
-                  else DEFAULT_HPARAMS)
+        Loaded the way showdowns / evaluate.py load a config
+        (``src.hparams.extract_hparams``): a pre-2026-10-12 record is upgraded to
+        the values that code actually ran with, and retired keys (e.g.
+        ``convergence_pi_threshold``) are dropped, since the constructor rejects
+        them. Knobs the file does not set take the shipped defaults. A conflicting
+        combination raises here, which is at plan time.
+        """
+        from src.hparams import (DEFAULT_HPARAMS, apply_dim_rules, check_conflicts,
+                                 extract_hparams)
+
+        raw = (self.config["hparams"] if self.config["hparams"] is not None
+               else DEFAULT_HPARAMS)
+        hp = extract_hparams(dict(raw), source="zombi_hop hparams", log=None)
         for key in set(hp) & set(self.config["fixed"]):
             hp.pop(key)
-        # run_single_trial's rule: the top-m ellipsoid fit needs at least d+1 points.
-        if dim > 3 and (hp.get("top_m_points") is None or hp["top_m_points"] < dim + 1):
-            hp["top_m_points"] = max(dim + 1, 4)
+        # The top-m ellipsoid fit needs at least d+1 points (shared with
+        # run_mobo / evaluate.py / the hardware runner).
+        hp = apply_dim_rules(hp, dim)
+        check_conflicts(hp, context=f"zombi_hop dim {dim}")
         return hp
 
     # ── run ──

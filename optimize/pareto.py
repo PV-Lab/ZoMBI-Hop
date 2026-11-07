@@ -241,6 +241,7 @@ def _run_signature(cfg: dict) -> dict:
         "repulsion_profile": cfg.get("repulsion_profile"),
         "never_terminate": cfg.get("never_terminate"),
         "budget_points": cfg.get("budget_points"),
+        "ensemble_output_rescale": cfg.get("ensemble_output_rescale"),
     }
 
 

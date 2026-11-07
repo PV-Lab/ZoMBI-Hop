@@ -902,9 +902,13 @@ def summarize(out_dir: str, *, ci: float = DEFAULT_CI, n_boot: int = DEFAULT_N_B
         f"{manifest['batch_size']}, identical for every method at a given dimension. "
         f"Noise: "
         f"input {manifest['input_noise']:g}, output {manifest['output_noise_frac']:g} x |y|. "
-        + ("Landscape: bumps-only `CartesianEnsemble` on the unit cube — *n* "
-           "negated-Ackley needles of sharpness *b* peaking at 1.0 on a plain at 0.75 "
-           "(`benchmarks/sweeps/needles.py`). "
+        + (("Landscape: bumps-only `CartesianEnsemble` on the unit cube — *n* "
+            "negated-Ackley needles of sharpness *b* "
+            + ("rescaled to [0, 1]: peaks at 1.0 on a plain at 0 (`--unit-range`, "
+               "output 0.75..1 stretched onto 0..1, so the plain reads exactly 0) "
+               if manifest.get("landscape", {}).get("output_rescale") else
+               "peaking at 1.0 on a plain at 0.75 ")
+            + "(`benchmarks/sweeps/needles.py`). ")
            if manifest.get("landscape", {}).get("kind", "needles") == "needles" else
            "Landscape: **varied height** — *n* negated-Ackley needles of sharpness *b* "
            "on the unit cube, heights drawn U(0.5, 1) with the tallest set to 1.0, on "

@@ -314,6 +314,10 @@ def plan(args) -> str:
 
     kind = getattr(args, "landscape", None) or "needles"
     land = nd.landscape_module(kind)
+    unit_range = bool(getattr(args, "unit_range", False))
+    if unit_range and kind != "needles":
+        raise SystemExit(f"--unit-range applies to --landscape needles only "
+                         f"({kind} already has its plain at {land.PLAIN_Y})")
     feasibility = land.plan_feasibility(dims, counts, widths)
     manifest = {
         "schema_version": SCHEMA_VERSION,
@@ -351,6 +355,12 @@ def plan(args) -> str:
             "sigma_x": float(nd.SIGMA_X),
             "sigma_y_at_peak": round(float(nd.sigma_y_at_peak()), 6),
             "plain_y": land.PLAIN_Y, "peak_y": land.PEAK_Y,
+            # --unit-range: every cell's Ensemble maps [plain_y, peak_y] onto [0, 1]
+            # (output_rescale), as the showdowns' needles unit_range=true does.
+            # plain_y / peak_y above stay the UNSCALED levels.
+            **({"unit_range": True,
+                "output_rescale": [float(land.PLAIN_Y), float(land.PEAK_Y)]}
+               if unit_range else {}),
         },
         "feasibility": feasibility,
         "reclaim_after_min": float(args.reclaim_after_min),
@@ -547,6 +557,15 @@ def run_one_cell(task: dict, out_dir: str, manifest: dict, target: str,
     land = nd.landscape_module(manifest.get("landscape", {}).get("kind"))
     built = land.build_landscape(task["dim"], task["n_needles"], task["basin_width"],
                                  landscape_seed(seed_base, task))
+    rescale = manifest.get("landscape", {}).get("output_rescale")
+    if rescale is not None:
+        # --unit-range: same centers and basins, output stretched onto [0, 1]. The
+        # built["record"] prominence numbers stay on the unscaled 0.75..1 output.
+        from synthetic_data.ensemble import Ensemble
+
+        lcfg = {**built["config"], "output_rescale": [float(v) for v in rescale]}
+        built = {**built, "config": lcfg, "fn": Ensemble(**lcfg),
+                 "record": {**built["record"], "output_rescale": lcfg["output_rescale"]}}
     fn = built["fn"]
     truth = GroundTruth(optima=built["centers"],
                         peak_value=float(fn.predict(built["centers"]).max()))

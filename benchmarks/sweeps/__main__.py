@@ -167,6 +167,12 @@ def main() -> None:
                         "coordinate (0 = the optimiser gets the point it asked for)")
     p.add_argument("--output-noise-frac", type=float, default=DEFAULT_OUTPUT_NOISE_FRAC,
                    help="multiplicative measurement noise, sd = frac * |y|")
+    p.add_argument("--unit-range", action="store_true",
+                   help="needles only: stretch the output from plain 0.75 .. peak 1.0 "
+                        "onto 0 .. 1 (Ensemble output_rescale), exactly as the "
+                        "showdowns' --dataset needles unit_range=true. Same centers "
+                        "and basins; the multiplicative noise then reads 0 on the "
+                        "plain and 0.045 at a peak")
     p.add_argument("--extractor", default="gp_peaks",
                    help="needle extractor for methods that do not declare needles "
                         "(and the controlled *_extracted metrics for all methods)")
