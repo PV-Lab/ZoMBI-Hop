@@ -170,6 +170,63 @@ def metric_dist_to_needles(
     return float((cost[rows, cols].sum() + pen * (n - len(rows))) / n)
 
 
+def metric_greedy_dist(
+    samples: np.ndarray,
+    true_optima: list[np.ndarray],
+    *,
+    dim: int | None = None,
+) -> float:
+    """Mean distance from each true optimum to the nearest SAMPLE ("greedy dist").
+
+    For every true optimum, take the closest point the run actually measured; the
+    score is the mean of those distances. Lower is better; 0.0 means every optimum
+    was measured exactly, and the upper end is whatever the domain's geometry allows
+    (composition L2), not a fixed penalty.
+
+    How this differs from :func:`metric_dist_to_needles`, and why both exist:
+
+    * **It scores the samples, not the declarations.** Nothing about which needles an
+      optimiser chose to declare (or what an extractor found in its samples) enters
+      it, so it is the one distance every method can be scored on without an
+      extractor standing in the middle. It answers "did the search ever get near each
+      optimum", where ``dist_to_needles`` answers "did it correctly report them".
+    * **The pairing is greedy, hence the name.** Each optimum takes its nearest
+      sample independently, so two optima may share one; there is no one-to-one
+      assignment. That is the right choice here — a sample is not a claim, so two
+      optima being close to the same measurement is not double-counting anything.
+      (``dist_to_needles`` pairs one-to-one precisely because a needle IS a claim.)
+    * **There is no unmatched penalty and no cap.** With at least one sample every
+      optimum has a nearest one, so no term is ever missing. A far-away optimum
+      contributes its true distance rather than saturating at ``UNMATCHED_PENALTY``,
+      which is what makes the metric keep moving on landscapes where a run declares
+      nothing useful.
+    * **It can only improve.** Samples accumulate, so the per-optimum minimum is
+      non-increasing: a greedy-dist trajectory falls monotonically and flattens when
+      the search stops finding new ground. ``dist_to_needles`` can rise (declaring a
+      bad needle costs), so the two read differently over a budget.
+
+    It is the distance-valued sibling of ``frac_optima_visited`` in
+    ``benchmarks/methods/runner.py``, which thresholds these same per-optimum minima
+    at ``MATCH_RADIUS`` instead of averaging them — the fraction saturates at 0.0 on
+    a landscape nothing was found on, where the mean distance still ranks the runs.
+
+    Returns 0.0 when there are no true optima (nothing to be far from) and ``inf``
+    when there are no samples; a caller that may pass an empty sample set should
+    check ``isfinite`` before writing the value to JSON.
+    """
+    del dim  # scale-free in d; kept for call-site symmetry with the metrics above
+    n_opt = len(true_optima)
+    if n_opt == 0:
+        return 0.0
+    n_samp = len(samples)
+    if n_samp == 0:
+        return float("inf")
+    X = as_numpy(samples, dtype=float).reshape(n_samp, -1)
+    opt = np.asarray([as_numpy(t, dtype=float).ravel() for t in true_optima],
+                     dtype=float)
+    return float(cKDTree(X).query(opt, k=1)[0].mean())
+
+
 def zoom_size_fraction(zoom_bounds, full_bounds=None) -> float:
     """Linear size of a zoom box relative to the full domain, in (0, 1].
 

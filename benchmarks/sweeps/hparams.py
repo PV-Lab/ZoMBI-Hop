@@ -1,22 +1,40 @@
 """
 benchmarks/sweeps/hparams.py
 ============================
-Which ZoMBI-Hop configuration each dimension of the sweep runs.
+Which ZoMBI-Hop configuration each dimension of the sweep runs. (The other methods
+take their configuration from their own ``defaults`` plus any ``--method-config`` /
+``--method-set`` overrides — see :mod:`benchmarks.sweeps.configs`.)
 
-The sweep asks how robust the optimiser is to the *landscape*, so within a
-dimension the configuration is held fixed — a difference between two grid cells at
-the same dim is then attributable to the needle count and the basin width and
-nothing else. Across dimensions the configuration changes, because a single config
-would hand one dimension its own tuning and the rest somebody else's; the price is
-that dim-to-dim comparisons vary the optimiser as well as the landscape, and the
-summary says so.
+Within a dimension the configuration is held fixed, so a difference between two
+cells at the same dim is attributable to the landscape and nothing else. Across
+dimensions it changes, because one config would hand one dimension its own tuning
+and the rest somebody else's; dim-to-dim comparisons of ZoMBI-Hop therefore vary
+its hyperparameters as well as the landscape, and the summary says so.
+
+Tuned on the simplex, run on the cube
+-------------------------------------
+Every file below was tuned by MOBO on the *simplex* ensemble landscapes; the sweep
+now runs on the unit cube. ZoMBI-Hop's length-scale hyperparameters are
+dimensionless fractions of a unit-extent domain on both (``BoxDomain`` defaults to
+the unit cube for exactly this reason — see ``src/utils/domain.py``), so they carry
+over, but they are a transfer, not a cube-tuned optimum. The baselines run their
+published defaults with no tuning at all, so neither side of the comparison was
+tuned on these landscapes.
+
+Cube dimension = simplex free dimensions
+----------------------------------------
+A D-component simplex has D - 1 free coordinates, so a config tuned on the
+D-simplex is run on the (D - 1)-cube: the 3-simplex ("3d") config at cube dim 2,
+the 6-simplex ("6d") config at cube dim 5, and so on. The default grid (2, 3, 5, 9)
+is the simplex grid (3, 4, 6, 10) in free dimensions.
 
 The map
 -------
 ============ =============================================== =========================
-dim          file                                            provenance
+cube dim     file                                            provenance
+(simplex)
 ============ =============================================== =========================
-3            ``optimize/hparams/trial_112_composition.json``  archived 3d MOBO winner
+2 (3)        ``optimize/hparams/trial_112_composition.json``  archived 3d MOBO winner
                                                              (``mobo_3d_05_06_15_32``
                                                              trial 112), re-expressed
                                                              for composition space.
@@ -28,7 +46,8 @@ dim          file                                            provenance
                                                              ``warm_start``'s
                                                              ``REFERENCE_HPARAMS``
                                                              comes from.
-4, 6, 10     ``optimize/hparams/clamped_6d/dist1c.json``      best ``dist_to_needles``
+3, 5, 9      ``optimize/hparams/clamped_6d/dist1c.json``      best ``dist_to_needles``
+(4, 6, 10)
                                                              trial of the 6d ensemble
                                                              pool
                                                              (``mobo_ensemble_6d_job19202380``
@@ -37,15 +56,15 @@ dim          file                                            provenance
 ============ =============================================== =========================
 
 Two of those assignments are stand-ins and are labelled as such in the manifest,
-so nobody reads a dim-4 or dim-10 result as "the tuned configuration for that
+so nobody reads a dim-3 or dim-9 result as "the tuned configuration for that
 dimension":
 
-* **dim 4** has no tuned file in the repo. ``ensemble_mobo_4d.sbatch`` seeds its
+* **dim 3 (4-simplex)** has no tuned file in the repo. ``ensemble_mobo_4d.sbatch`` seeds its
   own search from the dim-3 trial 112, so either neighbour was defensible; the 6d
-  config is used because 4 and 6 sit on the same side of the dim-3 special case
+  config is used because 4 and 6 sit on the same side of the 3-simplex special case
   (a 3-simplex is a triangle, and the dim-3 config is tuned against a ternary
   render grid the others do not have).
-* **dim 10** has ``optimize/hparams/10d_ensemble.json``, but that file records
+* **dim 9 (10-simplex)** has ``optimize/hparams/10d_ensemble.json``, but that file records
   ``"phase": "sobol"`` — trial 3 of the initial quasi-random sweep, not a tuned
   winner — so the 6d configuration is used instead.
 
@@ -65,20 +84,24 @@ import os
 
 from ._paths import REPO_ROOT
 
-#: dim -> (path relative to the repo root, one-line provenance, is it a stand-in).
+#: Cube dim -> (path relative to the repo root, one-line provenance, is it a
+#: stand-in). Keyed by free dimensions: the D-simplex config runs at cube dim D - 1.
 HPARAM_MAP: dict[int, tuple[str, str, bool]] = {
-    3: ("optimize/hparams/trial_112_composition.json",
-        "archived 3d MOBO winner (mobo_3d_05_06_15_32 trial 112), composition-space",
+    2: ("optimize/hparams/trial_112_composition.json",
+        "3-simplex MOBO winner (mobo_3d_05_06_15_32 trial 112), composition-space",
         False),
-    4: ("optimize/hparams/clamped_6d/dist1c.json",
-        "6d dist_to_needles winner (job19202380 trial 23) — no tuned 4d config exists",
+    3: ("optimize/hparams/clamped_6d/dist1c.json",
+        "6-simplex dist_to_needles winner (job19202380 trial 23) — no tuned "
+        "4-simplex config exists",
         True),
-    6: ("optimize/hparams/clamped_6d/dist1c.json",
-        "6d dist_to_needles winner (job19202380 trial 23), clamped to HPARAM_SPACE",
+    5: ("optimize/hparams/clamped_6d/dist1c.json",
+        "6-simplex dist_to_needles winner (job19202380 trial 23), clamped to "
+        "HPARAM_SPACE",
         False),
-    10: ("optimize/hparams/clamped_6d/dist1c.json",
-         "6d config: 10d_ensemble.json is an untuned Sobol-phase trial, not a winner",
-         True),
+    9: ("optimize/hparams/clamped_6d/dist1c.json",
+        "6-simplex config: 10d_ensemble.json is an untuned Sobol-phase trial, not a "
+        "winner",
+        True),
 }
 
 
@@ -128,7 +151,7 @@ def hparams_for_dim(dim: int, overrides: dict[int, str] | None = None) -> dict:
 
 
 def parse_hparam_overrides(pairs: list[str] | None) -> dict[int, str]:
-    """``["3=my3d.json", "10=my10d.json"]`` -> ``{3: "my3d.json", 10: "my10d.json"}``."""
+    """``["2=my2d.json", "9=my9d.json"]`` -> ``{2: "my2d.json", 9: "my9d.json"}``."""
     out: dict[int, str] = {}
     for raw in pairs or []:
         if "=" not in raw:
