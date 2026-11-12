@@ -73,6 +73,10 @@ class ZoMBIHop:
     algorithm on a box (see src/utils/domain.py).
     """
 
+    # Two-head mode link (src/core/two_head.py). Class-level default so objects
+    # built without __init__ (test doubles) behave as single-head runs.
+    two_head_link = None
+
     def __init__(self,
                  objective,
                  X_init_actual: torch.Tensor,
@@ -195,6 +199,9 @@ class ZoMBIHop:
         self.full_bounds = full_bounds
 
         self._needle_plot_points_ref = needle_plot_points_ref
+        # Two-head mode (src/core/two_head.py): set by TwoHeadHub.attach(). None for
+        # an ordinary single-head run, in which case nothing below changes.
+        self.two_head_link = None
         self.ellipsoid_drop_fraction = ellipsoid_drop_fraction
         self.ellipsoid_eigenvalue_floor = ellipsoid_eigenvalue_floor
         self.max_penalty_radius = max_penalty_radius
@@ -567,12 +574,16 @@ class ZoMBIHop:
         # Current activation only: the candidate, its repeats and the median pick
         # all come from rows this activation measured, so a needle is never
         # declared on (or confirmed by) an earlier activation's points.
-        act_start = getattr(dh, "activation_start_idx", None)
-        if act_start is not None:
-            mask = mask.clone()
-            mask[:act_start] = False
-            if not mask.any():
-                return None, None, None, "no_points"
+        # (Two-head mode: the other head's rows are excluded too.)
+        if hasattr(dh, "current_activation_mask"):
+            mask = mask & dh.current_activation_mask()
+        else:
+            act_start = getattr(dh, "activation_start_idx", None)
+            if act_start is not None:
+                mask = mask.clone()
+                mask[:act_start] = False
+        if not mask.any():
+            return None, None, None, "no_points"
         idx = torch.where(mask)[0]
         X_unpen = dh.X_all_actual[idx]
         Y_unpen = dh.Y_all[idx].reshape(-1)
@@ -819,6 +830,10 @@ class ZoMBIHop:
 
         ranges = retro.activation_point_ranges(dh.run_dir)
         n_rows = dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0
+        # Two-head mode: rows the other head measured never belong to this head's
+        # activations (all False outside two-head mode).
+        _foreign = (dh.foreign_mask().tolist() if hasattr(dh, "foreign_mask")
+                    else [False] * n_rows)
         declared = 0
         candidates_out: List[dict] = []
         earlier_points: List[torch.Tensor] = []
@@ -826,7 +841,7 @@ class ZoMBIHop:
             act = trig["activation"]
             entry = dict(trig)
             rows = [i for (a, b) in ranges.get(act, [])
-                    for i in range(a, min(b, n_rows))]
+                    for i in range(a, min(b, n_rows)) if not _foreign[i]]
             if not rows:
                 entry["skipped_reason"] = "empty"
                 _rlog(f"  [retro] activation {act}: trigger at z{trig['zoom']}/"
@@ -1200,7 +1215,14 @@ class ZoMBIHop:
 
     def _log(self, message: str):
         if self.verbose:
-            print(message)
+            # Two-head mode: tag console lines with the head (run.log is per head).
+            link = getattr(self, "two_head_link", None)
+            if link is not None:
+                message_out = "\n".join(f"[{link.tag}] {ln}" if ln.strip() else ln
+                                         for ln in str(message).split("\n"))
+                print(message_out)
+            else:
+                print(message)
         try:
             self.data_handler.write_log(message)
         except Exception:
@@ -1347,6 +1369,10 @@ class ZoMBIHop:
         assert X_expected.shape[0] == X_actual.shape[0] == Y.shape[0]
 
         penalty_mask = self.data_handler.add_all_points(X_actual, X_expected, Y.unsqueeze(1))
+        if self.two_head_link is not None:
+            # Two-head mode: hand this line to the other head's GP and take in
+            # whatever the other head measured meanwhile (GP data only).
+            self.two_head_link.after_measurement(X_actual, X_expected, Y)
         return X_actual[penalty_mask], Y[penalty_mask]
 
     def _space_filling_measurement(self, dh, n_pool: int = 2048,
@@ -1394,7 +1420,10 @@ class ZoMBIHop:
         full_bounds = torch.stack([full_lo, full_hi])
         before = dh.X_all_actual.shape[0] if dh.X_all_actual is not None else 0
         self._objective_wrapper(center, full_bounds, self.gp_handler.acq_fn)
+        # Own rows only: in two-head mode the call also pulls in the other head's.
         after = dh.X_all_actual.shape[0] if dh.X_all_actual is not None else before
+        if hasattr(dh, "foreign_mask"):
+            return int((~dh.foreign_mask()[before:after]).sum().item())
         return after - before
 
     def run(self, max_activations: int = 5, time_limit_hours: float = None,
@@ -1549,8 +1578,14 @@ class ZoMBIHop:
             # Rows measured from here on belong to this activation (zoom windows and
             # needle declarations see only these). A resumed activation keeps the
             # start its snapshot recorded.
-            if not (activation == start_activation
-                    and getattr(dh, "activation_start_idx", None) is not None):
+            resumed_activation = (activation == start_activation
+                                  and getattr(dh, "activation_start_idx", None) is not None)
+            if self.two_head_link is not None:
+                # Two-head mode: the other head's penalty regions are adopted only
+                # here, between activations, never mid-activation (a resumed
+                # activation is mid-activation, so it only takes in points).
+                self.two_head_link.at_activation_boundary(sync_regions=not resumed_activation)
+            if not resumed_activation:
                 dh.activation_start_idx = (dh.X_all_actual.shape[0]
                                            if dh.X_all_actual is not None else 0)
 

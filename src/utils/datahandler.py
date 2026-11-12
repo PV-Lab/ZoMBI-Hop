@@ -253,6 +253,18 @@ class DataHandler:
         # None = unset (fresh run before activation 0 starts): every row counts.
         self.activation_start_idx: Optional[int] = None
 
+        # Two-head mode (src/core/two_head.py). Rows of X_all_actual that the OTHER
+        # head measured: they feed this head's GP (paring, fitting, best-so-far) but
+        # never its activation logic (zoom windows, needle declaration), which sees
+        # only this head's own rows. Stored per row, lazily padded with False, so a
+        # single-head run never touches it.
+        self._foreign_rows: Optional[torch.Tensor] = None
+        # Called with a region record each time THIS head declares a needle or an
+        # exclusion zone, so the other head can import it at its next activation
+        # boundary. None outside two-head mode. Suppressed while importing.
+        self.region_listener = None
+        self._importing_region = False
+
         # Logging
         self.log_ei_history: List[float] = []
 
@@ -412,6 +424,8 @@ class DataHandler:
 
         X_new = (self.X_all_actual[n_prev:].to(device=self.device, dtype=self.dtype)
                  if n_curr > n_prev else _empty_x)
+        foreign_new = (self.foreign_mask()[n_prev:] if n_curr > n_prev
+                       else torch.zeros(0, dtype=torch.bool, device=self.device))
         X_exp_new = (self.X_all_expected[n_prev:].to(device=self.device, dtype=self.dtype)
                      if n_curr > n_prev else _empty_x)
         Y_new = (self.Y_all[n_prev:].to(device=self.device, dtype=self.dtype)
@@ -427,6 +441,8 @@ class DataHandler:
             'X_new': X_new,
             'X_exp_new': X_exp_new,
             'Y_new': Y_new,
+            # Two-head mode: True for rows the other head measured (absent = False)
+            'foreign_new': foreign_new,
             # Small tensors — full copy each snapshot
             'bounds': self.bounds,
             'current_zoom_bounds': (
@@ -469,6 +485,9 @@ class DataHandler:
                 'zoom': r['zoom'],
                 'iteration': r['iteration'],
                 'n_points': r.get('n_points'),
+                # Two-head mode: the head that declared it, when not this one
+                **({'origin_head': r['origin_head']} if r.get('origin_head') is not None
+                   else {}),
             }
             for r in self.needles_results
         ]
@@ -667,6 +686,7 @@ class DataHandler:
         X_parts: List[torch.Tensor] = []
         X_exp_parts: List[torch.Tensor] = []
         Y_parts: List[torch.Tensor] = []
+        F_parts: List[torch.Tensor] = []
         last_delta: Optional[dict] = None
 
         for name in all_snap_names:
@@ -684,6 +704,10 @@ class DataHandler:
                 y_new = d.get('Y_new')
                 if isinstance(y_new, torch.Tensor):
                     Y_parts.append(y_new.to(self.device, self.dtype))
+                f_new = d.get('foreign_new')
+                if not (isinstance(f_new, torch.Tensor) and f_new.shape[0] == x_new.shape[0]):
+                    f_new = torch.zeros(x_new.shape[0], dtype=torch.bool)
+                F_parts.append(f_new.to(self.device, torch.bool))
 
             last_delta = d
             if name == snapshot_name:
@@ -701,6 +725,7 @@ class DataHandler:
             self.Y_all = (torch.cat(Y_parts, dim=0) if Y_parts
                           else torch.zeros(self.X_all_actual.shape[0], 1,
                                            device=self.device, dtype=self.dtype))
+            self._foreign_rows = torch.cat(F_parts, dim=0) if F_parts else None
         else:
             self.X_all_actual = torch.zeros(0, _d, device=self.device, dtype=self.dtype)
             self.X_all_expected = torch.zeros(0, _d, device=self.device, dtype=self.dtype)
@@ -953,6 +978,7 @@ class DataHandler:
                 'zoom': r['zoom'],
                 'iteration': r['iteration'],
                 'n_points': r.get('n_points'),
+                'origin_head': r.get('origin_head'),
             }
             for r in data
         ]
@@ -981,8 +1007,13 @@ class DataHandler:
         new_X_actual: torch.Tensor,
         new_X_expected: torch.Tensor,
         new_Y: torch.Tensor,
+        foreign: bool = False,
     ) -> torch.Tensor:
-        """Add new observations. Returns penalty mask for the new points (True = not penalized)."""
+        """Add new observations. Returns penalty mask for the new points (True = not penalized).
+
+        ``foreign`` (two-head mode): the rows were measured by the other head. They
+        join the GP data like any other row but are excluded from this head's
+        activation logic (``current_activation_mask``)."""
         new_X_actual = new_X_actual.to(device=self.device, dtype=self.dtype)
         new_X_expected = new_X_expected.to(device=self.device, dtype=self.dtype)
         new_Y = new_Y.to(device=self.device, dtype=self.dtype)
@@ -1029,6 +1060,11 @@ class DataHandler:
             new_penalty_mask = new_penalty_mask_novel
 
         # Append only the novel (non-duplicate) points to the stored data.
+        if foreign or self._foreign_rows is not None:
+            self._foreign_rows = torch.cat([
+                self.foreign_mask(),
+                torch.full((new_X_actual.shape[0],), bool(foreign),
+                           dtype=torch.bool, device=self.device)])
         self.X_all_actual = torch.cat([self.X_all_actual, new_X_actual], dim=0)
         self.X_all_expected = torch.cat([self.X_all_expected, new_X_expected], dim=0)
         self.Y_all = torch.cat([self.Y_all, new_Y], dim=0)
@@ -1102,6 +1138,9 @@ class DataHandler:
 
         self._update_penalty_mask()
         self._sync_needles_db()
+        self._emit_region('needle', needle, needle_penalty_radius, M, B,
+                          value=float(needle_value), median_value=needle_median_value,
+                          zoom=zoom, iteration=iteration, reason=reason)
 
     def _enable_needles_db(self, optimizing_dims: List[int],
                            path: Optional[str] = None) -> None:
@@ -1330,6 +1369,7 @@ class DataHandler:
                 self.needle_B = self._tangent_basis()
 
         self._update_penalty_mask()
+        self._emit_region('exclusion', center, radius, M, B)
 
     def get_penalty_mask(self, X: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Return penalty mask (True = not penalized). If X is None, returns mask for all stored points."""
@@ -1751,7 +1791,60 @@ class DataHandler:
         mask = torch.ones(n, dtype=torch.bool, device=self.device)
         if self.activation_start_idx is not None:
             mask[:self.activation_start_idx] = False
+        # Two-head mode: the other head's rows are never this activation's.
+        if self._foreign_rows is not None:
+            mask &= ~self.foreign_mask()
         return mask
+
+    def foreign_mask(self) -> torch.Tensor:
+        """(n,) bool over X_all_actual: True for rows the other head measured
+        (two-head mode). All False outside two-head mode."""
+        n = self.X_all_actual.shape[0] if self.X_all_actual is not None else 0
+        f = self._foreign_rows
+        if f is None:
+            return torch.zeros(n, dtype=torch.bool, device=self.device)
+        f = f.to(self.device)
+        if f.shape[0] < n:
+            f = torch.cat([f, torch.zeros(n - f.shape[0], dtype=torch.bool,
+                                          device=self.device)])
+        return f[:n]
+
+    # ── two-head mode: shared penalty regions ──────────────────────────────
+
+    def _emit_region(self, kind: str, center: torch.Tensor, radius: float,
+                     M: Optional[torch.Tensor], B: Optional[torch.Tensor],
+                     **extra) -> None:
+        """Hand a region THIS head just declared to the two-head listener."""
+        if self.region_listener is None or self._importing_region:
+            return
+        cpu = lambda t: None if t is None else t.detach().to("cpu", torch.float64).clone()
+        rec = {'kind': kind, 'center': cpu(center.reshape(-1)), 'radius': float(radius),
+               'M': cpu(M), 'B': cpu(B if B is not None else self.needle_B), **extra}
+        try:
+            self.region_listener(rec)
+        except Exception as e:      # noqa: BLE001 — sharing must not kill the head
+            print(f"[two-head] region listener failed: {e!r}")
+
+    def import_region(self, rec: Dict[str, Any], origin_head: int) -> None:
+        """Add a region the other head declared (needle or exclusion zone) to this
+        head's penalty set. Not re-broadcast. The needle keeps ``origin_head`` in
+        its result record so needles.json shows who found it."""
+        dev = lambda t: None if t is None else t.to(self.device, self.dtype)
+        self._importing_region = True
+        try:
+            if rec['kind'] == 'needle':
+                self.add_needle(
+                    dev(rec['center']), float(rec.get('value', float('nan'))),
+                    float(rec['radius']), rec.get('zoom', -1), rec.get('iteration', -1),
+                    M=dev(rec.get('M')), B=dev(rec.get('B')),
+                    needle_median_value=rec.get('median_value'),
+                    reason=f"head{origin_head}:{rec.get('reason')}")
+                self.needles_results[-1]['origin_head'] = int(origin_head)
+            else:
+                self.add_exclusion(dev(rec['center']), M=dev(rec.get('M')),
+                                   B=dev(rec.get('B')), radius=float(rec['radius']))
+        finally:
+            self._importing_region = False
 
     def determine_new_bounds(self) -> torch.Tensor:
         """Next zoom box: the AABB of the top_m_points unpenalized points.
