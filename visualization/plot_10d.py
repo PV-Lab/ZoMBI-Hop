@@ -188,6 +188,14 @@ CN_MIN_CELLS, CN_MIN_NODES = 30, 4
 CN_PCT = (10.0, 90.0)      # CoNet colour bounds: 10th-90th percentile of the response
 CN_STAR = "#ff2d2d"        # discovered-needle / incumbent (best Objective) marker (red)
 CN_ZONE = "#ff4fd8"        # optimizer penalty zones: hatch, dashed outline, centre ring (magenta)
+# optimizer zoom boxes of the activation in force: the widest (zoom 0) is grey, each deeper level a step
+# further toward a muted orange, the deepest one shown being the full orange (see _cn_zoom_color)
+CN_ZOOM_WIDE = "#8e939b"
+CN_ZOOM_DEEP = "#d4894f"
+# GP background (the optimizer's surrogate, fitted on the points it would train on): peak opacity, and
+# the smoothing bandwidth relative to the dominance fields' (larger divisor -> follows samples tighter)
+CN_GP_A_MAX = 0.55
+CN_GP_H_DIV = 2.0
 CN_TRUE_OPT = "#2f9bff"    # synthetic landscape's true optimum marker (blue; drawn under, and larger than, red)
 # ---- two LIVE, user-tunable layout knobs (persist across new samples / timeline; see the UI) --------
 # CLUSTER DIST (self.gap_reach): when the campaign repeatedly samples one composition (e.g. near-pure
@@ -783,12 +791,28 @@ def conet_dominance_fields(M, limits=None):
     # zone, so a zone's shaded area follows the map exactly the way the composition regions do
     zmem = M["zones"]["member"].T.astype(float) if M.get("zones") else None   # (N, Z)
     zfield = np.zeros((G.shape[0], zmem.shape[1])) if zmem is not None else None
+    # zoom-box membership, smoothed the same way as the penalty zones
+    bmem = M["zooms"]["member"].T.astype(float) if M.get("zooms") else None   # (N, L)
+    bfield = np.zeros((G.shape[0], bmem.shape[1])) if bmem is not None else None
+    # GP posterior mean at each sample, carried onto the grid with a NARROWER kernel (W ** k is the same
+    # Gaussian at bandwidth h / sqrt(k)) so the background follows the surrogate rather than a wide blur
+    gpv = M.get("gp_bg")
+    gfield = np.zeros(G.shape[0]) if gpv is not None else None
+    gk = CN_GP_H_DIV ** 2
     for s in range(0, G.shape[0], 6000):
         W = np.exp(-cdist(G[s:s + 6000], E, "sqeuclidean") / (2 * h * h))
         field[s:s + 6000] = (W @ comp) / (W.sum(1)[:, None] + 1e-12)
         dens[s:s + 6000] = W.sum(1)
         if zfield is not None:
             zfield[s:s + 6000] = (W @ zmem) / (W.sum(1)[:, None] + 1e-12)
+        if bfield is not None:
+            bfield[s:s + 6000] = (W @ bmem) / (W.sum(1)[:, None] + 1e-12)
+        if gfield is not None:
+            Wn = W ** gk
+            sn = Wn.sum(1)
+            wide = (W @ gpv) / (W.sum(1) + 1e-12)
+            # far from every sample the narrow kernel underflows: fall back to the wide one there
+            gfield[s:s + 6000] = np.where(sn > 1e-200, (Wn @ gpv) / np.maximum(sn, 1e-300), wide)
     dens /= dens.max()
     dnn = cKDTree(E).query(G)[0]
     argf = field.argmax(1)
@@ -799,7 +823,9 @@ def conet_dominance_fields(M, limits=None):
                 field=field.reshape(sh + (comp.shape[1],)), argf=argf.reshape(sh),
                 margin=margin.reshape(sh), dens=dens.reshape(sh), dnn=dnn.reshape(sh),
                 mask=(dens > CN_DENS_THR).reshape(sh),
-                zone_field=None if zfield is None else np.moveaxis(zfield.reshape(sh + (-1,)), -1, 0))
+                zone_field=None if zfield is None else np.moveaxis(zfield.reshape(sh + (-1,)), -1, 0),
+                zoom_field=None if bfield is None else np.moveaxis(bfield.reshape(sh + (-1,)), -1, 0),
+                gp_field=None if gfield is None else gfield.reshape(sh))
 
 
 def _cn_place_labels(ax, cands, names, F, iy, ix, border_mask):
@@ -1067,7 +1093,9 @@ def _draw_blend_label(ax, x, y, pretty_names, color, alpha=1.0, stroke_col=None)
                                         box_alignment=(0.5, 0.5), annotation_clip=False, zorder=30))
 
 
-def _conet_underlay(ax, M, F, pal=None, labels=True):
+def _conet_underlay(ax, M, F, pal=None, labels=True, fill=True):
+    """Composition regions under a CoNet panel: the blended composition-colour fill (skipped when
+    *fill* is False, i.e. when the GP background takes its place) plus every region outline/label."""
     import matplotlib as mpl
     import matplotlib.patheffects as pe
     from scipy.ndimage import gaussian_filter, label as cc_label, binary_erosion
@@ -1088,8 +1116,9 @@ def _conet_underlay(ax, M, F, pal=None, labels=True):
     rgb = np.tensordot(w, cols, axes=([2], [0]))
     alpha = CN_A_MAX * _cn_smoothstep((reach - F["dnn"]) / taper)
     alpha = gaussian_filter(alpha, sigma=CN_FILL_BLUR)
-    ax.imshow(np.dstack([np.clip(rgb, 0, 1), alpha]), extent=F["ext"], origin="lower",
-              interpolation="bilinear", aspect="auto", zorder=0)
+    if fill:
+        ax.imshow(np.dstack([np.clip(rgb, 0, 1), alpha]), extent=F["ext"], origin="lower",
+                  interpolation="bilinear", aspect="auto", zorder=0)
     iy = np.clip(((M["E"][:, 1] - F["y0"]) / (F["y1"] - F["y0"]) * (CN_GRID - 1)).round().astype(int), 0, CN_GRID - 1)
     ix = np.clip(((M["E"][:, 0] - F["x0"]) / (F["x1"] - F["x0"]) * (CN_GRID - 1)).round().astype(int), 0, CN_GRID - 1)
     field, argf, gx, gy, margin = F["field"], F["argf"], F["gx"], F["gy"], F["margin"]
@@ -1273,12 +1302,96 @@ def _conet_zones(ax, M, F):
                    linewidths=2.0, zorder=7.5, path_effects=eff)
 
 
+def _conet_gp_background(ax, M, F, cmap, lo, hi):
+    """The GP posterior mean (``F['gp_field']``) as the panel background, in the response colormap.
+
+    The map has no out-of-sample transform, so the surrogate cannot be evaluated at arbitrary map
+    positions: it is evaluated at every drawn SAMPLE (``M['gp_bg']``) and carried onto the grid by
+    kernel smoothing. It fades out with distance from the samples, like the composition fill it
+    replaces, since the map says nothing about its empty space."""
+    gf = F.get("gp_field")
+    if gf is None:
+        return
+    import matplotlib as mpl
+    from scipy.ndimage import gaussian_filter
+    span = F.get("core_span", max(F["x1"] - F["x0"], F["y1"] - F["y0"]))
+    reach, taper = 1.5 * CN_FILL_R * span, CN_FILL_TAPER * span
+    alpha = CN_GP_A_MAX * _cn_smoothstep((reach - F["dnn"]) / taper)
+    alpha = gaussian_filter(alpha, sigma=CN_FILL_BLUR)
+    cm = mpl.colormaps[cmap] if isinstance(cmap, str) else cmap
+    rgba = cm(mpl.colors.Normalize(lo, hi, clip=True)(gf))
+    rgba[..., 3] = alpha
+    ax.imshow(rgba, extent=F["ext"], origin="lower", interpolation="bilinear", aspect="auto", zorder=0)
+
+
+def _cn_zoom_color(level, deepest):
+    """Grey for zoom 0, stepping toward the muted orange; *deepest* (the deepest level shown) is fully
+    orange. Interpolated in RGB, which stays desaturated in between rather than passing through a hue."""
+    import matplotlib as mpl
+    t = 0.0 if deepest <= 0 else float(level) / float(deepest)
+    a, b = np.array(mpl.colors.to_rgb(CN_ZOOM_WIDE)), np.array(mpl.colors.to_rgb(CN_ZOOM_DEEP))
+    return tuple(a + (b - a) * t)
+
+
+def _conet_zooms(ax, M, F, pal=None):
+    """The optimizer's zoom boxes for the activation in force (``M['zooms']``), drawn from which
+    SAMPLES each box contains -- the same treatment as ``_conet_zones`` and for the same reason (a box in
+    composition space cannot be projected onto this map). Each level gets a faint fill (nested levels
+    stack, so the deepest box reads most orange) and a solid outline; dashed + hatched stays reserved for
+    penalty zones. A small legend names the levels, marking the one currently being searched."""
+    zf = F.get("zoom_field")
+    Z = M.get("zooms")
+    if zf is None or not Z:
+        return
+    import matplotlib.patheffects as pe
+    from matplotlib.lines import Line2D
+    from scipy.ndimage import gaussian_filter
+    pal = pal or CN_PAL_DARK
+    gx, gy = F["gx"], F["gy"]
+    levels = [int(lv) for lv in Z["levels"]]
+    deepest = max(levels) if levels else 0
+    eff = [pe.withStroke(linewidth=3.0, foreground="black")]
+    handles = []
+    for lev, z in sorted(zip(levels, zf), key=lambda t: t[0]):
+        ind = gaussian_filter(((z >= 0.5) & F["mask"]).astype(float), sigma=2.0)
+        col = _cn_zoom_color(lev, deepest)
+        cur = lev == Z.get("current")
+        if ind.max() <= 0.5:                              # too few drawn samples inside to outline
+            handles.append(Line2D([], [], color=col, lw=1.0, ls=":",
+                                  label=f"zoom {lev}  (too few samples to outline)"))
+            continue
+        ax.contourf(gx, gy, ind, [0.5, 2.0], colors=[col], alpha=0.07, zorder=2.3 + 0.01 * lev)
+        cs = ax.contour(gx, gy, ind, [0.5], colors=[col], linewidths=1.6, alpha=0.95,
+                        zorder=6.1 + 0.01 * lev)
+        try:
+            cs.set_path_effects(eff)                      # mpl>=3.8: ContourSet is a Collection
+        except AttributeError:
+            for c in cs.collections:
+                c.set_path_effects(eff)
+        handles.append(Line2D([], [], color=col, lw=2.4 if cur else 1.6,
+                              label=f"zoom {lev}" + ("  (searching)" if cur else "")))
+    if handles:
+        leg = ax.legend(handles=handles, loc="lower right", fontsize=9, frameon=True,
+                        title=f"activation {Z.get('activation', '?')}", title_fontsize=9)
+        fr = leg.get_frame()
+        fr.set_facecolor(pal["stroke"] or UI_BG)
+        fr.set_alpha(0.75)
+        fr.set_edgecolor(pal["faint"])
+        for t in leg.get_texts() + [leg.get_title()]:
+            t.set_color(pal["muted"])
+        leg.set_zorder(9)
+
+
 def _conet_panel(fig, rect, cbrect, M, F, resp, bounds, view, target_eg, pal=None, labels=True):
     import matplotlib as mpl
     import matplotlib.patheffects as pe
     pal = pal or CN_PAL_DARK
     ax = fig.add_axes(rect); ax.set_facecolor("none")
-    _conet_underlay(ax, M, F, pal=pal, labels=labels)
+    gp_bg = F.get("gp_field") is not None
+    if gp_bg:
+        _conet_gp_background(ax, M, F, _cmap_for(resp), *bounds[resp])
+    _conet_underlay(ax, M, F, pal=pal, labels=labels, fill=not gp_bg)
+    _conet_zooms(ax, M, F, pal=pal)
     _conet_zones(ax, M, F)
     E = M["E"]; iters = M["iters"]
     vis = np.ones(len(iters), bool) if view is None else (iters <= view + 0.5)   # time-travel
@@ -1724,7 +1837,7 @@ def load_run_conet_data(run_dir, snapshot=None):
 
 def build_conet(comp, names, resp, iters, umap_md=CN_UMAP_MD, gap_reach=CN_GAP_REACH,
                 purity_thr=CN_PURITY_THR, needles_comp=None, show_needles=False, frame=None,
-                limits=None, zones=None):
+                limits=None, zones=None, zooms=None, gp_bg=None):
     """Build the CoNet structure (UMAP) + dominance fields for a single-objective run. Ranked needle
     optima (if any) are anchored to their nearest sample node and stored as ``M['needles']``; whether
     their stars are drawn is gated by ``M['show_needles']`` (the UI toggle / --needles flag).
@@ -1734,7 +1847,14 @@ def build_conet(comp, names, resp, iters, umap_md=CN_UMAP_MD, gap_reach=CN_GAP_R
 
     *zones*: optional optimizer penalty zones as ``(member (Z, N) bool, centers (Z,) int)`` — which
     samples each zone contains, and the sample nearest each zone's centre (-1 = none). Drawn by
-    ``_conet_zones`` from that membership, never by projecting the ellipsoid itself."""
+    ``_conet_zones`` from that membership, never by projecting the ellipsoid itself.
+
+    *zooms*: optional zoom boxes of the activation in force, as a dict with ``levels`` (L,) int,
+    ``member`` (L, N) bool (which samples each box contains), ``current`` (the level being searched) and
+    ``activation``. Drawn by ``_conet_zooms`` from that membership, the same way as the zones.
+
+    *gp_bg*: optional (N,) GP posterior mean at each sample; when given it replaces the composition fill
+    as the panel background (``_conet_gp_background``)."""
     M = build_conet_structure(comp, names, resp, iters, list(VALUE_COLUMNS),
                               min_dist=umap_md, gap_reach=gap_reach, purity_thr=purity_thr,
                               frame=frame)
@@ -1743,6 +1863,11 @@ def build_conet(comp, names, resp, iters, umap_md=CN_UMAP_MD, gap_reach=CN_GAP_R
     M["show_needles"] = bool(show_needles)
     if zones is not None and len(zones[0]):
         M["zones"] = dict(member=np.asarray(zones[0], bool), centers=np.asarray(zones[1], int))
+    if zooms is not None and len(zooms["levels"]):
+        M["zooms"] = dict(zooms, levels=np.asarray(zooms["levels"], int),
+                          member=np.asarray(zooms["member"], bool).reshape(len(zooms["levels"]), -1))
+    if gp_bg is not None:
+        M["gp_bg"] = np.asarray(gp_bg, float).reshape(-1)
     with _Progress("dominance fields"):
         F = conet_dominance_fields(M, limits=limits)
     return M, F

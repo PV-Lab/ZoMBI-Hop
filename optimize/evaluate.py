@@ -1002,7 +1002,10 @@ def zone_state(dh) -> dict:
     region's centre, sphere radius and ellipsoid M (None = sphere fallback), the
     shared tangent basis B, needles first and then exclusion zones (the
     ``_penalty_regions`` order, with ``n_needles`` marking the boundary).
-    ``n_points`` is the samples collected when it was taken.
+    ``n_points`` is the samples collected when it was taken. ``bounds`` is the
+    (2, d) box the optimizer is searching in at that moment — taken from inside
+    the objective call, it is the box of the line being measured — which lets
+    ``visualization/plot_run.py`` outline the zoom levels at every step.
     """
     centers, radii, M_list = dh._penalty_regions()
     cpu = lambda t: None if t is None else t.detach().cpu().clone()
@@ -1014,6 +1017,7 @@ def zone_state(dh) -> dict:
         radii=cpu(radii).reshape(-1) if n else torch.zeros(0),
         M=[cpu(m) for m in M_list[:n]],
         B=cpu(dh.needle_B),
+        bounds=cpu(dh.bounds),
     )
 
 

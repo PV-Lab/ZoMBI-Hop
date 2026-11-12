@@ -374,6 +374,16 @@ class Dataset:
     bool matrix saying which samples each zone contains, plus each zone's
     centre as the index of its nearest sample. ``zones_at`` picks the entry for
     a time-slider step.
+
+    ``zooms`` is the run's zoom-box history, or None when the source keeps no
+    optimizer state — see ``run_zone_history``. Each entry is ``(n_points,
+    activation, zoom, member)``: the box a line was searched in, which activation
+    and zoom level it belonged to, and a ``(N,)`` bool saying which samples lie
+    inside it; it counts as in force once ``n_points`` samples exist. ``zooms_at``
+    gathers, for a time-slider step, every level of the activation in force.
+
+    ``max_gp_points`` is the optimizer's GP training budget (``DataHandler``'s
+    ``max_gp_points``), used when the CoNet background re-creates its GP.
     """
 
     X: np.ndarray
@@ -388,6 +398,8 @@ class Dataset:
     bounds: np.ndarray | None = None
     goal: str = "maximize"
     zones: list | None = None
+    zooms: list | None = None
+    max_gp_points: int = 3000
 
     def __iter__(self):
         """Unpack as the legacy ``(X, Y, labels, title)`` tuple.
@@ -513,6 +525,33 @@ class Dataset:
         pos = np.full(len(self.Y), -1, dtype=int)
         pos[rows] = np.arange(len(rows))
         return member[:, rows], pos[centers]
+
+    def zooms_at(self, rows: np.ndarray) -> dict | None:
+        """Zoom boxes of the activation in force once ``rows`` had been collected.
+
+        The activation in force is the one of the latest box recorded at or before
+        ``len(rows)`` points; every zoom level that activation has entered so far
+        is returned, each with the LAST box recorded for it (a failure retry
+        recomputes the box without changing the level). Levels deeper than the one
+        being searched are dropped, so a restarted activation never shows a box it
+        has not re-entered. Returns a dict for ``plot_10d.build_conet(zooms=...)``
+        — ``levels`` (L,), ``member`` (L, len(rows)) bool, ``current`` (the level
+        being searched) and ``activation`` — or None when the source records none.
+        """
+        if not self.zooms:
+            return None
+        live = [e for e in self.zooms if e[0] <= len(rows)]
+        if not live:
+            return None
+        _, act, cur, _ = live[-1]
+        by_level = {}
+        for _, a, z, member in live:
+            if a == act:
+                by_level[z] = member          # latest box per level wins
+        levels = sorted(z for z in by_level if z <= cur)
+        return dict(levels=np.asarray(levels, dtype=int),
+                    member=np.stack([by_level[z][rows] for z in levels]),
+                    current=int(cur), activation=int(act))
 
 
 def line_index(iteration: np.ndarray | None, n: int) -> np.ndarray:
@@ -712,8 +751,45 @@ def _zone_regions(d: dict) -> tuple[np.ndarray, list, np.ndarray]:
     return np.concatenate(centers), M_list, np.asarray(radii)
 
 
+# A per-line snapshot is ``NNNN_act<a>_z<z>_i<i>``: its ``bounds`` are the box that
+# line was searched in. The ``_needle`` / ``_timeout`` / ``init`` ones are not —
+# a needle snapshot is taken after the bounds were already reset to the full box.
+_LINE_SNAPSHOT_RE = re.compile(r"^\d+_act(\d+)_z(\d+)_i(\d+)$")
+
+
+def _box_membership(X: np.ndarray, bounds) -> np.ndarray | None:
+    """``(N,)`` bool: which rows of ``X`` lie inside the ``(2, d)`` box ``bounds``.
+
+    The optimizer's own in-bounds test (``DataHandler.get_zoom_gp_data``), with a
+    hair of slack so a sample generated exactly on a box face is not lost to
+    float round-off. None when ``bounds`` is missing or the wrong shape.
+    """
+    if bounds is None:
+        return None
+    b = (bounds.detach().cpu().numpy() if hasattr(bounds, "detach")
+         else np.asarray(bounds)).astype(float)
+    if b.shape != (2, X.shape[1]):
+        return None
+    eps = 1e-9
+    return ((X >= b[0] - eps) & (X <= b[1] + eps)).all(axis=1)
+
+
 def run_penalty_zones(run_dir: Path, snapshot: str, X: np.ndarray) -> list | None:
-    """The run's penalty-zone history, for ``Dataset.zones``.
+    """The penalty-zone half of ``run_zone_history`` (kept for its callers)."""
+    return run_zone_history(run_dir, snapshot, X)[0]
+
+
+def run_zone_history(run_dir: Path, snapshot: str,
+                     X: np.ndarray) -> tuple[list | None, list | None]:
+    """``(zones, zooms)``: the run's penalty-zone and zoom-box histories.
+
+    Both come from the same snapshot ``delta.pt`` files, so they are read in one
+    pass. ``zooms`` holds one ``(n_points, activation, zoom, member)`` entry per
+    per-line snapshot (``_LINE_SNAPSHOT_RE``), with ``member`` the samples inside
+    the box that line was searched in (``_box_membership``) — see
+    ``Dataset.zooms``.
+
+    ``zones`` is the run's penalty-zone history, for ``Dataset.zones``.
 
     Every snapshot's ``delta.pt`` carries the complete needle + exclusion state
     (ellipsoid centre, precision M, shared tangent basis B), and that state
@@ -734,8 +810,9 @@ def run_penalty_zones(run_dir: Path, snapshot: str, X: np.ndarray) -> list | Non
 
     snaps_dir = run_dir / "snapshots"
     if not snaps_dir.is_dir():
-        return None
+        return None, None
     out: list = []
+    zooms: list = []
     prev = None
     for snap in sorted(p for p in snaps_dir.iterdir() if p.is_dir()):
         try:
@@ -743,6 +820,10 @@ def run_penalty_zones(run_dir: Path, snapshot: str, X: np.ndarray) -> list | Non
             d = torch.load(str(snap / "delta.pt"), map_location="cpu", weights_only=False)
         except Exception:
             continue                      # a partial/unreadable snapshot is skipped
+        m = _LINE_SNAPSHOT_RE.match(snap.name)
+        box = _box_membership(X, d.get("bounds")) if m else None
+        if box is not None:
+            zooms.append((n_points, int(m.group(1)), int(m.group(2)), box))
         centers, M_list, radii = _zone_regions(d)
         B = d.get("needle_B")
         B = None if B is None else B.detach().cpu().numpy().astype(float)
@@ -753,7 +834,7 @@ def run_penalty_zones(run_dir: Path, snapshot: str, X: np.ndarray) -> list | Non
             prev = sig
         if snap.name == snapshot:
             break                         # the view is reconstructed only this far
-    return out
+    return out, (zooms or None)
 
 
 def _zone_membership(X: np.ndarray, centers: np.ndarray, M_list: list,
@@ -930,7 +1011,8 @@ def load_run_source(
     # Matched before the columns are reordered for the diagram: needles.json
     # records a composition in the run's own dimension order.
     needles = run_needles(run_dir, snapshot, X, Y)
-    zones = run_penalty_zones(run_dir, snapshot, X)   # also needs the run's own order
+    # Also needs the run's own column order: B and the zoom boxes were built in it.
+    zones, zooms = run_zone_history(run_dir, snapshot, X)
     X = _reorder_columns(X, run_dims, corner_dims)
     if len(labels) != X.shape[1]:      # d>=5: _corner_config's triple-oriented default
         dims = corner_dims or run_dims or list(range(X.shape[1]))
@@ -943,7 +1025,17 @@ def load_run_source(
         activations=run_activations(run_dir, snapshot, len(X)),
         needles=needles,
         zones=zones,
+        zooms=zooms,
+        max_gp_points=_run_max_gp_points(run_dir),
     )
+
+
+def _run_max_gp_points(run_dir: Path, default: int = 3000) -> int:
+    """The run's ``max_gp_points`` from its config.json, else the optimizer default."""
+    try:
+        return int(json.loads((run_dir / "config.json").read_text())["max_gp_points"])
+    except Exception:
+        return default
 
 
 # ── data loading: showdown runs ───────────────────────────────────────────────
@@ -1056,6 +1148,12 @@ def load_showdown_run(run_dir: Path) -> Dataset:
 
     simplex = bool(n) and bool(np.allclose(X.sum(axis=1), 1.0, atol=1e-6))
     trial_run = f"{run_dir.parent.name}/{run_dir.name}"
+    zones = zooms = None
+    if X.shape[1] < CONVERGENCE_ONLY_MIN_D:
+        zones, zooms = showdown_zone_history(
+            run_dir, X,
+            pts["activation"].to_numpy(dtype=int) if "activation" in pts.columns else None,
+            pts["zoom"].to_numpy(dtype=int) if "zoom" in pts.columns else None)
     return Dataset(
         X=X, Y=Y, labels=tuple(cols),
         title=f"{run_dir.parents[3].name} / {run_dir.parents[1].name} ({trial_run})",
@@ -1066,14 +1164,29 @@ def load_showdown_run(run_dir: Path) -> Dataset:
         needles=needles,
         simplex=simplex,
         goal="maximize" if maximize else "minimize",
-        zones=(None if X.shape[1] >= CONVERGENCE_ONLY_MIN_D
-               else showdown_penalty_zones(run_dir, X)),
+        zones=zones,
+        zooms=zooms,
     )
 
 
 def showdown_penalty_zones(run_dir: Path, X: np.ndarray) -> list | None:
-    """``run_penalty_zones``'s history for a showdown run, from its ``zones.pt``.
+    """The penalty-zone half of ``showdown_zone_history`` (kept for its callers)."""
+    return showdown_zone_history(run_dir, X)[0]
 
+
+def showdown_zone_history(run_dir: Path, X: np.ndarray, act: np.ndarray | None = None,
+                          zoom: np.ndarray | None = None) -> tuple[list | None, list | None]:
+    """``(zones, zooms)`` for a showdown run, from its ``zones.pt``.
+
+    The zoom half needs ``bounds`` in each state, which evaluate.py records from
+    2026-11-11 on (earlier zones.pt files give None), plus points.csv's per-point
+    ``act``/``zoom`` columns: a line state is taken while the line is measured,
+    with ``n_points`` samples already stored, so the line's own first sample —
+    index ``n_points`` — carries its activation and zoom level. The box counts as
+    in force once that sample exists (``n_points + 1``). The final state, taken
+    after the run with every sample stored, has no line and is skipped.
+
+    The zone half is ``run_penalty_zones``'s history for a showdown run.
     evaluate.py saves the complete zone state as each line is chosen, plus the
     state the run ended in (``evaluate.zone_state``); each is tested against every
     sample with the optimizer's membership rule and, as for a run directory, kept
@@ -1084,11 +1197,17 @@ def showdown_penalty_zones(run_dir: Path, X: np.ndarray) -> list | None:
 
     path = Path(run_dir) / "zones.pt"
     if not path.exists():
-        return None
+        return None, None
     np_ = lambda t: None if t is None else t.detach().cpu().numpy().astype(float)
     out: list = []
+    zooms: list = []
     prev = None
     for st in torch.load(str(path), map_location="cpu", weights_only=True):
+        n_before = int(st["n_points"])
+        box = _box_membership(X, st.get("bounds"))
+        if (box is not None and act is not None and zoom is not None
+                and n_before < len(act)):
+            zooms.append((n_before + 1, int(act[n_before]), int(zoom[n_before]), box))
         centers = np_(st["centers"]).reshape(-1, X.shape[1])
         member, centers_idx = _zone_membership(
             X, centers, [np_(m) for m in st["M"]], np_(st["radii"]).reshape(-1),
@@ -1097,7 +1216,7 @@ def showdown_penalty_zones(run_dir: Path, X: np.ndarray) -> list | None:
         if sig != prev:
             out.append((int(st["n_points"]), member, centers_idx))
             prev = sig
-    return out
+    return out, (zooms or None)
 
 
 def showdown_penalty_coverage(run_dir: Path) -> tuple | None:
@@ -2303,6 +2422,84 @@ def fit_conet_frame(ds: Dataset, *, key: tuple) -> dict:
     return fit
 
 
+# The GP background's hyperparameters are fitted on at most this many of the
+# training points (an ARD Matern fit is cubic in them, and runs once per slider
+# step); the posterior is then conditioned on up to CONET_GP_MAX_TRAIN of them.
+CONET_GP_HP_POINTS = 300
+CONET_GP_MAX_TRAIN = 2500
+
+
+def conet_gp_training_mask(ds: Dataset, sel: np.ndarray, zones, zooms) -> np.ndarray:
+    """``(len(sel),)`` bool: the samples the optimizer's GP was trained on at this step.
+
+    Mirrors ``ZoMBIHop.run``: at a zoom level the GP is fitted on
+    ``DataHandler.get_zoom_gp_data(bounds)`` — the unpenalised points inside the
+    box being searched — and at the full box on ``get_gp_data()``, which is the
+    same set when the box is everything. Both keep the best ``max_gp_points`` by
+    objective, and both fall back to every unpenalised point (then to every
+    point) when fewer than two remain. The box is the one of the level being
+    searched (``zooms['current']``); a source without zoom history uses all.
+
+    It differs from the optimizer in one respect: the optimizer prefers its
+    *pared* (noise-deduplicated) points, which snapshots do not store, so the raw
+    samples stand in for them.
+    """
+    n = len(sel)
+    pen = (np.asarray(zones[0], bool).any(axis=0) if zones is not None and len(zones[0])
+           else np.zeros(n, dtype=bool))
+    inbox = np.ones(n, dtype=bool)
+    if zooms is not None and len(zooms["levels"]):
+        lv = list(zooms["levels"]).index(zooms["current"]) \
+            if zooms["current"] in zooms["levels"] else len(zooms["levels"]) - 1
+        inbox = np.asarray(zooms["member"][lv], bool)
+    train = inbox & ~pen
+    if train.sum() < 2:
+        train = ~pen
+    if train.sum() < 2:
+        train = np.ones(n, dtype=bool)
+    idx = np.flatnonzero(train)
+    cap = min(int(ds.max_gp_points), CONET_GP_MAX_TRAIN)
+    if len(idx) > cap:
+        # The optimizer keeps the BEST points, in its own maximise convention.
+        y = ds.Y[sel][idx] * (1.0 if ds.goal == "maximize" else -1.0)
+        idx = idx[np.argsort(-y)[:cap]]
+        train = np.zeros(n, dtype=bool)
+        train[idx] = True
+    return train
+
+
+def conet_gp_values(ds: Dataset, sel: np.ndarray, train: np.ndarray) -> np.ndarray:
+    """GP posterior mean at every sample in ``sel``, trained on ``sel[train]``.
+
+    A stand-in for the optimizer's BoTorch ``SingleTaskGP`` (ARD Matern-5/2,
+    standardised outcome, fitted noise): the same family, refitted here because a
+    snapshot keeps no GP. Hyperparameters are fitted on a seeded subsample of at
+    most ``CONET_GP_HP_POINTS`` training points, then held fixed while the
+    posterior is conditioned on all of them. Inputs are ``embed_X``, the same
+    coordinates the CoNet embeds.
+    """
+    Xs = ds.embed_X[sel]
+    Xt, yt = Xs[train], ds.Y[sel][train]
+    y_mean, y_std = float(yt.mean()), float(yt.std()) or 1.0
+    y = (yt - y_mean) / y_std
+    d = Xs.shape[1]
+    kernel = (ConstantKernel(1.0, (1e-2, 1e2))
+              * Matern(length_scale=np.full(d, 0.3), length_scale_bounds=(1e-2, 1e1), nu=2.5)
+              + WhiteKernel(noise_level=1e-2, noise_level_bounds=(1e-6, 1e0)))
+    rng = np.random.default_rng(0)
+    sub = (rng.choice(len(Xt), CONET_GP_HP_POINTS, replace=False)
+           if len(Xt) > CONET_GP_HP_POINTS else np.arange(len(Xt)))
+    import warnings
+    from sklearn.exceptions import ConvergenceWarning
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        hp = GaussianProcessRegressor(kernel=kernel, normalize_y=False, random_state=0)
+        hp.fit(Xt[sub], y[sub])
+        gp = GaussianProcessRegressor(kernel=hp.kernel_, optimizer=None, normalize_y=False)
+        gp.fit(Xt, y)
+    return gp.predict(Xs) * y_std + y_mean
+
+
 def conet_png_bytes(ds: Dataset, *, key: tuple, rows: np.ndarray | None = None) -> bytes:
     """Render the CoNet to PNG bytes, optionally restricted to ``rows``.
 
@@ -2319,6 +2516,12 @@ def conet_png_bytes(ds: Dataset, *, key: tuple, rows: np.ndarray | None = None) 
     The points of the step's newest deposition line come out red-rimmed: the fit
     carries the line index as plot_10d's iteration, and plot_10d rims the highest
     iteration present — which, on a prefix, is the line that step added.
+
+    The zoom boxes of the activation in force are outlined (grey at zoom 0,
+    turning muted orange with depth), and the background is the GP the optimizer
+    would have been searching with at this step: fitted on the unpenalised points
+    inside the current box (``conet_gp_training_mask``), evaluated at every drawn
+    sample, and smoothed onto the map.
     """
     import plot_10d as p10
 
@@ -2336,13 +2539,17 @@ def conet_png_bytes(ds: Dataset, *, key: tuple, rows: np.ndarray | None = None) 
     # Penalty zones in force at this step, drawn from which samples each contains
     # (exact) rather than by projecting the ellipsoids, which this map cannot do.
     zones = ds.zones_at(sel)
+    zooms = ds.zooms_at(sel)
+    train = conet_gp_training_mask(ds, sel, zones, zooms)
+    gp_bg = conet_gp_values(ds, sel, train)
     M, F = p10.build_conet(
         fit["comp"][sel], fit["names"], fit["resp"][sel], fit["iters"][sel],
-        frame=frame, limits=fit["limits"], zones=zones,
+        frame=frame, limits=fit["limits"], zones=zones, zooms=zooms, gp_bg=gp_bg,
     )
     title = f"{ds.title} · CoNet (d={ds.d}"
     title += "" if rows is None else f", {len(sel)}/{total} samples"
-    title += ")" if zones is None else f", {len(zones[0])} penalty zones)"
+    title += "" if zones is None else f", {len(zones[0])} penalty zones"
+    title += f"; GP background on {int(train.sum())} pts)"
 
     buf = io.BytesIO()
     p10.save_png(M, F, fit["bounds"], title, buf)
@@ -2405,7 +2612,7 @@ CACHE_MAX_BYTES = 4 * 1024 ** 3   # least-recently-used signatures pruned past t
 # otherwise be masked by steps cached before it. Bump this whenever that happens
 # (adding the needle rules did): old steps are then simply never looked up, and
 # age out with the prune, instead of being served stale.
-STEP_FORMAT = 5
+STEP_FORMAT = 6
 PRECOMPUTE = True                 # --no-precompute renders steps on demand instead
 STEP_URL_PREFIX = "/plot-run-step"
 
@@ -3874,13 +4081,15 @@ def render_state(source_type, run_name, db_name, db_value, background, show_poin
         # scatter-plot matrix either (which deliberately fits no surrogate), so
         # say 'n/a' rather than naming a mode that is not being applied.
         has_bg = full.d < CONET_MIN_D and not (full.d == 4 and not full.simplex)
+        if full.zooms and conet:
+            act_note += "\nzoom boxes: outlined on the CoNet (grey = zoom 0 -> orange = deepest)"
         status = (
             f"{len(ds.X)}/{len(full.X)} points · {full.n_lines} lines\n"
             f"Y range: {yr}\n"
             f"space: {'simplex' if full.simplex else 'box (non-simplex)'}"
             f" · d={full.d} · goal={full.goal}\n"
             f"diagram: {diagram}\n"
-            f"background: {background if has_bg else 'n/a'}\n"
+            f"background: {background if has_bg else ('GP (current zoom box)' if conet else 'n/a')}\n"
             f"components: {full.labels}\n"
             f"{act_note}"
         )
