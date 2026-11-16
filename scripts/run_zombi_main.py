@@ -60,6 +60,9 @@ INIT_PRINT_PURE_LAST = True
 # Progress file for the initial design, in the run directory. Lets a run that is
 # stopped mid-initialization resume at the next unmeasured pair.
 INIT_STATE_NAME = "init_state.json"
+# Attempts at swapping in a new init_state.json while another program (Dropbox's
+# uploader, antivirus) holds the old one open; ~5 s in all, then it is written in place.
+INIT_STATE_REPLACE_TRIES = 6
 # Initialization stall watchdog (src/utils/init_queue.py). DiSCO sends nothing for a
 # slide that fails completely, so if no result arrives for this long the outstanding
 # traces are presumed lost and re-sent (each at most INIT_MAX_SENDS times, then
@@ -1046,23 +1049,73 @@ def linebo_sampler_wrapper(
     return wrapper, _flush_state
 
 
-def _save_init_state(run_dir: Path, state: Dict[str, Any]) -> None:
-    """Atomically write the initialization progress file."""
+def _save_init_state(run_dir: Path, state: Dict[str, Any]) -> bool:
+    """Write the initialization progress file. Never raises: an exception here would
+    stop a live hardware run, while a missed save only costs precision on resume (the
+    next save rewrites the whole state).
+
+    The run directory lives in Dropbox. Its sync client (like antivirus or the search
+    indexer) opens a freshly written file to upload it, and while it holds it Windows
+    refuses to rename over it (PermissionError, WinError 5) but still allows writing it
+    in place. So the atomic replace is retried for a few seconds, then the file is
+    written in place; if even that fails, the newest state stays in the side file,
+    where _load_init_state finds it.
+    """
     path = Path(run_dir) / INIT_STATE_NAME
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(state, indent=1))
-    os.replace(tmp, path)
+    text = json.dumps(state, indent=1)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text)
+    except OSError:
+        tmp = None
+    if tmp is not None:
+        for attempt in range(INIT_STATE_REPLACE_TRIES):
+            try:
+                os.replace(tmp, path)
+                for stale in path.parent.glob(path.name + "*.tmp"):
+                    try:
+                        stale.unlink()      # older side files; this state supersedes them
+                    except OSError:
+                        pass
+                return True
+            except PermissionError:
+                time.sleep(0.25 * (attempt + 1))
+            except OSError:
+                break
+    try:
+        path.write_text(text)
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+        return True
+    except OSError as exc:
+        print(f"[init] WARNING could not save {path.name} ({exc!r}); the run continues "
+              f"and the next save retries")
+        return False
 
 
 def _load_init_state(run_dir: Path) -> Dict[str, Any] | None:
+    """The saved initialization progress: init_state.json, or a side file left by a
+    save that could not replace it (see _save_init_state) when that holds more of the
+    run (more pairs sent and results recorded)."""
     path = Path(run_dir) / INIT_STATE_NAME
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text())
-    except Exception as exc:
-        print(f"[init] WARNING could not read {path}: {exc}")
-        return None
+    best, best_key, best_file = None, None, None
+    for f in [path, *sorted(path.parent.glob(path.name + "*.tmp"))]:
+        if not f.exists():
+            continue
+        try:
+            st = json.loads(f.read_text())
+        except Exception as exc:
+            print(f"[init] WARNING could not read {f.name}: {exc}")
+            continue
+        q = st.get("queue") if isinstance(st, dict) else None
+        q = q if isinstance(q, dict) else {}
+        key = (len(q.get("writes", [])) + len(q.get("result_times", [])), f == path)
+        if best_key is None or key > best_key:
+            best, best_key, best_file = st, key, f
+    if best_file is not None and best_file != path:
+        print(f"[init] Using {best_file.name}: it holds more progress than {path.name} "
+              f"(a save could not replace the file while another program had it open)")
+    return best
 
 
 def plan_axial_initialization(
@@ -1445,12 +1498,31 @@ def _load_needles_for_plot(
     return out
 
 
+OPTIMIZER_CHOICES = ("lanes", "zombihop")
+DEFAULT_OPTIMIZER = "lanes"
+
+
+def _optimizer_choice(name: str | None = None) -> str:
+    """--optimizer / ZOMBI_OPTIMIZER -> "lanes" (default) or "zombihop"."""
+    raw = name if name else os.environ.get("ZOMBI_OPTIMIZER", "")
+    val = str(raw or DEFAULT_OPTIMIZER).strip().lower()
+    if val not in OPTIMIZER_CHOICES:
+        print(f"[ZoMBI] Unknown optimizer {raw!r}; using {DEFAULT_OPTIMIZER!r} "
+              f"(choices: {', '.join(OPTIMIZER_CHOICES)})")
+        val = DEFAULT_OPTIMIZER
+    return val
+
+
 def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None = None,
                    checkpoint_dir: str | None = None, hparams_path: str | None = None,
                    new_run_uuid: str | None = None,
                    bounds_lo: list | None = None, bounds_hi: list | None = None,
-                   retro_needles: bool = True):
+                   retro_needles: bool = True, optimizer_name: str | None = None):
     """Run DB-driven ZoMBI-Hop loop (new or resume).
+
+    optimizer_name : "lanes" (default: two-lane engine, four-slot protocol,
+        scripts/lanes_hw.py) or "zombihop" (the legacy single ZoMBIHop loop). None ->
+        env ZOMBI_OPTIMIZER, else "lanes". Initialization is the same for both.
 
     hparams_path : optional path to a trial.json-style JSON file whose 'hparams'
         override DEFAULT_HW_HPARAMS for this run.
@@ -1470,6 +1542,14 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
     global OPTIMIZING_DIMS
     if optimizing_dims is not None:
         OPTIMIZING_DIMS = list(optimizing_dims)
+
+    # LANES: every run (new or resumed, either optimizer) starts on today's two-slot packet,
+    # which the axial init and the legacy loop need; the lanes driver switches the 1 Hz
+    # sender to four slots at its first slot write. Clears a flag left by a stopped lanes run.
+    try:
+        communication.clear_slots4()
+    except Exception as _e:
+        print(f"[lanes] WARNING could not reset the four-slot sender flag: {_e!r}")
 
     # Merge built-in defaults with any user-supplied hyperparameter file. A new run
     # gets its dimension's defaults too; a resume does not — its config.json wins
@@ -1630,6 +1710,16 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
             print(f"[ZoMBI] {dimensions}-dim run: top_m_points "
                   f"{hw_hparams.get('top_m_points')} -> {new_hparams['top_m_points']} "
                   f"(must be >= dims + 1; same rule as the showdowns).")
+        if _optimizer_choice(optimizer_name) == "lanes":
+            # DEFAULT: the two-lane engine on the four-slot protocol (scripts/lanes_hw.py).
+            # The legacy single-ZoMBIHop loop below runs only with --optimizer zombihop
+            # (or ZOMBI_OPTIMIZER=zombihop).
+            from scripts import lanes_hw
+            # needles_db=True: mirror the lanes needles into sql/needles.db (DiSCO's stars)
+            lanes_hw.run_lanes_hardware(run_dir, X_init_actual, X_init_expected, Y_init, bounds,
+                                        new_hparams, preset="leader", opt_dims=list(OPTIMIZING_DIMS),
+                                        y_to_optimizer=y_measured_to_optimizer, needles_db=True)
+            return
         optimizer = ZoMBIHop(
             objective=objective_wrapper,
             X_init_actual=X_init_actual,
@@ -1732,6 +1822,11 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
 if __name__ == "__main__":
     import sys
     resume_uuid = None
+    if "--optimizer" in sys.argv:                 # --optimizer lanes|zombihop (default lanes)
+        _i = sys.argv.index("--optimizer")
+        if _i + 1 < len(sys.argv):
+            os.environ["ZOMBI_OPTIMIZER"] = sys.argv[_i + 1]
+        del sys.argv[_i:_i + 2]
     if len(sys.argv) >= 2:
         a1 = sys.argv[1].strip().lower()
         if a1 in ("-h", "--help", "help"):

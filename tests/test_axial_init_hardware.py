@@ -358,6 +358,8 @@ def _fast_hparams(path):
 def test_end_to_end_no_prediction_before_init_complete(hw_env, monkeypatch, torch):
     """Full new hardware run: the optimiser's first line is requested only after the
     queue is done, and its snapshot holds the whole design."""
+    # This test checks the legacy ZoMBIHop hand-off after init; lanes is the default since 13 Nov.
+    monkeypatch.setenv("ZOMBI_OPTIMIZER", "zombihop")
     dims = [0, 2, 8, 9]
     seen = []
 
@@ -391,6 +393,8 @@ def test_end_to_end_no_prediction_before_init_complete(hw_env, monkeypatch, torc
 def test_end_to_end_resume_during_initialization(hw_env, monkeypatch, torch):
     """Stop mid-initialization, then resume through run_zombi_main: measured traces
     are kept and not printed again; the rest are completed."""
+    # This test checks the legacy ZoMBIHop hand-off after init; lanes is the default since 13 Nov.
+    monkeypatch.setenv("ZOMBI_OPTIMIZER", "zombihop")
     dims = [0, 2, 3, 4, 8, 9]
     ckpt = hw_env / "ckpt"
     real_get_y = rzm.get_y_measurements

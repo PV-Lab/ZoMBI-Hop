@@ -151,7 +151,15 @@ def main():
                         help="On resume, skip the retroactive needle pass that "
                              "declares needles past activations would have "
                              "produced under the current convergence criteria.")
+    parser.add_argument("--optimizer", default=os.environ.get("ZOMBI_OPTIMIZER") or "lanes",
+                        choices=("lanes", "zombihop"),
+                        help="Optimizer after initialization: 'lanes' (default; two-lane engine, "
+                             "four-slot protocol) or 'zombihop' (legacy single ZoMBIHop loop). "
+                             "Env ZOMBI_OPTIMIZER sets the default.")
     args = parser.parse_args()
+    # The ZoMBI child process inherits the environment: run_zombi_main reads it.
+    os.environ["ZOMBI_OPTIMIZER"] = args.optimizer
+    print(f"[Main] Optimizer: {args.optimizer}")
 
     resume_uuid = args.resume_uuid
     optimizing_dims = None

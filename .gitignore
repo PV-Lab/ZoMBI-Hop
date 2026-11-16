@@ -2,6 +2,7 @@
 *.err
 *.out
 
+benchmarks/zoom_fix/*
 data/*
 optimize/pareto_front.png
 hyperparameters/*
