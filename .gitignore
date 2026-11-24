@@ -2,6 +2,7 @@
 *.err
 *.out
 
+zombihop_checkpoints/*
 ZoMBI/*
 data/*
 optimize/pareto_front.png
