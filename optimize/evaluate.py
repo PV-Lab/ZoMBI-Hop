@@ -236,7 +236,7 @@ DEFAULT_DB_VALUE = "Objective"
 NEWRF_OPTIMA_FILENAME = "newRF_optima.json"
 # Uniform simplex samples behind metrics_over_time.csv's pct_space_penalized*
 # columns: ~0.2 percentage-point Monte Carlo error at 50% coverage.
-PENALTY_COVERAGE_SAMPLES = 50_000
+PENALTY_COVERAGE_SAMPLES = rm.PENALTY_COVERAGE_SAMPLES
 
 # Canonical campaign1a RF reference optima from mobo_05_06_15_32 (interactive picker).
 TRIAL112_REFERENCE_OPTIMA = os.path.join(
@@ -1253,7 +1253,21 @@ def run_single_eval(
     log_x: bool = False,
     log_y: bool = False,
     checkpoint: bool = False,
+    optimizer: str = "zombihop",
 ) -> dict:
+    if optimizer == "lanes":
+        # The two-lane engine (src/lanes), the hardware default optimizer, driven by a
+        # simulated pair of rails (optimize/lanes_eval.py). Same artifacts, from the
+        # engine's shared DataHandler; max_lines counts both lanes' lines together.
+        from lanes_eval import run_lanes_eval
+        if checkpoint:
+            print("      [lanes] --checkpoint is not supported for the lanes engine; a "
+                  "retried run starts over")
+        return run_lanes_eval(
+            sys.modules[__name__], hparams, ds, dataset, out_dir, time_limit_min,
+            top_k=top_k, max_lines=max_lines, final_frame_only=final_frame_only,
+            coverage=coverage, no_video=no_video, no_convergence_plot=no_convergence_plot,
+            no_plots=no_plots, log_x=log_x, log_y=log_y)
     os.makedirs(out_dir, exist_ok=True)
     # --checkpoint: snapshot as the run goes, and resume from a previous attempt's
     # snapshots if this run dir has any (a preempted / killed worker).
@@ -1271,7 +1285,6 @@ def run_single_eval(
     dim = ds["dim"]
     fn = ds["fn"]
     maximize = ds["maximize"]
-    true_optima = ds["true_optima"]
     cols = coord_cols(dim, dataset)
 
     plot_state: dict = {"line_0": None, "line_1": None}
@@ -1470,6 +1483,33 @@ def run_single_eval(
         traceback.print_exc()
     runtime = prev_elapsed + (time.time() - t0)
 
+    result = _finalize_eval(
+        dh=dh, payloads=payloads, snap_records=snap_records, zone_states=zone_states,
+        n_lines=call_counter[0], runtime=runtime, hparams=hparams, ds=ds, dataset=dataset,
+        out_dir=out_dir, cols=cols, final_frame_only=final_frame_only, coverage=coverage,
+        no_video=no_video, no_convergence_plot=no_convergence_plot, no_plots=no_plots,
+        log_x=log_x, log_y=log_y)
+    if interrupted:
+        raise KeyboardInterrupt
+    return result
+
+
+def _finalize_eval(
+    *, dh, payloads: list[dict], snap_records: list[tuple], zone_states: list[dict],
+    n_lines: int, runtime: float, hparams: dict, ds: dict, dataset: str, out_dir: str,
+    cols: list[str], final_frame_only: bool = False, coverage: bool = False,
+    no_video: bool = False, no_convergence_plot: bool = False, no_plots: bool = False,
+    log_x: bool = False, log_y: bool = False,
+) -> dict:
+    """Metrics + every per-run artifact (CSVs, zones.pt, plots, metrics.json, CoNet)
+    for a finished run, from its data handler and the per-line records.
+
+    Shared by the single-loop run (run_single_eval) and the lanes run
+    (lanes_eval), which passes the lanes engine's shared DataHandler."""
+    dim = ds["dim"]
+    maximize = ds["maximize"]
+    true_optima = ds["true_optima"]
+
     needle_t = dh.get_all_needle_locations()
     discovered = needle_t.detach().cpu().numpy() if needle_t.numel() > 0 else np.empty((0, dim))
     X_all_np = (dh.X_all_actual.detach().cpu().numpy()
@@ -1485,7 +1525,7 @@ def run_single_eval(
     # it is what the showdown summary reports (higher is better).
     nn_spacing = rm.metric_median_nn_spacing(X_all_np, dim=dim)
     pct_comp = rm.metric_pct_matched_comp(discovered, true_optima, dim=dim)
-    print(f"      [run]  iters={call_counter[0]}  dist={dist:.4f}  dup={dup:.4f}"
+    print(f"      [run]  iters={n_lines}  dist={dist:.4f}  dup={dup:.4f}"
           f"  nn={nn_spacing:.5f}"
           f"  pct_comp={pct_comp:.2f}  t={runtime:.1f}s"
           f"  needles={len(discovered)}/{len(true_optima)}")
@@ -1678,8 +1718,6 @@ def run_single_eval(
                             for f in ("ensemble_config.json", "rungp_config.json")):
         rm._render_conet_artifacts(out_dir)
 
-    if interrupted:
-        raise KeyboardInterrupt
     return {
         "dist": dist, "dup": dup, "nn_spacing": nn_spacing,
         "pct_comp": pct_comp, "pct": pct_comp,
@@ -1960,6 +1998,7 @@ def evaluate_dataset(
                     log_x=args.log_x,
                     log_y=args.log_y,
                     checkpoint=getattr(args, "checkpoint", False),
+                    optimizer=getattr(args, "optimizer", "zombihop"),
                 )
                 if dynamic_alt is not None:
                     from warm_start import dynamic_hparams as dyn
@@ -2097,6 +2136,12 @@ def main() -> None:
                              "coverage, CoNet) while still writing every CSV and "
                              "metrics.json. Used for the extra repeats of a showdown "
                              "cell, where only one repeat needs pictures.")
+    parser.add_argument("--optimizer", choices=("zombihop", "lanes"), default="zombihop",
+                        help="'zombihop' (default): the single ZoMBIHop loop, what run_mobo "
+                             "tunes. 'lanes': the two-lane engine (src/lanes), the hardware "
+                             "default, on two simulated rails (optimize/lanes_eval.py); "
+                             "--max-lines is the TOTAL line budget of both lanes. Not "
+                             "checkpointable.")
     parser.add_argument("--checkpoint", action="store_true",
                         help="Snapshot each run under <run_dir>/checkpoint/ as it goes, and "
                              "RESUME from those snapshots if the run dir already has them "

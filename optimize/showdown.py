@@ -37,6 +37,14 @@ speed and with how expensive a config's own acquisition step is. ``--time-limit`
 still passed, but only as a safety cap, so runs normally end on the point budget.
 Pass ``--budget-points 0`` for the old wall-clock-only behaviour.
 
+Optimizer
+---------
+``--optimizer lanes`` (default) runs every task on the two-lane engine (src/lanes),
+the optimizer the hardware runs by default, on two simulated rails
+(optimize/lanes_eval.py); the point budget is shared by both lanes. ``--optimizer
+zombihop`` runs the single ZoMBIHop loop, the algorithm run_mobo tunes. Lanes runs
+are not checkpointable, so a preempted lanes task starts over.
+
 Repeats
 -------
 ``--n-repeats N`` runs every (config, landscape) cell N times. One run of a cell is
@@ -496,6 +504,8 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
         "budget_points": args.budget_points if max_lines is not None else None,
         "max_lines": max_lines,
         "init_design": args.init,
+        # evaluate.py --optimizer: 'lanes' (hardware default) or 'zombihop'.
+        "optimizer": args.optimizer,
         "n_init_lines": n_init,
         "ensemble_overrides": args.ensemble_overrides or None,
         "landscape_seed": args.landscape_seed,
@@ -580,7 +590,7 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
         dataset_flags = (f"--dataset {args.dataset} --dim {args.dim} \\\n            "
                          f"--ensemble-landscape-indices \"$LS\" \\\n            "
                          f"--ensemble-seed {args.landscape_seed} \\\n            ")
-    extra_flags = ""
+    extra_flags = f"--optimizer {args.optimizer} \\\n            "
     if args.init != "random":
         extra_flags += f"--init {args.init} \\\n            "
     if args.ensemble_overrides:
@@ -625,6 +635,7 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
               "usually finish well inside the estimates below")
     else:
         print(f"    budget: wall-clock only ({args.time_limit:g} h/run, no point cap)")
+    print(f"    optimizer: {args.optimizer}")
     print(f"    queue -> {queue_path}")
     print(f"    {args.n_workers} persistent worker(s) @ {walltime_h} h; "
           f"~{exp_h:.1f} h to drain (worst case {worst_h:.1f} h) "
@@ -908,6 +919,11 @@ def main() -> None:
                     help="initial design for every run (evaluate.py --init). 'axial' "
                          "measures more init lines, so it gets fewer optimizer lines "
                          "under the same --budget-points (default: %(default)s)")
+    ap.add_argument("--optimizer", choices=("lanes", "zombihop"), default="lanes",
+                    help="optimizer every task runs (evaluate.py --optimizer): 'lanes' = the "
+                         "two-lane engine the hardware runs by default, on two simulated "
+                         "rails sharing the point budget; 'zombihop' = the single ZoMBIHop "
+                         "loop run_mobo tunes (default: %(default)s)")
     ap.add_argument("--ensemble-override", default=None, metavar="KEY=VAL[,...]",
                     help="pin ensemble knobs on every landscape (evaluate.py "
                          "--ensemble-override), e.g. 'basin_width=2.2,n_optima=15'; the "
