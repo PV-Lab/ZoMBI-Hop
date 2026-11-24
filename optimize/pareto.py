@@ -245,7 +245,21 @@ def _run_signature(cfg: dict) -> dict:
         # 2026-11-24 random_simplex seeding fix: absent in older configs, whose trials
         # ran with every unseeded random_simplex call returning the same samples.
         "random_simplex_seeded": cfg.get("random_simplex_seeded"),
+        # 2026-11-24 10d range change (see run_mobo._run_signature): a config
+        # without recorded ranges reports the legacy ranges it drew from.
+        "ensemble_optima_range": _recorded_ensemble_ranges(cfg)[0],
+        "ensemble_basin_width_range": _recorded_ensemble_ranges(cfg)[1],
     }
+
+
+def _recorded_ensemble_ranges(cfg: dict):
+    """synthetic_data.ensemble.recorded_ensemble_ranges, imported lazily (repo root
+    is not on sys.path when this file runs as a script)."""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
+    from synthetic_data.ensemble import recorded_ensemble_ranges
+    return recorded_ensemble_ranges(cfg)
 
 
 def _signatures_match(a: dict, b: dict) -> bool:

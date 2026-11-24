@@ -171,7 +171,18 @@ def region_modes(dim: int, domain: str = "simplex") -> tuple[str, ...]:
 # the same thing at any dimension); higher-dimensional simplices have far more room
 # so they get many more basins.  ``random_ensemble_config`` is the single source of
 # truth shared by optimize/run_mobo.py, optimize/evaluate.py and plot_ensemble.py.
+#
+# 2026-11-24: 10d narrowed from (50, 150) optima / b in (2.2, 15) to (5, 30) /
+# (2.2, 6). Runs record the ranges they drew from (run_config.json
+# ``ensemble_optima_range`` / ``ensemble_basin_width_range``); a config without
+# them predates the change and drew from :func:`legacy_ensemble_ranges`.
 OPTIMA_COUNT_RANGES: dict[int, tuple[int, int]] = {
+    3: (5, 30),
+    4: (20, 50),
+    10: (5, 30),
+}
+# The table before 2026-11-24, for runs whose config does not record its ranges.
+LEGACY_OPTIMA_COUNT_RANGES: dict[int, tuple[int, int]] = {
     3: (5, 30),
     4: (20, 50),
     10: (50, 150),
@@ -190,17 +201,53 @@ def optima_count_range(dim: int) -> tuple[int, int]:
     return (5 * dim, 15 * dim)
 
 
-# Range of basin sharpness ``b`` to draw, fixed for every simplex dimension.
+# Range of basin sharpness ``b`` to draw: BASIN_WIDTH_RANGE unless the dimension
+# has its own entry in BASIN_WIDTH_RANGES. Before 2026-11-24 every dimension used
+# BASIN_WIDTH_RANGE (that is the legacy value).
 BASIN_WIDTH_RANGE: tuple[float, float] = (2.2, 15.0)
+BASIN_WIDTH_RANGES: dict[int, tuple[float, float]] = {
+    10: (2.2, 6.0),
+}
 
 
 def basin_width_range(dim: int) -> tuple[float, float]:
     """``(lo, hi)`` range of basin sharpness ``b`` to draw.
 
-    Fixed at :data:`BASIN_WIDTH_RANGE` for all dimensions: a broad basin floor
-    (``2.2``) up to a moderately sharp basin (``15``).
+    :data:`BASIN_WIDTH_RANGES` for the dimensions listed there, otherwise
+    :data:`BASIN_WIDTH_RANGE`: a broad basin floor (``2.2``) up to a moderately
+    sharp basin (``15``).
     """
-    return BASIN_WIDTH_RANGE
+    return BASIN_WIDTH_RANGES.get(int(dim), BASIN_WIDTH_RANGE)
+
+
+def legacy_ensemble_ranges(dim: int) -> tuple[tuple[int, int], tuple[float, float]]:
+    """``(optima_range, basin_width_range)`` drawn from before 2026-11-24.
+
+    For run configs that predate the recorded ranges: resuming such a run, or
+    comparing its signature, must use the distribution it actually drew from.
+    """
+    dim = int(dim)
+    opt = LEGACY_OPTIMA_COUNT_RANGES.get(dim, (5 * dim, 15 * dim))
+    return opt, BASIN_WIDTH_RANGE
+
+
+def recorded_ensemble_ranges(run_cfg: dict) -> tuple[list | None, list | None]:
+    """``(optima_range, basin_width_range)`` a MOBO run's per-trial draws use.
+
+    Read from ``run_config.json``'s ``ensemble_optima_range`` /
+    ``ensemble_basin_width_range``; a per-trial-ensemble run without them
+    predates 2026-11-24 and gets :func:`legacy_ensemble_ranges`. ``(None, None)``
+    for runs that do not re-randomize an ensemble. Shared by run_mobo (resume,
+    signature) and pareto (signature), so both agree on what a missing key means.
+    """
+    if not run_cfg.get("ensemble_random_per_run"):
+        return None, None
+    opt, bw = run_cfg.get("ensemble_optima_range"), run_cfg.get("ensemble_basin_width_range")
+    if opt is None or bw is None:
+        lopt, lbw = legacy_ensemble_ranges(int(run_cfg.get("dim", 3)))
+        opt = opt if opt is not None else lopt
+        bw = bw if bw is not None else lbw
+    return [int(v) for v in opt], [float(v) for v in bw]
 
 
 def _sobol_point(d: int, index: int, seed: int) -> np.ndarray:
@@ -229,6 +276,8 @@ def random_ensemble_config(
     optima_margin: float = 0.2,
     input_noise: float = _DEFAULT_INPUT_NOISE,
     domain: str = "simplex",
+    optima_range: tuple[int, int] | None = None,
+    bw_range: tuple[float, float] | None = None,
 ) -> dict:
     """Draw the ``index``-th :class:`Ensemble` configuration from a Sobol' sweep.
 
@@ -254,12 +303,17 @@ def random_ensemble_config(
     domain : ``"simplex"`` (default) or ``"cube"``.  A cube config additionally
         carries ``"domain": "cube"``; the knob draws are otherwise identical, so
         the same ``(seed, index)`` gives the same settings on either domain.
+    optima_range, bw_range : override the dimension's default ``n_optima`` /
+        ``basin_width`` draw ranges (inclusive ``(lo, hi)``). A resumed run passes
+        the ranges it was started with, so a later change to the defaults does not
+        switch its landscape distribution mid-run. Every other knob, and the Sobol
+        coordinate each one consumes, is unaffected.
     """
     dim = int(dim)
     if domain not in DOMAINS:
         raise ValueError(f"domain must be one of {DOMAINS} (got {domain!r}).")
-    opt_lo, opt_hi = optima_count_range(dim)
-    bw_lo, bw_hi = basin_width_range(dim)
+    opt_lo, opt_hi = (int(v) for v in (optima_range or optima_count_range(dim)))
+    bw_lo, bw_hi = (float(v) for v in (bw_range or basin_width_range(dim)))
     regions = region_modes(dim, domain)
     layout_opts = ("scatter",) + regions
 
