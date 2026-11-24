@@ -87,7 +87,7 @@ def start_serial(parent_shutdown: "multiprocessing.synchronize.Event"):
 
 def start_zombi(resume_uuid=None, optimizing_dims=None, checkpoint_dir=None,
                 hparams_path=None, new_run_uuid=None,
-                bounds_lo=None, bounds_hi=None, retro_needles=True, two_head=False):
+                bounds_lo=None, bounds_hi=None, retro_needles=True):
     try:
         time.sleep(2)
         if resume_uuid:
@@ -98,7 +98,7 @@ def start_zombi(resume_uuid=None, optimizing_dims=None, checkpoint_dir=None,
                        checkpoint_dir=checkpoint_dir, hparams_path=hparams_path,
                        new_run_uuid=new_run_uuid,
                        bounds_lo=bounds_lo, bounds_hi=bounds_hi,
-                       retro_needles=retro_needles, two_head=two_head)
+                       retro_needles=retro_needles)
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
@@ -151,12 +151,6 @@ def main():
                         help="On resume, skip the retroactive needle pass that "
                              "declares needles past activations would have "
                              "produced under the current convergence criteria.")
-    parser.add_argument("--two-head", action="store_true", dest="two_head",
-                        help="Two-head mode: two independent ZoMBI-Hop heads, one per "
-                             "DiSCO rail (head0 = main, head1 = cache), sharing GP data "
-                             "and penalty regions between activations. Needs DiSCO on "
-                             "rails protocol v2 (docs/disco_independent_rails.md). A "
-                             "two-head run always resumes as two-head.")
     parser.add_argument("--optimizer", default=os.environ.get("ZOMBI_OPTIMIZER") or "lanes",
                         choices=("lanes", "zombihop"),
                         help="Optimizer after initialization: 'lanes' (default; two-lane engine, "
@@ -190,7 +184,6 @@ def main():
     hparams_path = args.hparams
     new_run_uuid = args.run_uuid if resume_uuid is None else None
     retro_needles = not args.no_retro_needles
-    two_head = bool(args.two_head)
 
     if resume_uuid is not None and resume_uuid.lower() == 'list':
         list_runs_and_exit()
@@ -282,8 +275,7 @@ def main():
     p_zombi = multiprocessing.Process(target=start_zombi,
                                       args=(resume_uuid, optimizing_dims, checkpoint_dir,
                                             hparams_path, new_run_uuid,
-                                            bounds_lo, bounds_hi, retro_needles,
-                                            two_head),
+                                            bounds_lo, bounds_hi, retro_needles),
                                       name="ZoMBI")
 
     zombi_finished_normally = False

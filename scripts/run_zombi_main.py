@@ -81,20 +81,6 @@ INIT_MIN_WRITE_GAP_S = 5.0
 # two at launch) and is not taken for an init trace.
 INIT_MIN_RESULT_LATENCY_MIN = 15.0
 
-# Two-head mode (src/core/two_head.py, scripts/rail_broker.py): two independent
-# ZoMBI-Hop heads on one landscape, head 0 on the main rail, head 1 on the cache
-# rail, sharing every measured point (GP data) and adopting each other's penalty
-# regions only between activations. Needs DiSCO on rails protocol v2
-# (docs/disco_independent_rails.md). Head 0 lives in run_<uuid>, head 1 in
-# run_<uuid>_h1; run_<uuid>/two_head.json marks the run, so resuming run_<uuid>
-# resumes both heads. Rail stall watchdog: same rules as the init queue.
-TWO_HEAD_STATE_NAME = "two_head.json"
-TWO_HEAD_SUFFIX = "_h1"
-TWO_HEAD_FIRST_RESULT_TIMEOUT_MIN = INIT_FIRST_RESULT_TIMEOUT_MIN
-TWO_HEAD_STALL_FLOOR_MIN = INIT_STALL_FLOOR_MIN
-TWO_HEAD_STALL_MULT = INIT_STALL_MULT
-TWO_HEAD_MAX_SENDS = INIT_MAX_SENDS
-
 # ARCHERFISH MODULES TO PRINT AND OPTIMIZE FROM
 OPTIMIZING_DIMS = [0, 8, 9]
 
@@ -953,47 +939,6 @@ def objective(
     )
 
 
-def _line_payload(left: np.ndarray, right: np.ndarray, num_experiments: int):
-    """One line as written to a compositions.db slot: (x_sent (n, d), start10,
-    end10, array10), normalised and padded exactly as _write_line_pair does."""
-    x_sent = np.array([left + t * (right - left) for t in np.linspace(0, 1, num_experiments)])
-    start10 = _pad_to_10d(normalize_last_axis(np.round(left, 3)))[0]
-    end10 = _pad_to_10d(normalize_last_axis(np.round(right, 3)))[0]
-    arr10 = _pad_to_10d(normalize_last_axis(np.round(x_sent, 3)))
-    return x_sent, start10, end10, arr10
-
-
-def rail_objective(
-    broker,
-    head: int,
-    endpoints: torch.Tensor,
-    endpoints_log_ref: Dict[str, Any] | None = None,
-    num_experiments: int = NUM_EXPERIMENTS,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Two-head mode objective: print LineBO's best line (endpoints[0]) on this
-    head's own rail only, and return that line's measured (x_actual, y) once the
-    broker has routed its result back. The other rail is never touched."""
-    assert endpoints.dim() == 3 and endpoints.shape[1] == 2
-    device, dtype = endpoints.device, endpoints.dtype
-    left = endpoints[0, 0].detach().cpu().numpy()
-    right = endpoints[0, 1].detach().cpu().numpy()
-    if endpoints_log_ref is not None:
-        # line_1 mirrors line_0: in two-head mode only one line is printed per call.
-        endpoints_log_ref.update(line_0_left=left, line_0_right=right,
-                                 line_1_left=left, line_1_right=right)
-    _, s10, e10, a10 = _line_payload(left, right, num_experiments)
-    x_meas, y = broker.measure(head, left, right, (s10, e10, a10))
-    if len(y) < num_experiments:
-        print(f"[rail_objective] WARNING head{head} rail returned {len(y)}/{num_experiments} "
-              f"usable points ({num_experiments - len(y)} dropped)")
-    return (
-        torch.tensor(np.asarray(x_meas, np.float64).reshape(-1, len(OPTIMIZING_DIMS)),
-                     device=device, dtype=dtype),
-        torch.tensor(y_measured_to_optimizer(np.asarray(y, np.float64)),
-                     device=device, dtype=dtype),
-    )
-
-
 def linebo_sampler_wrapper(
     dimensions: int,
     num_lines: int = 10,
@@ -1004,7 +949,6 @@ def linebo_sampler_wrapper(
     run_dir_ref: List | None = None,
     optimizer_ref: List | None = None,
     show_live_plots: bool = True,
-    objective_fn=None,
 ):
     """
     Wrapper for LineBO.sampler: calls linebo.sampler, then logs expected, actual, y
@@ -1020,17 +964,13 @@ def linebo_sampler_wrapper(
     show_live_plots : bool
         When False (hardware mode), suppresses the matplotlib popup window but
         still accumulates data for live_plot_state.json.
-    objective_fn : callable(endpoints, endpoints_log_ref) -> (x_actual, y), optional
-        Replaces the (main, cache) pair objective; two-head mode passes a
-        per-head ``rail_objective``.
     """
     if needle_plot_points is None:
         needle_plot_points = []
     endpoints_log_ref: Dict[str, Any] = {}
     prior_endpoints_ref: Dict[str, Any] = {}   # previous iteration's endpoints
     linebo = LineBO(
-        (lambda ep: objective_fn(ep, endpoints_log_ref)) if objective_fn is not None else
-        (lambda ep: objective(ep, ready_for_objectives=True, endpoints_log_ref=endpoints_log_ref)),
+        lambda ep: objective(ep, ready_for_objectives=True, endpoints_log_ref=endpoints_log_ref),
         dimensions,
         num_points_per_line=100,
         num_lines=num_lines,
@@ -1577,21 +1517,12 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
                    checkpoint_dir: str | None = None, hparams_path: str | None = None,
                    new_run_uuid: str | None = None,
                    bounds_lo: list | None = None, bounds_hi: list | None = None,
-                   retro_needles: bool = True, two_head: bool = False,
-                   optimizer_name: str | None = None):
+                   retro_needles: bool = True, optimizer_name: str | None = None):
     """Run DB-driven ZoMBI-Hop loop (new or resume).
 
     optimizer_name : "lanes" (default: two-lane engine, four-slot protocol,
         scripts/lanes_hw.py) or "zombihop" (the legacy single ZoMBIHop loop). None ->
         env ZOMBI_OPTIMIZER, else "lanes". Initialization is the same for both.
-        two_head forces "zombihop" (its heads are ZoMBIHop loops).
-
-    two_head : run two independent heads on one landscape, one per DiSCO rail
-        (see TWO_HEAD_STATE_NAME above; needs DiSCO rails protocol v2). The mode is
-        recorded in run_<uuid>/two_head.json, so resuming a two-head run is always
-        two-head. Passing it when resuming a single-head run converts that run:
-        the existing run becomes head 0 and a fresh head 1 starts from its initial
-        design, taking in all of head 0's points as GP data.
 
     hparams_path : optional path to a trial.json-style JSON file whose 'hparams'
         override DEFAULT_HW_HPARAMS for this run.
@@ -1611,11 +1542,6 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
     global OPTIMIZING_DIMS
     if optimizing_dims is not None:
         OPTIMIZING_DIMS = list(optimizing_dims)
-    if resume_uuid is not None and str(resume_uuid).endswith(TWO_HEAD_SUFFIX):
-        base = str(resume_uuid)[:-len(TWO_HEAD_SUFFIX)]
-        raise ValueError(
-            f"run_{resume_uuid} is head 1 of two-head run run_{base}; resume run_{base} "
-            f"(both heads resume together).")
 
     # LANES: every run (new or resumed, either optimizer) starts on today's two-slot packet,
     # which the axial init and the legacy loop need; the lanes driver switches the 1 Hz
@@ -1676,19 +1602,6 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
         ckpt_path = Path("actual_runs") / "checkpoints"
     ckpt_path.mkdir(parents=True, exist_ok=True)
 
-    if resume_uuid is not None and (ckpt_path / f"run_{resume_uuid}" / TWO_HEAD_STATE_NAME).exists():
-        if not two_head:
-            print(f"[ZoMBI] run_{resume_uuid} is a two-head run: resuming both heads.")
-        two_head = True
-    elif resume_uuid is not None and two_head:
-        print(f"[ZoMBI] Converting single-head run_{resume_uuid} to two-head mode: it "
-              f"becomes head 0 (main rail); head 1 (cache rail) starts fresh in "
-              f"run_{resume_uuid}{TWO_HEAD_SUFFIX}.")
-    if two_head and _optimizer_choice(optimizer_name) == "lanes":
-        print("[ZoMBI] Two-head mode runs ZoMBIHop heads: using the legacy 'zombihop' "
-              "loop instead of the 'lanes' engine.")
-        optimizer_name = "zombihop"
-
     # Per-dim search box (2, dimensions). Defaults to the full [0,1] simplex, but a
     # caller (GUI) may pass a tightened box; on resume, restore it from hw_config.json
     # so the box persists. Bounds are aligned to OPTIMIZING_DIMS order.
@@ -1748,39 +1661,17 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
     run_dir_ref: List = [None]
     optimizer_ref: List = [None]
 
-    # Two-head mode: the hub carries points/regions between the heads and the
-    # broker gives each head its own rail.
-    base_uuid = init_uuid or resume_uuid
-    hub = broker = None
-    if two_head:
-        from src.core.two_head import TwoHeadHub
-        from scripts.rail_broker import RailBroker
-        hub = TwoHeadHub(on_regions_changed=_two_head_needles_db_writer)
-        broker = RailBroker(
-            OPTIMIZING_DIMS,
-            first_timeout_s=TWO_HEAD_FIRST_RESULT_TIMEOUT_MIN * 60.0,
-            stall_floor_s=TWO_HEAD_STALL_FLOOR_MIN * 60.0,
-            stall_mult=TWO_HEAD_STALL_MULT,
-            max_sends=TWO_HEAD_MAX_SENDS,
-            stop_event=hub.stop_event,
-            on_extra_data=lambda _h, x, y: _publish_extra_result(hub, x, y),
-            log_path=ckpt_path / f"run_{base_uuid}" / "rails_log.jsonl",
-        )
-
-    def _make_objective_wrapper(plot_seed, head: int = 0, dir_ref=run_dir_ref,
-                                opt_ref=optimizer_ref, needle_pts=needle_plot_points):
+    def _make_objective_wrapper(plot_seed):
         return linebo_sampler_wrapper(
             dimensions=dimensions,
             num_lines=10,
             device=device,
             dtype=dtype,
             resume_plot_data=plot_seed,
-            needle_plot_points=needle_pts,
-            run_dir_ref=dir_ref,
-            optimizer_ref=opt_ref,
+            needle_plot_points=needle_plot_points,
+            run_dir_ref=run_dir_ref,
+            optimizer_ref=optimizer_ref,
             show_live_plots=False,  # hardware mode: use GUI ternary tab, no popup
-            objective_fn=(None if broker is None else
-                          (lambda ep, ref, _h=head: rail_objective(broker, _h, ep, ref))),
         )
 
     if init_uuid is not None:
@@ -1906,22 +1797,13 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
             f"zoom={optimizer.current_zoom}, iteration={optimizer.current_iteration}\n"
         )
 
-    head1 = None
-    if two_head:
-        head1 = _build_second_head(
-            optimizer, base_uuid, ckpt_path, device, dtype, _make_objective_wrapper,
-            retro_needles=retro_needles)
-        _write_two_head_state(ckpt_path, base_uuid)
-
     # Live-mirror discovered needles into sql/needles.db (optimizing dims → full
     # 10-col composition, sorted best-first). Rewritten on every needle add; the
-    # immediate sync here reflects any needles already loaded on resume. In
-    # two-head mode the hub writes the union of both heads' needles instead.
-    if not two_head:
-        try:
-            optimizer.data_handler._enable_needles_db(OPTIMIZING_DIMS)
-        except Exception as e:
-            print(f"[ZoMBI] needles.db live-sync setup failed: {e}")
+    # immediate sync here reflects any needles already loaded on resume.
+    try:
+        optimizer.data_handler._enable_needles_db(OPTIMIZING_DIMS)
+    except Exception as e:
+        print(f"[ZoMBI] needles.db live-sync setup failed: {e}")
 
     print("=" * 80)
     print("STARTING OPTIMIZATION")
@@ -1933,131 +1815,8 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
     # pathway (over-penalisation, activation failure, noise-floor exhaustion) is
     # converted into "shrink all penalty volumes by 70%, reset bounds, continue".
     # Only the user Stop button ends the run.
-    run_kwargs = dict(max_activations=float("inf"), time_limit_hours=None,
-                      never_terminate=True)
-    if not two_head:
-        optimizer.run(**run_kwargs)
-        return
-
-    from src.core.two_head import run_heads
-    hub.attach(0, optimizer)
-    hub.attach(1, head1)
-    # Resume: re-offer each head's own points to the other (duplicates are
-    # dropped) and rebuild the shared region list. No-op for a fresh run.
-    hub.reconcile([optimizer, head1])
-    broker.start()
-    print("=" * 80)
-    print(f"TWO-HEAD MODE: head0 -> main rail (run_{base_uuid}), head1 -> cache rail "
-          f"(run_{base_uuid}{TWO_HEAD_SUFFIX}). Points are shared as GP data at every "
-          f"measurement; penalty regions are adopted only between activations.")
-    print("=" * 80 + "\n")
-    run_heads([optimizer, head1], hub, run_kwargs, on_abort=broker.abort)
-
-
-# ── two-head helpers ────────────────────────────────────────────────────────────
-
-def _two_head_needles_db_writer(regions) -> None:
-    """Mirror the union of both heads' needles into sql/needles.db (each needle
-    once, by centre; both copies of a needle found by both heads are kept)."""
-    from src.utils.needles_db import write_needles
-    recs, seen = [], []
-    for _origin, r in regions:
-        if r.get("kind") != "needle":
-            continue
-        c = r["center"]
-        if any(torch.allclose(c, o, atol=1e-9) for o in seen):
-            continue
-        seen.append(c)
-        recs.append({"point": c, "value": r.get("value"), "median_value": r.get("median_value")})
-    write_needles(recs, OPTIMIZING_DIMS)
-
-
-def _publish_extra_result(hub, x: np.ndarray, y: np.ndarray) -> None:
-    """A result no head is waiting for any more (late, or a re-send's twin):
-    give it to BOTH heads as GP data."""
-    if len(y) == 0:
-        return
-    xt = torch.tensor(np.asarray(x, np.float64))
-    hub.publish_points(None, xt, expected_from_actual(xt),
-                       torch.tensor(y_measured_to_optimizer(np.asarray(y, np.float64))))
-
-
-def _write_two_head_state(ckpt_path: Path, base_uuid: str) -> None:
-    base = ckpt_path / f"run_{base_uuid}"
-    h1 = ckpt_path / f"run_{base_uuid}{TWO_HEAD_SUFFIX}"
-    state = {"two_head": True, "protocol": "rails-v2",
-             "heads": {"0": {"run": base.name, "slot": "main"},
-                       "1": {"run": h1.name, "slot": "cache"}}}
-    p = base / TWO_HEAD_STATE_NAME
-    if not p.exists():
-        state["created"] = time.time()
-        p.write_text(json.dumps(state, indent=2))
-    (h1 / "two_head_member.json").write_text(json.dumps(
-        {"two_head": True, "head": 1, "slot": "cache", "base_run": base.name}, indent=2))
-    # Let the GUI label head 1's axes like head 0's.
-    hw0, hw1 = base / "hw_config.json", h1 / "hw_config.json"
-    if hw0.exists() and not hw1.exists():
-        try:
-            hw1.write_text(hw0.read_text())
-        except OSError:
-            pass
-
-
-def _build_second_head(head0, base_uuid: str, ckpt_path: Path, device, dtype,
-                       make_wrapper, retro_needles: bool = True):
-    """Head 1 (cache rail) of a two-head run: resumed from run_<uuid>_h1 if it has
-    a snapshot, else started fresh from head 0's initial design with head 0's
-    in-force hyperparameters."""
-    uuid1 = f"{base_uuid}{TWO_HEAD_SUFFIX}"
-    run_dir1 = ckpt_path / f"run_{uuid1}"
-    resume1 = run_dir1.exists() and _latest_snapshot_dir(run_dir1) is not None
-    dir_ref: List = [run_dir1]
-    opt_ref: List = [None]
-    needle_pts: List[Dict[str, float]] = []
-    dh0 = head0.data_handler
-    hp = dict(head0.hparams_in_force())
-    d = len(OPTIMIZING_DIMS)
-    if resume1:
-        seed = _load_plot_data_from_run(run_dir1)
-        if seed is not None:
-            needle_pts.extend(_load_needles_for_plot(run_dir1, seed[2]))
-        wrapper, flush = make_wrapper(seed, head=1, dir_ref=dir_ref, opt_ref=opt_ref,
-                                      needle_pts=needle_pts)
-        _dummy = torch.zeros(0, d, device=device, dtype=dtype)
-        head1 = ZoMBIHop(
-            objective=wrapper, X_init_actual=_dummy, X_init_expected=_dummy,
-            Y_init=torch.zeros(0, 1, device=device, dtype=dtype),
-            device=str(device), dtype=dtype, bounds=head0.full_bounds.clone(),
-            run_uuid=uuid1, checkpoint_dir=str(ckpt_path), num_iterations_saved=50,
-            verbose=True, needle_plot_points_ref=needle_pts, **hp)
-        if retro_needles:
-            try:
-                res = head1.retro_declare_needles(dry_run=False)
-                if res.get("applied"):
-                    print(f"[two-head] head1: retroactively declared {res.get('n_declared')} "
-                          f"needle(s) under the current criteria.")
-            except Exception as e:
-                print(f"[two-head] head1 retro needle pass failed: {e}")
-        print(f"[two-head] Resumed head1 (run_{uuid1}) at activation="
-              f"{head1.current_activation}, zoom={head1.current_zoom}")
-    else:
-        X0, Xe0, Y0 = dh0.X_init_actual, dh0.X_init_expected, dh0.Y_init
-        if X0 is None or X0.shape[0] == 0:
-            raise RuntimeError(f"run_{base_uuid} has no initial design to start head1 from")
-        seed = (list(range(1, Y0.shape[0] + 1)), Y0.ravel().tolist(),
-                list(X0.detach().cpu().numpy()))
-        wrapper, flush = make_wrapper(seed, head=1, dir_ref=dir_ref, opt_ref=opt_ref,
-                                      needle_pts=needle_pts)
-        head1 = ZoMBIHop(
-            objective=wrapper, X_init_actual=X0, X_init_expected=Xe0, Y_init=Y0,
-            device=str(device), dtype=dtype, bounds=head0.full_bounds.clone(),
-            run_uuid=uuid1, resume=False, checkpoint_dir=str(ckpt_path),
-            num_iterations_saved=50, verbose=True, needle_plot_points_ref=needle_pts, **hp)
-        print(f"[two-head] Started head1 in run_{uuid1} from head0's initial design "
-              f"({Y0.shape[0]} points)")
-    opt_ref[0] = head1
-    flush()
-    return head1
+    optimizer.run(max_activations=float("inf"), time_limit_hours=None,
+                  never_terminate=True)
 
 
 if __name__ == "__main__":

@@ -33,21 +33,6 @@ _last_objective_comps = None
 # composition path (composition_receiver only writes when compositions.db's ts changes).
 _last_objective_ts = None
 
-# ── Rails protocol v2 (independent main/cache rails; see docs/disco_independent_rails.md)
-# Slot names in compositions.db / the composition packet.
-RAIL_SLOTS = ("main", "cache")
-# Serialises compositions.db writers within one process (the two heads of a
-# two-head run each write their own slot from their own thread).
-_comp_db_lock = threading.Lock()
-# v2 objective packets carry their slot; DiSCO re-sends each slot's latest result
-# until it is acknowledged, interleaving slots, so dedup is per (slot, ts) over a
-# bounded memory instead of "same as the last packet".
-_seen_slot_objectives: "dict[tuple, None]" = {}
-_SEEN_SLOT_OBJECTIVES_MAX = 512
-# Latest objective ts ingested per slot; echoed to DiSCO in every composition
-# packet ("ack_main"/"ack_cache") so it can stop re-sending that result.
-_objective_acks: "dict[str, Any]" = {"main": None, "cache": None}
-
 
 def _serial_process_signal_handler(signum, frame):
     """Only used in the dedicated serial I/O process (not at import: avoids every child
@@ -132,10 +117,6 @@ def write_compositions(start,
                        array_cache,
                        db_path="./sql/compositions.db"):
     """
-    Write BOTH rails as one packet (protocol v1 behaviour; also used by the axial
-    initialization). Both slots get ``timestamp`` as their per-slot ts in the
-    ``slot_ts`` table, so a rails-v2 DiSCO arms both, exactly like v1.
-
     Overwrite the following tables in compositions.db:
       - compositions       : the main array (n×10)
       - start              : the main 1×10 start vector
@@ -225,169 +206,8 @@ def write_compositions(start,
     cur.execute("CREATE TABLE timestamp (ts REAL)")
     cur.execute("INSERT INTO timestamp VALUES (?)", (float(timestamp),))
 
-    # 8) per-slot timestamps (rails protocol v2): both slots are new
-    _write_slot_ts(cur, {"main": float(timestamp), "cache": float(timestamp)})
-
     conn.commit()
     conn.close()
-
-
-def _write_slot_ts(cur, values: "dict[str, float | None]") -> None:
-    cur.execute("CREATE TABLE IF NOT EXISTS slot_ts (slot TEXT PRIMARY KEY, ts REAL)")
-    for slot, ts in values.items():
-        cur.execute("INSERT OR REPLACE INTO slot_ts (slot, ts) VALUES (?, ?)",
-                    (slot, None if ts is None else float(ts)))
-
-
-_SLOT_TABLES = {
-    "main": ("compositions", "start", "end"),
-    "cache": ("compositions_cache", "start_cache", "end_cache"),
-}
-
-
-def write_slot(slot: str, start, end, array, slot_ts: float,
-               db_path: str = "./sql/compositions.db") -> None:
-    """Rails protocol v2: command ONE rail, leaving the other untouched.
-
-    Rewrites only ``slot``'s three tables (``compositions``/``start``/``end`` for
-    "main", the ``*_cache`` tables for "cache") and its row of ``slot_ts``, in one
-    transaction. The legacy ``timestamp`` is bumped too (it changes on every
-    write, as before), but a v2 DiSCO arms a slot only when that slot's ts changes,
-    so the other rail's line is neither re-printed nor dropped. A v1 DiSCO would
-    re-arm both slots on the bumped ``timestamp`` - two-head mode needs v2.
-
-    The other slot's tables are created empty if missing (its ts stays NULL =
-    idle) so the composition sender always finds every table.
-    """
-    if slot not in RAIL_SLOTS:
-        raise ValueError(f"slot must be one of {RAIL_SLOTS}, got {slot!r}")
-    array = np.asarray(array, float)
-    start = np.asarray(start, float).ravel()
-    end = np.asarray(end, float).ravel()
-    if array.ndim != 2 or array.shape[1] != 10:
-        raise ValueError("`array` must be 2D with exactly 10 columns")
-    if start.shape != (10,) or end.shape != (10,):
-        raise ValueError("`start`/`end` must be 1D with length 10")
-    t_comp, t_start, t_end = _SLOT_TABLES[slot]
-    col_defs = ", ".join(f"col_{i} REAL" for i in range(10))
-    ph = ", ".join("?" for _ in range(10))
-    with _comp_db_lock:
-        conn = sqlite3.connect(db_path, timeout=30.0)
-        conn.isolation_level = None             # explicit transaction below
-        cur = conn.cursor()
-        try:
-            cur.execute("BEGIN IMMEDIATE")
-            for tbl in _SLOT_TABLES["main"] + _SLOT_TABLES["cache"]:
-                cur.execute(f"CREATE TABLE IF NOT EXISTS {tbl} ({col_defs})")
-            cur.execute(f"DELETE FROM {t_comp}")
-            cur.executemany(f"INSERT INTO {t_comp} VALUES ({ph})", array.tolist())
-            cur.execute(f"DELETE FROM {t_start}")
-            cur.execute(f"INSERT INTO {t_start} VALUES ({ph})", start.tolist())
-            cur.execute(f"DELETE FROM {t_end}")
-            cur.execute(f"INSERT INTO {t_end} VALUES ({ph})", end.tolist())
-            cur.execute("CREATE TABLE IF NOT EXISTS slot_ts (slot TEXT PRIMARY KEY, ts REAL)")
-            for other in RAIL_SLOTS:
-                cur.execute("INSERT OR IGNORE INTO slot_ts (slot, ts) VALUES (?, NULL)", (other,))
-            cur.execute("UPDATE slot_ts SET ts = ? WHERE slot = ?", (float(slot_ts), slot))
-            cur.execute("CREATE TABLE IF NOT EXISTS timestamp (ts REAL)")
-            cur.execute("DELETE FROM timestamp")
-            cur.execute("INSERT INTO timestamp VALUES (?)", (float(slot_ts),))
-            cur.execute("COMMIT")
-        except Exception:
-            cur.execute("ROLLBACK")
-            raise
-        finally:
-            conn.close()
-
-
-def read_slot_ts(db_path: str = "./sql/compositions.db") -> "dict[str, float | None]":
-    """Per-slot timestamps currently in compositions.db ({} if none recorded)."""
-    try:
-        conn = sqlite3.connect(db_path, timeout=10.0)
-        rows = conn.execute("SELECT slot, ts FROM slot_ts").fetchall()
-        conn.close()
-        return {r[0]: r[1] for r in rows}
-    except sqlite3.Error:
-        return {}
-
-
-# ── objective queue (rails protocol v2) ──────────────────────────────────────
-# Every ingested objective packet is APPENDED here (in addition to the legacy
-# single-packet `objective` table + handshake), so two results arriving close
-# together can never overwrite each other. Two-head mode consumes this queue
-# (scripts/rail_broker.py); single-head mode keeps using the handshake.
-_OBJ_QUEUE_DDL = """CREATE TABLE IF NOT EXISTS objective_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    received REAL,
-    ts REAL,
-    slot TEXT,
-    slot_ts REAL,
-    values_json TEXT,
-    comps_json TEXT,
-    consumed INTEGER DEFAULT 0
-)"""
-
-
-def append_objective_queue(db_path: str, vals, comps, ts=None, slot=None,
-                           slot_ts=None) -> None:
-    vals = np.asarray(vals, float).ravel()
-    with _objective_db_lock:
-        conn = sqlite3.connect(db_path, timeout=30.0)
-        try:
-            conn.execute(_OBJ_QUEUE_DDL)
-            conn.execute(
-                "INSERT INTO objective_queue (received, ts, slot, slot_ts, values_json, "
-                "comps_json) VALUES (?, ?, ?, ?, ?, ?)",
-                (time.time(), ts, slot, slot_ts,
-                 json.dumps([float(v) if np.isfinite(v) else None for v in vals]),
-                 json.dumps(comps) if comps is not None else None))
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def read_objective_queue(db_path: str = "./sql/objective.db", after_id: int = 0):
-    """Unconsumed queue rows with id > after_id, oldest first, as dicts
-    (values with NaN for missing, comps as an (n, 10) array or None)."""
-    conn = sqlite3.connect(db_path, timeout=30.0)
-    try:
-        conn.execute(_OBJ_QUEUE_DDL)
-        rows = conn.execute(
-            "SELECT id, received, ts, slot, slot_ts, values_json, comps_json FROM "
-            "objective_queue WHERE consumed = 0 AND id > ? ORDER BY id", (int(after_id),)
-        ).fetchall()
-    finally:
-        conn.close()
-    out = []
-    for rid, rec, ts, slot, sts, vj, cj in rows:
-        vals = np.array([np.nan if v is None else v for v in json.loads(vj or "[]")], float)
-        comps = np.asarray(json.loads(cj), float) if cj else None
-        out.append({"id": rid, "received": rec, "ts": ts, "slot": slot, "slot_ts": sts,
-                    "values": vals, "comps": comps})
-    return out
-
-
-def consume_objective_queue(ids, db_path: str = "./sql/objective.db") -> None:
-    ids = [int(i) for i in ids]
-    if not ids:
-        return
-    with _objective_db_lock:
-        conn = sqlite3.connect(db_path, timeout=30.0)
-        try:
-            conn.execute(_OBJ_QUEUE_DDL)
-            conn.executemany("UPDATE objective_queue SET consumed = 1 WHERE id = ?",
-                             [(i,) for i in ids])
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def clear_objective_queue(db_path: str = "./sql/objective.db") -> int:
-    """Mark every queued result consumed (stale results from before this session).
-    Returns how many were discarded."""
-    rows = read_objective_queue(db_path)
-    consume_objective_queue([r["id"] for r in rows], db_path)
-    return len(rows)
     
 
 # # — 3) reset_compositions drops all four tables —
@@ -1335,32 +1155,18 @@ def objective_receiver(hz, obj_db_path, mem_db_path, verbose=False, super_verbos
                     print(f"[objective_receiver] ⚠ Unexpected values shape {vals.shape}, ignoring")
                 continue
 
-            all_nan = not np.isfinite(vals).any()
-            if all_nan and pkt.get("slot") is None:
+            if not np.isfinite(vals).any():
                 if verbose:
                     print(f"[objective_receiver] ⚠ All-NaN/inf packet ({vals.size} values), ignoring")
                 continue
-            # (A v2 packet that is all-NaN still says "this rail's slide failed": it
-            # is queued below so two-head mode can re-plan at once, but it never
-            # reaches the legacy single-packet mailbox.)
             # ─────────────────────────────────────────────────────────────
 
             comps = pkt.get("comps", None)
             ts = pkt.get("ts", None)
-            # Rails protocol v2: which rail printed this slide, and the per-slot
-            # composition ts it printed (docs/disco_independent_rails.md).
-            slot = pkt.get("slot", None)
-            slot_ts = pkt.get("slot_ts", None)
-            slot_key = (str(slot), ts) if (slot is not None and ts is not None) else None
 
             # Dedup so we only process/write once per distinct packet.
             global _last_objective_vals, _last_objective_comps, _last_objective_ts
-            if slot_key is not None:
-                # v2: DiSCO re-sends each slot's latest result until acknowledged,
-                # interleaving slots - remember every (slot, ts) recently ingested.
-                if slot_key in _seen_slot_objectives:
-                    continue
-            elif ts is not None:
+            if ts is not None:
                 # Timestamp handshake (mirrors composition_receiver): DiSCO bumps
                 # objective.db's ts on every write, so identical ~1 Hz re-sends carry
                 # the SAME ts. Ingest only when the ts is new; this stops the receiver
@@ -1389,28 +1195,6 @@ def objective_receiver(hz, obj_db_path, mem_db_path, verbose=False, super_verbos
             _last_objective_ts = ts
             _last_objective_vals = vals.copy()
             _last_objective_comps = comps if comps is None else [np.asarray(c).copy() for c in comps]
-
-            # Append to the objective queue (two-head mode reads it; nothing is
-            # ever overwritten there). On failure, re-arm the dedup so DiSCO's
-            # re-send of this packet retries the write.
-            try:
-                append_objective_queue(obj_db_path, vals, comps, ts=ts, slot=slot,
-                                       slot_ts=slot_ts)
-            except Exception as e:
-                print(f"[objective_receiver] ERROR appending to objective_queue: {e!r}")
-                _last_objective_ts = None
-                continue
-            if slot_key is not None:
-                _seen_slot_objectives[slot_key] = None
-                while len(_seen_slot_objectives) > _SEEN_SLOT_OBJECTIVES_MAX:
-                    _seen_slot_objectives.pop(next(iter(_seen_slot_objectives)))
-                if slot in _objective_acks:
-                    _objective_acks[slot] = ts
-                if verbose:
-                    print(f"[objective_receiver] queued {slot} result ts={ts} "
-                          f"slot_ts={slot_ts} ({vals.size} values)")
-            if all_nan:
-                continue
 
             if verbose:
                 print(f"[objective_receiver] ▶ Received raw data: {len(raw)} bytes")
@@ -1599,11 +1383,7 @@ def composition_sender(ser, hz, comp_db_path, chaos=False, verbose=True, super_v
                     print(f"[composition_sender] DB {comp_db_path} does not exist.")
                 return None
             conn = sqlite3.connect(comp_db_path, timeout=10.0)
-            # One read transaction for every table below, so a concurrent write
-            # (write_slot commits atomically) is seen entirely or not at all.
-            conn.isolation_level = None
             cur  = conn.cursor()
-            cur.execute("BEGIN")
             # timestamp
             cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='timestamp'")
             if not cur.fetchone(): 
@@ -1626,29 +1406,14 @@ def composition_sender(ser, hz, comp_db_path, chaos=False, verbose=True, super_v
             start, end    = f("start"), f("end")
             comps         = f("compositions")
             sc, ec, cc    = f("start_cache"), f("end_cache"), f("compositions_cache")
-            # Rails protocol v2: per-slot timestamps (absent in an old DB).
-            slot_ts = None
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='slot_ts'")
-            if cur.fetchone():
-                cur.execute("SELECT slot, ts FROM slot_ts")
-                slot_ts = {r[0]: r[1] for r in cur.fetchall()}
             conn.close()
-            if slot_ts is not None:
-                # v2: a slot that was never commanded (ts NULL) may be empty; send
-                # it as empty lists and DiSCO leaves that rail idle.
-                ok = ((start and end and comps) or slot_ts.get("main") is None) and \
-                     ((sc and ec and cc) or slot_ts.get("cache") is None) and \
-                     (start or sc)
-            else:
-                ok = start and end and comps and sc and ec and cc
-            if not ok:
+            if not (start and end and comps and sc and ec and cc): 
                 if super_verbose:
                     print(f"[composition_sender] Not all required tables have data.")
                 return None
             if super_verbose:
                 print(f"[composition_sender] Read all tables successfully.")
-            first = lambda rows: rows[0] if rows else []
-            return ts, first(start), first(end), comps, first(sc), first(ec), cc, slot_ts
+            return ts, start[0], end[0], comps, sc[0], ec[0], cc
         except Exception as e:
             print(f"[composition_sender] Database read error: {e}")
             return None
@@ -1717,7 +1482,7 @@ def composition_sender(ser, hz, comp_db_path, chaos=False, verbose=True, super_v
                     print(f"[composition_sender] No data to send this cycle.")
                 continue
 
-            ts, start, end, comps, sc, ec, cc, slot_ts = data
+            ts, start, end, comps, sc, ec, cc = data
             if chaos:
                 ts = np.random.randint(1,10)
 
@@ -1731,15 +1496,6 @@ def composition_sender(ser, hz, comp_db_path, chaos=False, verbose=True, super_v
                 "end_cache":         list(ec),
                 "compositions_cache":[list(r) for r in cc]
             }
-            if slot_ts is not None:
-                # Rails protocol v2 (docs/disco_independent_rails.md): a v2 DiSCO
-                # arms each slot only when ITS ts changes, and stops re-sending a
-                # slot's result once the matching ack comes back. v1 ignores these.
-                pkt["protocol"] = 2
-                pkt["ts_main"] = slot_ts.get("main")
-                pkt["ts_cache"] = slot_ts.get("cache")
-                pkt["ack_main"] = _objective_acks.get("main")
-                pkt["ack_cache"] = _objective_acks.get("cache")
             raw = (json.dumps(pkt) + "\n").encode()
             if super_verbose:
                 print(f"[composition_sender] Sending packet: {pkt}")

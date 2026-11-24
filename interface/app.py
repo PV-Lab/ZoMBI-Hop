@@ -4749,37 +4749,6 @@ class NewRunDialog(tk.Toplevel):
                   foreground="gray").grid(
             row=hrow, column=0, columnspan=2, sticky="w", padx=8)
 
-        # ── one head / two heads ───────────────────────────────────────────
-        hrow += 1
-        ttk.Label(hw, text="Heads:").grid(row=hrow, column=0, sticky="w", padx=8,
-                                          pady=(6, 0))
-        self._hw_two_head_var = tk.BooleanVar(value=False)
-        hf = ttk.Frame(hw)
-        hf.grid(row=hrow, column=1, sticky="w", pady=(6, 0))
-        rb1 = ttk.Radiobutton(hf, text="One head", value=False,
-                              variable=self._hw_two_head_var,
-                              command=self._update_heads_note)
-        rb2 = ttk.Radiobutton(hf, text="Two heads (main + cache rails)", value=True,
-                              variable=self._hw_two_head_var,
-                              command=self._update_heads_note)
-        rb1.pack(side="left")
-        rb2.pack(side="left", padx=(12, 0))
-        ToolTip(rb1, "Standard run: one ZoMBI-Hop instance; each line is written to "
-                     "both rails (main + cache) and only the main rail's result is used.")
-        ToolTip(rb2, "Run two independent ZoMBI-Hop heads on this landscape, one per "
-                     "DiSCO rail (head0 → main, head1 → cache). Every measured point is "
-                     "shared as GP data; each head adopts the other's needles/exclusion "
-                     "zones only between its own activations. Head 1 is saved as "
-                     "run_<uuid>_h1.\nNeeds DiSCO on rails protocol v2 "
-                     "(docs/disco_independent_rails.md).")
-
-        hrow += 1
-        self._hw_heads_note = tk.StringVar(value="")
-        ttk.Label(hw, textvariable=self._hw_heads_note, foreground="gray",
-                  wraplength=430, justify="left").grid(
-            row=hrow, column=0, columnspan=2, sticky="w", padx=8)
-        self._update_heads_note()
-
         hrow += 1
         hw_btn_f = ttk.Frame(hw)
         hw_btn_f.grid(row=hrow, column=0, columnspan=2, sticky="w", padx=8, pady=6)
@@ -5019,31 +4988,12 @@ class NewRunDialog(tk.Toplevel):
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _update_heads_note(self):
-        if self._hw_two_head_var.get():
-            self._hw_heads_note.set(
-                "Two heads: head0 → main rail (run_<uuid>), head1 → cache rail "
-                "(run_<uuid>_h1). Requires DiSCO rails protocol v2.")
-        else:
-            self._hw_heads_note.set("One head: a single optimiser drives both rails "
-                                    "(standard mode).")
-
     def _start_hardware(self):
         try:
             dims_raw = self._hw_dims.dims_csv()
             bounds_lo, bounds_hi = self._hw_dims.bounds_for_selected()
         except ValueError as exc:
             messagebox.showerror("Config error", str(exc))
-            return
-        if self._hw_two_head_var.get() and not messagebox.askokcancel(
-                "Two-head mode",
-                "Launch in TWO-HEAD mode?\n\n"
-                "head0 drives the main rail, head1 the cache rail, each commanding its "
-                "own rail independently.\n\n"
-                "DiSCO must be on rails protocol v2 (per-slot timestamps, slot-tagged "
-                "results; see docs/disco_independent_rails.md). On the old protocol every "
-                "write re-prints the other rail's line.",
-                parent=self):
             return
         self._app.launch_hardware_process(
             uuid         = self._uuid_var.get().strip() or None,
@@ -5054,7 +5004,6 @@ class NewRunDialog(tk.Toplevel):
             python       = self._hw_python_var.get(),
             ckpt_dir     = self._app.ckpt_dir,
             hparams_path = self._hw_hparams_var.get().strip() or None,
-            two_head     = bool(self._hw_two_head_var.get()),
         )
         self.destroy()
 
@@ -5897,7 +5846,6 @@ class ZoMBIApp(tk.Tk):
         python:       str | None = None,
         ckpt_dir:     str | None = None,
         hparams_path: str | None = None,
-        two_head:     bool       = False,
     ):
         """Spawn scripts/main.py as a subprocess and stream its output to the log panel.
 
@@ -5911,14 +5859,7 @@ class ZoMBIApp(tk.Tk):
         python       – python executable
         ckpt_dir     – checkpoint directory (defaults to self.ckpt_dir)
         hparams_path – optional path to a trial.json-style hyperparameter file
-        two_head     – two-head mode for a NEW run (a two-head run always resumes
-                       as two-head; resuming its head-1 directory resumes the pair)
         """
-        if uuid and uuid.endswith("_h1"):
-            # Head 1 of a two-head run is never launched on its own.
-            uuid = uuid[:-len("_h1")]
-            self.log_to_main(f"run_{uuid}_h1 is head 1 of two-head run run_{uuid}; "
-                             f"resuming run_{uuid} (both heads).", tag="info")
         if script   is None: script   = str(Path(__file__).resolve().parent.parent / "scripts" / "main.py")
         if python   is None: python   = sys.executable
         if ckpt_dir is None: ckpt_dir = self.ckpt_dir
@@ -5961,8 +5902,6 @@ class ZoMBIApp(tk.Tk):
             cmd += ["--hparams", hparams_path]
         if new_uuid:
             cmd += ["--run-uuid", new_uuid]
-        if two_head:
-            cmd += ["--two-head"]
 
         self.log_to_main(f"Launching: {' '.join(cmd)}", tag="info")
 
