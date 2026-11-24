@@ -4,6 +4,7 @@
 
 zombihop_checkpoints/*
 ZoMBI/*
+benchmarks/zoom_fix/*
 data/*
 optimize/pareto_front.png
 hyperparameters/*

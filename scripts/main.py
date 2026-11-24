@@ -157,7 +157,15 @@ def main():
                              "and penalty regions between activations. Needs DiSCO on "
                              "rails protocol v2 (docs/disco_independent_rails.md). A "
                              "two-head run always resumes as two-head.")
+    parser.add_argument("--optimizer", default=os.environ.get("ZOMBI_OPTIMIZER") or "lanes",
+                        choices=("lanes", "zombihop"),
+                        help="Optimizer after initialization: 'lanes' (default; two-lane engine, "
+                             "four-slot protocol) or 'zombihop' (legacy single ZoMBIHop loop). "
+                             "Env ZOMBI_OPTIMIZER sets the default.")
     args = parser.parse_args()
+    # The ZoMBI child process inherits the environment: run_zombi_main reads it.
+    os.environ["ZOMBI_OPTIMIZER"] = args.optimizer
+    print(f"[Main] Optimizer: {args.optimizer}")
 
     resume_uuid = args.resume_uuid
     optimizing_dims = None

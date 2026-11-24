@@ -60,7 +60,10 @@ except ImportError:
     _BOTORCH_OK = False
 
 from src import ZoMBIHop, LineBO
-from visualization.plot_convergence import draw_needle_leashes
+from visualization.plot_convergence import (
+    draw_needle_leashes, draw_search_bands, init_packet_sizes, orient_packets,
+    sample_axis_label,
+)
 from src.core.hparam_live import (
     LIVE_EDITABLE_NAMES,
     OVERRIDE_FILENAME as OVERRIDE_HPARAMS_FILENAME,
@@ -623,6 +626,10 @@ class RunData:
         self.needle_indices: Optional[np.ndarray]= None  # (k,) int
         self.activation_starts: Optional[np.ndarray] = None  # (a,) int sample idx
         self.declared_samples: Optional[np.ndarray] = None   # (k,) sample idx per needle declaration
+        self.n_init: int                         = 0     # init-design samples (before activation 0)
+        self.zoom_starts: Optional[np.ndarray]   = None  # (z,) sample idx where each (activation, zoom) stretch begins
+        self.zoom_levels: Optional[np.ndarray]   = None  # (z,) that stretch's zoom level (0 = full field)
+        self.packet_starts: Optional[np.ndarray] = None  # (p,) sample idx where each result packet begins
         self.needles_json: list                  = []
         self.summary: dict                       = {}
         self.d: int                              = 0
@@ -653,17 +660,28 @@ def _list_snapshots(run_dir: Path) -> list[str]:
 
 
 _ACT_RE = re.compile(r"_act(\d+)")
+_ACT_ZOOM_RE = re.compile(r"_act(\d+)_z(\d+)")
 
 
-def _activation_timeline(run_dir: Path, snapshot_name: str) -> tuple[np.ndarray, np.ndarray]:
-    """Activation start indices and needle-declaration sample indices.
+def _activation_timeline(
+        run_dir: Path, snapshot_name: str,
+) -> tuple[np.ndarray, np.ndarray, int, np.ndarray, np.ndarray, np.ndarray]:
+    """Activation starts, needle-declaration samples, init size, zoom stretches,
+    result packets.
 
     Replays the delta snapshots up to ``snapshot_name`` (the same traversal
     ``reconstruct_snapshot_tensors`` uses).
 
+    ``n_init``: the number of initialization samples — everything measured
+    before activation 0's first sample. The init snapshot carries no ``actN``
+    tag, so this is the cumulative point count at the first ``actN`` snapshot
+    that adds points; a run still in its init phase (no such snapshot yet) is
+    all init. Taken from the replay rather than the deltas' ``n_init_points``
+    marker, which older resumes reset to 0 in every later snapshot.
+
     ``starts``: the cumulative point count each time the ``actN`` number in the
-    snapshot-dir name increments. The leading 0 (init / activation 0) is dropped
-    so callers get only the interior reset boundaries.
+    snapshot-dir name changes, after activation 0 — i.e. the interior reset
+    boundaries only. Activation 0's own start is ``n_init``.
 
     ``declared``: one entry per needle, in discovery order — the last sample
     index measured before the snapshot whose needle stack first grew. A needle
@@ -674,15 +692,33 @@ def _activation_timeline(run_dir: Path, snapshot_name: str) -> tuple[np.ndarray,
     replaces every needle), the earlier declarations are dropped and all of the
     rebuilt stack's needles count as declared at that snapshot.
 
-    Both empty for legacy full-copy runs with no per-snapshot deltas."""
+    ``zoom_starts`` / ``zoom_levels``: one entry per stretch of samples measured
+    at a single (activation, zoom) — the cumulative point count each time the
+    ``actN_zM`` pair in the snapshot-dir name changes, and that stretch's zoom
+    level M (0 = the full field, 1 = the first zoom-in, …). A stretch runs to
+    the next one's start. Untagged snapshots (``final``, retro / corrected
+    needles) continue the current stretch, and init has none, so the first
+    stretch starts at ``n_init``.
+
+    ``packet_starts``: where each result packet begins — the batch of samples
+    one objective call returned (``orient_packets`` flips them for display).
+    After init that is every snapshot that adds points; the init packets come
+    from ``init_packet_sizes`` and are omitted when it cannot tell them apart.
+
+    All empty / 0 for legacy full-copy runs with no per-snapshot deltas."""
     snap_dir = run_dir / "snapshots"
     if not snap_dir.is_dir():
-        return np.array([], dtype=int), np.array([], dtype=int)
+        empty = np.array([], dtype=int)
+        return empty, empty, 0, empty, empty, empty
     starts: list[int] = []
     declared: list[int] = []
+    zoom_starts: list[int] = []
+    zoom_levels: list[int] = []
+    packets: list[int] = []   # first sample of every snapshot that adds points
     n_seen = 0
     stack: list[int] = []   # needle_indices of the current needle stack
     cur_act: Optional[int] = None
+    cur_act_zoom: Optional[tuple[int, int]] = None
     for sdir in sorted(s for s in snap_dir.iterdir() if s.is_dir()):
         delta_path = sdir / "delta.pt"
         if delta_path.exists():
@@ -702,6 +738,14 @@ def _activation_timeline(run_dir: Path, snapshot_name: str) -> tuple[np.ndarray,
         if act is not None and act != cur_act and n_new > 0:
             starts.append(n_seen)
             cur_act = act
+        mz = _ACT_ZOOM_RE.search(sdir.name)
+        act_zoom = (int(mz.group(1)), int(mz.group(2))) if mz else cur_act_zoom
+        if act_zoom is not None and act_zoom != cur_act_zoom and n_new > 0:
+            zoom_starts.append(n_seen)
+            zoom_levels.append(act_zoom[1])
+            cur_act_zoom = act_zoom
+        if n_new > 0:
+            packets.append(n_seen)
         n_seen += n_new
         if new_stack != stack:
             if new_stack[:len(stack)] != stack:   # rebuilt, not appended to
@@ -710,8 +754,14 @@ def _activation_timeline(run_dir: Path, snapshot_name: str) -> tuple[np.ndarray,
             stack = new_stack
         if sdir.name == snapshot_name:
             break
-    return (np.array(sorted({s for s in starts if s > 0}), dtype=int),
-            np.array(declared, dtype=int))
+    n_init = starts[0] if starts else n_seen
+    sizes = init_packet_sizes(run_dir, n_init) or []
+    init_starts = np.cumsum([0] + sizes[:-1]).tolist() if sizes else []
+    packet_starts = sorted(set(init_starts) | {p for p in packets if p >= n_init})
+    return (np.array(sorted({s for s in starts if s > n_init}), dtype=int),
+            np.array(declared, dtype=int), n_init,
+            np.array(zoom_starts, dtype=int), np.array(zoom_levels, dtype=int),
+            np.array(packet_starts, dtype=int))
 
 
 def load_run(run_dir: Path, snapshot_name: Optional[str] = None) -> RunData:
@@ -761,7 +811,9 @@ def load_run(run_dir: Path, snapshot_name: Optional[str] = None) -> RunData:
         if ni is not None:
             rd.needle_indices = ni.long().numpy().ravel()
 
-        rd.activation_starts, rd.declared_samples = _activation_timeline(run_dir, snapshot_name)
+        (rd.activation_starts, rd.declared_samples, rd.n_init,
+         rd.zoom_starts, rd.zoom_levels,
+         rd.packet_starts) = _activation_timeline(run_dir, snapshot_name)
 
         # Trust region (current zoom bounds, fall back to full bounds) +
         # per-needle penalty-ellipsoid params, for the ternary overlays.
@@ -1150,15 +1202,64 @@ class SnapshotSliderFrame(ttk.Frame):
 
 # ── convergence plot ──────────────────────────────────────────────────────────
 
+# Lanes runs keep their results in <run>/lanes/ (scripts/lanes_hw.py), not in
+# snapshots: the Convergence tab draws them with visualization/lanes_timeline.py
+# (ONE plot, both lanes, one block per dive), and a run still in its axial
+# initialization (init_state.json, no snapshots yet) with its init view.
+# run_dir -> lanes_signature last drawn.
+_LANES_SIG: dict = {}
+
+
+def _draw_lanes_convergence(frame, rd) -> bool:
+    """Draw a lanes run, or a run still initialising, into ``frame.fig``; True
+    when drawn. False for any other run (the snapshot plot then draws as before)
+    and on a lanes-plot error, which is reported on the status bar instead of
+    raising. The canvas renders inside the try, so a draw-time error falls back too."""
+    run_dir = getattr(rd, "run_dir", None)
+    try:
+        from visualization import lanes_timeline as lt
+        if lt.run_kind(run_dir) not in ("lanes", "init"):
+            return False
+        _LANES_SIG[str(run_dir)] = lt.lanes_signature(run_dir)
+        frame.fig.clf()
+        lt.draw_lanes_convergence(frame.fig, lt.load_lanes_run(run_dir))
+        (getattr(frame, "canvas", None) or frame.fig.canvas).draw()
+        return True
+    except Exception as exc:
+        try:
+            frame.fig.clf()
+            frame.winfo_toplevel().set_status(
+                f"Lanes convergence plot failed ({exc!r}); showing the snapshot plot.")
+        except Exception:
+            pass
+        return False
+
+
+def _lanes_changed(rd) -> bool:
+    """True when a lanes run's result files (or an initialising run's
+    init_state.json) changed since its plot was drawn."""
+    run_dir = getattr(rd, "run_dir", None)
+    if run_dir is None:
+        return False
+    from visualization import lanes_timeline as lt
+    sig = lt.lanes_signature(run_dir)
+    return sig is not None and _LANES_SIG.get(str(run_dir)) != sig
+
+
 class ConvergencePlotFrame(PlotFrame):
     def update(self, rd: RunData):
+        if _draw_lanes_convergence(self, rd):   # lanes / initialising run (above)
+            return
         self.fig.clf()
         if rd.Y_all is None or len(rd.Y_all) == 0:
             self.draw(); return
         ax  = self.fig.add_subplot(111)
-        Y   = rd.Y_all
+        # Each result packet (one objective call's batch) is drawn with its
+        # higher-Y end last. Display only: the penalty colouring and needle stars
+        # move with their points; bands and boundaries sit between packets.
+        Y, pm, needle_idx = orient_packets(rd.Y_all, rd.packet_starts,
+                                           rd.penalty_mask, rd.needle_indices)
         idx = np.arange(len(Y))
-        pm  = rd.penalty_mask
 
         if pm is not None and pm.any():
             ax.scatter(idx[~pm], Y[~pm], s=10, alpha=0.35, color="#aaaaaa",
@@ -1168,17 +1269,25 @@ class ConvergencePlotFrame(PlotFrame):
         else:
             ax.scatter(idx, Y, s=10, alpha=0.65, color="steelblue", label="obs", zorder=2)
 
+        # Search-phase bands: the init design in gray, then each zoomed-in
+        # stretch in orange by depth (zoom 0 is the full field, unshaded). Init
+        # is not a search phase, so it gets no running-best envelope: activation
+        # 0 starts at the first post-init sample.
+        n_init = min(max(int(rd.n_init), 0), len(Y))
+        draw_search_bands(ax, len(Y), n_init, rd.zoom_starts, rd.zoom_levels)
+
         # Running best, reset at every activation: each activation is a fresh
         # ZoMBI search phase, so the envelope accumulates only within the current
-        # phase rather than over the whole run. Boundaries are the activations'
-        # first sample indices; each [start, end) slice gets its own cumulative
-        # max, drawn as an independent orange segment.
+        # phase rather than over the whole run. Activation 0 starts at the first
+        # post-init sample; later boundaries are the activations' first sample
+        # indices. Each [start, end) slice gets its own cumulative max, drawn as
+        # an independent orange segment.
         act_starts = rd.activation_starts
         if act_starts is None or len(act_starts) == 0:
             act_starts = np.array([], dtype=int)
         else:
-            act_starts = act_starts[(act_starts > 0) & (act_starts < len(Y))]
-        bounds = np.concatenate(([0], act_starts))
+            act_starts = act_starts[(act_starts > n_init) & (act_starts < len(Y))]
+        bounds = np.concatenate(([n_init], act_starts))
         ends = np.concatenate((act_starts, [len(Y)]))
         labeled = False
         for start, end in zip(bounds, ends):
@@ -1194,9 +1303,9 @@ class ConvergencePlotFrame(PlotFrame):
         # Each needle: a numbered star on its sampled point, leashed horizontally
         # to a diamond where it was declared — the leash length is how long the
         # point sat measured before the search confirmed it.
-        draw_needle_leashes(ax, Y, rd.needle_indices, rd.declared_samples, act_starts)
+        draw_needle_leashes(ax, Y, needle_idx, rd.declared_samples, act_starts)
 
-        ax.set_xlabel("Sample index")
+        ax.set_xlabel(sample_axis_label(rd.packet_starts))
         ax.set_ylabel("Objective Y")
         ax.set_title(f"{rd.run_id} — Convergence  "
                      f"(snap: {rd.snapshot_name},  {rd.n_points} pts, {rd.n_needles} needles)",
@@ -6107,6 +6216,18 @@ class ZoMBIApp(tk.Tk):
                         self.set_status(
                             f"Auto-updated: {rd_new.run_id}  "
                             f"({rd_new.n_points} pts, {rd_new.n_needles} needles)")
+            except Exception:
+                pass
+
+            # Lanes runs add results under <run>/lanes/ (and an initialising run to
+            # init_state.json) without moving latest.txt: redraw the Convergence
+            # tab now if visible, else when it is selected.
+            try:
+                if _lanes_changed(rd):
+                    if self._pending_rd is None:
+                        self._pending_rd = rd
+                    self._dirty_tabs.add(str(self._conv))
+                    self._render_current_tab()
             except Exception:
                 pass
 
