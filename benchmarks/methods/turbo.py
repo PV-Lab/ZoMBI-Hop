@@ -33,6 +33,26 @@ TuRBO does not declare a set of optima, so it is scored through the extractor li
 the other baselines. Each region's incumbent at restart is still written to
 ``turbo_trust_regions.csv`` — those are TuRBO's own converged local optima, useful
 for seeing how many distinct basins its restarts visited.
+
+Line mode (``sampling="line"``; ``benchmarks/sweeps --sampling line``)
+--------------------------------------------------------------------
+TuRBO measures LINES, using zombi_hop's LineBO geometry (see
+``benchmarks/sweeps/LINEWISE.md``):
+
+* A region's initial design is ``n_init_lines`` random chords through the whole box
+  (the first region's are the same chords every line-mode method starts from).
+* Each step fits the region's GP as usual, draws ``linebo_num_lines`` random chords
+  through the region's box (the same ARD-shaped box ``_candidates`` samples from),
+  draws ONE joint Thompson sample over all ``linebo_num_lines x
+  linebo_points_per_line`` chord points, and measures the chord with the highest
+  mean sample value at ``batch_size`` points. Those are model queries, not
+  measurements: only the chosen chord counts against the budget, exactly as
+  point-mode TuRBO samples thousands of candidates and measures one. The
+  coordinate-perturbation mask of ``_candidates`` has no chord counterpart and is
+  not used.
+* A line is ONE step for the success/failure counters, so ``tau_fail`` defaults to
+  the sequential ``max(4, d)`` (not the q-batch ``ceil(max(4/q, d/q))``, which at
+  q = 24 is 1 and would halve the region after every unimproved line).
 """
 
 from __future__ import annotations
@@ -42,6 +62,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import _lines
 from ._gp import fit_matern_gp
 from .base import AskTellMethod, Problem, sobol_design
 from .registry import register
@@ -81,6 +102,7 @@ class TuRBO(AskTellMethod):
         "n_candidates": None,          # None -> min(5000, max(2000, 200 d))
         "max_train_points": None,      # per region; None = all of its data
         "improvement_rtol": 1e-3,
+        **_lines.LINE_DEFAULTS,
     }
 
     # ── setup ──
@@ -89,13 +111,16 @@ class TuRBO(AskTellMethod):
         self.dim = problem.dim
         self.q = problem.batch_size
         cfg = self.config
+        self.line_mode = _lines.check_sampling(self.name, cfg, problem.batch_size)
+        q_step = 1 if self.line_mode else self.q    # a line is one sequential step
         self.tau_fail = int(cfg["failure_tolerance"] or
-                            math.ceil(max(4.0 / self.q, self.dim / self.q)))
+                            math.ceil(max(4.0 / q_step, self.dim / q_step)))
         self.tau_succ = int(cfg["success_tolerance"])
         self.n_cand = int(cfg["n_candidates"] or min(5000, max(2000, 200 * self.dim)))
         self.X = np.empty((0, self.dim))
         self.Y = np.empty(0)
         self._init_queue: list[tuple[int, np.ndarray]] = []   # (tr_id, point)
+        self._line_queue: list[tuple[int, np.ndarray]] = []   # (tr_id, point), line mode
         self._assign: list[tuple[int, bool]] = []             # per asked point
         self._n_sobol_draws = 0
         self.history: list[dict] = []
@@ -105,6 +130,13 @@ class TuRBO(AskTellMethod):
         tr = _TrustRegion(tr_id=tr_id, restart=restart,
                           length=float(self.config["length_init"]),
                           n_start=len(self.Y))
+        if self.line_mode:
+            chords = _lines.init_chords(self.rng, int(self.config["n_init_lines"]), self.dim)
+            pts = [p for left, right in chords
+                   for p in _lines.line_points(left, right, self.q)]
+            tr.pending_init = len(pts)
+            self._init_queue.extend((tr_id, p) for p in pts)
+            return tr
         pts = sobol_design(int(self.config["n_init"]), self.dim,
                            self.seed * 7919 + 104_729 * self._n_sobol_draws + tr_id)
         self._n_sobol_draws += 1
@@ -115,6 +147,8 @@ class TuRBO(AskTellMethod):
     # ── ask ──
 
     def ask(self, n: int) -> np.ndarray:
+        if self.line_mode:
+            return self._ask_line(n)
         pts: list[np.ndarray] = []
         self._assign = []
         while self._init_queue and len(pts) < n:
@@ -131,6 +165,63 @@ class TuRBO(AskTellMethod):
             pts.extend(X_ts)
             self._assign.extend((o, False) for o in owners)
         return np.asarray(pts, dtype=float).reshape(n, self.dim)
+
+    def _ask_line(self, n: int) -> np.ndarray:
+        """Init lines first, then one Thompson-sampled chord per step."""
+        if not self._init_queue and not self._line_queue:
+            active = [tr for tr in self.trs if tr.active]
+            if active:
+                left, right, owner = self._thompson_line(active)
+            else:   # unreachable with whole init lines; kept for safety
+                lo, hi = np.zeros(self.dim), np.ones(self.dim)
+                (left,), (right,) = _lines.random_chords(self.rng, 1, lo, hi)
+                owner = -1
+            self._line_queue.extend((owner, p)
+                                    for p in _lines.line_points(left, right, self.q))
+        pts: list[np.ndarray] = []
+        self._assign = []
+        for queue, is_init in ((self._init_queue, True), (self._line_queue, False)):
+            while queue and len(pts) < n:
+                tr_id, p = queue.pop(0)
+                pts.append(p)
+                self._assign.append((tr_id, is_init))
+        return np.asarray(pts, dtype=float).reshape(len(pts), self.dim)
+
+    def _region_box(self, tr: _TrustRegion) -> tuple[np.ndarray, np.ndarray]:
+        """The region's ARD-shaped box, as ``_candidates`` builds it."""
+        w = tr.lengthscales / tr.lengthscales.mean()
+        w = w / np.prod(w ** (1.0 / self.dim))
+        return (np.clip(tr.best_x - w * tr.length / 2.0, 0.0, 1.0),
+                np.clip(tr.best_x + w * tr.length / 2.0, 0.0, 1.0))
+
+    def _thompson_line(self, active: list[_TrustRegion]):
+        """The chord with the highest mean of one joint posterior sample, over
+        ``linebo_num_lines`` chords per region (model queries only)."""
+        import torch
+
+        from ._gp import tensor
+
+        k = int(self.config["linebo_num_lines"])
+        P = int(self.config["linebo_points_per_line"])
+        best = (-np.inf, None, None, -1)
+        for tr in active:
+            idx = self._train_idx(tr)
+            model, _, _ = fit_matern_gp(self.X[idx], self.Y[idx], device=self.device)
+            tr.lengthscales = (model.covar_module.base_kernel.lengthscale
+                               .detach().cpu().numpy().ravel())
+            lo, hi = self._region_box(tr)
+            left, right = _lines.random_chords(self.rng, k, lo, hi)
+            pts = _lines.line_points(left, right, P).reshape(-1, self.dim)
+            with torch.no_grad():
+                post = model.posterior(tensor(pts, self.device))
+                S = post.rsample(sample_shape=torch.Size([1])).reshape(k, P)
+            score = S.mean(dim=1).cpu().numpy()
+            j = int(np.argmax(score))
+            if score[j] > best[0]:
+                best = (float(score[j]), left[j], right[j], tr.tr_id)
+            del model, post
+        _, left, right, owner = best
+        return left, right, owner
 
     def _train_idx(self, tr: _TrustRegion) -> np.ndarray:
         idx = np.asarray(tr.idx, dtype=int)
@@ -253,7 +344,8 @@ class TuRBO(AskTellMethod):
     # ── reporting ──
 
     def summary(self) -> dict:
-        return {"n_restarts": len(getattr(self, "history", [])),
+        return {"sampling": self.config["sampling"],
+                "n_restarts": len(getattr(self, "history", [])),
                 "tau_fail": getattr(self, "tau_fail", None),
                 "n_candidates": getattr(self, "n_cand", None)}
 

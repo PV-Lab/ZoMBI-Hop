@@ -124,7 +124,8 @@ class ZoMBIHop:
                  min_iters_per_zoom: int = _HP["min_iters_per_zoom"],
                  needle_min_repeats: int = _HP["needle_min_repeats"],
                  needle_repeat_radius_frac: float = _HP["needle_repeat_radius_frac"],
-                 domain: Optional[Domain] = None):
+                 domain: Optional[Domain] = None,
+                 needle_pick: str = "median"):
         """Initialize ZoMBIHop optimizer.
 
         Every hyperparameter is declared — type, valid range, meaning, and whether
@@ -174,7 +175,17 @@ class ZoMBIHop:
         budget or runs out of zoom levels without declaring a needle has its
         region penalised (``_penalize_capped_zone``), so the next activation is
         repelled from it rather than converging straight back in.
+
+        ``needle_pick`` — which member of the repeat cluster a declaration lands
+        on: ``"median"`` (default; the repeat whose Y is closest to the cluster
+        median, see the repeatability gate above) or ``"argmax"`` (the in-bounds
+        best point itself). Not a tuned hyperparameter: the median pick guards
+        hardware runs against upward noise excursions, and ``benchmarks/sweeps``
+        switches it to ``"argmax"`` on its synthetic landscapes.
         """
+        if needle_pick not in ("median", "argmax"):
+            raise ValueError(f"needle_pick must be 'median' or 'argmax', got {needle_pick!r}")
+        self.needle_pick = needle_pick
         self.device = torch.device(device)
         self.dtype = dtype
         self.verbose = verbose
@@ -595,7 +606,8 @@ class ZoMBIHop:
                 return None, None, None, "no_points"
             idx, X_unpen, Y_unpen = idx[in_b], X_unpen[in_b], Y_unpen[in_b]
 
-        best_X = X_unpen[int(Y_unpen.argmax().item())]
+        best_local = int(Y_unpen.argmax().item())
+        best_X = X_unpen[best_local]
 
         # Repeats are searched over all of this activation's unpenalised points, not
         # only the in-bounds ones: a measurement sitting just outside the box edge is
@@ -613,6 +625,15 @@ class ZoMBIHop:
                 f"{radius:.4f} (need {self.needle_min_repeats}) — keep sampling."
             )
             return None, None, None, "not_repeatable"
+
+        if self.needle_pick == "argmax":
+            pick = idx[best_local]
+            self._log(
+                f"  [repeat-gate] {n_others} repeat(s) within {radius:.4f} "
+                f"(need {self.needle_min_repeats}); declaring the in-bounds argmax "
+                f"(Y={dh.Y_all[pick].reshape(-1)[0].item():.4f})."
+            )
+            return dh.X_all_actual[pick], dh.Y_all[pick], int(pick.item()), "ok"
 
         Y_near = dh.Y_all[near].reshape(-1)
         median = Y_near.median()

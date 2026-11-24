@@ -10,6 +10,14 @@ plan time and frozen into the manifest.
   ``POINTWISE.md``). The manifest also records ``resolved_hparams``, the values it
   actually runs (the hparams file plus the ``top_m_points`` floor).
 * Every other method gets its class ``defaults``, the same at every dimension.
+* ``sampling`` (``plan --sampling``) is set on every method that has the key:
+  ``"point"`` (one point per call, POINTWISE.md) or ``"line"`` (every method
+  measures LineBO lines, LINEWISE.md).
+* ``zombi_hop`` declares needles on the in-bounds argmax with the repeatability
+  gate off (``needle_pick="argmax"``, ``hparam_overrides={"needle_min_repeats": 0}``)
+  in every sweep: the median-closest repeat and the 5-repeat gate guard hardware
+  against noise spikes, and cost it on these synthetic landscapes (LINEWISE.md).
+  ``--method-set zombi_hop.needle_pick=median`` restores the shipped behaviour.
 
 Either can be overridden for the whole campaign:
 
@@ -37,6 +45,10 @@ from benchmarks.methods import get_method  # noqa: E402
 from .hparams import hparams_for_dim  # noqa: E402
 
 ZOMBI = "zombi_hop"
+SAMPLING_MODES = ("point", "line")
+#: zombi_hop's needle declaration in sweeps (overridable per key).
+ZOMBI_SWEEP_DECLARATION = {"needle_pick": "argmax",
+                           "hparam_overrides": {"needle_min_repeats": 0}}
 
 
 def _parse_value(raw: str):
@@ -98,12 +110,15 @@ def method_names(refs: list[str]) -> dict[str, str]:
 
 def resolve_method_configs(refs: list[str], dims: list[int], *,
                            zombi_hparam_files: dict[int, str] | None = None,
-                           overrides: dict[str, dict] | None = None) -> dict:
+                           overrides: dict[str, dict] | None = None,
+                           sampling: str = "point") -> dict:
     """``{name: {str(dim): {"config", "source", "is_stand_in"}}}`` for the manifest.
 
     ``refs`` are ``--methods`` entries; overrides are keyed by method NAME.
     """
     overrides = overrides or {}
+    if sampling not in SAMPLING_MODES:
+        raise ValueError(f"sampling must be one of {SAMPLING_MODES}, got {sampling!r}")
     names = method_names(refs)
     stray = sorted(set(overrides) - set(names))
     if stray:
@@ -114,8 +129,11 @@ def resolve_method_configs(refs: list[str], dims: list[int], *,
         per_dim = {}
         for dim in sorted(set(int(d) for d in dims)):
             override = dict(overrides.get(name, {}))
+            if "sampling" in cls.defaults:
+                override.setdefault("sampling", sampling)
             if name == ZOMBI:
-                override.setdefault("sampling", "point")
+                for key, value in ZOMBI_SWEEP_DECLARATION.items():
+                    override.setdefault(key, value)
             if name == ZOMBI and "hparams" not in override:
                 rec = hparams_for_dim(dim, zombi_hparam_files)
                 override["hparams"] = rec["hparams"]

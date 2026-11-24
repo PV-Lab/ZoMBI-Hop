@@ -87,6 +87,8 @@ DEFAULT_METHODS = ("zombi_hop", "random", "gp_bo", "turbo", "hebo")
 DEFAULT_BUDGET_PER_DIM = 100
 #: One point per call for every method (POINTWISE.md). Was 24: one LineBO line.
 DEFAULT_BATCH = 1
+#: Points per line under ``plan --sampling line`` (LINEWISE.md): run_mobo's line.
+DEFAULT_LINE_BATCH = 24
 
 
 # ─── Layout ──────────────────────────────────────────────────────────────────────
@@ -278,7 +280,30 @@ def plan(args) -> str:
     method_refs = method_names(_csv(args.methods, str))   # unknown names fail here
     methods = list(method_refs)
     n_draws = max(1, int(args.n_draws))
-    if args.budget is not None:
+    sampling = getattr(args, "sampling", "point")
+    if args.batch_size is None:
+        args.batch_size = DEFAULT_LINE_BATCH if sampling == "line" else DEFAULT_BATCH
+    if sampling == "line" and int(args.batch_size) < 2:
+        raise SystemExit(f"--sampling line needs --batch-size >= 2 points per line "
+                         f"(got {args.batch_size})")
+    lines_per_dim = None
+    if getattr(args, "lines_per_dim", None):
+        if sampling != "line":
+            raise SystemExit("--lines-per-dim needs --sampling line")
+        if args.budget is not None:
+            raise SystemExit("give --lines-per-dim or --budget, not both")
+        lines_per_dim = {}
+        for item in _csv(args.lines_per_dim, str):
+            d, sep, n = item.partition("=")
+            if not sep:
+                raise SystemExit(f"--lines-per-dim entry {item!r} is not DIM=N")
+            lines_per_dim[str(int(d))] = int(n)
+        missing = [d for d in dims if str(d) not in lines_per_dim]
+        if missing:
+            raise SystemExit(f"--lines-per-dim has no line count for dim(s) {missing}")
+        lines_per_dim = {str(d): lines_per_dim[str(d)] for d in dims}
+        budgets = {d: n * int(args.batch_size) for d, n in lines_per_dim.items()}
+    elif args.budget is not None:
         budgets = {str(d): int(args.budget) for d in dims}
     else:
         budgets = {str(d): int(args.budget_per_dim) * d for d in dims}
@@ -288,7 +313,8 @@ def plan(args) -> str:
     configs = resolve_method_configs(
         list(method_refs.values()), dims,
         zombi_hparam_files=parse_hparam_overrides(args.hparams),
-        overrides=parse_method_overrides(args.method_config, args.method_set))
+        overrides=parse_method_overrides(args.method_config, args.method_set),
+        sampling=sampling)
     if "hebo" in methods:
         from benchmarks.methods.hebo_method import _import_hebo
 
@@ -332,9 +358,13 @@ def plan(args) -> str:
         # Flat budget if --budget was given, else None; the per-dim numbers are in
         # "budgets" either way (read them with cell_budget).
         "budget": None if args.budget is None else int(args.budget),
-        "budget_per_dim": None if args.budget is not None else int(args.budget_per_dim),
+        "budget_per_dim": (None if (args.budget is not None or lines_per_dim)
+                           else int(args.budget_per_dim)),
         "budgets": budgets,
         "batch_size": int(args.batch_size),
+        # "point" (POINTWISE.md) or "line" (LINEWISE.md): every method's mode.
+        "sampling": sampling,
+        "lines_per_dim": lines_per_dim,
         "input_noise": float(args.input_noise),
         "output_noise_frac": float(args.output_noise_frac),
         "extractor": {"name": args.extractor, "kwargs": extractor_kwargs,
@@ -398,10 +428,19 @@ def plan(args) -> str:
           f"= {manifest['n_configurations']} configuration(s) on the unit cube")
     print(f"    x {n_draws} draw(s) x {len(methods)} method(s) = {len(tasks)} cell(s)")
     rule = (f"{args.budget} at every dim" if args.budget is not None
-            else f"{args.budget_per_dim} x dim")
+            else (f"lines {lines_per_dim} x {args.batch_size} points" if lines_per_dim
+                  else f"{args.budget_per_dim} x dim"))
     print(f"    budget: {rule} = " + ", ".join(f"{n} at {d}d" for d, n in budgets.items())
           + f" points per cell, in batches of {args.batch_size} "
           f"(wall-clock ceiling {args.cell_max_hours:g} h)")
+    print(f"    sampling: {sampling}"
+          + (f" (every method measures {args.batch_size}-point LineBO lines)"
+             if sampling == "line" else " (one point per call)"))
+    if sampling == "line":
+        ragged = [d for d, n in budgets.items() if n % int(args.batch_size)]
+        if ragged:
+            print(f"    WARNING: the budget at dim {', '.join(ragged)} is not a whole "
+                  f"number of {args.batch_size}-point lines; the last line is cut short.")
     small = [d for d, n in budgets.items() if n <= 48]
     if small:
         print(f"    WARNING: the budget at dim {', '.join(small)} does not exceed the "
@@ -414,8 +453,7 @@ def plan(args) -> str:
                 flag = "  [STAND-IN]" if rec["is_stand_in"] else ""
                 where = f"dim {dim:>2}" if method == "zombi_hop" else "all dims"
                 print(f"    {method:<10} {where}: {rec['source']}{flag}")
-    zombi_cfg = next(iter(configs.get("zombi_hop", {}).values()), {}).get("config", {})
-    if zombi_cfg.get("sampling") == "point" and int(args.batch_size) != 1:
+    if sampling == "point" and int(args.batch_size) != 1:
         print(f"    WARNING: zombi_hop measures 1 point per call but the baselines get "
               f"batches of {args.batch_size}; the comparison is not like-for-like.")
     tight = [r for r in feasibility if not r["feasible"]]

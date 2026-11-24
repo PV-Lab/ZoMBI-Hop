@@ -8,12 +8,19 @@ random search. ``sampler="sobol"`` walks one scrambled Sobol' sequence instead,
 which covers the box more evenly for the same budget; it is the stronger
 space-filling baseline, and the gap between the two says how much of a method's
 advantage is merely "not clumping".
+
+``sampling="line"`` (``benchmarks/sweeps --sampling line``) measures random LINES
+instead: the ``n_init_lines`` chords every line-mode method starts from, then one
+uniform random chord through the box per call (anchor uniform, direction isotropic:
+LineBO's chord with no acquisition to rank it), at ``batch_size`` points. ``sampler``
+is ignored in line mode. See ``benchmarks/sweeps/LINEWISE.md``.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
+from . import _lines
 from .base import AskTellMethod, Problem
 from .registry import register
 
@@ -22,13 +29,20 @@ from .registry import register
 class RandomSearch(AskTellMethod):
     name = "random"
     description = "i.i.d. uniform (or Sobol') samples in the unit box"
-    defaults = {"sampler": "uniform"}
+    defaults = {"sampler": "uniform", **_lines.LINE_DEFAULTS}
 
     def setup(self, problem: Problem) -> None:
         if self.config["sampler"] not in ("uniform", "sobol"):
             raise ValueError(f"random: sampler must be 'uniform' or 'sobol', "
                              f"got {self.config['sampler']!r}")
         self.dim = problem.dim
+        self.line_mode = _lines.check_sampling(self.name, self.config, problem.batch_size)
+        if self.line_mode:
+            self.B = int(problem.batch_size)
+            self._queue = _lines.LineQueue()
+            for left, right in _lines.init_chords(self.rng, int(self.config["n_init_lines"]),
+                                                  self.dim):
+                self._queue.push_line(left, right, self.B)
         self._sobol = None
         if self.config["sampler"] == "sobol":
             from scipy.stats import qmc
@@ -37,6 +51,12 @@ class RandomSearch(AskTellMethod):
                                     seed=self.seed & 0xFFFFFFFF)
 
     def ask(self, n: int) -> np.ndarray:
+        if self.line_mode:
+            if not len(self._queue):
+                left, right = _lines.random_chords(self.rng, 1, np.zeros(self.dim),
+                                                   np.ones(self.dim))
+                self._queue.push_line(left[0], right[0], self.B)
+            return self._queue.pop(n)
         if self._sobol is not None:
             import warnings
 

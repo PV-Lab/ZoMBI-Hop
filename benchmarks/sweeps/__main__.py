@@ -32,6 +32,7 @@ from benchmarks.methods.base import DEFAULT_OUTPUT_NOISE_FRAC  # noqa: E402
 from . import needles as nd  # noqa: E402
 from .campaign import (  # noqa: E402
     DEFAULT_BATCH,
+    DEFAULT_LINE_BATCH,
     DEFAULT_BUDGET_PER_DIM,
     DEFAULT_METHODS,
     cell_command,
@@ -78,6 +79,10 @@ def _add_config_args(p: argparse.ArgumentParser) -> None:
                    default=None, help="one config key for one method (value parsed "
                                       "as JSON); repeatable, applied after "
                                       "--method-config")
+    p.add_argument("--sampling", choices=("point", "line"), default="point",
+                   help="point: every method measures one point per call "
+                        "(POINTWISE.md). line: every method measures LineBO lines "
+                        "of --batch-size points (LINEWISE.md)")
 
 
 def describe(args) -> None:
@@ -89,7 +94,8 @@ def describe(args) -> None:
     rows = nd.plan_feasibility(dims, counts, widths)
     configs = resolve_method_configs(
         methods, dims, zombi_hparam_files=parse_hparam_overrides(args.hparams),
-        overrides=parse_method_overrides(args.method_config, args.method_set))
+        overrides=parse_method_overrides(args.method_config, args.method_set),
+        sampling=args.sampling)
     if args.json:
         print(json.dumps({"grid": {"dims": dims, "n_needles": counts,
                                    "basin_widths": widths},
@@ -158,10 +164,15 @@ def main() -> None:
                         "included (100 -> 200 points at 2d, 900 at 9d)")
     p.add_argument("--budget", type=int, default=None,
                    help="one flat budget for every dim instead of --budget-per-dim")
-    p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH,
-                   help="points per call for every method (the q of the batch "
-                        "baselines). 1 = fully sequential, which zombi_hop's point "
-                        "mode assumes; see POINTWISE.md")
+    p.add_argument("--batch-size", type=int, default=None,
+                   help=f"points per call for every method: points per line in "
+                        f"--sampling line (default {DEFAULT_LINE_BATCH}), else the q "
+                        f"of the batch baselines (default {DEFAULT_BATCH}, fully "
+                        f"sequential; POINTWISE.md)")
+    p.add_argument("--lines-per-dim", default=None, metavar="DIM=N,...",
+                   help="--sampling line only: the budget in LINES per dim, init "
+                        "lines included (e.g. 2=10,3=20,5=125 -> 240/480/3000 points "
+                        "at 24 points per line). Replaces --budget-per-dim")
     p.add_argument("--input-noise", type=float, default=0.0,
                    help="sd of Gaussian actuation noise added to every requested "
                         "coordinate (0 = the optimiser gets the point it asked for)")

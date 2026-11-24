@@ -54,6 +54,13 @@ never_terminate     keep ZoMBI-Hop sampling until the budget is spent instead of
                     not comparable to one that spent 3000)
 boundary_repulsion  ``BoxDomain(boundary_repulsion=...)``; off by default because
                     needles may sit on a face of the box
+needle_pick         ``ZoMBIHop(needle_pick=...)``: "median" (default, the shipped
+                    behaviour: declare the repeat closest to the cluster median) or
+                    "argmax" (declare the in-bounds best point). ``benchmarks/sweeps``
+                    plans "argmax" (see ``benchmarks/sweeps/LINEWISE.md``)
+hparam_overrides    hyperparameters set on top of ``hparams`` after it is loaded
+                    (e.g. ``{"needle_min_repeats": 0}`` turns the repeatability gate
+                    off); recorded in ``resolved_hparams`` like every other value
 """
 
 from __future__ import annotations
@@ -63,6 +70,7 @@ import math
 import numpy as np
 
 from ._paths import ensure_paths
+from ._lines import box_chord, init_chords
 from .base import Method, Problem, sobol_design
 from .registry import register
 
@@ -73,16 +81,8 @@ ZOMBI_FIXED = {"max_gp_points": 3000, "acquisition_type": "ucb",
                "input_noise": 0.128, "verbose": False}
 
 
-def _box_chord(x0: np.ndarray, direction: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Endpoints of the line ``x0 + t*direction`` clipped to the unit box."""
-    with np.errstate(divide="ignore", invalid="ignore"):
-        t0 = (0.0 - x0) / direction
-        t1 = (1.0 - x0) / direction
-    lo = np.where(direction != 0, np.minimum(t0, t1), -np.inf)
-    hi = np.where(direction != 0, np.maximum(t0, t1), np.inf)
-    t_min, t_max = float(lo.max()), float(hi.min())
-    return (np.clip(x0 + t_min * direction, 0.0, 1.0),
-            np.clip(x0 + t_max * direction, 0.0, 1.0))
+#: Kept for importers of the old private name; the geometry lives in ``_lines``.
+_box_chord = box_chord
 
 
 @register
@@ -100,6 +100,8 @@ class ZoMBIHopMethod(Method):
         "linebo_points_per_line": 100,
         "never_terminate": True,
         "boundary_repulsion": False,
+        "needle_pick": "median",
+        "hparam_overrides": {},
     }
 
     def __init__(self, config=None, *, seed=0, device="cpu"):
@@ -119,12 +121,17 @@ class ZoMBIHopMethod(Method):
         them. Knobs the file does not set take the shipped defaults. A conflicting
         combination raises here, which is at plan time.
         """
-        from src.hparams import (DEFAULT_HPARAMS, apply_dim_rules, check_conflicts,
-                                 extract_hparams)
+        from src.hparams import (DEFAULT_HPARAMS, HPARAMS, apply_dim_rules,
+                                 check_conflicts, coerce, extract_hparams)
 
         raw = (self.config["hparams"] if self.config["hparams"] is not None
                else DEFAULT_HPARAMS)
         hp = extract_hparams(dict(raw), source="zombi_hop hparams", log=None)
+        overrides = dict(self.config["hparam_overrides"] or {})
+        unknown = sorted(set(overrides) - set(HPARAMS))
+        if unknown:
+            raise TypeError(f"zombi_hop: unknown hparam_overrides key(s) {unknown}")
+        hp.update({k: coerce(k, v) for k, v in overrides.items()})
         for key in set(hp) & set(self.config["fixed"]):
             hp.pop(key)
         # The top-m ellipsoid fit needs at least d+1 points (shared with
@@ -184,12 +191,8 @@ class ZoMBIHopMethod(Method):
             init = sobol_design(int(self.config["n_init_points"]), d, self.seed)
             inits = [(lambda x=x: measure(x[None, :], activation=-1, zoom=-1)) for x in init]
         else:
-            inits = []
-            for _ in range(int(self.config["n_init_lines"])):
-                x0 = self.rng.random(d)
-                v = self.rng.normal(size=d)
-                left, right = _box_chord(x0, v / np.linalg.norm(v))
-                inits.append(lambda l=left, r=right: measure_line(l, r, activation=-1, zoom=-1))
+            inits = [(lambda l=left, r=right: measure_line(l, r, activation=-1, zoom=-1))
+                     for left, right in init_chords(self.rng, int(self.config["n_init_lines"]), d)]
         for step in inits:
             X_req, X_act, Y = step()
             xe.append(X_req)
@@ -223,7 +226,7 @@ class ZoMBIHopMethod(Method):
             Y_init=T(np.concatenate(ys)).reshape(-1, 1),
             **self.config["fixed"], **self.resolved_hparams(d),
             device=str(dev), dtype=dt, run_uuid=None, checkpoint_dir=None,
-            domain=domain,
+            domain=domain, needle_pick=str(self.config["needle_pick"]),
         )
         self.optimizer.run(max_activations=math.inf, time_limit_hours=None,
                            never_terminate=bool(self.config["never_terminate"]))

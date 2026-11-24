@@ -899,7 +899,12 @@ def summarize(out_dir: str, *, ci: float = DEFAULT_CI, n_boot: int = DEFAULT_N_B
         f"{manifest['n_draws']} draw(s).",
         "",
         f"Budget: **{budget_text} measured points per cell** in batches of "
-        f"{manifest['batch_size']}, identical for every method at a given dimension. "
+        f"{manifest['batch_size']}, identical for every method at a given dimension"
+        + (f" — every method measures {manifest['batch_size']}-point LineBO lines "
+           f"(`--sampling line`, LINEWISE.md; lines per dim "
+           f"{manifest.get('lines_per_dim')}). "
+           if manifest.get("sampling") == "line" else ". ")
+        +
         f"Noise: "
         f"input {manifest['input_noise']:g}, output {manifest['output_noise_frac']:g} x |y|. "
         + (("Landscape: bumps-only `CartesianEnsemble` on the unit cube — *n* "
