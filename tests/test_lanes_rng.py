@@ -6,8 +6,8 @@
   generator (CUDA once src.core.zombihop is imported, REVIEW F2): CUDA and CPU generator states are compared
   with a reference draw;
 * an explicit ``seed=`` is passed through without any global draw;
-* after the scope the three module attributes are the original objects and two unseeded calls are
-  identical again (today's behaviour, simplex.py 254-256);
+* after the scope the three module attributes are the original objects; unseeded calls still differ,
+  since random_simplex itself draws the seed the same way since 2026-11-24;
 * nested install / uninstall ref-count; idempotent uninstall; no double wrap over a ``_zoomfix`` wrapper;
 * the wrapper is token-identical to the sandbox's PF 412-415 (AST; skipped when the sandbox is absent).
 
@@ -121,7 +121,8 @@ def test_scope_restores_originals_and_unseeded_behaviour():
     for m in MODS:
         assert m.random_simplex is orig[m]
     assert not SeededSimplex.installed()
-    assert torch.equal(_draw(), _draw())             # today's unseeded behaviour: identical samples
+    # random_simplex draws an unseeded call's seed itself since 2026-11-24 (same draw as the wrapper)
+    assert not torch.equal(_draw(), _draw())
 
 
 def test_nested_install_refcount_and_idempotent_uninstall():

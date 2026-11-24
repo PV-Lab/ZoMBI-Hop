@@ -10,6 +10,7 @@ The simplex constraint ensures that compositions sum to 1:
 """
 from __future__ import annotations
 
+import os
 import torch
 import math
 from collections import namedtuple
@@ -201,6 +202,11 @@ def newton_in_bracket(
     return torch.minimum(torch.maximum(t, tl), th)
 
 
+#: Env var that restores the pre-2026-11-24 unseeded behaviour (see random_simplex). Set
+#: only by optimize/run_mobo.py when it resumes a MOBO run scored under that behaviour.
+LEGACY_UNSEEDED_ENV = "ZOMBI_LEGACY_UNSEEDED_SIMPLEX"
+
+
 def random_simplex(
     num_samples: int,
     a: torch.Tensor,
@@ -251,6 +257,13 @@ def random_simplex(
         ss, si = subset_sums_and_signs(caps_full[k + 1:])
         precomp.append((ss, si))
 
+    # seed=None draws the seed from the global torch RNG (one torch.randint on the
+    # default device, the same draw the lanes engine's Fix 4 wrapper makes, so lanes
+    # runs are unchanged). Before 2026-11-24 an unseeded call built a Generator with
+    # torch's fixed default seed and so returned the SAME samples on every call; the
+    # LEGACY_UNSEEDED_ENV env var brings that back for resumed MOBO runs only.
+    if seed is None and os.environ.get(LEGACY_UNSEEDED_ENV) != "1":
+        seed = int(torch.randint(0, 2 ** 62, (1,)).item())
     rng = torch.Generator(device=device)
     if seed is not None:
         rng.manual_seed(seed)

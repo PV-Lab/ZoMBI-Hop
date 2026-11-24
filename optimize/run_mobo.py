@@ -311,6 +311,11 @@ BUDGET_POINTS: int | None = DEFAULT_BUDGET_POINTS
 # ``never_terminate`` in run_config.json; a resumed run without it keeps the old
 # behaviour (False) so its own trials stay comparable.
 NEVER_TERMINATE = True
+# random_simplex draws an unseeded call's seed from the global RNG (fixed 2026-11-24;
+# before, every unseeded call returned the same samples). New runs stamp
+# ``random_simplex_seeded`` in run_config.json; a resumed run without it keeps the old
+# behaviour (src.utils.simplex.LEGACY_UNSEEDED_ENV) so its own trials stay comparable.
+RANDOM_SIMPLEX_SEEDED = True
 
 # MOBO settings
 N_INIT_TRIALS    = 8       # Sobol initial designs before BO begins
@@ -533,6 +538,12 @@ def _host_rss() -> tuple[int, int]:
 # summary printed after optimizer.run() returns cannot catch a transient RAM
 # spike that OOM-kills the job mid-run, so we also sample inside the timed loop.
 MEM_LOG_EVERY = 50
+
+# Uniform simplex samples behind metrics_over_time.csv's pct_space_penalized*
+# columns (penalized_space.png): ~0.2 percentage-point Monte Carlo error at 50%
+# coverage. evaluate.py reuses this constant, so MOBO trials and showdown runs
+# measure coverage identically.
+PENALTY_COVERAGE_SAMPLES = 50_000
 
 
 def log_resource_usage(tag: str) -> None:
@@ -764,6 +775,8 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
         cfg["never_terminate"] = True
     if BUDGET_POINTS is not None:
         cfg["budget_points"] = int(BUDGET_POINTS)
+    if RANDOM_SIMPLEX_SEEDED:
+        cfg["random_simplex_seeded"] = True
     # Same rule for the zone penalty shape: not a tuned axis, so every trial runs the
     # registry default. That default became "linear" on 2026-10-18; history without the
     # key was scored under "quadratic" and must not pool with linear runs.
@@ -1419,6 +1432,9 @@ def _run_signature(cfg: dict) -> dict:
         "never_terminate": cfg.get("never_terminate"),
         "budget_points": cfg.get("budget_points"),
         "ensemble_output_rescale": cfg.get("ensemble_output_rescale"),
+        # 2026-11-24 random_simplex seeding fix: absent in older configs, whose trials
+        # ran with every unseeded random_simplex call returning the same samples.
+        "random_simplex_seeded": cfg.get("random_simplex_seeded"),
     }
 
 
@@ -2799,6 +2815,16 @@ def run_single_trial(
     dh_ref = [None]
     gp_ref = [None]
 
+    # Fixed uniform sample of the simplex for the per-line penalised-space estimate.
+    # Its own generator, so measuring coverage never moves the optimiser's RNG.
+    coverage_X = torch.as_tensor(
+        np.random.default_rng(0).dirichlet(np.ones(dim), size=PENALTY_COVERAGE_SAMPLES),
+        dtype=DTYPE, device=DEVICE)
+    # Seconds spent measuring coverage inside the timed loop. Subtracted from
+    # runtime afterwards: it is instrumentation, not optimiser work, and
+    # avg_time_per_iter_s is a MOBO objective.
+    coverage_s = [0.0]
+
     sim_obj = make_sim_obj(fn_callable, DEVICE, DTYPE, maximize=maximize)
     inner   = make_linebo_wrapper(sim_obj, dim, NUM_LINES, DEVICE, DTYPE, plot_state)
 
@@ -2820,6 +2846,9 @@ def run_single_trial(
         call_counter[0] += 1
         dh = dh_ref[0]
         needles = dh.needles
+        t_cov = time.time()
+        pen_any, pen_needle = dh.penalty_coverage(coverage_X)
+        coverage_s[0] += time.time() - t_cov
         payload = dict(
             iter_num=call_counter[0],
             needles=(as_numpy(needles)
@@ -2833,6 +2862,8 @@ def run_single_trial(
             # just per snapshot) so lines-per-activation is exact rather than
             # inferred from point counts.
             activation=int(dh.current_activation),
+            pct_space_penalized=100.0 * pen_any,
+            pct_space_penalized_needles=100.0 * pen_needle,
         )
         if keep_heavy:
             # Drop heavy fields from the prior payload — only the final one is rendered.
@@ -2941,7 +2972,10 @@ def run_single_trial(
     except Exception as exc:
         print(f"    [trial] ZoMBI crashed: {exc}")
         traceback.print_exc()
-    runtime = time.time() - t0
+    runtime = time.time() - t0 - coverage_s[0]
+    if coverage_s[0] > 0:
+        print(f"    [trial] penalised-space measurement: {coverage_s[0]:.1f}s "
+              "(excluded from runtime)", flush=True)
 
     n_iters = call_counter[0]
     avg_time_per_iter = runtime / n_iters if n_iters > 0 else 0.0
@@ -2992,6 +3026,11 @@ def run_single_trial(
                          declared_samples=plot_metrics.needle_declaration_samples(trial_dir))
     except Exception as exc:
         print(f"    [trial] static plot failed: {exc}")
+    try:
+        import plot_metrics
+        plot_metrics.plot_penalized_space(trial_dir)
+    except Exception as exc:
+        print(f"    [trial] penalized_space plot failed: {exc}")
 
     # CoNet artifacts (ensemble runs only: the uniform baseline reconstructs the
     # landscape from ensemble_config.json). Best-effort, isolated subprocesses.
@@ -3900,7 +3939,8 @@ def _set_run_rules(cli_budget: int | None, saved_cfg: dict | None = None) -> Non
     before 2026-11-07 have neither key: no point cap, never_terminate off). An
     explicit --budget-points that contradicts the saved run is an error.
     """
-    global BUDGET_POINTS, NEVER_TERMINATE
+    global BUDGET_POINTS, NEVER_TERMINATE, RANDOM_SIMPLEX_SEEDED
+    from src.utils.simplex import LEGACY_UNSEEDED_ENV
     if saved_cfg is not None:
         saved = saved_cfg.get("budget_points")
         if cli_budget is not None and (cli_budget or None) != saved:
@@ -3908,11 +3948,19 @@ def _set_run_rules(cli_budget: int | None, saved_cfg: dict | None = None) -> Non
                      f"was started with budget_points={saved!r}.")
         BUDGET_POINTS = saved
         NEVER_TERMINATE = bool(saved_cfg.get("never_terminate", False))
+        RANDOM_SIMPLEX_SEEDED = bool(saved_cfg.get("random_simplex_seeded", False))
     else:
         b = DEFAULT_BUDGET_POINTS if cli_budget is None else cli_budget
         BUDGET_POINTS = int(b) if b and b > 0 else None
         NEVER_TERMINATE = True
-    print(f"  [rules] budget_points={BUDGET_POINTS}  never_terminate={NEVER_TERMINATE}")
+        RANDOM_SIMPLEX_SEEDED = True
+    # Read by random_simplex at call time; the env reaches any subprocess too.
+    if RANDOM_SIMPLEX_SEEDED:
+        os.environ.pop(LEGACY_UNSEEDED_ENV, None)
+    else:
+        os.environ[LEGACY_UNSEEDED_ENV] = "1"
+    print(f"  [rules] budget_points={BUDGET_POINTS}  never_terminate={NEVER_TERMINATE}"
+          f"  random_simplex_seeded={RANDOM_SIMPLEX_SEEDED}")
 
 
 def main() -> None:

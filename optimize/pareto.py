@@ -242,6 +242,9 @@ def _run_signature(cfg: dict) -> dict:
         "never_terminate": cfg.get("never_terminate"),
         "budget_points": cfg.get("budget_points"),
         "ensemble_output_rescale": cfg.get("ensemble_output_rescale"),
+        # 2026-11-24 random_simplex seeding fix: absent in older configs, whose trials
+        # ran with every unseeded random_simplex call returning the same samples.
+        "random_simplex_seeded": cfg.get("random_simplex_seeded"),
     }
 
 

@@ -25,6 +25,11 @@ when an engine is built and ``token.uninstall()`` restores them in ``engine.clos
   install wraps again.
 
 No import-time side effects (REVIEW F12): nothing is patched until ``install()`` is called.
+
+Since 2026-11-24 ``random_simplex`` itself draws an unseeded call's seed with the same
+``torch.randint(0, 2 ** 62, (1,))``, so the bug above is fixed for every caller and this wrapper no
+longer changes any samples. It is kept so the engine draws exactly as validated even when
+``ZOMBI_LEGACY_UNSEEDED_SIMPLEX=1`` restores the old behaviour for a resumed MOBO run.
 """
 from __future__ import annotations
 
