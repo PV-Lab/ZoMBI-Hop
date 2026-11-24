@@ -2,23 +2,48 @@
 #SBATCH --job-name=ensemble_mobo_10d
 #SBATCH --output=optimize/scripts/logs/ensemble_mobo_10d_%j.out
 #SBATCH --error=optimize/scripts/logs/ensemble_mobo_10d_%j.err
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=128G
+#SBATCH --mem=48G
 #SBATCH --partition=sched_mit_sloan_gpu_r8
 #SBATCH --gres=gpu:1
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@120
 
+# =============================================================================
+# 10d MOBO campaign "campaign_10d_20k_20261124" (started 2026-11-24).
+#   * seeded with optimize/hparams/dup1c_custom.json + 3 random (Sobol) trials,
+#     then MOBO (qLogNEHVI) on the pooled history;
+#   * 2 ensemble landscapes per trial (--ensemble-repeats 2), 20k measured points
+#     per landscape run (--budget-points 20000), no plots (data only);
+#   * history pooled ONLY from this campaign's run dirs ($CAMPAIGN/mobo_*): it lives
+#     outside optimize/runs/mobo_*, and --share-dirs points at it alone. (Its
+#     signature -- budget 20000, 2 repeats, random_simplex_seeded -- matches no
+#     older run anyway.)
+# Up to 8 of these run at once (babysitter TARGET[10d]=8; 8 of the partition's 16
+# A100s). The previous 10d fleet script (3000 points, 5 repeats) is in git history.
+#
+# Roles: the first 4 jobs to start each claim one init trial (seed, sobol1..3) with
+# an atomic mkdir under $CAMPAIGN/init_claims/; every later job is a BO worker. A BO
+# worker that starts before the 4 init trials are done does not sit on a GPU: it
+# resubmits itself to start an hour later and exits. Init workers run BO after their
+# init trial, waiting (--min-history 4) until all 4 init trials are in.
+# =============================================================================
+
+CAMPAIGN="optimize/runs/campaign_10d_20k_20261124"
+N_INIT=4                    # dup1c_custom seed + 3 Sobol
+WALL_S=$(( 24 * 3600 ))     # keep equal to --time above
+INIT_GRACE_H=14             # BO workers stop waiting for init this long after launch
+
 # --- auto-continue across the wall-time limit ---------------------------------
-# 120s before the --time limit SLURM sends USR1 to this batch script.
-# Preferred path: requeue THIS job (same ID) so it resumes when scheduled.
-# Fallback: if requeue is refused (e.g. requeue/age limit reached), submit a
-# brand-new job so the chain never dies. Cancel with `scancel` to stop it.
+# Normal path: run_mobo stops on its own before starting a landscape run that cannot
+# finish by $DEADLINE (exit 75) and this job requeues itself under the SAME id, so the
+# trial resumes at that landscape run. The USR1 trap (120 s before the kill) is the
+# backstop if a run overruns. Requeue keeps the job id -> same RUN_DIR -> resume; if
+# requeue is refused, a fresh job is submitted (new id, new run dir).
 requeued=0
-on_time_limit() {
-    echo "[$(date)] wall-time approaching; requeuing job $SLURM_JOB_ID"
+requeue_self() {
     if scontrol requeue "$SLURM_JOB_ID"; then
         requeued=1
         echo "[$(date)] requeue accepted"
@@ -26,63 +51,89 @@ on_time_limit() {
         echo "[$(date)] requeue refused; submitting a fresh job"
         sbatch "$0"
     fi
+}
+on_time_limit() {
+    echo "[$(date)] wall-time approaching; requeuing job $SLURM_JOB_ID"
+    requeue_self
     exit 0
 }
 trap on_time_limit USR1
 
-# Stable run dir keyed on the job id: a `scontrol requeue` keeps the SAME
-# SLURM_JOB_ID, so the relaunched job re-enters this exact folder and resumes the
-# interrupted ensemble trial (reusing already-finished run_<k> repeats) instead of
-# starting a fresh run and re-spending that GPU time. A clean-exit chain or the
-# fallback resubmit gets a new job id (new dir) — a genuinely fresh run, which is
-# correct. Keep the `mobo_` prefix so shared-history's `mobo_*` glob still sees it.
-RUN_DIR="optimize/runs/mobo_ensemble_10d_job${SLURM_JOB_ID}"
+DEADLINE=$(( $(date +%s) + WALL_S - 300 ))
+mkdir -p "$CAMPAIGN/init_claims"
+[ -f "$CAMPAIGN/started_at" ] || date +%s > "$CAMPAIGN/started_at"
 
-# Randomize the ensemble landscape per job, but keep it STABLE across a requeue.
-# Keying the seed on SLURM_JOB_ID (like RUN_DIR above) means a `scontrol requeue`
-# — same job id — rebuilds the identical landscape so the resumed trials still
-# match, while every fresh sbatch / clean-exit resubmit gets a new id and thus a
-# new landscape. Modulo keeps it in the int32 range NumPy's RandomState accepts.
+# Stable run dir keyed on the job id (a requeue keeps the id and resumes in place).
+# The mobo_ prefix is what --share-history globs.
+RUN_DIR="$CAMPAIGN/mobo_ensemble_10d_job${SLURM_JOB_ID}"
+# Landscape seed per job, stable across a requeue (int32 range for NumPy).
 ENSEMBLE_SEED=$(( SLURM_JOB_ID % 2147483647 ))
 
-# Seeds: the four 6d Pareto winners (2 best dist_to_needles, 2 best dup_fraction from
-# the job192023xx pool) PLUS merge1, the hand-crafted config that led the showdown's
-# gap-to-field on dist while declaring the most needles — all PROJECTED into the
-# HPARAM_SPACE re-tightened on 2026-08-12. The projection is written to disk rather
-# than left to hparams_to_norm's silent [0,1] clamp so the configuration that gets
-# re-evaluated here is exactly the one the JSON describes; seeding the older
-# optimize/hparams/clamped_6d/ files directly would now re-evaluate something neither
-# file describes (dup1c's nat_grad_max_steps=400 would land on 80, dist2c's
-# max_zooms=10 on 6, and so on). merge1 needed no projection at all — it already sat
-# inside every new bound, which is a large part of why the new bounds are where they
-# are. Regenerate with optimize/hparams/tight_6d/ if HPARAM_SPACE moves again.
-#
-# These are re-evaluated as initial trials IN ADDITION to the full Sobol init
-# (load_seed_hparams ignores their stored 6d metrics), which is what makes a fresh
-# 10d pool start from known-good regions without inheriting incomparable scores.
-# The old 10d runs were moved to optimize/runs/archived_runs/ — they were tuned
-# under the OLD bounds, where the same normalised coordinate means a different
-# configuration (and the space has since lost an axis, so it is not even the same
-# dimension), and --share-history only globs one level (runs/mobo_*), so archiving
-# them is what keeps this pool clean. Do not move them back.
-uv run python optimize/run_mobo.py --dataset ensemble --dim 10 --time-limit 2 --init axial --budget-points 3000 --share-history \
+n_done() { ls "$CAMPAIGN"/mobo_*/trial_*/trial.json 2>/dev/null | wc -l; }
+
+# --- role (persisted in RUN_DIR/role so a requeue keeps it) --------------------
+if [ -f "$RUN_DIR/role" ]; then
+    ROLE=$(cat "$RUN_DIR/role")
+else
+    ROLE=bo
+    for r in seed sobol1 sobol2 sobol3; do
+        c="$CAMPAIGN/init_claims/$r"
+        if [ -d "$c" ]; then
+            # Reclaim an init slot whose owner is gone (not queued/running) without
+            # having finished its init trial (a crash replaced by a fresh job id).
+            owner=$(cat "$c/owner" 2>/dev/null)
+            if [ -n "$owner" ] && [ -z "$(squeue -h -j "$owner" -o %T 2>/dev/null)" ] \
+               && ! ls "$CAMPAIGN/mobo_ensemble_10d_job${owner}"/trial_1/trial.json >/dev/null 2>&1; then
+                echo "[$(date)] init slot $r: owner job $owner is gone without a result; reclaiming"
+                rm -rf "$c"
+            fi
+        fi
+        if mkdir "$c" 2>/dev/null; then
+            echo "$SLURM_JOB_ID" > "$c/owner"
+            ROLE=$r
+            break
+        fi
+    done
+    if [ "$ROLE" = bo ]; then
+        started=$(cat "$CAMPAIGN/started_at")
+        if [ "$(n_done)" -lt "$N_INIT" ] && [ $(( $(date +%s) - started )) -lt $(( INIT_GRACE_H * 3600 )) ]; then
+            echo "[$(date)] BO worker: $(n_done)/$N_INIT init trials done; resubmitting to start in 1 h"
+            sbatch --begin=now+1hour "$0"
+            exit 0
+        fi
+    fi
+    mkdir -p "$RUN_DIR"
+    echo "$ROLE" > "$RUN_DIR/role"
+fi
+echo "[$(date)] job $SLURM_JOB_ID on $(hostname): role=$ROLE run_dir=$RUN_DIR seed=$ENSEMBLE_SEED"
+
+case "$ROLE" in
+    seed)   INIT_ARGS=(--start-from-best optimize/hparams/dup1c_custom.json --n-init-trials 0) ;;
+    sobol*) INIT_ARGS=(--n-init-trials 1 --force-init) ;;
+    *)      INIT_ARGS=(--n-init-trials 0) ;;
+esac
+
+# --time-limit 9: per-landscape-run safety cap in hours (a dup1c_custom 10d run at
+# 20k points takes ~4.8 h); runs normally end on the point budget.
+uv run python optimize/run_mobo.py --dataset ensemble --dim 10 --init axial \
+    --budget-points 20000 --ensemble-repeats 2 --time-limit 9 \
+    --share-history --share-dirs "$CAMPAIGN" \
     --ensemble-seed "$ENSEMBLE_SEED" \
-    --start-from-best \
-        optimize/hparams/dup1c_custom.json \
-    --run-dir "$RUN_DIR" &
+    "${INIT_ARGS[@]}" --min-history "$N_INIT" \
+    --deadline-epoch "$DEADLINE" \
+    --run-dir "$RUN_DIR" < /dev/null &
 wait $!
 rc=$?
 
-# Reached only if the run exits on its own (not killed by the wall-time signal).
-# Only resubmit on a clean exit (rc=0). A non-zero rc means run_mobo.py hit a
-# fatal abort (MAX_CONSEC_FAIL consecutive crashes) or the process died — in that
-# case resubmitting just spawns another dead run_dir every couple of minutes, so
-# stop the chain and let the user fix the root cause and resubmit manually.
 if [ "$requeued" -eq 0 ]; then
-    if [ "$rc" -eq 0 ]; then
+    if [ "$rc" -eq 75 ]; then
+        echo "[$(date)] run stopped before its deadline (rc=75); requeuing job $SLURM_JOB_ID"
+        requeue_self
+    elif [ "$rc" -eq 0 ]; then
         echo "[$(date)] run exited cleanly (rc=0); submitting next job"
         sbatch "$0"
     else
+        # Marker the babysitter classifies crashes by -- keep the wording.
         echo "[$(date)] run exited with rc=$rc (fatal abort/crash) — NOT resubmitting."
         echo "[$(date)] fix the issue and resubmit manually with: sbatch $0"
     fi

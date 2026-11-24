@@ -54,6 +54,11 @@ n_points per repeat as a diagnostic.
 
 MOBO engine: qLogNEHVI (BoTorch, maximises negated objectives).
 
+Plots are OFF by default (since 2026-11-24, for campaign throughput): a trial writes
+its CSVs (points, needles, metrics_over_time), metrics.json and, at 3D,
+coverage_ground_truth.npz, and nothing is rendered. ``--plots`` restores the renders
+described next.
+
 Landscape plotting scales with dimension: 3D renders per-iteration ternary frames
 plus an end-of-trial static coverage plot; 4D renders a single end-of-trial
 interactive (rotatable) point-cloud HTML (point_cloud.html; no per-iteration
@@ -254,8 +259,10 @@ from synthetic_data.ackley import Ackley
 from synthetic_data.campaign_datasets import load_metadata, resolve_metadata_path
 from synthetic_data.ensemble import (
     Ensemble,
+    basin_width_range,
     optima_count_range,
     random_ensemble_config,
+    recorded_ensemble_ranges,
 )
 
 DATASET_DIMS = {"RF": 3, "ackley3d": 3, "ackley4d": 4, "ackley10d": 10}
@@ -316,6 +323,80 @@ NEVER_TERMINATE = True
 # ``random_simplex_seeded`` in run_config.json; a resumed run without it keeps the old
 # behaviour (src.utils.simplex.LEGACY_UNSEEDED_ENV) so its own trials stay comparable.
 RANDOM_SIMPLEX_SEEDED = True
+# Render per-trial plots (convergence, dist_from_centre, line-length histogram,
+# penalized space, metrics/needle-value plots, CoNet pair, final ternary frame, 4D
+# point cloud, hparam edge proximity)? Off by default since 2026-11-24 for campaign
+# throughput: every CSV, metrics.json and coverage_ground_truth.npz is still written,
+# so any plot can be rendered afterwards. --plots turns them back on. Not part of the
+# run signature: it never changes a trial's scores.
+RENDER_PLOTS = False
+# Job deadline (--deadline-epoch, Unix seconds; None = none). Before each ensemble
+# repeat the run checks whether that repeat can still finish (estimate: the slowest
+# repeat this process has run, plus DEADLINE_MARGIN_S) and otherwise stops cleanly
+# with exit code DEADLINE_EXIT_CODE, so the sbatch wrapper requeues the SAME job id
+# and the trial resumes at that repeat. Without it, a repeat cut off by the SLURM
+# wall-time is lost whole (repeats resume only at run_<k> granularity).
+DEADLINE_EPOCH: float | None = None
+DEADLINE_MARGIN_S = 600
+DEADLINE_EXIT_CODE = 75
+_REPEAT_SECONDS: list[float] = []
+# --min-history N: a BO proposal waits (polling shared history) until the GP has at
+# least N trials, so parallel workers don't fit MOBO on one or two points while the
+# campaign's init trials are still finishing elsewhere.
+MIN_HISTORY = 0
+MIN_HISTORY_POLL_S = 120
+FORCE_INIT = False
+# Parallel BO: sibling runs' in-flight trials (their pending.json, no trial.json yet)
+# are passed to qLogNEHVI as X_pending so concurrent workers don't propose the same
+# point. A pending.json older than this is a dead worker's and is ignored.
+PENDING_MAX_AGE_S = 36 * 3600
+# Give up waiting after this long (a sibling's init trial may have died) and propose
+# from whatever history there is, as long as there is at least one trial.
+MIN_HISTORY_MAX_WAIT_S = 2 * 3600
+
+
+class _DeadlineStop(BaseException):
+    """Clean stop before work that cannot finish by DEADLINE_EPOCH (not a failure:
+    a BaseException so the per-trial ``except Exception`` retry loop never sees it)."""
+
+
+def _sibling_pending_X(share_dirs: list[str] | None, run_dir: str) -> list[torch.Tensor]:
+    """x_norm of every in-flight trial in sibling runs under *share_dirs*."""
+    out: list[torch.Tensor] = []
+    if not share_dirs:
+        return out
+    own = os.path.realpath(run_dir)
+    now = time.time()
+    for d in share_dirs:
+        for p in glob.glob(os.path.join(d, "mobo_*", "trial_*", "pending.json")):
+            tdir = os.path.dirname(p)
+            if os.path.realpath(os.path.dirname(tdir)) == own:
+                continue
+            if os.path.exists(os.path.join(tdir, "trial.json")):
+                continue
+            try:
+                if now - os.path.getmtime(p) > PENDING_MAX_AGE_S:
+                    continue
+                with open(p) as f:
+                    x = json.load(f).get("x_norm")
+                if x is not None and len(x) == N_HPARAMS:
+                    out.append(torch.tensor(x, dtype=DTYPE))
+            except Exception:
+                continue
+    return out
+
+
+def _check_deadline(what: str, est_s: float | None = None) -> None:
+    if DEADLINE_EPOCH is None:
+        return
+    if est_s is None:
+        est_s = max(_REPEAT_SECONDS) if _REPEAT_SECONDS else 0.0
+    left = DEADLINE_EPOCH - time.time()
+    if left < est_s + DEADLINE_MARGIN_S:
+        print(f"  [deadline] {left / 3600:.2f} h left, {what} needs ~{est_s / 3600:.2f} h "
+              f"(+{DEADLINE_MARGIN_S // 60} min margin): stopping cleanly for a requeue",
+              flush=True)
+        raise _DeadlineStop(what)
 
 # MOBO settings
 N_INIT_TRIALS    = 8       # Sobol initial designs before BO begins
@@ -804,6 +885,8 @@ def write_run_config(run_dir, landscape: LandscapeSpec, *,
         cfg["ensemble_repeats"] = ensemble_spec.get("n_repeats", ENSEMBLE_N_REPEATS)
         if ensemble_spec.get("output_rescale") is not None:
             cfg["ensemble_output_rescale"] = [float(v) for v in ensemble_spec["output_rescale"]]
+        cfg["ensemble_optima_range"] = list(ensemble_spec["optima_range"])
+        cfg["ensemble_basin_width_range"] = list(ensemble_spec["basin_width_range"])
     if batch_name:
         cfg["batch_name"] = batch_name
     if batch_config_path:
@@ -1435,6 +1518,11 @@ def _run_signature(cfg: dict) -> dict:
         # 2026-11-24 random_simplex seeding fix: absent in older configs, whose trials
         # ran with every unseeded random_simplex call returning the same samples.
         "random_simplex_seeded": cfg.get("random_simplex_seeded"),
+        # 2026-11-24 10d range change: the n_optima / basin_width draw ranges. A
+        # config without them reports the legacy ranges it drew from, so 3d/4d/6d
+        # pools (unchanged ranges) still match while old and new 10d split.
+        "ensemble_optima_range": recorded_ensemble_ranges(cfg)[0],
+        "ensemble_basin_width_range": recorded_ensemble_ranges(cfg)[1],
     }
 
 
@@ -2594,6 +2682,7 @@ def reseed_ackley_dataset(ds: dict, seed: int) -> dict:
 def build_ensemble_landscape(
     dim: int, *, optima_margin: float, seed: int, time_limit_hours: float | None,
     output_rescale: list | None = None,
+    optima_range: list | None = None, bw_range: list | None = None,
 ) -> LandscapeSpec:
     """Base ``LandscapeSpec`` for the layered Ensemble objective.
 
@@ -2603,7 +2692,8 @@ def build_ensemble_landscape(
     tagged ``"ensemble"`` so resume can recognise and rebuild it.
     """
     cfg = random_ensemble_config(dim, index=0, total=1, seed=int(seed),
-                                 optima_margin=optima_margin)
+                                 optima_margin=optima_margin,
+                                 optima_range=optima_range, bw_range=bw_range)
     if output_rescale is not None:
         cfg["output_rescale"] = [float(v) for v in output_rescale]
     fn = Ensemble(**cfg)
@@ -2836,7 +2926,8 @@ def run_single_trial(
     # cloud every iteration, which on a long trial exhausts the cgroup limit and
     # triggers an OOM kill. At dim ≥ 4 no frames are drawn, so heavy fields are
     # never kept.
-    keep_heavy = landscape.render_ternary
+    # Without plots nothing reads the heavy fields (nor the per-line GP grid at 3D).
+    keep_heavy = landscape.render_ternary and RENDER_PLOTS
     HEAVY_PAYLOAD_KEYS = (
         "pared_X", "pared_Y", "needle_M_list", "needle_B", "bounds", "gp_grid_vals",
     )
@@ -3012,61 +3103,63 @@ def run_single_trial(
     except Exception as exc:
         print(f"    [trial] CSV write failed: {exc}")
 
-    try:
-        plot_dist_from_centre(os.path.join(trial_dir, "dist_from_centre.png"), dh, maximize)
-        plot_line_length_hist(os.path.join(trial_dir, "line_length_hist.png"), payloads)
-        # Pass the per-point activation ids so the running-best envelope RESETS at
-        # every activation boundary (a sawtooth per activation) instead of one
-        # globally-monotone curve — each activation is a fresh ZoMBI search phase,
-        # so coasting on an earlier phase's peak hides how much it re-explores.
-        act_per_point, _ = _activation_zoom_per_point(n_points, snap_records)
-        import plot_metrics
-        plot_convergence(os.path.join(trial_dir, "convergence.png"), dh, maximize,
-                         activations=act_per_point,
-                         declared_samples=plot_metrics.needle_declaration_samples(trial_dir))
-    except Exception as exc:
-        print(f"    [trial] static plot failed: {exc}")
-    try:
-        import plot_metrics
-        plot_metrics.plot_penalized_space(trial_dir)
-    except Exception as exc:
-        print(f"    [trial] penalized_space plot failed: {exc}")
-
-    # CoNet artifacts (ensemble runs only: the uniform baseline reconstructs the
-    # landscape from ensemble_config.json). Best-effort, isolated subprocesses.
-    if ensemble_config is not None:
-        _render_conet_artifacts(trial_dir)
-
-    if landscape.render_ternary and grid_pts is not None and grid_vals is not None and payloads:
-        plots_dir = os.path.join(trial_dir, "plots")
-        os.makedirs(plots_dir, exist_ok=True)
-        # Only render the final iteration's frame per run — the full per-iteration
-        # sweep dominates wall-clock (each frame re-plots the accumulated cloud, so
-        # cost grows with iteration count). Videos are built separately (make_videos.py).
-        p = payloads[-1]
-        print("    [trial] rendering final ternary frame …", flush=True)
+    # --plots only (RENDER_PLOTS): the data above is everything a plot needs later.
+    if RENDER_PLOTS:
         try:
-            ref_title = (
-                "Reference: oracle landscape"
-                if landscape.landscape == "synthetic"
-                else "Reference: RF landscape"
-            )
-            render_frame(
-                p, grid_pts, grid_vals, true_optima, maximize,
-                os.path.join(plots_dir, f"iter_{p['iter_num'] - 1:04d}.png"),
-                ref_title=ref_title,
-            )
+            plot_dist_from_centre(os.path.join(trial_dir, "dist_from_centre.png"), dh, maximize)
+            plot_line_length_hist(os.path.join(trial_dir, "line_length_hist.png"), payloads)
+            # Pass the per-point activation ids so the running-best envelope RESETS at
+            # every activation boundary (a sawtooth per activation) instead of one
+            # globally-monotone curve — each activation is a fresh ZoMBI search phase,
+            # so coasting on an earlier phase's peak hides how much it re-explores.
+            act_per_point, _ = _activation_zoom_per_point(n_points, snap_records)
+            import plot_metrics
+            plot_convergence(os.path.join(trial_dir, "convergence.png"), dh, maximize,
+                             activations=act_per_point,
+                             declared_samples=plot_metrics.needle_declaration_samples(trial_dir))
         except Exception as exc:
-            print(f"    [trial] frame {p['iter_num']} failed: {exc}")
-
-    if dim == 4 and hasattr(fn_callable, "predict"):
+            print(f"    [trial] static plot failed: {exc}")
         try:
-            print("    [trial] rendering 4D interactive point cloud …", flush=True)
-            _render_4d_point_cloud(
-                os.path.join(trial_dir, "point_cloud.html"),
-                fn_callable, dh, payloads[-1] if payloads else None)
+            import plot_metrics
+            plot_metrics.plot_penalized_space(trial_dir)
         except Exception as exc:
-            print(f"    [trial] 4D point cloud failed: {exc}")
+            print(f"    [trial] penalized_space plot failed: {exc}")
+
+        # CoNet artifacts (ensemble runs only: the uniform baseline reconstructs the
+        # landscape from ensemble_config.json). Best-effort, isolated subprocesses.
+        if ensemble_config is not None:
+            _render_conet_artifacts(trial_dir)
+
+        if landscape.render_ternary and grid_pts is not None and grid_vals is not None and payloads:
+            plots_dir = os.path.join(trial_dir, "plots")
+            os.makedirs(plots_dir, exist_ok=True)
+            # Only render the final iteration's frame per run — the full per-iteration
+            # sweep dominates wall-clock (each frame re-plots the accumulated cloud, so
+            # cost grows with iteration count). Videos are built separately (make_videos.py).
+            p = payloads[-1]
+            print("    [trial] rendering final ternary frame …", flush=True)
+            try:
+                ref_title = (
+                    "Reference: oracle landscape"
+                    if landscape.landscape == "synthetic"
+                    else "Reference: RF landscape"
+                )
+                render_frame(
+                    p, grid_pts, grid_vals, true_optima, maximize,
+                    os.path.join(plots_dir, f"iter_{p['iter_num'] - 1:04d}.png"),
+                    ref_title=ref_title,
+                )
+            except Exception as exc:
+                print(f"    [trial] frame {p['iter_num']} failed: {exc}")
+
+        if dim == 4 and hasattr(fn_callable, "predict"):
+            try:
+                print("    [trial] rendering 4D interactive point cloud …", flush=True)
+                _render_4d_point_cloud(
+                    os.path.join(trial_dir, "point_cloud.html"),
+                    fn_callable, dh, payloads[-1] if payloads else None)
+            except Exception as exc:
+                print(f"    [trial] 4D point cloud failed: {exc}")
 
     # Noiseless objective at the true optima — the ceiling the needle values are
     # chasing (observed Y can exceed it: make_sim_obj adds output noise).
@@ -3075,7 +3168,8 @@ def run_single_trial(
                         for o in true_optima) if true_optima else None
     except Exception:
         true_best = None
-    _auto_generate_plots(trial_dir, dim, true_best=true_best)
+    if RENDER_PLOTS:
+        _auto_generate_plots(trial_dir, dim, true_best=true_best)
 
     result = {"dist": dist, "dup": dup, "runtime": runtime,
               "avg_time_per_iter": avg_time_per_iter, "n_iters": n_iters,
@@ -3175,7 +3269,9 @@ def evaluate_hparams(
         idx = int(trial_num) * 1024 + int(k)
         cfg = random_ensemble_config(
             ensemble_spec["dim"], idx, seed=int(ensemble_spec["seed"]),
-            optima_margin=ensemble_spec["optima_margin"])
+            optima_margin=ensemble_spec["optima_margin"],
+            optima_range=ensemble_spec["optima_range"],
+            bw_range=ensemble_spec["basin_width_range"])
         if ensemble_spec.get("output_rescale") is not None:
             # Saved with the trial's ensemble_config.json, so the CoNet render and
             # any rebuild see the same rescaled landscape.
@@ -3195,8 +3291,11 @@ def evaluate_hparams(
         # so this repeat re-runs cleanly from scratch.
         if os.path.isdir(run_dir):
             shutil.rmtree(run_dir, ignore_errors=True)
+        _check_deadline(f"ensemble repeat {k}/{n_repeats}")
         print(f"    [ensemble repeat {k}/{n_repeats}]", flush=True)
+        _t_rep = time.time()
         r = run_single_trial(hparams, landscape, run_dir, ensemble_config=cfg)
+        _REPEAT_SECONDS.append(time.time() - _t_rep)
         rep = {
             "run": k,
             "dist": round(r["dist"], 6),
@@ -3474,7 +3573,10 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
             init_design = None
     if init_design is None:
         n_seed  = len(seed_X)
-        n_sobol = n_init_trials if n_prior == 0 else 0
+        # FORCE_INIT (--force-init): run the Sobol init even when shared history
+        # already has trials -- a campaign's init worker that starts late still
+        # evaluates its random point.
+        n_sobol = n_init_trials if (n_prior == 0 or FORCE_INIT) else 0
         X_sobol = load_or_make_sobol(run_dir, bounds, n_sobol)
         init_design = ([(x, "seed") for x in seed_X]
                        + [(X_sobol[i], "sobol") for i in range(X_sobol.shape[0])])
@@ -3503,6 +3605,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
     consec_fail = 0
     consec_hardfail = 0
     aborted = False
+    deadline_stop = False
     try:
         while max_trials is None or len(Y_obs) < max_trials:
             _refresh_shared_history()  # absorb siblings' trials produced since last loop
@@ -3533,6 +3636,27 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                 elif use_init:
                     x_new = init_design[n_done][0].detach().cpu().clone()
                 else:
+                    _t_wait = time.time()
+                    _waited = False
+                    while len(X_prior) + len(X_obs) < MIN_HISTORY:
+                        _waited = True
+                        if (time.time() - _t_wait > MIN_HISTORY_MAX_WAIT_S
+                                and len(X_prior) + len(X_obs) >= 1):
+                            print(f"  [min-history] waited {MIN_HISTORY_MAX_WAIT_S // 3600} h; "
+                                  f"proposing from {len(X_prior) + len(X_obs)} trial(s)",
+                                  flush=True)
+                            break
+                        print(f"  [min-history] {len(X_prior) + len(X_obs)} of "
+                              f"{MIN_HISTORY} trial(s) in the history; waiting "
+                              f"{MIN_HISTORY_POLL_S}s for sibling runs", flush=True)
+                        _check_deadline("the min-history wait", est_s=MIN_HISTORY_POLL_S)
+                        time.sleep(MIN_HISTORY_POLL_S)
+                        _refresh_shared_history()
+                    if _waited:
+                        _j = float(np.random.default_rng().uniform(0, 300))
+                        print(f"  [min-history] released; {_j:.0f}s jitter before proposing",
+                              flush=True)
+                        time.sleep(_j)
                     X_t = torch.stack(X_prior + X_obs).to(DEVICE)
                     Y_t = torch.stack(Y_prior + Y_obs).to(DEVICE)
                     span = (Y_t.max(dim=0).values - Y_t.min(dim=0).values).clamp(min=1e-6)
@@ -3544,7 +3668,13 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                     )
                     mll = ExactMarginalLogLikelihood(model.likelihood, model)
                     fit_gpytorch_mll(mll)
-                    acq = qLogNEHVI(model=model, ref_point=ref_point, X_baseline=X_t)
+                    X_pend = _sibling_pending_X(share_dirs, run_dir)
+                    if X_pend:
+                        print(f"  [share] {len(X_pend)} sibling trial(s) in flight -> "
+                              f"X_pending", flush=True)
+                    acq = qLogNEHVI(
+                        model=model, ref_point=ref_point, X_baseline=X_t,
+                        X_pending=(torch.stack(X_pend).to(DEVICE) if X_pend else None))
                     candidate, _ = optimize_acqf(
                         acq_function=acq, bounds=bounds.to(DEVICE), q=1,
                         num_restarts=N_MOBO_RESTARTS, raw_samples=N_MOBO_SAMPLES,
@@ -3634,11 +3764,12 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                         aborted = True
                         break
                     continue
-                try:
-                    plot_hparam_edge_proximity(
-                        os.path.join(trial_dir, "hparam_edge_proximity.png"), x_new)
-                except Exception as exc:
-                    print(f"    [trial] hparam_edge_proximity failed: {exc}")
+                if RENDER_PLOTS:
+                    try:
+                        plot_hparam_edge_proximity(
+                            os.path.join(trial_dir, "hparam_edge_proximity.png"), x_new)
+                    except Exception as exc:
+                        print(f"    [trial] hparam_edge_proximity failed: {exc}")
 
                 X_obs.append(x_new.detach().cpu())
                 Y_obs.append(torch.tensor(
@@ -3686,6 +3817,8 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                 continue
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user — finalising results …")
+    except _DeadlineStop:
+        deadline_stop = True
 
     if max_trials is not None and len(Y_obs) >= max_trials:
         print(f"\n[stop] max_trials={max_trials} reached ({len(Y_obs)} completed).")
@@ -3696,6 +3829,11 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
           f"({n_prior} prior + {len(Y_obs)} new = {n_prior + len(Y_obs)} total). Results in {run_dir}")
     print(f"Resume (crawls all runs) with:  python optimize/run_mobo.py --resume")
     print(f"Pareto front across all runs:   python optimize/pareto.py")
+
+    if deadline_stop:
+        print(f"\n[deadline] stopped before the job's deadline; exit code "
+              f"{DEADLINE_EXIT_CODE} — the sbatch wrapper requeues this job id to resume.")
+        sys.exit(DEADLINE_EXIT_CODE)
 
     if aborted:
         # Fatal abort (MAX_CONSEC_FAIL consecutive crashes), not a clean finish.
@@ -3785,7 +3923,13 @@ def _landscape_from_legacy_ackley_cfg(cfg: dict) -> tuple[LandscapeSpec, str]:
 def _ensemble_spec_from_cfg(cfg: dict) -> dict | None:
     """Reconstruct the per-trial ensemble randomization spec from a run_config."""
     if cfg.get("dataset") == ENSEMBLE_DATASET or cfg.get("oracle") == "ensemble":
+        dim = int(cfg.get("dim", ENSEMBLE_DEFAULT_DIM))
+        opt_range, bw_range = recorded_ensemble_ranges(
+            {"ensemble_random_per_run": True, "dim": dim, **cfg})
         return {
+            # Absent before 2026-11-24: a resumed old run keeps the legacy ranges.
+            "optima_range": opt_range,
+            "basin_width_range": bw_range,
             "dim": int(cfg.get("dim", ENSEMBLE_DEFAULT_DIM)),
             "optima_margin": float(cfg.get("ensemble_optima_margin", 0.2)),
             "seed": int(cfg.get("ensemble_seed", cfg.get("seed", 0))),
@@ -3805,6 +3949,7 @@ def _landscape_from_run_config_legacy(cfg: dict) -> tuple[LandscapeSpec, str | N
             ens["dim"], optima_margin=ens["optima_margin"], seed=ens["seed"],
             time_limit_hours=cfg.get("time_limit_hours"),
             output_rescale=ens.get("output_rescale"),
+            optima_range=ens["optima_range"], bw_range=ens["basin_width_range"],
         )
         return landscape, None
     ackley_variant = cfg.get("ackley_variant")
@@ -4017,6 +4162,23 @@ def main() -> None:
                              "rounded down to even). Axial runs only share history with "
                              "axial runs. On --resume/--resume-from the saved run's "
                              "design is used.")
+    parser.add_argument("--deadline-epoch", type=float, default=None, metavar="UNIX_S",
+                        help="stop cleanly (exit code 75) before starting an ensemble "
+                             "repeat that would not finish by this time, so a wrapper "
+                             "can requeue and resume at that repeat instead of losing it "
+                             "to the wall-time kill")
+    parser.add_argument("--force-init", action="store_true",
+                        help="run the --n-init-trials Sobol init even when shared history "
+                             "already has trials (normally skipped then)")
+    parser.add_argument("--min-history", type=int, default=0, metavar="N",
+                        help="before each BO proposal, wait (polling shared history every "
+                             f"{MIN_HISTORY_POLL_S}s) until the history holds at least N "
+                             "trials (default: 0, no wait)")
+    parser.add_argument("--plots", action="store_true",
+                        help="render the per-trial plots (convergence, CoNet pair, "
+                             "ternary frame, ...). Off by default for throughput: the "
+                             "CSVs and metrics.json are always written, so plots can be "
+                             "made afterwards.")
     parser.add_argument("--budget-points", type=int, default=None,
                         help="measured-point budget per simulated run, converted to an "
                              "optimizer-line cap after the init lines, as showdown.py "
@@ -4120,6 +4282,17 @@ def main() -> None:
     time_limit_override = args.time_limit_hours if args.time_limit_hours is not None else args.time_limit
     _set_init_design(args.init)
     _set_run_rules(args.budget_points)
+    global RENDER_PLOTS, DEADLINE_EPOCH, MIN_HISTORY, FORCE_INIT
+    FORCE_INIT = bool(args.force_init)
+    RENDER_PLOTS = bool(args.plots)
+    DEADLINE_EPOCH = args.deadline_epoch
+    MIN_HISTORY = max(0, int(args.min_history))
+    if DEADLINE_EPOCH is not None:
+        print(f"  [rules] deadline: {datetime.datetime.fromtimestamp(DEADLINE_EPOCH)} "
+              f"(clean stop + exit {DEADLINE_EXIT_CODE} before a repeat that can't finish)")
+    if MIN_HISTORY:
+        print(f"  [rules] min-history: BO waits for {MIN_HISTORY} trial(s)")
+    print(f"  [rules] plots={'on' if RENDER_PLOTS else 'off (data only; --plots renders them)'}")
 
     max_trials = args.max_trials
     batch_name = None
@@ -4130,7 +4303,8 @@ def main() -> None:
         batch = load_batch_config(args.config, script_dir)
         batch_name = batch["name"]
         batch_config_path = batch["config_path"]
-        n_init = batch.get("n_init_trials") or args.n_init_trials or N_INIT_TRIALS
+        n_init = next((v for v in (batch.get("n_init_trials"), args.n_init_trials)
+                       if v is not None), N_INIT_TRIALS)   # an explicit 0 means 0
         _apply_runtime_overrides(
             device=args.device,
             time_limit_hours=batch.get("time_limit_hours") or time_limit_override,
@@ -4274,7 +4448,7 @@ def main() -> None:
         print("\n[seed] Loading 'start from best' hyperparameters to re-evaluate …")
         seed_X = load_seed_hparams(args.start_from_best)
 
-    n_init = args.n_init_trials or N_INIT_TRIALS
+    n_init = args.n_init_trials if args.n_init_trials is not None else N_INIT_TRIALS
     ackley_variant: str | None = (
         args.ackley_variant if args.dataset.startswith("ackley") else None
     )
@@ -4550,10 +4724,14 @@ def main() -> None:
             "dim": dim, "optima_margin": args.ensemble_margin, "seed": args.ensemble_seed,
             "n_repeats": args.ensemble_repeats,
             "output_rescale": list(ENSEMBLE_OUTPUT_RESCALE),
+            "optima_range": list(optima_count_range(dim)),
+            "basin_width_range": list(basin_width_range(dim)),
         }
         lo, hi = optima_count_range(dim)
+        bw_lo, bw_hi = basin_width_range(dim)
         resolutions = [
-            f"dataset: CLI --dataset ensemble (re-randomized per trial, n_optima in [{lo}, {hi}])",
+            f"dataset: CLI --dataset ensemble (re-randomized per trial, n_optima in [{lo}, {hi}], "
+            f"basin_width in [{bw_lo:g}, {bw_hi:g}])",
             f"ensemble_seed: {args.ensemble_seed}   ensemble_margin: {args.ensemble_margin}"
             f"   ensemble_repeats: {args.ensemble_repeats}",
             f"time_limit_hours: {'CLI' if time_limit_override is not None else 'default'} "
@@ -4629,6 +4807,8 @@ def main() -> None:
         ensemble_spec = {
             "dim": dim, "optima_margin": args.ensemble_margin,
             "seed": args.ensemble_seed, "n_repeats": args.ensemble_repeats,
+            "optima_range": list(optima_count_range(dim)),
+            "basin_width_range": list(basin_width_range(dim)),
         }
         lo, hi = optima_count_range(dim)
         resolutions = [

@@ -59,7 +59,7 @@ cd "$REPO" || { echo "cannot cd $REPO" >&2; exit 1; }
 # 2026-08-11 dist_to_needles change and would mix metric scales in one GP. Leaving
 # them listed-but-paused means `fleet.sh resume 3d` is all that is needed once their
 # history is sorted, rather than another edit here.
-declare -A TARGET=( [10d]=4 [4d]=2 [3d]=2 )
+declare -A TARGET=( [10d]=8 [4d]=2 [3d]=2 )   # 10d=8: campaign_10d_20k_20261124, half the 16 sloan A100s
 COOLDOWN=600             # min seconds between environmental resubmits of a type
 CIRCUIT_BREAK_FAILS=3    # N consecutive FAILED for a type -> halt, stop escalating
 
@@ -181,7 +181,9 @@ Delete the smoke run dir (optimize/runs/_babysit_smoke_${jobid}) when done."
     # crashes are rare; a stuck holder is bounded by claude's own runtime.
     ( exec 8>"$STATE/fix.lock"
       flock 8
+      # Pinned (user, 2026-11-24): at least Opus 5.5 at high effort for every escalation.
       claude -p "$prompt" \
+        --model claude-opus-5-5 --effort high \
         --allowedTools \
             "Read" "Write" "Edit" "Glob" "Grep" \
             "Bash(uv run:*)" \
