@@ -1253,21 +1253,7 @@ def run_single_eval(
     log_x: bool = False,
     log_y: bool = False,
     checkpoint: bool = False,
-    two_head: bool = False,
 ) -> dict:
-    if two_head:
-        # Two independent heads on this landscape sharing GP data (src/core/two_head.py),
-        # the simulated counterpart of the hardware two-head mode. Same artifacts, from
-        # a merged view of both heads; the line budget is split between them.
-        from two_head_eval import run_two_head_eval
-        if checkpoint:
-            print("      [two-head] --checkpoint is not supported in two-head mode; a "
-                  "retried run starts over")
-        return run_two_head_eval(
-            sys.modules[__name__], hparams, ds, dataset, out_dir, time_limit_min,
-            top_k=top_k, max_lines=max_lines, final_frame_only=final_frame_only,
-            coverage=coverage, no_video=no_video, no_convergence_plot=no_convergence_plot,
-            no_plots=no_plots, log_x=log_x, log_y=log_y)
     os.makedirs(out_dir, exist_ok=True)
     # --checkpoint: snapshot as the run goes, and resume from a previous attempt's
     # snapshots if this run dir has any (a preempted / killed worker).
@@ -1285,6 +1271,7 @@ def run_single_eval(
     dim = ds["dim"]
     fn = ds["fn"]
     maximize = ds["maximize"]
+    true_optima = ds["true_optima"]
     cols = coord_cols(dim, dataset)
 
     plot_state: dict = {"line_0": None, "line_1": None}
@@ -1483,33 +1470,6 @@ def run_single_eval(
         traceback.print_exc()
     runtime = prev_elapsed + (time.time() - t0)
 
-    result = _finalize_eval(
-        dh=dh, payloads=payloads, snap_records=snap_records, zone_states=zone_states,
-        n_lines=call_counter[0], runtime=runtime, hparams=hparams, ds=ds, dataset=dataset,
-        out_dir=out_dir, cols=cols, final_frame_only=final_frame_only, coverage=coverage,
-        no_video=no_video, no_convergence_plot=no_convergence_plot, no_plots=no_plots,
-        log_x=log_x, log_y=log_y)
-    if interrupted:
-        raise KeyboardInterrupt
-    return result
-
-
-def _finalize_eval(
-    *, dh, payloads: list[dict], snap_records: list[tuple], zone_states: list[dict],
-    n_lines: int, runtime: float, hparams: dict, ds: dict, dataset: str, out_dir: str,
-    cols: list[str], final_frame_only: bool = False, coverage: bool = False,
-    no_video: bool = False, no_convergence_plot: bool = False, no_plots: bool = False,
-    log_x: bool = False, log_y: bool = False,
-) -> dict:
-    """Metrics + every per-run artifact (CSVs, zones.pt, plots, metrics.json, CoNet)
-    for a finished run, from its data handler and the per-line records.
-
-    Shared by the single-head run (run_single_eval) and the two-head run
-    (two_head_eval), which passes a merged view of both heads."""
-    dim = ds["dim"]
-    maximize = ds["maximize"]
-    true_optima = ds["true_optima"]
-
     needle_t = dh.get_all_needle_locations()
     discovered = needle_t.detach().cpu().numpy() if needle_t.numel() > 0 else np.empty((0, dim))
     X_all_np = (dh.X_all_actual.detach().cpu().numpy()
@@ -1525,7 +1485,7 @@ def _finalize_eval(
     # it is what the showdown summary reports (higher is better).
     nn_spacing = rm.metric_median_nn_spacing(X_all_np, dim=dim)
     pct_comp = rm.metric_pct_matched_comp(discovered, true_optima, dim=dim)
-    print(f"      [run]  iters={n_lines}  dist={dist:.4f}  dup={dup:.4f}"
+    print(f"      [run]  iters={call_counter[0]}  dist={dist:.4f}  dup={dup:.4f}"
           f"  nn={nn_spacing:.5f}"
           f"  pct_comp={pct_comp:.2f}  t={runtime:.1f}s"
           f"  needles={len(discovered)}/{len(true_optima)}")
@@ -1718,6 +1678,8 @@ def _finalize_eval(
                             for f in ("ensemble_config.json", "rungp_config.json")):
         rm._render_conet_artifacts(out_dir)
 
+    if interrupted:
+        raise KeyboardInterrupt
     return {
         "dist": dist, "dup": dup, "nn_spacing": nn_spacing,
         "pct_comp": pct_comp, "pct": pct_comp,
@@ -1998,7 +1960,6 @@ def evaluate_dataset(
                     log_x=args.log_x,
                     log_y=args.log_y,
                     checkpoint=getattr(args, "checkpoint", False),
-                    two_head=getattr(args, "two_head", False),
                 )
                 if dynamic_alt is not None:
                     from warm_start import dynamic_hparams as dyn
@@ -2136,13 +2097,6 @@ def main() -> None:
                              "coverage, CoNet) while still writing every CSV and "
                              "metrics.json. Used for the extra repeats of a showdown "
                              "cell, where only one repeat needs pictures.")
-    parser.add_argument("--two-head", action="store_true", dest="two_head",
-                        help="Two-head mode (as the hardware --two-head): two independent "
-                             "ZoMBI-Hop heads on the landscape, sharing every measured point "
-                             "as GP data and adopting each other's penalty regions only "
-                             "between activations. --max-lines is the TOTAL optimizer line "
-                             "budget, split between the heads; metrics and artifacts are for "
-                             "the merged run. Not checkpointable.")
     parser.add_argument("--checkpoint", action="store_true",
                         help="Snapshot each run under <run_dir>/checkpoint/ as it goes, and "
                              "RESUME from those snapshots if the run dir already has them "

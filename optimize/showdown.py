@@ -496,9 +496,6 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
         "budget_points": args.budget_points if max_lines is not None else None,
         "max_lines": max_lines,
         "init_design": args.init,
-        # Two-head mode: max_lines is the TOTAL optimizer line budget, split
-        # between the two heads (evaluate.py --two-head).
-        "two_head": bool(args.two_head),
         "n_init_lines": n_init,
         "ensemble_overrides": args.ensemble_overrides or None,
         "landscape_seed": args.landscape_seed,
@@ -584,8 +581,6 @@ def write_plan(chosen: list[dict], landscapes: list[int], args) -> str:
                          f"--ensemble-landscape-indices \"$LS\" \\\n            "
                          f"--ensemble-seed {args.landscape_seed} \\\n            ")
     extra_flags = ""
-    if args.two_head:
-        extra_flags += "--two-head \\\n            "
     if args.init != "random":
         extra_flags += f"--init {args.init} \\\n            "
     if args.ensemble_overrides:
@@ -913,11 +908,6 @@ def main() -> None:
                     help="initial design for every run (evaluate.py --init). 'axial' "
                          "measures more init lines, so it gets fewer optimizer lines "
                          "under the same --budget-points (default: %(default)s)")
-    ap.add_argument("--two-head", action="store_true", dest="two_head",
-                    help="run every task in two-head mode (evaluate.py --two-head): two "
-                         "independent heads sharing GP data, the --budget-points budget "
-                         "split between them. Not checkpointable, so a retried task "
-                         "starts over")
     ap.add_argument("--ensemble-override", default=None, metavar="KEY=VAL[,...]",
                     help="pin ensemble knobs on every landscape (evaluate.py "
                          "--ensemble-override), e.g. 'basin_width=2.2,n_optima=15'; the "
