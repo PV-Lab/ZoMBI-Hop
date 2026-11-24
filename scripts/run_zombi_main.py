@@ -1385,6 +1385,22 @@ def _latest_snapshot_dir(run_dir: Path) -> Path | None:
     return None
 
 
+def _is_lanes_run(run_dir: Path) -> bool:
+    """True once a run has entered its lanes phase: scripts/lanes_hw.py writes
+    <run>/lanes/meta.json and lanes/init.pt when its driver starts. Such a run has
+    no snapshot at the run root (the engine snapshots under lanes/engine/)."""
+    lanes = Path(run_dir) / "lanes"
+    return (lanes / "meta.json").exists() or (lanes / "init.pt").exists()
+
+
+def _lanes_config_path(run_dir: Path) -> Path:
+    """config.json of a lanes run. The lanes engine's DataHandler writes it, under
+    the checkpoint dir lanes_hw gives the engine (<run>/lanes/engine) and the run's
+    own uuid, so it is <run>/lanes/engine/run_<uuid>/config.json, not <run>/config.json."""
+    run_dir = Path(run_dir)
+    return run_dir / "lanes" / "engine" / run_dir.name / "config.json"
+
+
 def _load_bounds_from_run(run_dir: Path, device: torch.device, dtype: torch.dtype = torch.float64) -> torch.Tensor:
     """Load bounds tensor from a saved run directory (for resuming). Handles both snapshot formats."""
     snap = _latest_snapshot_dir(run_dir)
@@ -1580,11 +1596,35 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
     # moves (a new run prints its initial lines before ZoMBIHop is constructed). On
     # resume the run's config.json wins over these values, so check that merge.
     _run_cfg = None
+    resume_is_lanes = False
     if resume_uuid is not None:
-        _cfg_path = (Path(checkpoint_dir) if checkpoint_dir is not None
-                     else Path("actual_runs") / "checkpoints") / f"run_{resume_uuid}" / "config.json"
+        _resume_dir = (Path(checkpoint_dir) if checkpoint_dir is not None
+                       else Path("actual_runs") / "checkpoints") / f"run_{resume_uuid}"
+        resume_is_lanes = _is_lanes_run(_resume_dir)
+        _cfg_path = (_lanes_config_path(_resume_dir) if resume_is_lanes
+                     else _resume_dir / "config.json")
         if _cfg_path.exists():
             _run_cfg = json.loads(_cfg_path.read_text(encoding="utf-8-sig"))
+        if resume_is_lanes:
+            # A lanes run always resumes on the lanes engine, whatever --optimizer /
+            # ZOMBI_OPTIMIZER say (the legacy loop would start over on its init data).
+            if _optimizer_choice(optimizer_name) != "lanes":
+                print(f"[ZoMBI] run_{resume_uuid} is a lanes run: resuming it on the "
+                      f"lanes engine (ignoring optimizer "
+                      f"{_optimizer_choice(optimizer_name)!r}).")
+            optimizer_name = "lanes"
+            # The lanes engine is rebuilt from the run's data, not loaded from a
+            # snapshot, so nothing restores the knobs it ran with (the legacy loop
+            # gets them from load_state). Apply its config.json here, with the same
+            # precedence a legacy resume has (recorded values win, except input_noise).
+            if _run_cfg is not None:
+                hw_hparams = resolve_for_run(hw_hparams, _run_cfg)
+                print(f"[ZoMBI] Lanes resume: hyperparameters from {_cfg_path} "
+                      f"(its values win over defaults and --hparams, except input_noise).")
+            else:
+                print(f"[ZoMBI] WARNING lanes resume: {_cfg_path} not found; resuming with "
+                      f"the default hyperparameters"
+                      + (f" plus {hparams_path}" if hparams_path else "") + ".")
     check_conflicts(resolve_for_run(hw_hparams, _run_cfg, dim=new_run_dim),
                     context=f"resume of run_{resume_uuid} (config.json values win)"
                     if resume_uuid else "new hardware run")
@@ -1631,7 +1671,18 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
         init_uuid = new_run_uuid or _fresh_run_uuid(ckpt_path)
     else:
         _rd = ckpt_path / f"run_{resume_uuid}"
-        if (_rd.exists() and _latest_snapshot_dir(_rd) is None
+        if resume_is_lanes:
+            # A lanes run resumes through the same path as a new run: the finished
+            # initial design is reloaded from init_state.json (nothing is re-measured),
+            # then lanes_hw rebuilds the engine from it plus lanes/rows.jsonl.
+            if _load_init_state(_rd) is None:
+                raise RuntimeError(
+                    f"run_{resume_uuid} is a lanes run but has no {INIT_STATE_NAME}; "
+                    f"its initial design cannot be reloaded for the resume")
+            init_uuid = resume_uuid
+            print(f"[Resume] run_{resume_uuid} is a lanes run: reloading its initial "
+                  f"design, then resuming the lanes engine from {_rd / 'lanes'}.")
+        elif (_rd.exists() and _latest_snapshot_dir(_rd) is None
                 and _load_init_state(_rd) is not None):
             init_uuid = resume_uuid
             print(f"[Resume] run_{resume_uuid} was stopped during initialization; "
@@ -1677,6 +1728,7 @@ def run_zombi_main(resume_uuid: str | None = None, optimizing_dims: list | None 
     if init_uuid is not None:
         print("=" * 80)
         print("STARTING NEW ZOMBIHOP TRIAL (DATABASE-DRIVEN)" if resume_uuid is None
+              else "RESUMING LANES RUN (DATABASE-DRIVEN)" if resume_is_lanes
               else "CONTINUING ZOMBIHOP TRIAL INITIALIZATION (DATABASE-DRIVEN)")
         print("=" * 80)
         print(f"Dimensions: {dimensions} (from OPTIMIZING_DIMS: {OPTIMIZING_DIMS})")
