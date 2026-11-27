@@ -10,6 +10,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@120
+#SBATCH --open-mode=append
 
 # =============================================================================
 # 10d MOBO campaign "campaign_10d_20k_20261124" (started 2026-11-24).
@@ -21,8 +22,11 @@
 #     outside optimize/runs/mobo_*, and --share-dirs points at it alone. (Its
 #     signature -- budget 20000, 2 repeats, random_simplex_seeded -- matches no
 #     older run anyway.)
-# Up to 8 of these run at once (babysitter TARGET[10d]=8; 8 of the partition's 16
-# A100s). The previous 10d fleet script (3000 points, 5 repeats) is in git history.
+# Up to 6 of these run at once (babysitter TARGET[10d]=6 plus the $CAMPAIGN/max_workers
+# cap, which run_mobo checks at each trial boundary; see optimize/worker_cap.py -- the
+# cap is how a running chain is shrunk, since a job's `sbatch "$0"` resubmits SLURM's
+# spooled copy of this script and never sees edits to it). Was 8 until 2026-11-25.
+# The previous 10d fleet script (3000 points, 5 repeats) is in git history.
 #
 # Roles: the first 4 jobs to start each claim one init trial (seed, sobol1..3) with
 # an atomic mkdir under $CAMPAIGN/init_claims/; every later job is a BO worker. A BO
@@ -129,6 +133,8 @@ if [ "$requeued" -eq 0 ]; then
     if [ "$rc" -eq 75 ]; then
         echo "[$(date)] run stopped before its deadline (rc=75); requeuing job $SLURM_JOB_ID"
         requeue_self
+    elif [ "$rc" -eq 76 ]; then
+        echo "[$(date)] worker retired under $CAMPAIGN/max_workers (rc=76); not resubmitting"
     elif [ "$rc" -eq 0 ]; then
         echo "[$(date)] run exited cleanly (rc=0); submitting next job"
         sbatch "$0"

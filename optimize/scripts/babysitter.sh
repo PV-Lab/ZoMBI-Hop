@@ -59,7 +59,7 @@ cd "$REPO" || { echo "cannot cd $REPO" >&2; exit 1; }
 # 2026-08-11 dist_to_needles change and would mix metric scales in one GP. Leaving
 # them listed-but-paused means `fleet.sh resume 3d` is all that is needed once their
 # history is sorted, rather than another edit here.
-declare -A TARGET=( [10d]=8 [4d]=2 [3d]=2 )   # 10d=8: campaign_10d_20k_20261124, half the 16 sloan A100s
+declare -A TARGET=( [10d]=3 [4d]=2 [3d]=2 )   # 10d=3 since 2026-11-27 (3 more GPUs go to the lanes showdown); 6 on 11-25, 8 before
 COOLDOWN=600             # min seconds between environmental resubmits of a type
 CIRCUIT_BREAK_FAILS=3    # N consecutive FAILED for a type -> halt, stop escalating
 
@@ -92,9 +92,12 @@ recent_ended_ids() {
 }
 
 # Did this job's wrapper report a fatal app crash?  crashed <name> <jobid>
+# A worker retired under the campaign's max_workers cap (run_mobo exit 76, see
+# optimize/worker_cap.py) is not a crash, even where an older copy of the sbatch
+# wrapper printed the crash marker for that exit code.
 crashed() {
     local f="$SCRIPTS/logs/${1}_${2}.out"
-    [ -f "$f" ] && grep -q "fatal abort/crash" "$f"
+    [ -f "$f" ] && grep -q "fatal abort/crash" "$f" && ! grep -q "^\[retire\]" "$f"
 }
 
 resubmit() {                       # resubmit <script> <n>
@@ -217,7 +220,13 @@ for type in "${!TARGET[@]}"; do
     fi
 
     # squeue lists only active jobs (R/PD/CF/CG) -> that IS the live fleet count.
-    active="$(squeue -u adewinmb -n "$name" -h -o '%i' 2>/dev/null | wc -l)"
+    # A failed squeue (slurm controller down/timing out) must not read as "0 active":
+    # on 2026-11-25 and 2026-11-27 it did, and the pass tried to submit a whole fleet.
+    if ! sq="$(squeue -u adewinmb -n "$name" -h -o '%i' 2>/dev/null)"; then
+        log "$name: squeue failed (slurm controller unreachable?) — skipping this pass."
+        continue
+    fi
+    active="$(printf '%s' "$sq" | grep -c .)"
     if [ "$active" -ge "$target" ]; then
         continue                                   # healthy; stay quiet
     fi

@@ -355,6 +355,11 @@ PENDING_MAX_AGE_S = 36 * 3600
 MIN_HISTORY_MAX_WAIT_S = 2 * 3600
 
 
+class _RetireStop(BaseException):
+    """Clean stop at a trial boundary because the campaign is over its worker cap
+    (``<share_dir>/max_workers``; see optimize/worker_cap.py)."""
+
+
 class _DeadlineStop(BaseException):
     """Clean stop before work that cannot finish by DEADLINE_EPOCH (not a failure:
     a BaseException so the per-trial ``except Exception`` retry loop never sees it)."""
@@ -415,6 +420,7 @@ N_MOBO_SAMPLES   = 512
 # optimize/collab_dirs.py so run_mobo, pareto, and sync_runs can't drift apart.
 # The current user's own dir is detected by matching $HOME below and is always
 # scanned; the other is added only when SHARE_COLLABORATOR_HISTORY is True.
+from optimize.worker_cap import should_retire, RETIRE_EXIT_CODE  # noqa: E402
 from optimize.collab_dirs import (  # noqa: E402  — repo root on sys.path from import block above
     SHARE_COLLABORATOR_HISTORY,
     COLLABORATOR_RUNS_DIRS as _COLLABORATOR_RUNS_DIRS,
@@ -2327,6 +2333,46 @@ def _zoom_size_per_point(n_points: int, snap_records: list[tuple]) -> np.ndarray
     return s
 
 
+def zone_state(dh) -> dict:
+    """The data handler's complete penalty-zone state, as plain CPU tensors.
+
+    Everything ``DataHandler._inside_region`` needs to test membership: every
+    region's centre, sphere radius and ellipsoid M (None = sphere fallback), the
+    shared tangent basis B, needles first and then exclusion zones (the
+    ``_penalty_regions`` order, with ``n_needles`` marking the boundary).
+    ``n_points`` is the samples collected when it was taken. ``bounds`` is the
+    (2, d) box the optimizer is searching in at that moment — taken from inside
+    the objective call, it is the box of the line being measured — which lets
+    ``visualization/plot_run.py`` outline the zoom levels at every step.
+    """
+    centers, radii, M_list = dh._penalty_regions()
+    cpu = lambda t: None if t is None else t.detach().cpu().clone()
+    n = 0 if centers is None else int(centers.shape[0])
+    return dict(
+        n_points=int(dh.X_all_actual.shape[0]) if dh.X_all_actual is not None else 0,
+        n_needles=int(dh.needles.shape[0]) if dh.needles is not None else 0,
+        centers=cpu(centers) if n else torch.zeros(0, dh.d),
+        radii=cpu(radii).reshape(-1) if n else torch.zeros(0),
+        M=[cpu(m) for m in M_list[:n]],
+        B=cpu(dh.needle_B),
+        bounds=cpu(dh.bounds),
+    )
+
+
+
+def write_zones_pt(path: str, states: list[dict]) -> None:
+    """Penalty-zone history: one ``zone_state`` per measured line, plus the final one.
+
+    The CSVs only keep the END state (points.csv's ``penalized`` column) and the
+    volume fraction per line, but zones are refit, shrunk and replaced as the run
+    goes, so which samples a zone held at an earlier line cannot be recovered from
+    them. This is what lets ``visualization/plot_run.py`` shade the zones at every
+    time-slider step of a showdown or MOBO run. Only tensors, ints, lists and None, so it
+    loads with ``torch.load(..., weights_only=True)``.
+    """
+    torch.save(states, path)
+
+
 def write_points_csv(path: str, dh, snap_records: list[tuple], *, dim: int = 3) -> None:
     X = dh.X_all_actual.detach().cpu().numpy()
     Y = dh.Y_all.detach().cpu().numpy().ravel()
@@ -2900,6 +2946,10 @@ def run_single_trial(
 
     plot_state: dict = {"line_0": None, "line_1": None}
     payloads: list[dict] = []
+    # Penalty-zone state per measured line -> zones.pt (saved with or without
+    # --plots: plot_run.py replays it for zone shading and the CoNet's GP mask).
+    zone_states: list[dict] = []
+    zones_ok = [True]                # set False if recording ever fails
     snap_records: list[tuple] = []
     call_counter = [0]
     dh_ref = [None]
@@ -2981,6 +3031,12 @@ def run_single_trial(
                 repulsion_profile=getattr(gp_ref[0], "repulsion_profile", "linear"),
                 repulsion_edge_value=float(getattr(gp_ref[0], "repulsion_edge_value", 0.0)),
             )
+        if zones_ok[0]:
+            try:
+                zone_states.append(zone_state(dh))
+            except Exception as exc:   # never let the zones.pt record break a trial
+                print(f"    [zones] recording disabled for this run: {exc}", flush=True)
+                zones_ok[0] = False
         payloads.append(payload)
         # Sample memory inside the timed loop so a mid-run RAM spike (which can
         # OOM-kill the job before the post-run summary prints) is visible.
@@ -3102,6 +3158,12 @@ def run_single_trial(
         )
     except Exception as exc:
         print(f"    [trial] CSV write failed: {exc}")
+    try:
+        if zones_ok[0]:
+            write_zones_pt(os.path.join(trial_dir, "zones.pt"),
+                           zone_states + [zone_state(dh)])
+    except Exception as exc:
+        print(f"    [trial] zones.pt write failed: {exc}")
 
     # --plots only (RENDER_PLOTS): the data above is everything a plot needs later.
     if RENDER_PLOTS:
@@ -3606,6 +3668,7 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
     consec_hardfail = 0
     aborted = False
     deadline_stop = False
+    retire_stop = False
     try:
         while max_trials is None or len(Y_obs) < max_trials:
             _refresh_shared_history()  # absorb siblings' trials produced since last loop
@@ -3625,6 +3688,13 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
                 and os.path.exists(pending_path)
                 and not os.path.exists(os.path.join(trial_dir, "trial.json"))
             )
+            # Worker cap: retire only before a NEW trial, so no work is discarded.
+            if not resume_pending:
+                _why = should_retire(share_dirs)
+                if _why:
+                    print(f"\n[retire] {_why}: this worker retires before trial "
+                          f"{trial_num} (exit code {RETIRE_EXIT_CODE}).", flush=True)
+                    raise _RetireStop(_why)
 
             try:
                 if resume_pending:
@@ -3819,6 +3889,8 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
         print("\n[!] Interrupted by user — finalising results …")
     except _DeadlineStop:
         deadline_stop = True
+    except _RetireStop:
+        retire_stop = True
 
     if max_trials is not None and len(Y_obs) >= max_trials:
         print(f"\n[stop] max_trials={max_trials} reached ({len(Y_obs)} completed).")
@@ -3829,6 +3901,11 @@ def run_mobo(landscape: LandscapeSpec, run_dir,
           f"({n_prior} prior + {len(Y_obs)} new = {n_prior + len(Y_obs)} total). Results in {run_dir}")
     print(f"Resume (crawls all runs) with:  python optimize/run_mobo.py --resume")
     print(f"Pareto front across all runs:   python optimize/pareto.py")
+
+    if retire_stop:
+        print(f"\n[retire] worker retired under the campaign's max_workers cap; exit code "
+              f"{RETIRE_EXIT_CODE} — the sbatch wrapper must not resubmit it.")
+        sys.exit(RETIRE_EXIT_CODE)
 
     if deadline_stop:
         print(f"\n[deadline] stopped before the job's deadline; exit code "

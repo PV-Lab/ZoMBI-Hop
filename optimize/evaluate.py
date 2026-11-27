@@ -995,31 +995,9 @@ def write_needles_csv(path: str, dh, cols: list[str], dim: int) -> None:
     pd.DataFrame(rows, columns=columns).to_csv(path, index=False)
 
 
-def zone_state(dh) -> dict:
-    """The data handler's complete penalty-zone state, as plain CPU tensors.
-
-    Everything ``DataHandler._inside_region`` needs to test membership: every
-    region's centre, sphere radius and ellipsoid M (None = sphere fallback), the
-    shared tangent basis B, needles first and then exclusion zones (the
-    ``_penalty_regions`` order, with ``n_needles`` marking the boundary).
-    ``n_points`` is the samples collected when it was taken. ``bounds`` is the
-    (2, d) box the optimizer is searching in at that moment — taken from inside
-    the objective call, it is the box of the line being measured — which lets
-    ``visualization/plot_run.py`` outline the zoom levels at every step.
-    """
-    centers, radii, M_list = dh._penalty_regions()
-    cpu = lambda t: None if t is None else t.detach().cpu().clone()
-    n = 0 if centers is None else int(centers.shape[0])
-    return dict(
-        n_points=int(dh.X_all_actual.shape[0]) if dh.X_all_actual is not None else 0,
-        n_needles=int(dh.needles.shape[0]) if dh.needles is not None else 0,
-        centers=cpu(centers) if n else torch.zeros(0, dh.d),
-        radii=cpu(radii).reshape(-1) if n else torch.zeros(0),
-        M=[cpu(m) for m in M_list[:n]],
-        B=cpu(dh.needle_B),
-        bounds=cpu(dh.bounds),
-    )
-
+# zone_state / write_zones_pt live in run_mobo (which cannot import this module);
+# re-exported here under the names evaluate.py has always used.
+zone_state = rm.zone_state
 
 # ─── Checkpoint / resume (--checkpoint) ──────────────────────────────────────────
 #
@@ -1074,17 +1052,7 @@ def _light_payload(p: dict, dim: int) -> dict:
     return {k: v for k, v in p.items() if k not in ("pared_X", "pared_Y", "gp_grid_vals")}
 
 
-def write_zones_pt(path: str, states: list[dict]) -> None:
-    """Penalty-zone history: one ``zone_state`` per measured line, plus the final one.
-
-    The CSVs only keep the END state (points.csv's ``penalized`` column) and the
-    volume fraction per line, but zones are refit, shrunk and replaced as the run
-    goes, so which samples a zone held at an earlier line cannot be recovered from
-    them. This is what lets ``visualization/plot_run.py`` shade the zones at every
-    time-slider step of a showdown run. Only tensors, ints, lists and None, so it
-    loads with ``torch.load(..., weights_only=True)``.
-    """
-    torch.save(states, path)
+write_zones_pt = rm.write_zones_pt
 
 
 def write_point_cloud_html(path: str, predict_fn, peaks, dh, last_payload: dict) -> None:
