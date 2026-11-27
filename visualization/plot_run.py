@@ -37,7 +37,7 @@ triangle would assert a sum-to-one relationship they do not have:
     (``Dataset.embed_X``) — on raw ``hplc`` units one column would otherwise be
     94% of every row and the map would describe that column alone.
 
-Four data sources are supported, selectable in the app:
+Five data sources are supported, selectable in the app:
 
   * **Run directory** (e.g. ``runs/run_7eb9``) — the full measured dataset
     ``(X, Y)`` is reconstructed from the run's delta snapshots
@@ -66,6 +66,15 @@ Four data sources are supported, selectable in the app:
     ``metrics_over_time.csv`` instead (see ``load_showdown_run``), and the
     penalty zones from its ``zones.pt`` (written by evaluate.py since 2026-10-31;
     older showdowns have no zone shading).
+  * **MOBO run** (e.g. ``campaign_10d_20k_20261124/mobo_ensemble_10d_job30368131``,
+    then ``trial 3 · run 1``) — one landscape run of a ``run_mobo.py`` ensemble
+    trial. run_mobo writes the same evaluate.py CSVs a showdown run has, so it is
+    read the same way (``load_mobo_run``) — but unlike a d>=7 showdown run it gets
+    the full view, CoNet included, at every dimension. Zones come from its
+    ``zones.pt`` (run_mobo writes it from 2026-11-25 on, plots or not; earlier MOBO
+    runs have no zone shading). Runs at ``optimize/runs/mobo_*`` and one level down
+    (``optimize/runs/<campaign>/mobo_*``) are listed, so a MOBO run dir copied
+    into a local checkout's ``optimize/runs/`` shows up there.
 
 Where a background applies (every diagram but the d=4 scatter-plot matrix and the
 CoNet) the app trains a Random-Forest (or GP) surrogate on ``(X, Y)``, evaluates
@@ -1081,7 +1090,8 @@ def _showdown_csvs(run_dir: Path):
     return pts, mot, ndl
 
 
-def load_showdown_run(run_dir: Path) -> Dataset:
+def load_showdown_run(run_dir: Path, title: str | None = None,
+                      full_view: bool = False) -> Dataset:
     """Load one showdown run's ``trial_*/run_*`` artifact directory into a ``Dataset``.
 
     * **lines** — ``NOMINAL_LINE_POINTS``-point blocks laid out by
@@ -1149,14 +1159,14 @@ def load_showdown_run(run_dir: Path) -> Dataset:
     simplex = bool(n) and bool(np.allclose(X.sum(axis=1), 1.0, atol=1e-6))
     trial_run = f"{run_dir.parent.name}/{run_dir.name}"
     zones = zooms = None
-    if X.shape[1] < CONVERGENCE_ONLY_MIN_D:
+    if full_view or X.shape[1] < CONVERGENCE_ONLY_MIN_D:
         zones, zooms = showdown_zone_history(
             run_dir, X,
             pts["activation"].to_numpy(dtype=int) if "activation" in pts.columns else None,
             pts["zoom"].to_numpy(dtype=int) if "zoom" in pts.columns else None)
     return Dataset(
         X=X, Y=Y, labels=tuple(cols),
-        title=f"{run_dir.parents[3].name} / {run_dir.parents[1].name} ({trial_run})",
+        title=title or f"{run_dir.parents[3].name} / {run_dir.parents[1].name} ({trial_run})",
         lines=lines.astype(int),
         value_name="Y",
         activations=(pts["activation"].to_numpy(dtype=int)
@@ -1268,6 +1278,83 @@ def _list_showdown_runs(showdown: str) -> list[tuple[str, str]]:
             label = rd.name if len(arts) == 1 else f"{rd.name}  ({a.parent.name}/{a.name})"
             out.append((label, a.relative_to(SHOWDOWN_ROOT).as_posix()))
     return out
+
+
+def _list_mobo_runs() -> list[str]:
+    """MOBO run dirs, relative to SHOWDOWN_ROOT, newest first.
+
+    Both top-level ``optimize/runs/mobo_*`` and one level down (a campaign's
+    ``campaign_*/mobo_*``), keeping only those with at least one ``trial_*``.
+    """
+    if not SHOWDOWN_ROOT.is_dir():
+        return []
+    dirs = [p for pat in ("mobo_*", "*/mobo_*") for p in SHOWDOWN_ROOT.glob(pat)
+            if p.is_dir() and next(p.glob("trial_*"), None) is not None]
+    dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return [p.relative_to(SHOWDOWN_ROOT).as_posix() for p in dirs]
+
+
+def _suffix_num(p: Path) -> int:
+    """``trial_12`` / ``run_3`` -> 12 / 3 (0 when the name has no number)."""
+    try:
+        return int(p.name.rsplit("_", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def _list_mobo_trial_runs(mobo: str) -> list[tuple[str, str]]:
+    """``(label, artifact dir relative to SHOWDOWN_ROOT)`` per landscape run of a MOBO run.
+
+    One entry per ``trial_<t>/run_<k>`` that has a ``points.csv`` (run_mobo writes
+    the same evaluate.py artifacts a showdown run has). The label carries the
+    trial's phase (seed/sobol/mobo) and that landscape run's ``dist``, or
+    "in progress" for a trial whose repeats are not all in yet.
+    """
+    root = SHOWDOWN_ROOT / mobo
+    if not root.is_dir():
+        return []
+    out = []
+    for td in sorted(root.glob("trial_*"), key=_suffix_num):
+        phase = "in progress"
+        tj = td / "trial.json"
+        if tj.exists():
+            try:
+                t = json.loads(tj.read_text())
+                phase = str(t.get("phase", "?")) + (", failed" if t.get("failed") else "")
+            except Exception:
+                phase = "?"
+        for rd in sorted(td.glob("run_*"), key=_suffix_num):
+            if not (rd / "points.csv").exists():
+                continue
+            dist = ""
+            try:
+                m = json.loads((rd / "metrics.json").read_text())
+                dist = f", dist {float(m['dist']):.3f}"
+            except Exception:
+                pass
+            out.append((f"trial {_suffix_num(td)} · run {_suffix_num(rd)}  ({phase}{dist})",
+                        rd.relative_to(SHOWDOWN_ROOT).as_posix()))
+    return out
+
+
+def load_mobo_run(run_dir: Path) -> Dataset:
+    """One landscape run (``trial_<t>/run_<k>``) of a MOBO trial, as a ``Dataset``.
+
+    run_mobo's ensemble trials write the same points.csv / needles.csv /
+    metrics_over_time.csv a showdown run does, so this is ``load_showdown_run``
+    with a title naming the MOBO run instead of a showdown sweep.
+    """
+    run_dir = Path(run_dir)
+    try:
+        name = run_dir.parents[1].relative_to(SHOWDOWN_ROOT.resolve()).as_posix()
+    except ValueError:
+        name = run_dir.parents[1].name
+    # full_view: unlike a showdown run, a MOBO run gets the CoNet and the zones.pt
+    # replay at every dimension (slow at 10d / 20k points, but that view is the
+    # point of opening one).
+    return load_showdown_run(
+        run_dir, title=f"MOBO {name} ({run_dir.parent.name}/{run_dir.name})",
+        full_view=True)
 
 
 # ── data loading: database / csv ──────────────────────────────────────────────
@@ -2392,6 +2479,9 @@ def fit_conet_frame(ds: Dataset, *, key: tuple) -> dict:
       * ``limits`` — the axis extent, so the frame never rescales mid-animation.
       * ``bounds`` — the 10th-90th-percentile colour bounds, so a value keeps the
         same colour at every step.
+      * ``drawn`` — plot_10d's smooth-spread (de-overlapped) display positions and
+        marker scale, computed once on all the data; a step draws its rows of it, so
+        the spread never re-runs (or reshuffles points) while scrubbing.
     """
     import plot_10d as p10
 
@@ -2409,12 +2499,14 @@ def fit_conet_frame(ds: Dataset, *, key: tuple) -> dict:
     # is the real unit, so the rim marks every point the newest line added — the
     # same thing the simplex diagrams highlight.
     iters = np.asarray(ds.lines, dtype=float)
-    M, _ = p10.build_conet(comp, names, resp, iters)
+    M, F = p10.build_conet(comp, names, resp, iters)
     fit = {
         "comp": comp, "names": names, "resp": resp, "iters": iters,
         "frame": M["frame"], "E_raw": M["E_raw"],
-        "limits": p10._cn_view_limits(M["E"]),
+        "limits": ((F["x0"], F["x1"]), (F["y0"], F["y1"])),
         "bounds": p10.conet_bounds(resp),
+        "drawn": {"E": M["E"], "size_scale": M.get("size_scale", 1.0),
+                  "ref_pt": M.get("ref_pt")},
     }
     if len(_CONET_CACHE) >= _CONET_CACHE_MAX:
         _CONET_CACHE.pop(next(iter(_CONET_CACHE)))
@@ -2542,9 +2634,11 @@ def conet_png_bytes(ds: Dataset, *, key: tuple, rows: np.ndarray | None = None) 
     zooms = ds.zooms_at(sel)
     train = conet_gp_training_mask(ds, sel, zones, zooms)
     gp_bg = conet_gp_values(ds, sel, train)
+    drawn = dict(fit["drawn"], E=fit["drawn"]["E"][sel])
     M, F = p10.build_conet(
         fit["comp"][sel], fit["names"], fit["resp"][sel], fit["iters"][sel],
         frame=frame, limits=fit["limits"], zones=zones, zooms=zooms, gp_bg=gp_bg,
+        drawn=drawn,
     )
     title = f"{ds.title} · CoNet (d={ds.d}"
     title += "" if rows is None else f", {len(sel)}/{total} samples"
@@ -2612,7 +2706,7 @@ CACHE_MAX_BYTES = 4 * 1024 ** 3   # least-recently-used signatures pruned past t
 # otherwise be masked by steps cached before it. Bump this whenever that happens
 # (adding the needle rules did): old steps are then simply never looked up, and
 # age out with the prune, instead of being served stale.
-STEP_FORMAT = 6
+STEP_FORMAT = 7   # 7: CoNet smooth spread (plot_10d marker de-overlap)
 PRECOMPUTE = True                 # --no-precompute renders steps on demand instead
 STEP_URL_PREFIX = "/plot-run-step"
 
@@ -3217,8 +3311,13 @@ _DATA_CACHE_MAX = 8
 
 def _source_key(source_type: str, run_name: str | None, db_name: str | None,
                 db_value: str | None, public_name: str | None = None,
-                showdown_run: str | None = None) -> tuple:
+                showdown_run: str | None = None, mobo_run: str | None = None) -> tuple:
     """Cache key identifying a source, including its mtime so edits are picked up."""
+    if source_type == "mobo":
+        # mobo_run is a trial_*/run_* artifact dir relative to SHOWDOWN_ROOT (see
+        # _list_mobo_trial_runs); same files as a showdown run.
+        p = (SHOWDOWN_ROOT / (mobo_run or "")).resolve()
+        return ("mobo", str(p), (p / "points.csv").stat().st_mtime)
     if source_type == "showdown":
         # showdown_run is the artifact dir relative to SHOWDOWN_ROOT (see
         # _list_showdown_runs); keyed on points.csv, the file every view reads.
@@ -3246,6 +3345,8 @@ def load_source(key: tuple) -> Dataset:
         ds = load_run_source(Path(key[1]), None)
     elif key[0] == "showdown":
         ds = load_showdown_run(Path(key[1]))
+    elif key[0] == "mobo":
+        ds = load_mobo_run(Path(key[1]))
     elif key[0] == "public":
         ds = load_public_dataset(key[1])
     else:
@@ -3264,6 +3365,7 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
     db_names = _list_db_files()
     public_names = _list_public_datasets()
     showdown_names = _list_showdowns()
+    mobo_names = _list_mobo_runs()
 
     step_btn_style = {
         "flex": "0 0 auto", "width": "28px", "height": "28px", "padding": "0",
@@ -3306,6 +3408,7 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
                     {"label": " Data file (.db/.csv)", "value": "db"},
                     {"label": " Public dataset (Olympus)", "value": "public"},
                     {"label": " Showdown run", "value": "showdown"},
+                    {"label": " MOBO run", "value": "mobo"},
                 ],
                 value="db" if default_db else "run",
                 labelStyle={"display": "block"},
@@ -3362,6 +3465,27 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
                 html.Div(
                     "optimize/runs/showdown_*/runs/<config>__ls<landscape>__r<repeat>, "
                     "read from its points.csv / needles.csv / metrics_over_time.csv.",
+                    style={"fontSize": "11px", "color": "#777", "marginTop": "6px"},
+                ),
+            ]),
+
+            html.Div(id="mobo-controls", children=[
+                html.Label("MOBO run", style=label_style),
+                dcc.Dropdown(
+                    id="mobo-dropdown",
+                    options=[{"label": n, "value": n} for n in mobo_names],
+                    value=mobo_names[0] if mobo_names else None,
+                    clearable=False,
+                    optionHeight=50,
+                ),
+                html.Label("Trial / landscape run", style=label_style),
+                dcc.Dropdown(id="mobo-run-dropdown", clearable=False, optionHeight=40),
+                html.Div(
+                    "optimize/runs/[campaign_*/]mobo_*/trial_<t>/run_<k>: one landscape "
+                    "run of a MOBO trial, read from its points.csv / needles.csv / "
+                    "metrics_over_time.csv (+ zones.pt if saved). Shown as a CoNet at d>=5, "
+                    "even at 10d. The list is read when the run is picked; "
+                    "re-pick it to see newer trials.",
                     style={"fontSize": "11px", "color": "#777", "marginTop": "6px"},
                 ),
             ]),
@@ -3574,12 +3698,24 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         Output("db-controls", "style"),
         Output("public-controls", "style"),
         Output("showdown-controls", "style"),
+        Output("mobo-controls", "style"),
         Input("source-type", "value"),
     )
     def _toggle(source_type):
         show, hide = {}, {"display": "none"}
         return tuple(show if source_type == t else hide
-                     for t in ("run", "db", "public", "showdown"))
+                     for t in ("run", "db", "public", "showdown", "mobo"))
+
+    # Populate the trial/run dropdown when the MOBO run changes.
+    @app.callback(
+        Output("mobo-run-dropdown", "options"),
+        Output("mobo-run-dropdown", "value"),
+        Input("mobo-dropdown", "value"),
+    )
+    def _mobo_runs(mobo):
+        runs = _list_mobo_trial_runs(mobo) if mobo else []
+        return ([{"label": label, "value": rel} for label, rel in runs],
+                runs[0][1] if runs else None)
 
     # Populate the showdown run dropdown when the showdown sweep changes.
     @app.callback(
@@ -3752,12 +3888,14 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         Input("db-value-dropdown", "value"),
         Input("public-dropdown", "value"),
         Input("showdown-run-dropdown", "value"),
+        Input("mobo-run-dropdown", "value"),
     )
     def _timeline_range(source_type, run_name, db_name, db_value, public_name,
-                        showdown_run):
+                        showdown_run, mobo_run):
         try:
             ds = load_source(_source_key(source_type, run_name, db_name,
-                                         db_value, public_name, showdown_run))
+                                         db_value, public_name, showdown_run,
+                                         mobo_run))
         except Exception:
             return 1, 1, None
         n = max(ds.n_lines, 1)
@@ -3836,6 +3974,7 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         # several tests and sibling scripts call directly — keeps its meaning.
         Input("public-dropdown", "value"),
         Input("showdown-run-dropdown", "value"),
+        Input("mobo-run-dropdown", "value"),
     )
     def _render(*args):
         return render_state(*args, no_update=no_update)
@@ -3855,19 +3994,20 @@ def build_app(grid_n: int = TERNARY_GRID_N, n_estimators: int = RF_N_ESTIMATORS)
         Input("timeline-on", "value"),
         Input("timeline", "value"),
         Input("showdown-run-dropdown", "value"),
+        Input("mobo-run-dropdown", "value"),
     )
     def _render_penalized(penalized_on, source_type, run_name, db_name, db_value,
-                          public_name, timeline_on, timeline, showdown_run):
+                          public_name, timeline_on, timeline, showdown_run, mobo_run):
         if not penalized_on:
             return no_update, {"display": "none"}
         try:
             key = _source_key(source_type, run_name, db_name, db_value, public_name,
-                              showdown_run)
+                              showdown_run, mobo_run)
             full = load_source(key)
         except Exception:
             return no_update, {"display": "none"}
         coverage = None
-        if key[0] in ("run", "showdown"):
+        if key[0] in ("run", "showdown", "mobo"):
             if key not in _COVERAGE_CACHE:
                 _COVERAGE_CACHE[key] = (run_penalty_coverage if key[0] == "run"
                                         else showdown_penalty_coverage)(Path(key[1]))
@@ -3920,7 +4060,7 @@ def _diagram_name(ds: Dataset) -> str:
 def render_state(source_type, run_name, db_name, db_value, background, show_points,
                  gn, ntrees, gp_ls, scale, plot_size, color_override, color_min,
                  color_max, timeline_on, timeline, convergence_on, public_name=None,
-                 showdown_run=None, *, no_update=None, precompute=None):
+                 showdown_run=None, mobo_run=None, *, no_update=None, precompute=None):
     """Everything the main Dash callback renders, as a plain function.
 
     Split out of the callback body so it can be exercised (and its eight outputs
@@ -3949,9 +4089,13 @@ def render_state(source_type, run_name, db_name, db_value, background, show_poin
             return ((no_update,) * 7
                     + ("No showdown run selected — none found under optimize/runs/"
                        "showdown_*/runs.", no_update))
+        if source_type == "mobo" and not mobo_run:
+            return ((no_update,) * 7
+                    + ("No MOBO landscape run selected — pick a MOBO run that has a "
+                       "trial_*/run_*/points.csv.", no_update))
 
         key = _source_key(source_type, run_name, db_name, db_value, public_name,
-                          showdown_run)
+                          showdown_run, mobo_run)
         full = load_source(key)
 
         # The time slider cuts the dataset to its first N deposition lines.
@@ -3989,6 +4133,7 @@ def render_state(source_type, run_name, db_name, db_value, background, show_poin
         fig = no_update
         conet_src = no_update
         prefetch = no_update
+        # MOBO runs always get the full view (CoNet at d>=5); see load_mobo_run.
         conv_only = key[0] == "showdown" and full.d >= CONVERGENCE_ONLY_MIN_D
         conet = full.d >= CONET_MIN_D and not conv_only
         if conv_only:

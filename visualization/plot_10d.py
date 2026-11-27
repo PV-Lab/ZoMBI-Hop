@@ -197,6 +197,38 @@ CN_ZOOM_DEEP = "#d4894f"
 CN_GP_A_MAX = 0.55
 CN_GP_H_DIV = 2.0
 CN_TRUE_OPT = "#2f9bff"    # synthetic landscape's true optimum marker (blue; drawn under, and larger than, red)
+# ---- SMOOTH SPREAD (marker de-overlap; ported 2026-11-27 from the hardware GUI's live CoNet) ----------
+# UMAP stacks similar compositions on (nearly) the same spot, so a long campaign piles hundreds of
+# markers into a few blobs and the VOLUME of data disappears. The smooth spread (build_conet, on by
+# default; smooth_spread=False / --no-smooth-spread restores the raw layout) moves DISPLAY positions only:
+#   1) area-preserving anisotropic stretch so the 2-98 pct extent has the panel's aspect
+#      (CONET_FRAME_ASPECT) -> the map fills the frame instead of floating in dead space,
+#   2) _cn_spread_points: overlap relaxation in a fixed REFERENCE panel (CN_SMOOTH_REF_PT^2 points of
+#      area at the panel aspect), markers shrunk to an ink budget but never below CN_SMOOTH_MIN_AREA x
+#      their area; moves are capped and never land inside an enclosed void of the cloud,
+#   3) _cn_swap_polish: simulated-annealing SWAPS of which sample sits at which spread position, so
+#      on-screen neighbours are compositionally similar. The set of positions (silhouette, lobes, real
+#      voids) is unchanged; only who sits where.
+# The GUI tuned it on 4505 droplets (visible >= half a disc 37% -> 84%, heavy overlap 55% -> 8%). Here the
+# reference panel is save_png's actual panel (~1011 x 556 pt, geometric-mean side ~750 pt), so exported
+# PNGs draw markers at x1; any other panel size draws the same picture uniformly scaled
+# (_cn_marker_factor). Every sample-indexed overlay (needle stars, zones, zooms, GP background, picking)
+# follows the drawn positions automatically; explicit coordinates (true optima) go through
+# spread_extra_points.
+CN_SMOOTH_REF_PT = 750.0         # reference panel: geometric-mean side (points) at CONET_FRAME_ASPECT
+CN_SMOOTH_INK = 0.55             # marker-area budget (fraction of the reference panel area)
+CN_SMOOTH_MIN_AREA = 0.30        # marker-area floor (x normal area) in the reference panel
+CN_SMOOTH_SEP = 1.05             # relaxation target centre spacing, x mean diameter
+CN_SMOOTH_CAP = 0.20             # max move per point, fraction of the reference panel's mean side
+CN_SMOOTH_ITERS = 300
+CN_SPREAD_HOLE_DIAM = 3.0        # enclosed voids at least this many marker widths across are kept open
+CN_SWAP_K = 8                    # composition polish: drawn k-NN graph (symmetrised)
+CN_SWAP_RADIUS = 3.5             # swap partners within this x the median nearest-neighbour spacing
+CN_SWAP_LAM = 0.01               # displacement penalty (x (move / spacing)^2) -> samples stay near home
+CN_SWAP_ROUNDS = 4000            # annealing rounds (x CN_SWAP_BATCH candidate swaps); ~3 s at N=4500
+CN_SWAP_BATCH = 3000
+CN_SWAP_T0 = 0.05                # initial temperature (linear anneal to 0 at 85% of the rounds)
+CN_SPREAD_EXTRA_K = 8            # spread_extra_points: displacement interpolated from this many samples
 # ---- two LIVE, user-tunable layout knobs (persist across new samples / timeline; see the UI) --------
 # CLUSTER DIST (self.gap_reach): when the campaign repeatedly samples one composition (e.g. near-pure
 # CsPbI3), that clique's UMAP neighbourhoods become self-contained and repulsion exiles it many main-mass
@@ -415,6 +447,270 @@ def _cn_view_limits(E, pad=0.05):
     else:                                           # too wide -> heighten y
         e = (xs / target - ys) / 2.0; y0 -= e; y1 += e
     return (x0, x1), (y0, y1)
+
+
+# ---------------------------------------------------------------------------
+# smooth spread (see CN_SMOOTH_*): display-only marker de-overlap
+# ---------------------------------------------------------------------------
+def _cn_spread_points(E, d_pt, frame, panel_pt, cap_frac, sep=CN_SMOOTH_SEP, iters=CN_SMOOTH_ITERS,
+                      hole_diam=CN_SPREAD_HOLE_DIAM, seed=CN_SEED, bound=None):
+    """Screen-space overlap relaxation of the CoNet markers (display positions only).
+
+    E (N,2) layout positions, d_pt (N,) marker diameters in points, frame ((x0,x1),(y0,y1)) the view
+    limits the panel will show, panel_pt (w,h) the panel's size in points. Each pass pushes apart every
+    pair of markers whose centres are closer than sep x their mean diameter (damped half-deficit each
+    way, and at most half the marker's diameter per pass, so a dense pile grows outward as a filled disc
+    instead of exploding onto a hollow ring at the cap); each point's TOTAL move is capped at
+    cap_frac x the panel width and its marker kept inside *bound* (data units; default the frame). A
+    step that lands a centre inside an enclosed void of the ORIGINAL footprint (>= hole_diam
+    marker widths across) is undone, so real holes in the cloud stay open. Deterministic (seeded).
+    Returns (E_spread, median nearest-neighbour spacing in marker widths before, after)."""
+    from scipy.spatial import cKDTree
+    from scipy.ndimage import distance_transform_edt, binary_fill_holes, label as cc_label
+    E = np.asarray(E, float); d = np.asarray(d_pt, float)
+    (x0, x1), (y0, y1) = frame
+    pw, ph = float(panel_pt[0]), float(panel_pt[1])
+    sx, sy = pw / max(x1 - x0, 1e-12), ph / max(y1 - y0, 1e-12)      # points per data unit
+    S0 = np.column_stack([(E[:, 0] - x0) * sx, (E[:, 1] - y0) * sy])
+
+    def nn_spacing(S):
+        dist, j = cKDTree(S).query(S, k=2)
+        return float(np.median(dist[:, 1] / (0.5 * (d + d[j[:, 1]]))))
+
+    before = nn_spacing(S0)
+    # void guard: raster the original marker footprint (0.5 pt cells) and keep its big enclosed holes
+    cell = 0.5
+    gh, gw = int(np.ceil(ph / cell)) + 1, int(np.ceil(pw / cell)) + 1
+    lim = np.array([gw - 1, gh - 1])
+    centres = np.zeros((gh, gw), bool)
+    ij = np.clip(np.floor(S0 / cell).astype(int), 0, lim)
+    centres[ij[:, 1], ij[:, 0]] = True
+    d_med = float(np.median(d))
+    foot = distance_transform_edt(~centres) <= 0.5 * d_med / cell
+    lab, nlab = cc_label(binary_fill_holes(foot) & ~foot)
+    min_area = np.pi * (0.5 * hole_diam * d_med / cell) ** 2
+    keep = [k for k, a in enumerate(np.bincount(lab.ravel())) if k > 0 and a >= min_area]
+    hole = np.isin(lab, keep) if keep else None
+
+    S = S0.copy(); r = 0.5 * d; cap = cap_frac * pw
+    (bx0, bx1), (by0, by1) = bound if bound is not None else frame
+    bx0, bx1 = (bx0 - x0) * sx, (bx1 - x0) * sx; by0, by1 = (by0 - y0) * sy, (by1 - y0) * sy
+    rng = np.random.default_rng(seed)
+    rmax = sep * float(d.max())
+    for _ in range(iters):
+        pairs = cKDTree(S).query_pairs(rmax, output_type="ndarray")
+        if not len(pairs):
+            break
+        i, j = pairs[:, 0], pairs[:, 1]
+        dv = S[j] - S[i]
+        dist = np.hypot(dv[:, 0], dv[:, 1])
+        tgt = sep * 0.5 * (d[i] + d[j])
+        close = dist < tgt
+        if not close.any():
+            break
+        i, j, dv, dist, tgt = i[close], j[close], dv[close], dist[close], tgt[close]
+        tiny = dist < 1e-6
+        if tiny.any():                                  # coincident (re-sampled) compositions: random direction
+            ang = rng.uniform(0.0, 2.0 * np.pi, int(tiny.sum()))
+            dv[tiny] = np.column_stack([np.cos(ang), np.sin(ang)]); dist[tiny] = 1.0
+        push = (0.5 * 0.6 * (tgt - dist) / dist)[:, None] * dv       # damped half-deficit each way
+        dS = np.zeros_like(S)
+        np.add.at(dS, i, -push); np.add.at(dS, j, push)
+        step = np.hypot(dS[:, 0], dS[:, 1])
+        big = step > r                                  # <= half a diameter per pass (no explosion)
+        dS[big] *= (r[big] / step[big])[:, None]
+        S_prev = S
+        S = S + dS
+        off = S - S0
+        n = np.hypot(off[:, 0], off[:, 1])
+        far = n > cap
+        S[far] = S0[far] + off[far] * (cap / n[far])[:, None]
+        S[:, 0] = np.clip(S[:, 0], bx0 + r, bx1 - r); S[:, 1] = np.clip(S[:, 1], by0 + r, by1 - r)
+        if hole is not None:                            # undo steps that enter a kept void
+            ij = np.clip(np.floor(S / cell).astype(int), 0, lim)
+            bad = hole[ij[:, 1], ij[:, 0]]
+            S[bad] = S_prev[bad]
+    E_out = np.column_stack([x0 + S[:, 0] / sx, y0 + S[:, 1] / sy])
+    return E_out, before, nn_spacing(S)
+
+
+def _cn_swap_polish(S, comp, k=CN_SWAP_K, radius=CN_SWAP_RADIUS, lam=CN_SWAP_LAM, rounds=CN_SWAP_ROUNDS,
+                    batch=CN_SWAP_BATCH, T0=CN_SWAP_T0, seed=0):
+    """Composition polish of a drawn layout: simulated-annealing swaps of WHICH sample sits at WHICH
+    position S (screen points), so drawn neighbours are compositionally similar. Energy = summed L1
+    composition distance over the symmetrised drawn k-NN graph + lam x (displacement / median spacing)^2
+    (keeps each sample near its own spot). Each round draws `batch` candidate pairs within
+    radius x spacing, keeps a non-interacting subset (no shared graph neighbourhoods -> the batched
+    energy deltas are exact), and accepts by Metropolis with a linear anneal. Deterministic (seeded).
+    Returns A: A[site] = index of the sample drawn at S[site]."""
+    from scipy.spatial import cKDTree
+    S = np.asarray(S, float); comp = np.asarray(comp, float)
+    N = len(S)
+    A = np.arange(N)
+    if N < 2 * k + 2 or rounds <= 0:
+        return A
+    # work scales with N (tuned at N~4500; ~3 s there): a small map anneals in a fraction of a second
+    batch = int(min(batch, max(64, 0.67 * N)))
+    rounds = int(np.clip(rounds * np.sqrt(N / 4500.0), min(400, rounds), rounds))
+    tree = cKDTree(S)
+    a = float(np.median(tree.query(S, k=2)[0][:, 1])) or 1.0
+    nb0 = tree.query(S, k=k + 1)[1][:, 1:]
+    L = [set(r) for r in nb0]
+    for i in range(N):
+        L[i].discard(i)                          # coincident sites: kNN may return i itself -> no self-edge
+        for j in nb0[i]:
+            if j != i:
+                L[j].add(i)
+    nb = -np.ones((N, max(map(len, L))), int)
+    for i, l in enumerate(L):
+        nb[i, :len(l)] = sorted(l)
+    valid = nb >= 0
+    NBc = np.where(valid, nb, 0)
+    near = tree.query_ball_point(S, radius * a)
+    near_n = np.array([len(l) for l in near])
+    near_pad = np.zeros((N, near_n.max()), int)
+    for i, l in enumerate(near):
+        near_pad[i, :len(l)] = l
+    fp = np.hstack([np.arange(N)[:, None], NBc])                    # site + its graph neighbours
+    fpm = np.hstack([np.ones((N, 1), bool), valid])
+    rng = np.random.default_rng(seed)
+
+    def cost(sites, drops, partner):
+        l1 = np.abs(comp[drops][:, None, :] - comp[A[NBc[sites]]]).sum(-1)
+        wm = valid[sites] & (NBc[sites] != partner[:, None])        # the swap partner's edge cancels
+        return (l1 * wm).sum(1) + lam * ((S[sites] - S[drops]) ** 2).sum(1) / a ** 2
+
+    for it in range(rounds):
+        T = T0 * max(0.0, 1.0 - it / (0.85 * rounds))
+        u = rng.integers(0, N, batch)
+        kk = rng.integers(0, near_pad.shape[1], batch)
+        v = near_pad[u, kk]
+        ok = (kk < near_n[u]) & (v != u)
+        u, v = u[ok], v[ok]
+        pr = rng.random(len(u))
+        owner = np.full(N, -1.0)                 # highest-priority claim on every touched footprint
+        for f in (u, v):
+            np.maximum.at(owner, fp[f][fpm[f]], np.broadcast_to(pr[:, None], fp[f].shape)[fpm[f]])
+
+        def claim(f):
+            return np.where(fpm[f], owner[fp[f]], -1.0).max(1)
+        keep = (claim(u) <= pr) & (claim(v) <= pr)
+        u, v = u[keep], v[keep]
+        if not len(u):
+            continue
+        du, dv = A[u], A[v]
+        dE = cost(u, dv, v) + cost(v, du, u) - cost(u, du, v) - cost(v, dv, u)
+        acc = dE < 0
+        if T > 0:
+            acc |= rng.random(len(dE)) < np.exp(-np.maximum(dE, 0.0) / T)
+        A[u[acc]], A[v[acc]] = dv[acc], du[acc]
+    return A
+
+
+def _cn_ref_panel_pt():
+    """(w, h) in points of the smooth spread's reference panel: CN_SMOOTH_REF_PT^2 of area at the
+    fixed CONET_FRAME_ASPECT, so the reference frame and the drawn panels share one shape."""
+    s = np.sqrt(CONET_FRAME_ASPECT)
+    return CN_SMOOTH_REF_PT * s, CN_SMOOTH_REF_PT / s
+
+
+def fit_smooth_spread_frame(E):
+    """The smooth spread's coordinate frame, a pure function of the layout E: the area-preserving
+    stretch to the panel aspect (centre, scale, x-factor k) and the reference panel's view limits in the
+    stretched coordinates. Passing it to ``smooth_spread_layout(frame=...)`` lays a SECOND point set
+    out in the same coordinates (paired_conet: the real samples in the uniform baseline's frame)."""
+    E0 = np.asarray(E, float)
+    lo, hi = np.percentile(E0, [2.0, 98.0], axis=0)
+    w, h = float(hi[0] - lo[0]), float(hi[1] - lo[1])
+    if w > 1e-12 and h > 1e-12:
+        sf = dict(center=[float(v) for v in 0.5 * (lo + hi)], scale=float(np.sqrt(w * h)),
+                  k=float(np.sqrt(CONET_FRAME_ASPECT / (w / h))))
+    else:
+        sf = dict(center=[float(v) for v in E0.mean(0)], scale=1.0, k=1.0)
+    (x0, x1), (y0, y1) = _cn_view_limits(apply_smooth_stretch(E0, sf))
+    sf["ref_limits"] = ((float(x0), float(x1)), (float(y0), float(y1)))
+    return sf
+
+
+def apply_smooth_stretch(E, sf):
+    """Map layout coordinates into a smooth-spread frame's stretched coordinates (no relaxation)."""
+    Z = (np.asarray(E, float) - np.asarray(sf["center"], float)) / float(sf["scale"])
+    return np.column_stack([Z[:, 0] * sf["k"], Z[:, 1] / sf["k"]])
+
+
+def smooth_spread_layout(E, strengthN, comp, frame=None):
+    """SMOOTH SPREAD (see CN_SMOOTH_*): stretch -> overlap relaxation in the reference panel ->
+    composition swap polish. *frame*: a ``fit_smooth_spread_frame`` result to lay E out in (default:
+    fitted on E itself).
+
+    Returns (E_drawn, info). E_drawn is in the frame's stretched coordinates and always lies inside
+    ``info['frame']['draw_limits']`` (the axes to draw on; set here when the frame was fitted on E,
+    and the clamp box when a frame with them is passed in). info['area_scale'] multiplies every marker area IN THE REFERENCE
+    PANEL (the panel rescales it by _cn_marker_factor); info['Z'] / info['disp'] are the stretched layout
+    and its relaxation displacement (pre-swap), which spread_extra_points interpolates."""
+    import time
+    from scipy.spatial import cKDTree  # noqa: F401  (import-check before the heavy work)
+    t0 = time.time()
+    sf = frame if frame is not None else fit_smooth_spread_frame(E)
+    Z = apply_smooth_stretch(E, sf)
+    N = len(Z)
+    pw, ph = _cn_ref_panel_pt()
+    s = _cn_node_size(strengthN)
+    ink = float(np.sum(0.25 * np.pi * s)) / (pw * ph)                # total marker area / panel area
+    dscale = float(np.clip(np.sqrt(CN_SMOOTH_INK / max(ink, 1e-9)), np.sqrt(CN_SMOOTH_MIN_AREA), 1.0))
+    (x0, x1), (y0, y1) = sf["ref_limits"]
+    sx = pw / max(x1 - x0, 1e-12)                # isotropic: ref_limits has the panel's aspect
+    if sf.get("draw_limits") is not None:
+        bound = sf["draw_limits"]                # a second set: stay inside the first set's axes
+    else:                                        # free expansion: no sample can reach this box
+        m = (CN_SMOOTH_CAP * CN_SMOOTH_REF_PT + float(np.sqrt(s.max()))) / sx
+        bound = ((x0 - m, x1 + m), (y0 - m, y1 + m))
+    E1, before, after = _cn_spread_points(Z, np.sqrt(s) * dscale, sf["ref_limits"], (pw, ph),
+                                          CN_SMOOTH_CAP * CN_SMOOTH_REF_PT / pw,
+                                          sep=CN_SMOOTH_SEP, iters=CN_SMOOTH_ITERS,
+                                          hole_diam=CN_SPREAD_HOLE_DIAM, bound=bound)
+    t1 = time.time()
+    if sf.get("draw_limits") is None:
+        # axes = the spread's own extent (the relaxation may push edge piles past ref_limits); the
+        # frame now carries them, so a second set laid out in it shares these exact axes
+        (dx0, dx1), (dy0, dy1) = _cn_view_limits(E1)
+        sf = dict(sf, draw_limits=((float(dx0), float(dx1)), (float(dy0), float(dy1))))
+    (dx0, dx1), _ = sf["draw_limits"]
+    # markers were sized for ref_limits drawn on the reference panel; the axes show draw_limits, so
+    # the reference side grows with the span -> markers keep their size relative to the data
+    ref_pt = CN_SMOOTH_REF_PT * (dx1 - dx0) / (x1 - x0)
+    S = (E1 - np.array([x0, y0])) * sx
+    A = _cn_swap_polish(S, comp)
+    P = np.empty_like(S)
+    P[A] = S                                     # sample A[site] is drawn at site
+    E_out = np.array([x0, y0]) + P / sx
+    return E_out, dict(frame=sf, Z=Z, disp=E1 - Z, N=N, ink=ink, dscale=dscale,
+                       area_scale=dscale * dscale, ref_pt=float(ref_pt),
+                       nn_before=before, nn_after=after, moved=float(np.mean(A != np.arange(N))),
+                       secs_spread=t1 - t0, secs=time.time() - t0)
+
+
+def spread_extra_points(P, info, k=CN_SPREAD_EXTRA_K):
+    """Carry explicit layout coordinates P (e.g. true optima) into a smooth spread's drawn frame:
+    the frame's stretch, plus the inverse-distance-weighted relaxation displacement of the k nearest
+    spread samples, so a marker moves with the samples around it."""
+    from scipy.spatial import cKDTree
+    Zp = apply_smooth_stretch(np.asarray(P, float).reshape(-1, 2), info["frame"])
+    k = int(max(1, min(k, len(info["Z"]))))
+    d, j = cKDTree(info["Z"]).query(Zp, k=k)
+    d = d.reshape(len(Zp), k); j = j.reshape(len(Zp), k)
+    w = 1.0 / (d + 1e-9)
+    w /= w.sum(1, keepdims=True)
+    return Zp + np.einsum("nk,nkd->nd", w, info["disp"][j])
+
+
+def _cn_marker_factor(M, panel_w_pt, panel_h_pt):
+    """Extra marker-area factor for a panel of this size: the smooth spread's layout is tuned in a
+    reference panel, so markers scale with (panel area / reference area); 1.0 without the spread."""
+    ref = M.get("ref_pt")
+    if not ref:
+        return 1.0
+    return float(panel_w_pt) * float(panel_h_pt) / float(ref) ** 2
 
 
 def _cn_smoothstep(t):
@@ -1396,7 +1692,10 @@ def _conet_panel(fig, rect, cbrect, M, F, resp, bounds, view, target_eg, pal=Non
     E = M["E"]; iters = M["iters"]
     vis = np.ones(len(iters), bool) if view is None else (iters <= view + 0.5)   # time-travel
     y = M["resp"][:, M["resp_names"].index(resp)]
-    size = _cn_node_size(M["strengthN"]); lo, hi = bounds[resp]; cmap = _cmap_for(resp)
+    fw_in, fh_in = fig.get_size_inches()
+    size = (_cn_node_size(M["strengthN"]) * M.get("size_scale", 1.0)          # smooth-spread ink budget
+            * _cn_marker_factor(M, rect[2] * fw_in * 72.0, rect[3] * fh_in * 72.0))   # x panel size
+    lo, hi = bounds[resp]; cmap = _cmap_for(resp)
     m = np.isfinite(y) & vis
     if view is not None:
         cur_it = view
@@ -1837,7 +2136,8 @@ def load_run_conet_data(run_dir, snapshot=None):
 
 def build_conet(comp, names, resp, iters, umap_md=CN_UMAP_MD, gap_reach=CN_GAP_REACH,
                 purity_thr=CN_PURITY_THR, needles_comp=None, show_needles=False, frame=None,
-                limits=None, zones=None, zooms=None, gp_bg=None):
+                limits=None, zones=None, zooms=None, gp_bg=None, smooth_spread=True,
+                spread_frame=None, drawn=None):
     """Build the CoNet structure (UMAP) + dominance fields for a single-objective run. Ranked needle
     optima (if any) are anchored to their nearest sample node and stored as ``M['needles']``; whether
     their stars are drawn is gated by ``M['show_needles']`` (the UI toggle / --needles flag).
@@ -1854,10 +2154,39 @@ def build_conet(comp, names, resp, iters, umap_md=CN_UMAP_MD, gap_reach=CN_GAP_R
     ``activation``. Drawn by ``_conet_zooms`` from that membership, the same way as the zones.
 
     *gp_bg*: optional (N,) GP posterior mean at each sample; when given it replaces the composition fill
-    as the panel background (``_conet_gp_background``)."""
+    as the panel background (``_conet_gp_background``).
+
+    *smooth_spread* (default on): draw the samples at de-overlapped display positions (see
+    CN_SMOOTH_*); ``M['E_layout']`` keeps the true layout, ``M['E']`` is what is drawn and what the
+    dominance fields, overlays and click-picking use. *spread_frame*: a ``fit_smooth_spread_frame``
+    to lay these points out in (default: fitted on them). Without explicit *limits* the panel then
+    shows the spread frame's ``draw_limits``, which contain every drawn sample.
+
+    *drawn*: precomputed display positions instead of spreading here, as a dict with ``E`` (N, 2)
+    and, optionally, ``size_scale`` / ``ref_pt`` (plot_run's time slider replays the full-data
+    spread on a prefix this way, so points hold still while scrubbing)."""
     M = build_conet_structure(comp, names, resp, iters, list(VALUE_COLUMNS),
                               min_dist=umap_md, gap_reach=gap_reach, purity_thr=purity_thr,
                               frame=frame)
+    M["E_layout"] = M["E"]
+    if drawn is not None:
+        E_d = np.asarray(drawn["E"], float)
+        if E_d.shape != M["E"].shape:
+            raise ValueError(f"drawn E has shape {E_d.shape}, expected {M['E'].shape}")
+        M["E"] = E_d
+        M["size_scale"] = float(drawn.get("size_scale", 1.0))
+        if drawn.get("ref_pt"):
+            M["ref_pt"] = float(drawn["ref_pt"])
+    elif smooth_spread:
+        with _Progress(f"smooth spread ({M['N']} nodes)"):
+            E_d, info = smooth_spread_layout(M["E"], M["strengthN"], M["comp"], frame=spread_frame)
+        M["E"], M["size_scale"], M["ref_pt"], M["spread_info"] = (E_d, info["area_scale"],
+                                                                 info["ref_pt"], info)
+        print(f"[conet] smooth spread: N={info['N']}  marker area x{info['area_scale']:.2f}  "
+              f"nn spacing {info['nn_before']:.2f} -> {info['nn_after']:.2f} marker widths  "
+              f"swapped {100 * info['moved']:.0f}%  ({info['secs']:.1f}s)", flush=True)
+        if limits is None:
+            limits = info["frame"]["draw_limits"]
     M["iters"] = np.asarray(iters, float)
     M["needles"] = _needle_rows(M["comp"], needles_comp)
     M["show_needles"] = bool(show_needles)
@@ -2115,7 +2444,8 @@ def save_png(M, F, bounds, title, out_path, target_eg=TARGET_EG_DEFAULT, dpi=130
 
 
 def render_run_conet(run_dir, save_path=None, *, snapshot=None, show_needles=True,
-                     umap_md=CN_UMAP_MD, gap_reach=CN_GAP_REACH, purity_thr=CN_PURITY_THR):
+                     umap_md=CN_UMAP_MD, gap_reach=CN_GAP_REACH, purity_thr=CN_PURITY_THR,
+                     smooth_spread=True):
     """Render a run's CoNet PNG headlessly (the same view ``main --save`` produces).
 
     Loads the run's own samples + discovered needles, builds the CoNet and writes
@@ -2126,7 +2456,8 @@ def render_run_conet(run_dir, save_path=None, *, snapshot=None, show_needles=Tru
     save_path = Path(save_path) if save_path else run_dir / "conet.png"
     comp, names, resp, iters, title, needles_comp = load_run_conet_data(run_dir, snapshot)
     M, F = build_conet(comp, names, resp, iters, umap_md=umap_md, gap_reach=gap_reach,
-                       purity_thr=purity_thr, needles_comp=needles_comp, show_needles=show_needles)
+                       purity_thr=purity_thr, needles_comp=needles_comp, show_needles=show_needles,
+                       smooth_spread=smooth_spread)
     bounds = conet_bounds(resp)
     out = save_png(M, F, bounds, title, str(save_path))
     return out, len(M["needles"])
@@ -2152,13 +2483,16 @@ def main():
                     help="far-satellite squash factor (default: %(default)s)")
     ap.add_argument("--needles", action="store_true",
                     help="show the ranked-needle stars (off by default; toggleable live in the window)")
+    ap.add_argument("--no-smooth-spread", action="store_true",
+                    help="draw the raw UMAP layout (no marker de-overlap; see CN_SMOOTH_*)")
     args = ap.parse_args()
 
     run_dir = _resolve_run_dir(args.run)
     comp, names, resp, iters, title, needles_comp = load_run_conet_data(run_dir, args.snapshot)
     print(f"Loaded {len(comp)} samples from {run_dir.name} · components = {names}")
     M, F = build_conet(comp, names, resp, iters, umap_md=args.spread, gap_reach=args.gap_reach,
-                       purity_thr=args.purity, needles_comp=needles_comp, show_needles=args.needles)
+                       purity_thr=args.purity, needles_comp=needles_comp, show_needles=args.needles,
+                       smooth_spread=not args.no_smooth_spread)
     print(f"Needles: {len(M['needles'])} loaded"
           + ("" if M["needles"] else " (none found)"))
     bounds = conet_bounds(resp)

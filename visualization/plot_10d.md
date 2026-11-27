@@ -114,6 +114,7 @@ python visualization/plot_10d.py --run run_9dfe --save conet.png
 | `--purity` | Purity-layout threshold. `0` reverts to the plain plurality layout + regions. |
 | `--spread` | UMAP `min_dist` — how spread out the points are (needs a UMAP re-fit). |
 | `--gap-reach` | Squash factor pulling far-flung satellite clusters back toward the core. |
+| `--no-smooth-spread` | Draw the raw UMAP positions (markers may pile on top of each other). |
 
 ---
 
@@ -129,6 +130,15 @@ These don't change the data, only how it's *arranged* for legibility:
   squashes those distances back in.
 - **Spread** (`--spread`): UMAP `min_dist` — bigger spreads points out more within/between
   clusters.
+- **Smooth spread** (on by default; `--no-smooth-spread` turns it off): UMAP stacks
+  similar or resampled compositions on the same spot, so a pile of hundreds of samples reads
+  as one dot. The smooth spread moves only where the markers are *drawn*. It stretches the
+  map to fill the panel, pushes overlapping markers apart (moves are capped, so a pile becomes
+  a filled disc around its true spot, and real holes in the cloud stay open), and shrinks
+  markers when there are too many to fit. Then it swaps nearby samples so that neighbours on
+  screen have similar compositions. A position on the map therefore means "near here", not
+  an exact UMAP coordinate, and a bigger blob means more samples. Ported 2026-11-27 from the
+  hardware GUI's live CoNet (`CN_SMOOTH_*` / `CN_SWAP_*` in `plot_10d.py`).
 
 ---
 

@@ -78,6 +78,17 @@ exact compositions by the same out-of-sample interpolation as the real samples, 
 they sit at identical coordinates in the pair. The run's discovered needles are red
 stars on ``conet.png`` (drawn on top, so a needle on an optimum is red-inside-blue).
 Each panel carries a key for the markers it shows.
+
+Smooth spread (marker de-overlap)
+---------------------------------
+Both PNGs draw de-overlapped display positions (``plot_10d.smooth_spread_layout``;
+``--no-smooth-spread`` turns it off). The spread's FRAME — its stretch and its
+drawn extent, which becomes both PNGs' shared axis limits — is fitted on
+the uniform baseline, like everything else here, and the real samples are relaxed
+inside that same frame. The true optima move with the uniform samples around them
+(``plot_10d.spread_extra_points``), so they keep identical coordinates on the pair.
+The relaxation itself depends on each set's own density, so a real sample sits
+near, not exactly on, the spot a uniform sample of the same composition is drawn.
 """
 
 from __future__ import annotations
@@ -118,7 +129,7 @@ DEFAULT_UNIFORM_N = 15000
 FRAME_CACHE_VERSION = 1
 # Bump when only the uniform PNG's DRAWING changes (markers, legend): the cached
 # frame stays valid and the PNG is re-rendered from it, with no UMAP refit.
-UNIFORM_PNG_VERSION = 3
+UNIFORM_PNG_VERSION = 4   # 4: smooth spread (sidecar <key>.uniform_v4.json holds its frame)
 DEFAULT_FRAME_CACHE = _REPO / "optimize" / "runs" / ".conet_frames"
 
 
@@ -257,6 +268,37 @@ def _uniform_png_path(cache_path: Path) -> Path:
     return cache_path.with_suffix(f".uniform_v{UNIFORM_PNG_VERSION}.png")
 
 
+def _uniform_meta_path(cache_path: Path) -> Path:
+    """Sidecar of the cached uniform PNG: what the real render must share with it but cannot
+    rebuild without redoing the uniform drawing — the smooth-spread frame and the true optima's
+    drawn coordinates."""
+    return cache_path.with_suffix(f".uniform_v{UNIFORM_PNG_VERSION}.json")
+
+
+def _spread_meta(spread_frame, opt_E) -> dict:
+    return {"spread_frame": {"center": list(spread_frame["center"]),
+                             "scale": float(spread_frame["scale"]),
+                             "k": float(spread_frame["k"]),
+                             "ref_limits": [list(spread_frame["ref_limits"][0]),
+                                            list(spread_frame["ref_limits"][1])],
+                             "draw_limits": [list(spread_frame["draw_limits"][0]),
+                                             list(spread_frame["draw_limits"][1])]},
+            "opt_E": None if opt_E is None else np.asarray(opt_E, float).tolist()}
+
+
+def _read_spread_meta(path: Path) -> dict | None:
+    try:
+        meta = json.loads(path.read_text())
+        sf = meta["spread_frame"]
+        for key in ("ref_limits", "draw_limits"):
+            sf[key] = (tuple(sf[key][0]), tuple(sf[key][1]))
+        opt = meta.get("opt_E")
+        return {"spread_frame": sf,
+                "opt_E": None if opt is None else np.asarray(opt, float).reshape(-1, 2)}
+    except Exception:
+        return None
+
+
 # ── per-landscape frame cache ───────────────────────────────────────────────────
 
 def frame_key(cfg: dict, *, uniform_n: int, seed: int,
@@ -282,13 +324,17 @@ def frame_key(cfg: dict, *, uniform_n: int, seed: int,
     return hashlib.sha1(payload.encode()).hexdigest()[:16]
 
 
-def _save_frame(path: Path, *, comp_u, E_raw, frame, limits, bounds, png: Path) -> None:
+def _save_frame(path: Path, *, comp_u, E_raw, frame, limits, bounds, png: Path | None,
+                spread: dict | None = None) -> None:
     """Persist a fitted frame (arrays in .npz, the rest as an embedded JSON blob).
 
     Written to a process-unique temporary and renamed into place: several jobs may
     render runs of the SAME landscape concurrently and race to cache it, and a
     reader must never see a half-written file. Rename is atomic within a directory,
     so the loser of a race simply overwrites with byte-identical content.
+
+    *png* (+ its *spread* sidecar) is optional: a render without the smooth spread
+    caches the frame but not its PNG, which is only valid for the default drawing.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     meta = {
@@ -306,19 +352,21 @@ def _save_frame(path: Path, *, comp_u, E_raw, frame, limits, bounds, png: Path) 
     tmp_png = path.with_suffix(f".{os.getpid()}.tmp.png")
     np.savez_compressed(tmp_npz, comp_u=comp_u, E_raw=E_raw,
                         meta=np.array(json.dumps(meta)))
-    shutil.copyfile(png, tmp_png)
-    # PNG first: _load_frame requires BOTH, so publishing the npz last means a
-    # concurrent reader never sees an npz whose PNG has not landed yet.
-    os.replace(tmp_png, _uniform_png_path(path))
+    if png is not None:
+        # PNG first: _load_frame requires BOTH, so publishing the npz last means a
+        # concurrent reader never sees an npz whose PNG has not landed yet.
+        _save_uniform_png(path, png, spread)
     os.replace(tmp_npz, path)
 
 
 def _load_frame(path: Path) -> dict | None:
     """Load a cached frame, or None if absent/unreadable (a miss simply refits).
 
-    ``uniform_png`` is None when the frame is cached but its PNG predates
-    ``UNIFORM_PNG_VERSION``; the caller then re-renders the PNG from the frame."""
+    ``uniform_png`` is None when the frame is cached but its PNG (or the PNG's
+    spread sidecar) predates ``UNIFORM_PNG_VERSION``; the caller then re-renders
+    the PNG from the frame."""
     png = _uniform_png_path(path)
+    spread = _read_spread_meta(_uniform_meta_path(path)) if png.is_file() else None
     if not path.is_file():
         return None
     try:
@@ -336,7 +384,8 @@ def _load_frame(path: Path) -> dict | None:
                       "E_raw": z["E_raw"]},
             "limits": (tuple(meta["limits"][0]), tuple(meta["limits"][1])),
             "bounds": {k: tuple(v) for k, v in meta["bounds"].items()},
-            "uniform_png": png if png.is_file() else None,
+            "uniform_png": png if (png.is_file() and spread is not None) else None,
+            "uniform_spread": spread,
         }
     except Exception as exc:
         print(f"[paired-conet] cached frame {path.name} unreadable ({exc}); refitting.")
@@ -345,10 +394,14 @@ def _load_frame(path: Path) -> dict | None:
 
 # ── main render ─────────────────────────────────────────────────────────────────
 
-def _save_uniform_png(cache_path: Path, png: Path) -> None:
-    """Publish a re-rendered uniform PNG beside an already-cached frame (atomic rename,
-    for the same concurrent-writer reason as ``_save_frame``)."""
+def _save_uniform_png(cache_path: Path, png: Path, spread: dict) -> None:
+    """Publish a uniform PNG + its spread sidecar beside a cached frame (atomic renames,
+    for the same concurrent-writer reason as ``_save_frame``). Sidecar first: a reader
+    takes the PNG only when both are present."""
     import os
+    tmp_json = cache_path.with_suffix(f".{os.getpid()}.tmp.json")
+    tmp_json.write_text(json.dumps(spread))
+    os.replace(tmp_json, _uniform_meta_path(cache_path))
     tmp_png = cache_path.with_suffix(f".{os.getpid()}.tmp.png")
     shutil.copyfile(png, tmp_png)
     os.replace(tmp_png, _uniform_png_path(cache_path))
@@ -368,13 +421,17 @@ def _mark_uniform(M, opt_E) -> None:
 
 def render_uniform_png(ens, cfg, dim, names, out_path, *, uniform_n: int, seed: int,
                        k: int, purity, spread, gap_reach, frame_params=None, E_u_raw=None,
-                       limits=None) -> dict:
+                       limits=None, smooth_spread: bool = True) -> dict:
     """Render this landscape's uniform-baseline PNG, fitting the frame unless one is given.
 
     With ``frame_params``/``E_u_raw``/``limits`` (a cached frame) the UMAP fit is
     skipped and the map is replayed verbatim, so a drawing-only change re-renders
     without moving anything. Everything returned depends only on the landscape and the
     fit parameters — never on any run — so every run of this landscape can share it.
+
+    Returned limits: ``limits`` is the frame's LAYOUT extent (what the frame cache
+    stores); ``draw_limits`` the axes both PNGs are drawn on — the smooth spread's
+    reference limits when it is on, else ``limits``.
     """
     Xu = uniform_samples(dim, uniform_n, seed)
     Yu = ens.predict(Xu)
@@ -390,15 +447,24 @@ def render_uniform_png(ens, cfg, dim, names, out_path, *, uniform_n: int, seed: 
         umap_md=spread if spread is not None else p10.CN_UMAP_MD,
         gap_reach=gap_reach if gap_reach is not None else p10.CN_GAP_REACH,
         purity_thr=purity if purity is not None else p10.CN_PURITY_THR,
-        needles_comp=opt_comp, frame=frame, limits=limits,
+        needles_comp=opt_comp, frame=frame, limits=None if smooth_spread else limits,
+        smooth_spread=smooth_spread,
     )
     if frame is None:
         # Limits and colour bounds from the UNIFORM baseline only. Using the uniform+real
         # union would make both vary per run, which is exactly what has to stop.
-        limits = p10._cn_view_limits(Mu["E"])
+        limits = p10._cn_view_limits(Mu["E_layout"])
     bounds = p10.conet_bounds(resp_u)
     denom = fit_denominator(comp_u)
     opt_E = place_true_optima(opt_comp, comp_u, Mu["E_raw"], Mu["frame"], k=k, denom=denom)
+    spread_frame = None
+    draw_limits = limits
+    if smooth_spread:
+        info = Mu["spread_info"]
+        spread_frame = info["frame"]
+        draw_limits = spread_frame["draw_limits"]
+        if opt_E is not None:
+            opt_E = p10.spread_extra_points(opt_E, info)
     _mark_uniform(Mu, opt_E)
     print(f"[paired-conet] landscape frame {'fitted' if frame is None else 'replayed'}: "
           f"{len(comp_u)} uniform samples, "
@@ -411,7 +477,8 @@ def render_uniform_png(ens, cfg, dim, names, out_path, *, uniform_n: int, seed: 
         f"{len(comp_u)} samples · shared UMAP frame",
         str(out_path))
     return {"comp_u": comp_u, "active": active, "frame": Mu["frame"], "E_raw": Mu["E_raw"],
-            "limits": limits, "bounds": bounds, "denom": denom, "opt_comp": opt_comp}
+            "limits": limits, "draw_limits": draw_limits, "bounds": bounds, "denom": denom,
+            "opt_comp": opt_comp, "opt_E": opt_E, "spread_frame": spread_frame}
 
 
 def render_paired_conets(run_dir, *, k: int = DEFAULT_K,
@@ -419,7 +486,8 @@ def render_paired_conets(run_dir, *, k: int = DEFAULT_K,
                          seed: int = 0, show_needles: bool = True,
                          purity=None, spread=None, gap_reach=None,
                          conet_path=None, uniform_path=None,
-                         frame_cache: Path | None = DEFAULT_FRAME_CACHE
+                         frame_cache: Path | None = DEFAULT_FRAME_CACHE,
+                         smooth_spread: bool = True,
                          ) -> tuple[Path, Path]:
     """Draw both CoNets of a run in its landscape's shared frame. Returns both PNG paths."""
     run_dir = Path(run_dir)
@@ -444,42 +512,50 @@ def render_paired_conets(run_dir, *, k: int = DEFAULT_K,
         cached = _load_frame(cache_path)
 
     fit_kw = dict(uniform_n=uniform_n, seed=seed, k=k, purity=purity, spread=spread,
-                  gap_reach=gap_reach)
-    if cached is not None and cached["uniform_png"] is not None:
+                  gap_reach=gap_reach, smooth_spread=smooth_spread)
+    # The cached uniform PNG is the DEFAULT (smooth-spread) drawing; a render with the
+    # spread off replays the frame and redraws instead, and never caches its PNG.
+    if cached is not None and cached["uniform_png"] is not None and smooth_spread:
         comp_u = cached["comp_u"]
         frame_params = cached["frame"]
         E_u_raw = frame_params.pop("E_raw")
-        limits, bounds = cached["limits"], cached["bounds"]
+        bounds = cached["bounds"]
+        spread_frame = cached["uniform_spread"]["spread_frame"]
+        opt_E = cached["uniform_spread"]["opt_E"]
+        draw_limits = spread_frame["draw_limits"]
         shutil.copyfile(cached["uniform_png"], uniform_path)
-        _, active = p10._reduce_comp(uniform_samples(dim, uniform_n, seed))
-        opt_comp = true_optima_comp(ens, active)
         denom = fit_denominator(comp_u)
         print(f"[paired-conet] reusing cached landscape frame {cache_path.name} "
               f"({len(comp_u)} uniform samples)")
-    elif cached is not None:
-        # Frame cached, PNG from an older drawing version: replay the frame to redraw.
-        frame_params = cached["frame"]
-        E_u_raw = frame_params.pop("E_raw")
-        built = render_uniform_png(ens, cfg, dim, names, uniform_path, frame_params=frame_params,
-                                   E_u_raw=E_u_raw, limits=cached["limits"], **fit_kw)
-        comp_u, opt_comp, denom = built["comp_u"], built["opt_comp"], built["denom"]
-        limits, bounds = cached["limits"], cached["bounds"]
-        try:
-            _save_uniform_png(cache_path, uniform_path)
-            print(f"[paired-conet] re-rendered uniform PNG for cached frame {cache_path.name}")
-        except Exception as exc:
-            print(f"[paired-conet] could not cache uniform PNG ({exc}); continuing.")
     else:
-        built = render_uniform_png(ens, cfg, dim, names, uniform_path, **fit_kw)
-        comp_u, opt_comp, denom = built["comp_u"], built["opt_comp"], built["denom"]
-        frame_params = built["frame"]
-        E_u_raw = built["E_raw"]
-        limits, bounds = built["limits"], built["bounds"]
-        if cache_path is not None:
+        if cached is not None:
+            # Frame cached, PNG from an older drawing version (or spread off): replay it.
+            frame_params = cached["frame"]
+            E_u_raw = frame_params.pop("E_raw")
+            built = render_uniform_png(ens, cfg, dim, names, uniform_path,
+                                       frame_params=frame_params, E_u_raw=E_u_raw,
+                                       limits=cached["limits"], **fit_kw)
+            bounds = cached["bounds"]
+        else:
+            built = render_uniform_png(ens, cfg, dim, names, uniform_path, **fit_kw)
+            frame_params = built["frame"]
+            E_u_raw = built["E_raw"]
+            bounds = built["bounds"]
+        comp_u, denom = built["comp_u"], built["denom"]
+        spread_frame, opt_E = built["spread_frame"], built["opt_E"]
+        draw_limits = built["draw_limits"]
+        spread_meta = _spread_meta(spread_frame, opt_E) if smooth_spread else None
+        if cache_path is not None and cached is not None and smooth_spread:
+            try:
+                _save_uniform_png(cache_path, uniform_path, spread_meta)
+                print(f"[paired-conet] re-rendered uniform PNG for cached frame {cache_path.name}")
+            except Exception as exc:
+                print(f"[paired-conet] could not cache uniform PNG ({exc}); continuing.")
+        elif cache_path is not None and cached is None:
             try:
                 _save_frame(cache_path, comp_u=comp_u, E_raw=E_u_raw,
-                            frame=frame_params, limits=limits, bounds=bounds,
-                            png=uniform_path)
+                            frame=frame_params, limits=built["limits"], bounds=bounds,
+                            png=uniform_path if smooth_spread else None, spread=spread_meta)
                 print(f"[paired-conet] cached landscape frame -> {cache_path.name}")
             except Exception as exc:
                 print(f"[paired-conet] could not cache frame ({exc}); continuing.")
@@ -495,32 +571,34 @@ def render_paired_conets(run_dir, *, k: int = DEFAULT_K,
     E_r_raw = embed_out_of_sample(comp_r, comp_u, E_u_raw, k=k, denom=denom)
     frame = dict(frame_params)
     frame["E_raw"] = E_r_raw
-    Mr, _ = p10.build_conet(
+    Mr, Fr = p10.build_conet(
         comp_r, names, resp_r, iters_r,
         umap_md=spread if spread is not None else p10.CN_UMAP_MD,
         gap_reach=gap_reach if gap_reach is not None else p10.CN_GAP_REACH,
         purity_thr=purity if purity is not None else p10.CN_PURITY_THR,
         needles_comp=needles_r, show_needles=show_needles,
-        frame=frame, limits=limits,
+        frame=frame, limits=draw_limits,
+        smooth_spread=smooth_spread, spread_frame=spread_frame,
     )
-    Mr["true_optima_E"] = place_true_optima(opt_comp, comp_u, E_u_raw, frame_params,
-                                            k=k, denom=denom)
+    # Same coordinates as on the uniform PNG (computed there, from the uniform samples).
+    Mr["true_optima_E"] = opt_E
     Mr["star_legend"] = True
     print(f"[paired-conet] real samples placed into the landscape frame: "
           f"{len(comp_r)} samples, k={k} ({time.time() - t0:.0f}s)")
 
     # Real samples are interpolated between uniform landmarks, so they normally sit
     # well inside the uniform extent; the purity warp can still push a mixture out.
-    # Report rather than silently clip, since a clipped point is a lost observation.
-    (x0, x1), (y0, y1) = limits
-    E = Mr["E"]
+    # Report rather than silently drop: without the spread such a point is clipped
+    # off the panel; with it, the relaxation pins it to the frame edge (displaced).
+    (x0, x1), (y0, y1) = draw_limits
+    E = Mr["spread_info"]["Z"] if smooth_spread else Mr["E"]
     out = int(np.sum((E[:, 0] < x0) | (E[:, 0] > x1) |
                      (E[:, 1] < y0) | (E[:, 1] > y1)))
     if out:
         print(f"[paired-conet] WARNING: {out}/{len(E)} real samples fall outside the "
-              "landscape frame's limits and are clipped.")
+              "landscape frame's limits and are "
+              + ("pinned to its edge." if smooth_spread else "clipped."))
 
-    Fr = p10.conet_dominance_fields(Mr, limits=limits)
     out_r = p10.save_png(
         Mr, Fr, bounds,
         f"{title_r} · placed in the landscape's uniform UMAP frame (k={k})",
@@ -558,6 +636,8 @@ def main() -> None:
                     help="UMAP min_dist / point spread (default: plot_10d's CN_UMAP_MD)")
     ap.add_argument("--gap-reach", type=float, default=None,
                     help="far-satellite squash factor (default: plot_10d's CN_GAP_REACH)")
+    ap.add_argument("--no-smooth-spread", action="store_true",
+                    help="draw the raw layout (no marker de-overlap; see plot_10d CN_SMOOTH_*)")
     args = ap.parse_args()
 
     out_r, out_u = render_paired_conets(
@@ -565,6 +645,7 @@ def main() -> None:
         show_needles=not args.no_needles, purity=args.purity, spread=args.spread,
         gap_reach=args.gap_reach, conet_path=args.save, uniform_path=args.save_uniform,
         frame_cache=None if args.no_frame_cache else Path(args.frame_cache),
+        smooth_spread=not args.no_smooth_spread,
     )
     print(f"wrote {out_r}")
     print(f"wrote {out_u}")
